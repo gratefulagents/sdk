@@ -1,0 +1,21 @@
+description: Grateful Agents SDK headless harness smoke evals
+
+providers:
+  - id: exec: ./bin/grateful-agent-run --provider openai --model gpt-4.1-mini --output text --max-turns 8
+    label: grateful-agent-run
+
+prompts:
+  - "{{task}}"
+
+tests:
+  - vars:
+      task: "Reply with exactly: harness ok"
+    assert:
+      - type: equals
+        value: "harness ok"
+
+  - vars:
+      task: "In one short sentence, say whether you can use tools when needed."
+    assert:
+      - type: llm-rubric
+        value: "The answer should clearly state that the agent can use tools when needed."

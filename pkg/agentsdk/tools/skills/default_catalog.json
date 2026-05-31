@@ -1,0 +1,162 @@
+{
+  "skills": [
+    {
+      "name": "browser-playwright",
+      "description": "Browser automation via Playwright for web testing and UI verification",
+      "category": "browser",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/anthropics/mcp-server-playwright" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@anthropic/mcp-server-playwright"] },
+      "tags": ["browser", "automation", "testing", "screenshots"],
+      "verified": true
+    },
+    {
+      "name": "search-duckduckgo",
+      "description": "Web search via DuckDuckGo - no API key required",
+      "category": "search",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/nickclyde/duckduckgo-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "uvx", "args": ["duckduckgo-mcp-server"] },
+      "tags": ["search", "web", "free"],
+      "verified": true
+    },
+    {
+      "name": "search-exa",
+      "description": "High-quality AI-powered web search via Exa",
+      "category": "search",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/exa-labs/exa-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "exa-mcp-server"], "env": {"EXA_API_KEY": "${EXA_API_KEY}"} },
+      "tags": ["search", "web", "ai"],
+      "verified": true,
+      "requiresEnvVars": ["EXA_API_KEY"]
+    },
+    {
+      "name": "search-brave",
+      "description": "Web, image, video, and news search via Brave Search API",
+      "category": "search",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/anthropics/mcp-server-brave-search" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@anthropic/mcp-server-brave-search"], "env": {"BRAVE_API_KEY": "${BRAVE_API_KEY}"} },
+      "tags": ["search", "web", "images", "news"],
+      "verified": true,
+      "requiresEnvVars": ["BRAVE_API_KEY"]
+    },
+    {
+      "name": "fetch",
+      "description": "Fetch and convert web content for LLM consumption (official MCP reference server)",
+      "category": "web",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
+      "mcpConfig": { "type": "stdio", "command": "uvx", "args": ["mcp-server-fetch"] },
+      "tags": ["fetch", "web", "content", "official"],
+      "verified": true
+    },
+    {
+      "name": "filesystem",
+      "description": "Secure file operations with configurable access controls (official MCP reference server)",
+      "category": "filesystem",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"] },
+      "tags": ["files", "filesystem", "official"],
+      "verified": true
+    },
+    {
+      "name": "git-mcp",
+      "description": "Git repository operations - read, search, and manipulate Git repos (official MCP reference server)",
+      "category": "vcs",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
+      "mcpConfig": { "type": "stdio", "command": "uvx", "args": ["mcp-server-git"] },
+      "tags": ["git", "vcs", "official"],
+      "verified": true
+    },
+    {
+      "name": "github-mcp",
+      "description": "GitHub API integration - repositories, issues, PRs, and more",
+      "category": "vcs",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/github/github-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@github/mcp-server"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"} },
+      "tags": ["github", "vcs", "api"],
+      "verified": true,
+      "requiresEnvVars": ["GITHUB_TOKEN"]
+    },
+    {
+      "name": "sequential-thinking",
+      "description": "Dynamic problem-solving through structured thought sequences (official MCP reference server)",
+      "category": "reasoning",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"] },
+      "tags": ["reasoning", "thinking", "official"],
+      "verified": true
+    },
+    {
+      "name": "postgres-mcp",
+      "description": "PostgreSQL database access and querying via MCP",
+      "category": "database",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"], "env": {"DATABASE_URL": "${DATABASE_URL}"} },
+      "tags": ["database", "postgres", "sql", "official"],
+      "verified": true,
+      "requiresEnvVars": ["DATABASE_URL"]
+    },
+    {
+      "name": "slack-mcp",
+      "description": "Slack workspace integration - channels, messages, and users",
+      "category": "communication",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/zencoderai/slack-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "slack-mcp-server"], "env": {"SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"} },
+      "tags": ["slack", "messaging", "communication"],
+      "verified": true,
+      "requiresEnvVars": ["SLACK_BOT_TOKEN"]
+    },
+    {
+      "name": "sentry-mcp",
+      "description": "Sentry error tracking and monitoring integration",
+      "category": "monitoring",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/getsentry/sentry-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@sentry/mcp-server"], "env": {"SENTRY_AUTH_TOKEN": "${SENTRY_AUTH_TOKEN}"} },
+      "tags": ["monitoring", "errors", "sentry"],
+      "verified": true,
+      "requiresEnvVars": ["SENTRY_AUTH_TOKEN"]
+    },
+    {
+      "name": "firecrawl",
+      "description": "Web scraping and search via Firecrawl - crawl, scrape, and extract web content",
+      "category": "search",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/firecrawl/firecrawl-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "firecrawl-mcp-server"], "env": {"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"} },
+      "tags": ["search", "scraping", "web"],
+      "verified": true,
+      "requiresEnvVars": ["FIRECRAWL_API_KEY"]
+    },
+    {
+      "name": "linear-mcp",
+      "description": "Linear project management - issues, projects, and teams",
+      "category": "project-management",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/linear/linear-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@linear/mcp-server"], "env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"} },
+      "tags": ["linear", "project-management", "issues"],
+      "verified": true,
+      "requiresEnvVars": ["LINEAR_API_KEY"]
+    },
+    {
+      "name": "memory-knowledge-graph",
+      "description": "Persistent memory via knowledge graph with semantic search",
+      "category": "memory",
+      "version": "0.1.0",
+      "source": { "repository": "https://github.com/shaneholloman/mcp-knowledge-graph" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "mcp-knowledge-graph"] },
+      "tags": ["memory", "knowledge", "graph"],
+      "verified": true
+    }
+  ]
+}

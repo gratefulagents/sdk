@@ -1,0 +1,25 @@
+# Build artifacts
+/bin/
+
+# Local runtime and evaluation output
+/.grateful-evals/
+/runs/
+/jobs/
+/coverage.out
+/dist/
+
+# Python caches used by eval adapters
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.tmp
+
+# Local secrets and provider auth material
+.env
+.env.*
+auth.json
+*.token
+*.key

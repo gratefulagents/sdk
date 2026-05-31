@@ -1,0 +1,204 @@
+package agentsdk
+
+import (
+	"fmt"
+	"strings"
+)
+
+const (
+	DefaultMaxAutoLoops = 200
+
+	autoTrackerMaxRecentTools  = 10
+	autoTrackerMaxRecentErrors = 5
+
+	defaultCBMaxNoToolTurns   = 3
+	defaultCBMaxSameErrors    = 5
+	defaultCBMaxRepeatedCycle = 6
+)
+
+// AutoTracker tracks autonomous-loop progress for smart continuation and
+// circuit breakers.
+type AutoTracker struct {
+	consecutiveNoToolTurns int
+	recentToolCalls        []string
+	recentErrors           []string
+	toolCallCount          int
+}
+
+// CircuitBreakerResult reports whether an autonomous loop should pause.
+type CircuitBreakerResult struct {
+	Tripped bool
+	Reason  string
+}
+
+// Update analyzes the latest runner result items and updates tracker state.
+func (t *AutoTracker) Update(newItems []RunItem) {
+	if t == nil {
+		return
+	}
+	var turnToolCalls []string
+	var turnErrors []string
+	for _, item := range newItems {
+		if item.Type == RunItemToolCall && item.ToolCall != nil {
+			turnToolCalls = append(turnToolCalls, item.ToolCall.Name)
+		}
+		if item.Type == RunItemToolOutput && item.ToolOutput != nil && item.ToolOutput.IsError {
+			msg := item.ToolOutput.Content
+			if len(msg) > 200 {
+				msg = msg[:200]
+			}
+			turnErrors = append(turnErrors, msg)
+		}
+	}
+
+	if len(turnToolCalls) == 0 {
+		t.consecutiveNoToolTurns++
+	} else {
+		t.consecutiveNoToolTurns = 0
+	}
+	t.toolCallCount += len(turnToolCalls)
+
+	for _, call := range turnToolCalls {
+		t.recentToolCalls = append(t.recentToolCalls, call)
+		if len(t.recentToolCalls) > autoTrackerMaxRecentTools {
+			t.recentToolCalls = t.recentToolCalls[1:]
+		}
+	}
+	for _, errText := range turnErrors {
+		t.recentErrors = append(t.recentErrors, errText)
+		if len(t.recentErrors) > autoTrackerMaxRecentErrors {
+			t.recentErrors = t.recentErrors[1:]
+		}
+	}
+}
+
+func (t *AutoTracker) ConsecutiveNoToolTurns() int {
+	if t == nil {
+		return 0
+	}
+	return t.consecutiveNoToolTurns
+}
+
+func (t *AutoTracker) ToolCallCount() int {
+	if t == nil {
+		return 0
+	}
+	return t.toolCallCount
+}
+
+func (t *AutoTracker) consecutiveSameError() (int, string) {
+	if t == nil || len(t.recentErrors) == 0 {
+		return 0, ""
+	}
+	last := t.recentErrors[len(t.recentErrors)-1]
+	count := 0
+	for i := len(t.recentErrors) - 1; i >= 0; i-- {
+		if t.recentErrors[i] == last {
+			count++
+		} else {
+			break
+		}
+	}
+	return count, last
+}
+
+func (t *AutoTracker) detectRepetitiveCycle() (bool, []string) {
+	if t == nil {
+		return false, nil
+	}
+	calls := t.recentToolCalls
+	for cycleLen := 2; cycleLen <= 3; cycleLen++ {
+		needed := cycleLen * 2
+		if len(calls) < needed {
+			continue
+		}
+		tail := calls[len(calls)-needed:]
+		cycle := tail[:cycleLen]
+		match := true
+		for i := 0; i < needed; i++ {
+			if tail[i] != cycle[i%cycleLen] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true, cycle
+		}
+	}
+	return false, nil
+}
+
+// CheckCircuitBreakers reports hard-stop autonomous loop conditions.
+func (t *AutoTracker) CheckCircuitBreakers() CircuitBreakerResult {
+	if t == nil {
+		return CircuitBreakerResult{}
+	}
+	if t.consecutiveNoToolTurns >= defaultCBMaxNoToolTurns {
+		return CircuitBreakerResult{
+			Tripped: true,
+			Reason:  fmt.Sprintf("Agent stalled - no tool calls in %d consecutive turns", t.consecutiveNoToolTurns),
+		}
+	}
+	errCount, errMsg := t.consecutiveSameError()
+	if errCount >= defaultCBMaxSameErrors {
+		return CircuitBreakerResult{
+			Tripped: true,
+			Reason:  fmt.Sprintf("Agent stuck - same error repeated %d times: %s", errCount, truncateTitle(errMsg, 100)),
+		}
+	}
+	if cycling, cycle := t.detectRepetitiveCycle(); cycling {
+		cycleCount := len(t.recentToolCalls) / len(cycle)
+		if cycleCount >= defaultCBMaxRepeatedCycle/len(cycle) {
+			return CircuitBreakerResult{
+				Tripped: true,
+				Reason:  fmt.Sprintf("Agent stuck in tool loop - pattern [%s] repeated %d times", strings.Join(cycle, "->"), cycleCount),
+			}
+		}
+	}
+	return CircuitBreakerResult{}
+}
+
+// BuildSmartNudge generates a context-aware autonomous continuation prompt.
+func BuildSmartNudge(t *AutoTracker, phase string) string {
+	if t == nil {
+		t = &AutoTracker{}
+	}
+	phaseHint := ""
+	if phase != "" {
+		phaseHint = fmt.Sprintf(" You are in the %s phase.", phase)
+	}
+
+	if cycling, cycle := t.detectRepetitiveCycle(); cycling {
+		return fmt.Sprintf("[SYSTEM] Detected repetitive tool pattern: [%s]. You appear stuck in a loop. Step back, reassess your approach, and try something fundamentally different. If the current subtask is blocked, skip it and move on to other work.%s",
+			strings.Join(cycle, " -> "), autonomousFinishGuidance())
+	}
+
+	errCount, errMsg := t.consecutiveSameError()
+	if errCount >= 3 {
+		return fmt.Sprintf("[SYSTEM] You have hit the same error %d times: \"%s\". Do NOT retry the same approach. Try a fundamentally different strategy, or skip this subtask and move on.%s",
+			errCount, truncateTitle(errMsg, 120), autonomousFinishGuidance())
+	}
+
+	if t.consecutiveNoToolTurns >= 2 {
+		return "[SYSTEM] WARNING: You have produced text without tool calls for 2 consecutive turns. In autonomous mode, every turn MUST include at least one tool call. Do NOT output only text." + autonomousFinishGuidance()
+	}
+	if t.consecutiveNoToolTurns == 1 {
+		return "[SYSTEM] You produced text without tool calls. In autonomous mode, every turn must include at least one tool call." + autonomousFinishGuidance()
+	}
+	return fmt.Sprintf("[SYSTEM] Continue.%s %d tool calls so far. Use tools to make progress.%s", phaseHint, t.toolCallCount, autonomousFinishGuidance())
+}
+
+func autonomousFinishGuidance() string {
+	return " Finish is a hard stop, not a progress report: if you named any backlog item, TODO, follow-up, remaining risk, or next step, call a tool for the top item now. Call finish only when no actionable work remains or a concrete external blocker prevents useful tool progress."
+}
+
+func truncateTitle(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
+}

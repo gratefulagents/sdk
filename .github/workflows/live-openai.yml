@@ -1,0 +1,57 @@
+name: Live tests — OpenAI OAuth
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Override OPENAI_LIVE_MODEL (default gpt-5.5)"
+        required: false
+        default: ""
+      packages:
+        description: "Go packages to test"
+        required: false
+        default: "./examples/features/..."
+      run:
+        description: "Optional -run regex"
+        required: false
+        default: ""
+
+jobs:
+  live-openai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Write Codex OAuth auth.json
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -z "${CODEX_AUTH_JSON}" ]; then
+            echo "::error::CODEX_AUTH_JSON secret is not set"
+            exit 1
+          fi
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: go test
+        env:
+          GRATEFUL_LIVE_TESTS: required
+          GRATEFUL_LIVE_PROVIDER: openai
+          OPENAI_OAUTH_ACCOUNT_ID: ${{ secrets.OPENAI_OAUTH_ACCOUNT_ID }}
+          OPENAI_LIVE_MODEL: ${{ inputs.model }}
+        run: |
+          args=(-count=1 -v ${{ inputs.packages }})
+          if [ -n "${{ inputs.run }}" ]; then
+            args+=(-run "${{ inputs.run }}")
+          else
+            # Skip tests that hard-pin to a non-OpenAI provider.
+            args+=(-skip 'TestAnthropicLive|TestOpenRouterLive|TestMultiProvider')
+          fi
+          go test "${args[@]}"

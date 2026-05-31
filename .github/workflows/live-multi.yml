@@ -1,0 +1,64 @@
+name: Live tests — MultiProvider
+
+# Runs the entire feature suite through agentsdk.MultiProvider, registering
+# every provider whose secret is configured on the repository. The default
+# prefix decides which provider answers when a model name is unprefixed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      default_provider:
+        description: "Default provider prefix"
+        required: false
+        default: "openai"
+        type: choice
+        options:
+          - openai
+          - anthropic
+          - openrouter
+      packages:
+        description: "Go packages to test"
+        required: false
+        default: "./examples/features/..."
+      run:
+        description: "Optional -run regex"
+        required: false
+        default: ""
+
+jobs:
+  live-multi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Write Codex OAuth auth.json (when configured)
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -n "${CODEX_AUTH_JSON}" ]; then
+            mkdir -p "$HOME/.codex"
+            printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+            chmod 600 "$HOME/.codex/auth.json"
+            echo "OpenAI OAuth credentials installed"
+          else
+            echo "::notice::CODEX_AUTH_JSON not set; OpenAI provider will be unavailable"
+          fi
+
+      - name: go test
+        env:
+          GRATEFUL_LIVE_TESTS: required
+          GRATEFUL_LIVE_PROVIDER: multi
+          GRATEFUL_LIVE_DEFAULT_PROVIDER: ${{ inputs.default_provider }}
+          OPENAI_OAUTH_ACCOUNT_ID: ${{ secrets.OPENAI_OAUTH_ACCOUNT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          args=(-count=1 -v ${{ inputs.packages }})
+          if [ -n "${{ inputs.run }}" ]; then args+=(-run "${{ inputs.run }}"); fi
+          go test "${args[@]}"

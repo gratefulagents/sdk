@@ -1,0 +1,139 @@
+name: Terminal-Bench
+
+# Runs Terminal-Bench 2.1 through Harbor against the grateful-agent-run binary.
+# For leaderboard-like runs, use a large Linux runner with Docker capacity and
+# keep the default dataset, attempts, timeouts, and resources unchanged.
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Live provider for the agent"
+        required: false
+        default: "openai"
+        type: choice
+        options:
+          - openai
+          - anthropic
+          - openrouter
+      model:
+        description: "Model name (defaults: openai=gpt-5.5, anthropic=claude-sonnet-4-6, openrouter=deepseek/deepseek-v4-flash)"
+        required: false
+        default: ""
+      dataset:
+        description: "Harbor dataset"
+        required: false
+        default: "terminal-bench/terminal-bench-2-1"
+      n_concurrent:
+        description: "Concurrent Harbor trials"
+        required: false
+        default: "32"
+      n_attempts:
+        description: "Attempts per task"
+        required: false
+        default: "5"
+      max_turns:
+        description: "GRATEFUL_MAX_TURNS"
+        required: false
+        default: "80"
+      task_names:
+        description: "Comma-separated Harbor task names (blank = full dataset)"
+        required: false
+        default: ""
+
+jobs:
+  terminal-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Verify Docker
+        run: docker version
+
+      - name: Write Codex OAuth auth.json (when configured)
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          if [ -n "${CODEX_AUTH_JSON}" ]; then
+            mkdir -p "$HOME/.codex"
+            printf '%s' "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"
+            chmod 600 "$HOME/.codex/auth.json"
+          fi
+
+      - name: Resolve model default
+        id: model
+        env:
+          PROVIDER: ${{ inputs.provider }}
+          MODEL_INPUT: ${{ inputs.model }}
+        run: |
+          model="$MODEL_INPUT"
+          if [ -z "$model" ]; then
+            case "$PROVIDER" in
+              anthropic)  model="claude-sonnet-4-6" ;;
+              openrouter) model="deepseek/deepseek-v4-flash" ;;
+              *)          model="gpt-5.5" ;;
+            esac
+          fi
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+
+      - name: Run Terminal-Bench
+        env:
+          OPENAI_OAUTH_ACCOUNT_ID: ${{ secrets.OPENAI_OAUTH_ACCOUNT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GRATEFUL_PROVIDER: ${{ inputs.provider }}
+          GRATEFUL_MODEL: ${{ steps.model.outputs.model }}
+          GRATEFUL_MAX_TURNS: ${{ inputs.max_turns }}
+          GRATEFUL_MAX_TOKENS: "8192"
+          GRATEFUL_PERMISSION_MODE: "danger-full-access"
+          GRATEFUL_TOOL_ACCESS: "full"
+          TB_OUTPUT_PATH: jobs
+          TB_N_CONCURRENT: ${{ inputs.n_concurrent }}
+          TB_N_ATTEMPTS: ${{ inputs.n_attempts }}
+          RUN_ID: tb-${{ github.run_id }}
+          TB_DATASET: ${{ inputs.dataset }}
+          TB_TASK_NAMES: ${{ inputs.task_names }}
+        run: ./scripts/run-terminal-bench.sh
+
+      - name: Summarise results
+        if: always()
+        run: |
+          results="jobs/tb-${{ github.run_id }}/result.json"
+          if [ -f "$results" ]; then
+            jq -r '
+              if .accuracy? != null then "accuracy=\(.accuracy * 100)%"
+              elif .score? != null then "score=\(.score * 100)%"
+              elif .mean_reward? != null then "mean_reward=\(.mean_reward * 100)%"
+              else "result_keys=\(keys | join(","))"
+              end
+            ' "$results" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No result.json produced" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-bench-${{ github.run_id }}
+          path: |
+            jobs/tb-${{ github.run_id }}
+            jobs/tb-${{ github.run_id }}.harbor-run.log
+          if-no-files-found: warn
+          retention-days: 14
