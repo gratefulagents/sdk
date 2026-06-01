@@ -2,6 +2,7 @@ package projectstate
 
 import (
 	"context"
+	"errors"
 	"math"
 	"path/filepath"
 	"testing"
@@ -18,7 +19,6 @@ type fakeEmbedder struct {
 }
 
 func (f *fakeEmbedder) Model() string { return f.model }
-
 func (f *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	for i, t := range texts {
@@ -148,5 +148,40 @@ func TestLexicalFallbackWithoutEmbedder(t *testing.T) {
 	}
 	if _, err := store.SearchMemories(ctx, MemoryFilter{Query: ""}); err == nil {
 		t.Fatal("empty query should error")
+	}
+}
+
+// errEmbedder always fails, simulating an unavailable or timed-out provider.
+type errEmbedder struct{}
+
+func (errEmbedder) Model() string { return "err-1" }
+func (errEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("embedding provider unavailable")
+}
+
+// TestQueryEmbeddingFailureFallsBackToLexical verifies that when the query
+// embedding cannot be computed, recall falls back to query-relevant lexical
+// search instead of returning every memory ranked by recency/pinned boosts.
+func TestQueryEmbeddingFailureFallsBackToLexical(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewFilesystemStore(FilesystemOptions{
+		StateDir: filepath.Join(t.TempDir(), "state"),
+		Embedder: errEmbedder{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Run focused tests after storage changes."}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Use append-only project state."}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.SearchMemories(ctx, MemoryFilter{Query: "focused"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Content != "Run focused tests after storage changes." {
+		t.Fatalf("query-embedding-failure fallback = %+v, want only the lexically matching memory", got)
 	}
 }

@@ -432,6 +432,16 @@ func (s *FilesystemStore) SearchMemories(ctx context.Context, filter MemoryFilte
 // but not by keyword, so semantically relevant memories surface even when they
 // share no exact terms with the query.
 func (s *FilesystemStore) searchHybrid(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
+	// Embed the query first. If the embedding provider is unavailable or times
+	// out we have no semantic signal, so fall back to the lexical search rather
+	// than ranking every kind/tag match by recency and pinned boosts (which
+	// would return query-irrelevant memories).
+	vecs, embErr := s.embedder.Embed(ctx, []string{filter.Query})
+	if embErr != nil || len(vecs) != 1 || len(vecs[0]) == 0 {
+		return s.listMemories(ctx, filter, true)
+	}
+	queryVec := vecs[0]
+
 	st, err := s.loadState(ctx)
 	if err != nil {
 		return nil, err
@@ -447,10 +457,6 @@ func (s *FilesystemStore) searchHybrid(ctx context.Context, filter MemoryFilter)
 		return nil, nil
 	}
 	vectors := s.ensureEmbeddings(ctx, candidates)
-	var queryVec []float32
-	if vecs, embErr := s.embedder.Embed(ctx, []string{filter.Query}); embErr == nil && len(vecs) == 1 {
-		queryVec = vecs[0]
-	}
 	ranked := rankHybrid(filter.Query, candidates, queryVec, vectors, s.hybrid, time.Now().UTC())
 	if filter.Limit > 0 && len(ranked) > filter.Limit {
 		ranked = ranked[:filter.Limit]
