@@ -37,6 +37,8 @@ flowchart TD
 - `pkg/agentsdk/tracestore`: filesystem trace persistence.
 - `pkg/agentsdk/otel`: OpenTelemetry bridge.
 - `pkg/agentsdk/memory`: memory store and embedding helpers.
+- `pkg/agentsdk/projectstate`: durable event-sourced project state with typed tasks and typed long-term memories. Memory recall is lexical by default and hybrid (lexical + embedding cosine similarity) when an `Embedder` is configured.
+- `pkg/agentsdk/tools/projectstate`: agent-facing tools over a `projectstate.Store` (`task_*`, `memory_remember`, `memory_recall`, `memory_list`, `prime_context`).
 - `cmd/grateful-agent-run`: CLI and evaluation harness.
 - `examples`: focused runnable examples.
 - `test/integration`: live integration suites.

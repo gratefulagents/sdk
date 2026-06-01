@@ -32,6 +32,13 @@ type FilesystemOptions struct {
 	WorkDir   string
 	Actor     string
 	RunID     string
+	// Embedder enables embeddings-backed hybrid memory recall. When nil,
+	// SearchMemories falls back to the lexical keyword search and behaves
+	// exactly as before.
+	Embedder Embedder
+	// Hybrid tunes lexical/semantic fusion. When nil, DefaultHybridConfig is
+	// used. Ignored when Embedder is nil.
+	Hybrid *HybridConfig
 }
 
 type FilesystemStore struct {
@@ -41,6 +48,8 @@ type FilesystemStore struct {
 	workDir   string
 	actor     string
 	runID     string
+	embedder  Embedder
+	hybrid    HybridConfig
 }
 
 type state struct {
@@ -96,6 +105,11 @@ func NewFilesystemStore(opts FilesystemOptions) (*FilesystemStore, error) {
 		workDir:   workDir,
 		actor:     strings.TrimSpace(opts.Actor),
 		runID:     strings.TrimSpace(opts.RunID),
+		embedder:  opts.Embedder,
+		hybrid:    DefaultHybridConfig(),
+	}
+	if opts.Hybrid != nil {
+		s.hybrid = *opts.Hybrid
 	}
 	if err := s.ensureDirs(); err != nil {
 		return nil, err
@@ -392,11 +406,62 @@ func (s *FilesystemStore) UpsertMemory(ctx context.Context, in UpsertMemoryInput
 		out = cloneMemoryPtr(mem)
 		return mem, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if out != nil {
+		// Best-effort: caching the embedding must never fail the write. A
+		// missing vector is backfilled lazily on the next recall.
+		_ = s.cacheMemoryEmbedding(ctx, out.ID, out.Content)
+	}
 	return out, err
 }
 
 func (s *FilesystemStore) SearchMemories(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
-	return s.listMemories(ctx, filter, true)
+	if strings.TrimSpace(filter.Query) == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+	if s.embedder == nil {
+		return s.listMemories(ctx, filter, true)
+	}
+	return s.searchHybrid(ctx, filter)
+}
+
+// searchHybrid ranks memories by fusing the lexical keyword signal with cosine
+// similarity over cached embeddings. Candidates are filtered by kind and tags
+// but not by keyword, so semantically relevant memories surface even when they
+// share no exact terms with the query.
+func (s *FilesystemStore) searchHybrid(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
+	// Embed the query first. If the embedding provider is unavailable or times
+	// out we have no semantic signal, so fall back to the lexical search rather
+	// than ranking every kind/tag match by recency and pinned boosts (which
+	// would return query-irrelevant memories).
+	vecs, embErr := s.embedder.Embed(ctx, []string{filter.Query})
+	if embErr != nil || len(vecs) != 1 || len(vecs[0]) == 0 {
+		return s.listMemories(ctx, filter, true)
+	}
+	queryVec := vecs[0]
+
+	st, err := s.loadState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []Memory
+	for _, mem := range st.memories {
+		if !matchesAny(mem.Kind, filter.Kinds) || !matchesLabels(mem.Tags, filter.Tags) {
+			continue
+		}
+		candidates = append(candidates, mem)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	vectors := s.ensureEmbeddings(ctx, candidates)
+	ranked := rankHybrid(filter.Query, candidates, queryVec, vectors, s.hybrid, time.Now().UTC())
+	if filter.Limit > 0 && len(ranked) > filter.Limit {
+		ranked = ranked[:filter.Limit]
+	}
+	return ranked, nil
 }
 
 func (s *FilesystemStore) ListMemories(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
