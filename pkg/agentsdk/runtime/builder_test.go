@@ -135,7 +135,18 @@ func TestBuildToolBundleIncludesProjectStateTools(t *testing.T) {
 	for _, tool := range bundle.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"task_create", "task_ready", "task_claim", "task_close", "memory_remember", "memory_recall", "prime_context"} {
+	for _, want := range []string{
+		"task_create",
+		"task_ready",
+		"task_claim",
+		"task_close",
+		"memory_remember",
+		"memory_recall",
+		"memory_update",
+		"memory_delete",
+		"memory_stats",
+		"prime_context",
+	} {
 		if !names[want] {
 			t.Fatalf("missing project state tool %q; names=%v", want, names)
 		}
@@ -481,62 +492,62 @@ func TestModeOverridesFromSnapshot(t *testing.T) {
 }
 
 func TestBuildCatalogHandoffsTargetsSpecialists(t *testing.T) {
-cfg := Config{
-Model: "openai/gpt-5.5",
-RoleCatalog: agentsdk.RoleCatalog{
-{Name: "reviewer", Description: "Reviews code changes."},
-{Name: "release planner", Description: "Plans releases."},
-{Name: "missing"},
-},
-}
-specialists := map[string]*agentsdk.Agent{
-"reviewer":        {Name: "reviewer"},
-"release planner": {Name: "release planner"},
-}
+	cfg := Config{
+		Model: "openai/gpt-5.5",
+		RoleCatalog: agentsdk.RoleCatalog{
+			{Name: "reviewer", Description: "Reviews code changes."},
+			{Name: "release planner", Description: "Plans releases."},
+			{Name: "missing"},
+		},
+	}
+	specialists := map[string]*agentsdk.Agent{
+		"reviewer":        {Name: "reviewer"},
+		"release planner": {Name: "release planner"},
+	}
 
-handoffs := buildCatalogHandoffs(cfg, specialists)
-if len(handoffs) != 2 {
-t.Fatalf("len(handoffs) = %d, want 2", len(handoffs))
-}
-if handoffs[0].ToolName != "transfer_to_reviewer" {
-t.Errorf("handoffs[0].ToolName = %q, want transfer_to_reviewer", handoffs[0].ToolName)
-}
-if handoffs[0].Agent != specialists["reviewer"] {
-t.Errorf("handoffs[0] does not target the reviewer specialist")
-}
-if handoffs[1].ToolName != "transfer_to_release_planner" {
-t.Errorf("handoffs[1].ToolName = %q, want transfer_to_release_planner", handoffs[1].ToolName)
-}
-if handoffs[0].Description != "Reviews code changes." {
-t.Errorf("handoffs[0].Description = %q", handoffs[0].Description)
-}
+	handoffs := buildCatalogHandoffs(cfg, specialists)
+	if len(handoffs) != 2 {
+		t.Fatalf("len(handoffs) = %d, want 2", len(handoffs))
+	}
+	if handoffs[0].ToolName != "transfer_to_reviewer" {
+		t.Errorf("handoffs[0].ToolName = %q, want transfer_to_reviewer", handoffs[0].ToolName)
+	}
+	if handoffs[0].Agent != specialists["reviewer"] {
+		t.Errorf("handoffs[0] does not target the reviewer specialist")
+	}
+	if handoffs[1].ToolName != "transfer_to_release_planner" {
+		t.Errorf("handoffs[1].ToolName = %q, want transfer_to_release_planner", handoffs[1].ToolName)
+	}
+	if handoffs[0].Description != "Reviews code changes." {
+		t.Errorf("handoffs[0].Description = %q", handoffs[0].Description)
+	}
 }
 
 func TestBuildCatalogHandoffsFallsBackToGenericSpecialist(t *testing.T) {
-cfg := Config{Model: "openai/gpt-5.5"}
-handoffs := buildCatalogHandoffs(cfg, nil)
-if len(handoffs) != 1 {
-t.Fatalf("len(handoffs) = %d, want 1", len(handoffs))
-}
-if handoffs[0].ToolName != "transfer_to_specialist" {
-t.Errorf("ToolName = %q, want transfer_to_specialist", handoffs[0].ToolName)
-}
-if handoffs[0].Agent == nil || handoffs[0].Agent.Name != "specialist" {
-t.Errorf("fallback handoff should target the generic specialist agent")
-}
+	cfg := Config{Model: "openai/gpt-5.5"}
+	handoffs := buildCatalogHandoffs(cfg, nil)
+	if len(handoffs) != 1 {
+		t.Fatalf("len(handoffs) = %d, want 1", len(handoffs))
+	}
+	if handoffs[0].ToolName != "transfer_to_specialist" {
+		t.Errorf("ToolName = %q, want transfer_to_specialist", handoffs[0].ToolName)
+	}
+	if handoffs[0].Agent == nil || handoffs[0].Agent.Name != "specialist" {
+		t.Errorf("fallback handoff should target the generic specialist agent")
+	}
 }
 
 func TestSanitizeHandoffName(t *testing.T) {
-cases := map[string]string{
-"reviewer":        "reviewer",
-"Release Planner": "release_planner",
-"deep-dive.v2":    "deep_dive_v2",
-"  spaced  ":      "spaced",
-"!!!":             "specialist",
-}
-for in, want := range cases {
-if got := sanitizeHandoffName(in); got != want {
-t.Errorf("sanitizeHandoffName(%q) = %q, want %q", in, got, want)
-}
-}
+	cases := map[string]string{
+		"reviewer":        "reviewer",
+		"Release Planner": "release_planner",
+		"deep-dive.v2":    "deep_dive_v2",
+		"  spaced  ":      "spaced",
+		"!!!":             "specialist",
+	}
+	for in, want := range cases {
+		if got := sanitizeHandoffName(in); got != want {
+			t.Errorf("sanitizeHandoffName(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

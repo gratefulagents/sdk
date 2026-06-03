@@ -27,6 +27,9 @@ func Tools(store projectstate.Store, actor string) []agentsdk.Tool {
 		&memoryRememberTool{baseTool: base},
 		&memoryRecallTool{baseTool: base},
 		&memoryListTool{baseTool: base},
+		&memoryUpdateTool{baseTool: base},
+		&memoryDeleteTool{baseTool: base},
+		&memoryStatsTool{baseTool: base},
 		&primeContextTool{baseTool: base},
 	}
 }
@@ -356,6 +359,166 @@ func (t *memoryListTool) Execute(ctx context.Context, raw json.RawMessage, _ str
 	}
 	memories, err := t.store.ListMemories(ctx, in)
 	return jsonToolResult(memories, err), nil
+}
+
+type memoryUpdateTool struct{ baseTool }
+
+func (t *memoryUpdateTool) Name() string { return "memory_update" }
+func (t *memoryUpdateTool) Description() string {
+	return "Update an existing durable typed project memory by id. Omitted fields keep their current values."
+}
+func (t *memoryUpdateTool) IsReadOnly() bool { return false }
+func (t *memoryUpdateTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"id":{"type":"string"},
+			"content":{"type":"string"},
+			"kind":{"type":"string","enum":["pinned","semantic","episodic","procedural"]},
+			"scope":{"type":"string","enum":["project","user","task","file"]},
+			"tags":{"type":"array","items":{"type":"string"}},
+			"task_ids":{"type":"array","items":{"type":"string"}},
+			"file_paths":{"type":"array","items":{"type":"string"}},
+			"source_run":{"type":"string"}
+		},
+		"required":["id"]
+	}`)
+}
+func (t *memoryUpdateTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in struct {
+		ID        string   `json:"id"`
+		Content   *string  `json:"content"`
+		Kind      *string  `json:"kind"`
+		Scope     *string  `json:"scope"`
+		Tags      []string `json:"tags"`
+		TaskIDs   []string `json:"task_ids"`
+		FilePaths []string `json:"file_paths"`
+		SourceRun *string  `json:"source_run"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	existing, err := memoryByID(ctx, t.store, in.ID)
+	if err != nil {
+		return jsonToolResult(nil, err), nil
+	}
+	update := projectstate.UpsertMemoryInput{
+		ID:        existing.ID,
+		Kind:      existing.Kind,
+		Scope:     existing.Scope,
+		Content:   existing.Content,
+		Tags:      existing.Tags,
+		TaskIDs:   existing.TaskIDs,
+		FilePaths: existing.FilePaths,
+		SourceRun: existing.SourceRun,
+		Metadata:  existing.Metadata,
+	}
+	if in.Content != nil {
+		update.Content = *in.Content
+	}
+	if in.Kind != nil {
+		update.Kind = *in.Kind
+	}
+	if in.Scope != nil {
+		update.Scope = *in.Scope
+	}
+	if in.Tags != nil {
+		update.Tags = in.Tags
+	}
+	if in.TaskIDs != nil {
+		update.TaskIDs = in.TaskIDs
+	}
+	if in.FilePaths != nil {
+		update.FilePaths = in.FilePaths
+	}
+	if in.SourceRun != nil {
+		update.SourceRun = *in.SourceRun
+	}
+	mem, err := t.store.UpsertMemory(ctx, update)
+	return jsonToolResult(mem, err), nil
+}
+
+type memoryDeleteTool struct{ baseTool }
+
+func (t *memoryDeleteTool) Name() string { return "memory_delete" }
+func (t *memoryDeleteTool) Description() string {
+	return "Delete one durable typed project memory by id."
+}
+func (t *memoryDeleteTool) IsReadOnly() bool { return false }
+func (t *memoryDeleteTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)
+}
+func (t *memoryDeleteTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	err := t.store.DeleteMemory(ctx, in.ID)
+	return jsonToolResult(map[string]string{"id": strings.TrimSpace(in.ID), "status": "deleted"}, err), nil
+}
+
+type memoryStatsTool struct{ baseTool }
+
+func (t *memoryStatsTool) Name() string { return "memory_stats" }
+func (t *memoryStatsTool) Description() string {
+	return "Summarize durable typed project memory counts by kind, scope, and tag."
+}
+func (t *memoryStatsTool) IsReadOnly() bool { return true }
+func (t *memoryStatsTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"kinds":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}}}}`)
+}
+func (t *memoryStatsTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in projectstate.MemoryFilter
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	memories, err := t.store.ListMemories(ctx, in)
+	if err != nil {
+		return jsonToolResult(nil, err), nil
+	}
+	stats := memoryStats{
+		Total:   len(memories),
+		ByKind:  map[string]int{},
+		ByScope: map[string]int{},
+		ByTag:   map[string]int{},
+	}
+	for _, mem := range memories {
+		stats.ByKind[mem.Kind]++
+		stats.ByScope[mem.Scope]++
+		for _, tag := range mem.Tags {
+			tag = strings.TrimSpace(tag)
+			if tag != "" {
+				stats.ByTag[tag]++
+			}
+		}
+	}
+	return jsonToolResult(stats, nil), nil
+}
+
+type memoryStats struct {
+	Total   int            `json:"total"`
+	ByKind  map[string]int `json:"by_kind"`
+	ByScope map[string]int `json:"by_scope"`
+	ByTag   map[string]int `json:"by_tag"`
+}
+
+func memoryByID(ctx context.Context, store projectstate.Store, id string) (projectstate.Memory, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return projectstate.Memory{}, fmt.Errorf("memory id is required")
+	}
+	memories, err := store.ListMemories(ctx, projectstate.MemoryFilter{})
+	if err != nil {
+		return projectstate.Memory{}, err
+	}
+	for _, mem := range memories {
+		if mem.ID == id {
+			return mem, nil
+		}
+	}
+	return projectstate.Memory{}, fmt.Errorf("memory %q not found", id)
 }
 
 type primeContextTool struct{ baseTool }
