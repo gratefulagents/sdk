@@ -1,81 +1,9 @@
 package projectstate
 
 import (
-	"context"
 	"fmt"
 	"strings"
 )
-
-func (s *FilesystemStore) PrimeContext(ctx context.Context, opts PrimeOptions) (string, error) {
-	st, err := s.loadState(ctx)
-	if err != nil {
-		return "", err
-	}
-	opts.Actor = firstNonEmpty(opts.Actor, s.actor)
-	if opts.ReadyLimit <= 0 {
-		opts.ReadyLimit = 8
-	}
-	if opts.MemoryLimit <= 0 {
-		opts.MemoryLimit = 8
-	}
-
-	var b strings.Builder
-	b.WriteString("## Durable Project State\n")
-	if st.project.ProjectID != "" {
-		b.WriteString("Project: " + st.project.ProjectID + "\n")
-	}
-	if st.project.WorkDir != "" {
-		b.WriteString("Workspace: " + st.project.WorkDir + "\n")
-	}
-
-	active := activeTask(st, opts)
-	if active != nil {
-		b.WriteString("\n### Active Task\n")
-		writeTaskLine(&b, *active)
-		if active.Description != "" {
-			b.WriteString("  " + oneLine(active.Description, 220) + "\n")
-		}
-		if len(active.DependsOn) > 0 {
-			b.WriteString("  Depends on: " + strings.Join(active.DependsOn, ", ") + "\n")
-		}
-	}
-
-	ready := readyFromState(st, TaskFilter{Actor: opts.Actor, Limit: opts.ReadyLimit})
-	if len(ready) > 0 {
-		b.WriteString("\n### Ready Work\n")
-		for _, task := range ready {
-			writeTaskLine(&b, task)
-		}
-	}
-
-	blocked := blockedTasks(st, 5)
-	if len(blocked) > 0 {
-		b.WriteString("\n### Blocked Work\n")
-		for _, task := range blocked {
-			writeTaskLine(&b, task)
-		}
-	}
-
-	pinned, recent := memoriesForPrime(st, opts.MemoryLimit)
-	if len(pinned) > 0 {
-		b.WriteString("\n### Pinned Memories\n")
-		for _, mem := range pinned {
-			b.WriteString("- " + oneLine(mem.Content, 220) + memorySuffix(mem) + "\n")
-		}
-	}
-	if len(recent) > 0 {
-		b.WriteString("\n### Recent Memories\n")
-		for _, mem := range recent {
-			b.WriteString("- " + oneLine(mem.Content, 180) + memorySuffix(mem) + "\n")
-		}
-	}
-
-	out := strings.TrimSpace(b.String())
-	if out == "## Durable Project State" {
-		out += "\nNo durable tasks or memories yet."
-	}
-	return out, nil
-}
 
 func activeTask(st *state, opts PrimeOptions) *Task {
 	if opts.ActiveTaskID != "" {
