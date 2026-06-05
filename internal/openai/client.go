@@ -48,10 +48,11 @@ var logSecretRedactors = []*regexp.Regexp{
 type Option func(*clientConfig)
 
 type clientConfig struct {
-	baseURL       string
-	maxConcurrent int
-	apiMode       string
-	authSession   *OpenAIAuthSession
+	baseURL        string
+	maxConcurrent  int
+	apiMode        string
+	authSession    *OpenAIAuthSession
+	modelFallbacks []string
 }
 
 // WithBaseURL overrides the OpenAI-compatible API base URL.
@@ -82,6 +83,18 @@ func WithAuthSession(session *OpenAIAuthSession) Option {
 	return func(c *clientConfig) { c.authSession = session }
 }
 
+// WithModelFallbacks sets an ordered list of fallback model identifiers. For
+// OpenRouter (and other OpenAI-compatible backends that honor it) these are sent
+// as the request body's "models" array so the provider automatically retries the
+// next model when one is unavailable or errors. The primary request model is
+// always tried first; fallbacks follow in order. It is a no-op for the Responses
+// API path. An empty list leaves the request unchanged.
+func WithModelFallbacks(models []string) Option {
+	return func(c *clientConfig) {
+		c.modelFallbacks = append([]string(nil), models...)
+	}
+}
+
 // Client implements OpenAI-compatible Responses APIs.
 type Client struct {
 	authSession    *OpenAIAuthSession
@@ -91,6 +104,7 @@ type Client struct {
 	apiMode        string
 	httpClient     *http.Client
 	sem            chan struct{}
+	modelFallbacks []string
 }
 
 // CompactConversationResponse is the compacted context window returned by
@@ -150,6 +164,7 @@ func NewClientWithAuthSession(session *OpenAIAuthSession, opts ...Option) *Clien
 		apiMode:        normalizeAPIMode(cfg.apiMode),
 		httpClient:     httpClient,
 		sem:            make(chan struct{}, maxConcurrent),
+		modelFallbacks: cfg.modelFallbacks,
 	}
 }
 
@@ -583,6 +598,7 @@ func (c *Client) CreateMessage(ctx context.Context, req anthropic.CreateMessageR
 	if err != nil {
 		return nil, err
 	}
+	chatReq.Models = withModelFallbacks(chatReq.Model, c.modelFallbacks)
 
 	var out *anthropic.CreateMessageResponse
 	useResponsesFirst := c.shouldUseResponsesFirst(req.Model)
@@ -1863,6 +1879,7 @@ func sanitizeLogBody(body string) string {
 
 type chatCompletionRequest struct {
 	Model          string        `json:"model"`
+	Models         []string      `json:"models,omitempty"`
 	Messages       []chatMessage `json:"messages"`
 	MaxTokens      int           `json:"max_tokens,omitempty"`
 	Tools          []chatToolDef `json:"tools,omitempty"`
@@ -1917,6 +1934,32 @@ type chatUsage struct {
 type chatAPIError struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
+}
+
+// withModelFallbacks builds the OpenRouter-style "models" array for a request.
+// It returns nil when no fallbacks are configured so the request body is
+// unchanged and only "model" is sent. When fallbacks exist, the primary model is
+// placed first, followed by the fallbacks in order, with empty entries and
+// duplicates removed so the provider tries each candidate at most once.
+func withModelFallbacks(primary string, fallbacks []string) []string {
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	ordered := append([]string{primary}, fallbacks...)
+	seen := make(map[string]bool, len(ordered))
+	out := make([]string, 0, len(ordered))
+	for _, m := range ordered {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	if len(out) <= 1 {
+		return nil
+	}
+	return out
 }
 
 func toChatRequest(req anthropic.CreateMessageRequest) (chatCompletionRequest, error) {

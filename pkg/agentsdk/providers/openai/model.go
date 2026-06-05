@@ -19,11 +19,12 @@ import (
 )
 
 type OpenAIProvider struct {
-	baseURL     string                  // optional override (for gemini, openrouter, groq)
-	apiKey      string                  // optional API key override
-	authMode    internalopenai.AuthMode // "oauth" or "" (api-key)
-	apiMode     string                  // optional endpoint mode override
-	authSession *internalopenai.OpenAIAuthSession
+	baseURL        string                  // optional override (for gemini, openrouter, groq)
+	apiKey         string                  // optional API key override
+	authMode       internalopenai.AuthMode // "oauth" or "" (api-key)
+	apiMode        string                  // optional endpoint mode override
+	authSession    *internalopenai.OpenAIAuthSession
+	modelFallbacks []string // ordered OpenRouter-style fallback models
 }
 
 type ProviderConfig struct {
@@ -32,6 +33,10 @@ type ProviderConfig struct {
 	AuthMode    AuthMode
 	APIMode     string
 	AuthSession *AuthSession
+	// ModelFallbacks is an ordered list of fallback model identifiers sent as
+	// the OpenRouter "models" array so the provider retries the next model when
+	// one is unavailable. Empty disables fallback routing.
+	ModelFallbacks []string
 }
 
 func NewOpenAIProvider() *OpenAIProvider {
@@ -44,17 +49,18 @@ func NewOpenAIProviderWithBaseURL(baseURL string) *OpenAIProvider {
 
 func NewOpenAIProviderWithConfig(cfg ProviderConfig) *OpenAIProvider {
 	return &OpenAIProvider{
-		baseURL:     strings.TrimSpace(cfg.BaseURL),
-		apiKey:      strings.TrimSpace(cfg.APIKey),
-		authMode:    cfg.AuthMode,
-		apiMode:     strings.TrimSpace(cfg.APIMode),
-		authSession: cfg.AuthSession,
+		baseURL:        strings.TrimSpace(cfg.BaseURL),
+		apiKey:         strings.TrimSpace(cfg.APIKey),
+		authMode:       cfg.AuthMode,
+		apiMode:        strings.TrimSpace(cfg.APIMode),
+		authSession:    cfg.AuthSession,
+		modelFallbacks: append([]string(nil), cfg.ModelFallbacks...),
 	}
 }
 
 func (p *OpenAIProvider) GetModel(name string) (agentsdk.Model, error) {
 	name = agentsdk.ResolveModelForProvider(name, "openai")
-	m, err := newOpenAIModelFromConfig(p.baseURL, p.authMode, p.apiMode, p.apiKey, p.authSession)
+	m, err := newOpenAIModelFromConfig(p.baseURL, p.authMode, p.apiMode, p.apiKey, p.authSession, p.modelFallbacks)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +75,7 @@ type OpenAIModel struct {
 	model  string
 }
 
-func newOpenAIModelFromConfig(baseURL string, authMode internalopenai.AuthMode, apiMode string, apiKey string, session *internalopenai.OpenAIAuthSession) (*OpenAIModel, error) {
+func newOpenAIModelFromConfig(baseURL string, authMode internalopenai.AuthMode, apiMode string, apiKey string, session *internalopenai.OpenAIAuthSession, modelFallbacks []string) (*OpenAIModel, error) {
 	var opts []internalopenai.Option
 	baseURL = strings.TrimSpace(baseURL)
 	if baseURL != "" {
@@ -84,6 +90,9 @@ func newOpenAIModelFromConfig(baseURL string, authMode internalopenai.AuthMode, 
 	apiMode = strings.TrimSpace(apiMode)
 	if apiMode != "" {
 		opts = append(opts, internalopenai.WithAPIMode(apiMode))
+	}
+	if len(modelFallbacks) > 0 {
+		opts = append(opts, internalopenai.WithModelFallbacks(modelFallbacks))
 	}
 
 	if authMode == "" {

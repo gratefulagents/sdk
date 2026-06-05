@@ -26,6 +26,11 @@ type ProviderSpec struct {
 	ProviderAPIKeys          map[string]string
 	ProviderBaseURLs         map[string]string
 	ProviderAPIModes         map[string]string
+	// ModelFallbacks is an ordered list of fallback model identifiers sent as
+	// the OpenRouter "models" array so the provider retries the next model when
+	// one is unavailable. Applies to OpenAI-compatible providers (openrouter,
+	// gemini, groq, local, openai-api). Empty disables fallback routing.
+	ModelFallbacks []string
 }
 
 func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
@@ -127,11 +132,19 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 	if provider == "local" {
 		apiKey = firstNonEmpty(apiKey, "local-key")
 	}
+	// Model fallbacks are sent as the request-body "models" array, which is an
+	// OpenRouter routing feature. Other OpenAI-compatible backends may reject an
+	// unknown "models" field, so only forward fallbacks to OpenRouter.
+	var modelFallbacks []string
+	if provider == "openrouter" {
+		modelFallbacks = spec.ModelFallbacks
+	}
 	return sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
-		BaseURL:  baseURL,
-		APIKey:   apiKey,
-		APIMode:  apiModeForProvider(spec, provider, "chat-completions"),
-		AuthMode: sdkopenai.AuthModeAPIKey,
+		BaseURL:        baseURL,
+		APIKey:         apiKey,
+		APIMode:        apiModeForProvider(spec, provider, "chat-completions"),
+		AuthMode:       sdkopenai.AuthModeAPIKey,
+		ModelFallbacks: modelFallbacks,
 	})
 }
 

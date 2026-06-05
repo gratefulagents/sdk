@@ -41,6 +41,10 @@ type Config struct {
 	ProviderAPIKeys          map[string]string
 	ProviderBaseURLs         map[string]string
 	ProviderAPIModes         map[string]string
+	// ModelFallbacks is an ordered list of fallback model identifiers used by
+	// OpenAI-compatible providers (e.g. OpenRouter) to retry the next model when
+	// one is unavailable. Empty disables fallback routing.
+	ModelFallbacks []string
 
 	WorkDir      string
 	AgentName    string
@@ -350,6 +354,7 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 		ProviderAPIKeys:          cloneStringMap(cfg.ProviderAPIKeys),
 		ProviderBaseURLs:         cloneStringMap(cfg.ProviderBaseURLs),
 		ProviderAPIModes:         cloneStringMap(cfg.ProviderAPIModes),
+		ModelFallbacks:           append([]string(nil), cfg.ModelFallbacks...),
 	}
 }
 
