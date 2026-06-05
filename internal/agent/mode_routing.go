@@ -114,7 +114,10 @@ func ResolveRoleModeRouting(
 func ModeReasoningSettings(level any) ModelSettings {
 	switch normalizeModeReasoningLevel(level) {
 	case ReasoningNone:
-		return ModelSettings{ReasoningEffort: "minimal"}
+		// "none" disables reasoning. On OpenRouter this maps to
+		// reasoning.effort="none"; on the OpenAI Responses path it degrades to
+		// minimal (the closest supported behavior).
+		return ModelSettings{ReasoningEffort: "none"}
 	case ReasoningLow:
 		return ModelSettings{ThinkingBudget: 2048, ReasoningEffort: "low"}
 	case ReasoningMedium:

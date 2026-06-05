@@ -1884,6 +1884,7 @@ type chatCompletionRequest struct {
 	MaxTokens      int           `json:"max_tokens,omitempty"`
 	Tools          []chatToolDef `json:"tools,omitempty"`
 	ResponseFormat any           `json:"response_format,omitempty"`
+	Reasoning      any           `json:"reasoning,omitempty"`
 }
 
 type chatMessage struct {
@@ -1972,6 +1973,12 @@ func toChatRequest(req anthropic.CreateMessageRequest) (chatCompletionRequest, e
 		Model:     req.Model,
 		Messages:  chatMsgs,
 		MaxTokens: req.MaxTokens,
+	}
+	// OpenRouter unifies reasoning control via the request "reasoning" field.
+	// effort "none" disables reasoning entirely; other levels enable it at the
+	// requested effort. An empty effort omits the field (provider default).
+	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
+		out.Reasoning = map[string]any{"effort": effort}
 	}
 
 	if len(req.Tools) > 0 {

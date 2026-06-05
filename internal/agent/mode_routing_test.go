@@ -9,7 +9,7 @@ func TestModeReasoningSettings(t *testing.T) {
 		wantBudget int
 		wantEffort string
 	}{
-		{name: "none", level: ReasoningNone, wantEffort: "minimal"},
+		{name: "none", level: ReasoningNone, wantEffort: "none"},
 		{name: "low", level: ReasoningLow, wantBudget: 2048, wantEffort: "low"},
 		{name: "medium", level: ReasoningMedium, wantBudget: 4096, wantEffort: "medium"},
 		{name: "high", level: ReasoningHigh, wantBudget: 8192, wantEffort: "high"},

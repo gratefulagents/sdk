@@ -23,6 +23,12 @@ type CreateMessageRequest struct {
 	Betas         []string         `json:"-"` // Converted to SDK beta headers
 	OutputSchema  *OutputSchema    `json:"-"`
 
+	// OpenRouter chat-completions shim only: reasoning effort label
+	// ("none", "minimal", "low", "medium", "high", "xhigh"). "none" disables
+	// reasoning entirely. Empty leaves the provider/model default. Carried into
+	// the chat body's "reasoning" field; ignored on the native Anthropic path.
+	ReasoningEffort string `json:"-"`
+
 	// OpenAI Responses shim only: token threshold for server-side compaction.
 	CompactionThreshold int `json:"-"`
 }

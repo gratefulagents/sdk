@@ -291,15 +291,22 @@ func (m *OpenAIModel) buildRequest(req agentsdk.ModelRequest) internalanthropic.
 			Type:         "enabled",
 			BudgetTokens: req.Settings.ThinkingBudget,
 		}
-	} else if strings.EqualFold(req.Settings.ReasoningEffort, "minimal") {
+	} else if strings.EqualFold(req.Settings.ReasoningEffort, "minimal") ||
+		strings.EqualFold(req.Settings.ReasoningEffort, "none") {
 		// OpenAI supports an explicit "minimal" effort, but this shim forwards
 		// Anthropic-style thinking budgets. A tiny sentinel budget maps to
-		// explicit minimal reasoning without enabling heavy thinking.
+		// explicit minimal reasoning without enabling heavy thinking. "none"
+		// cannot be expressed on the Responses path, so it degrades to minimal
+		// there; on the OpenRouter chat path it disables reasoning outright via
+		// the reasoning.effort field below.
 		apiReq.Thinking = &internalanthropic.ThinkingConfig{
 			Type:         "enabled",
 			BudgetTokens: 1,
 		}
 	}
+	// Carry the reasoning effort label for the OpenRouter chat-completions shim,
+	// which translates it into the request "reasoning" field.
+	apiReq.ReasoningEffort = req.Settings.ReasoningEffort
 	apiReq.TextVerbosity = req.Settings.TextVerbosity
 	if req.CompactionThreshold > 0 && m.SupportsContextCompaction() {
 		apiReq.CompactionThreshold = req.CompactionThreshold
