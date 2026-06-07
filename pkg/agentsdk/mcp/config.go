@@ -21,15 +21,23 @@ type Config struct {
 // ServerConfig represents a single MCP server config.
 // Only stdio transport is supported right now.
 type ServerConfig struct {
-	Type              string            `json:"type,omitempty"`
-	Command           string            `json:"command,omitempty"`
-	Args              []string          `json:"args,omitempty"`
-	Env               map[string]string `json:"env,omitempty"`
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	// Enabled can explicitly disable a configured server without removing it
+	// from .mcp.json. Nil preserves compatibility and treats the server as
+	// enabled when the runtime MCP feature itself is enabled.
+	Enabled *bool `json:"enabled,omitempty"`
 	// AllowEnv is the explicit opt-in list of env names that may pass through
 	// the credential denylist (see FilterCredentialEnv). Names listed here are
 	// trusted to be set via cfg.Env even if they look like credentials.
-	AllowEnv          []string          `json:"allowEnv,omitempty"`
-	TrustReadOnlyHint bool              `json:"trustReadOnlyHint,omitempty"`
+	AllowEnv          []string `json:"allowEnv,omitempty"`
+	TrustReadOnlyHint bool     `json:"trustReadOnlyHint,omitempty"`
+	// AllowedTools, when non-empty, exposes only the listed raw MCP tool names
+	// for this server. Empty preserves compatibility and exposes all server
+	// tools once MCP is enabled by the runtime.
+	AllowedTools []string `json:"allowedTools,omitempty"`
 }
 
 // ConfigPathForWorkDir returns the .mcp.json path for a workspace.

@@ -12,7 +12,7 @@ import (
 
 func TestPolicyExample(t *testing.T) {
 	defaultPolicy := sdkpolicy.RuntimePolicy{}.Normalize()
-	if defaultPolicy.PermissionMode != sdkpolicy.PermissionModeWorkspaceWrite || !defaultPolicy.EnableMCP {
+	if defaultPolicy.PermissionMode != sdkpolicy.PermissionModeWorkspaceWrite || defaultPolicy.EnableMCP {
 		t.Fatalf("default policy = %+v", defaultPolicy)
 	}
 

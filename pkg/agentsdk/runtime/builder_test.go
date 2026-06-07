@@ -92,6 +92,81 @@ func TestBuildToolBundleCanDisableWebFetch(t *testing.T) {
 	}
 }
 
+func TestBuildToolBundleStrictFeaturesDefaultAllOff(t *testing.T) {
+	bundle, err := BuildToolBundle(context.Background(), Config{
+		WorkDir:  t.TempDir(),
+		Features: &Features{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bundle.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", toolNames(bundle.Tools))
+	}
+}
+
+func TestBuildToolBundleStrictFeaturesSelectsIndividualTools(t *testing.T) {
+	bundle, err := BuildToolBundle(context.Background(), Config{
+		WorkDir: t.TempDir(),
+		Features: &Features{
+			Tools: ToolFeatures{
+				ReadFile: true,
+				WebFetch: true,
+				Signals: SignalFeatures{
+					Finish: true,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, tool := range bundle.Tools {
+		names[tool.Name()] = true
+	}
+	for _, want := range []string{"read_file", "WebFetch", "finish"} {
+		if !names[want] {
+			t.Fatalf("missing tool %q; names=%v", want, toolNames(bundle.Tools))
+		}
+	}
+	for _, notWant := range []string{"list_files", "glob", "grep", "LSP", "Bash", "Write", "Edit", "present_plan", "set_phase", "AskUserQuestion"} {
+		if names[notWant] {
+			t.Fatalf("unexpected tool %q; names=%v", notWant, toolNames(bundle.Tools))
+		}
+	}
+}
+
+func TestBuildToolBundleStrictProjectStateCanExposeMemoryOnly(t *testing.T) {
+	bundle, err := BuildToolBundle(context.Background(), Config{
+		WorkDir:         t.TempDir(),
+		ProjectID:       "test-project",
+		ProjectStateDir: filepath.Join(t.TempDir(), "state"),
+		Features: &Features{
+			ProjectState: ProjectStateFeatures{
+				MemoryTools: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, tool := range bundle.Tools {
+		names[tool.Name()] = true
+	}
+	for _, want := range []string{"memory_remember", "memory_recall", "memory_list", "memory_update", "memory_delete", "memory_stats"} {
+		if !names[want] {
+			t.Fatalf("missing memory tool %q; names=%v", want, toolNames(bundle.Tools))
+		}
+	}
+	for _, notWant := range []string{"task_create", "task_ready", "task_show", "prime_context"} {
+		if names[notWant] {
+			t.Fatalf("unexpected project-state tool %q; names=%v", notWant, toolNames(bundle.Tools))
+		}
+	}
+}
+
 func TestBuildToolBundleWiresCommandSandboxConfig(t *testing.T) {
 	bundle, err := BuildToolBundle(context.Background(), Config{
 		WorkDir:              t.TempDir(),
@@ -373,6 +448,129 @@ func TestBuilderReusesSessionStateSubAgentSchedulerAcrossBuilds(t *testing.T) {
 	}
 }
 
+func TestBuildAgentStrictModesDisabledByDefault(t *testing.T) {
+	cfg := Config{
+		WorkDir:     t.TempDir(),
+		ActiveMode:  "feature-mode",
+		ActivePhase: "plan",
+		ModeSnapshot: &sdkmode.TemplateSpec{Phases: []sdkmode.Phase{
+			{ID: "plan"},
+			{ID: "ship"},
+		}},
+		Features: &Features{},
+	}
+	agent, _ := BuildAgent(cfg, nil, ToolBundle{})
+	instructions := agent.InstructionsFn(&agentsdk.RunContext{}, agent)
+	for _, notWant := range []string{"Session mode:", "Active mode:", "Active phase:", "This mode defines phases"} {
+		if strings.Contains(instructions, notWant) {
+			t.Fatalf("strict instructions unexpectedly contained %q:\n%s", notWant, instructions)
+		}
+	}
+}
+
+func TestBuildAgentStrictModesCanEnableInstructionsAndPhaseTracking(t *testing.T) {
+	cfg := Config{
+		WorkDir:     t.TempDir(),
+		ActiveMode:  "feature-mode",
+		ActivePhase: "plan",
+		ModeSnapshot: &sdkmode.TemplateSpec{Phases: []sdkmode.Phase{
+			{ID: "plan"},
+			{ID: "ship"},
+		}},
+		Features: &Features{
+			Modes: ModeFeatures{
+				Instructions:  true,
+				PhaseTracking: true,
+			},
+		},
+	}
+	agent, _ := BuildAgent(cfg, nil, ToolBundle{})
+	instructions := agent.InstructionsFn(&agentsdk.RunContext{}, agent)
+	for _, want := range []string{"Session mode:", "Active mode: feature-mode", "Active phase: plan", "This mode defines phases: plan -> ship"} {
+		if !strings.Contains(instructions, want) {
+			t.Fatalf("strict instructions missing %q:\n%s", want, instructions)
+		}
+	}
+}
+
+func TestBuildRunConfigStrictRuntimeDefaultsOff(t *testing.T) {
+	poller := func(context.Context) ([]agentsdk.RunItem, error) {
+		return []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "immediate"}}}, nil
+	}
+	runCfg := BuildRunConfig(Config{
+		WorkDir:              t.TempDir(),
+		ImmediateInputPoller: poller,
+		EnableRetry:          true,
+		EnableApproval:       true,
+		EnableCompaction:     true,
+		ForceFinalSummary:    true,
+		Features:             &Features{},
+	}, nil)
+	if runCfg.RetryPolicy != nil {
+		t.Fatalf("RetryPolicy = %#v, want nil", runCfg.RetryPolicy)
+	}
+	if runCfg.ToolPolicy != nil {
+		t.Fatalf("ToolPolicy = %#v, want nil", runCfg.ToolPolicy)
+	}
+	if runCfg.CompactionConfig.Enabled {
+		t.Fatalf("CompactionConfig.Enabled = true, want false")
+	}
+	if runCfg.ForceFinalSummaryTurn {
+		t.Fatalf("ForceFinalSummaryTurn = true, want false")
+	}
+	if runCfg.ImmediateInputPoller != nil {
+		t.Fatalf("ImmediateInputPoller was enabled in strict default config")
+	}
+	if runCfg.ModelSettings.ParallelToolCalls == nil || *runCfg.ModelSettings.ParallelToolCalls {
+		t.Fatalf("ParallelToolCalls = %v, want false", runCfg.ModelSettings.ParallelToolCalls)
+	}
+	if runCfg.ShouldTagUntrustedToolOutputs() {
+		t.Fatalf("ShouldTagUntrustedToolOutputs() = true, want false")
+	}
+}
+
+func TestBuildRunConfigStrictRuntimeCanEnableFeatures(t *testing.T) {
+	poller := func(context.Context) ([]agentsdk.RunItem, error) { return nil, nil }
+	runCfg := BuildRunConfig(Config{
+		WorkDir:              t.TempDir(),
+		ImmediateInputPoller: poller,
+		ToolTimeout:          10,
+		Features: &Features{
+			Runtime: RuntimeFeatures{
+				Compaction:            true,
+				Approval:              true,
+				Retry:                 true,
+				ForceFinalSummary:     true,
+				ImmediateInputPolling: true,
+				HandoffHistory:        true,
+				ParallelToolCalls:     true,
+				UntrustedToolOutputs:  true,
+			},
+		},
+	}, nil)
+	if runCfg.RetryPolicy == nil {
+		t.Fatal("RetryPolicy = nil, want enabled")
+	}
+	if runCfg.ToolPolicy == nil || !runCfg.ToolPolicy.ApprovalRequired || runCfg.ToolPolicy.DefaultTimeout != 10 {
+		t.Fatalf("ToolPolicy = %#v, want approval with timeout", runCfg.ToolPolicy)
+	}
+	if !runCfg.CompactionConfig.Enabled {
+		t.Fatalf("CompactionConfig.Enabled = false, want true")
+	}
+	if !runCfg.ForceFinalSummaryTurn {
+		t.Fatalf("ForceFinalSummaryTurn = false, want true")
+	}
+	if runCfg.ImmediateInputPoller == nil {
+		t.Fatalf("ImmediateInputPoller = nil, want enabled")
+	}
+	if runCfg.ModelSettings.ParallelToolCalls == nil || !*runCfg.ModelSettings.ParallelToolCalls {
+		t.Fatalf("ParallelToolCalls = %v, want true", runCfg.ModelSettings.ParallelToolCalls)
+	}
+	if !runCfg.ShouldTagUntrustedToolOutputs() {
+		t.Fatalf("ShouldTagUntrustedToolOutputs() = false, want true")
+	}
+}
+
 func TestBuildRunConfigHonorsHostOverrides(t *testing.T) {
 	settings := agentsdk.ModelSettings{ReasoningEffort: "high", MaxTokens: 123}
 	compaction := agentsdk.CompactionConfig{Enabled: true, TriggerTokens: 1000, TargetTokens: 500}
@@ -505,7 +703,7 @@ func TestBuildCatalogHandoffsTargetsSpecialists(t *testing.T) {
 		"release planner": {Name: "release planner"},
 	}
 
-	handoffs := buildCatalogHandoffs(cfg, specialists)
+	handoffs := buildCatalogHandoffs(cfg, specialists, HandoffFeatures{Enabled: true})
 	if len(handoffs) != 2 {
 		t.Fatalf("len(handoffs) = %d, want 2", len(handoffs))
 	}
@@ -525,7 +723,7 @@ func TestBuildCatalogHandoffsTargetsSpecialists(t *testing.T) {
 
 func TestBuildCatalogHandoffsFallsBackToGenericSpecialist(t *testing.T) {
 	cfg := Config{Model: "openai/gpt-5.5"}
-	handoffs := buildCatalogHandoffs(cfg, nil)
+	handoffs := buildCatalogHandoffs(cfg, nil, HandoffFeatures{Enabled: true, GenericFallback: true})
 	if len(handoffs) != 1 {
 		t.Fatalf("len(handoffs) = %d, want 1", len(handoffs))
 	}
@@ -534,6 +732,14 @@ func TestBuildCatalogHandoffsFallsBackToGenericSpecialist(t *testing.T) {
 	}
 	if handoffs[0].Agent == nil || handoffs[0].Agent.Name != "specialist" {
 		t.Errorf("fallback handoff should target the generic specialist agent")
+	}
+}
+
+func TestBuildCatalogHandoffsCanDisableGenericFallback(t *testing.T) {
+	cfg := Config{Model: "openai/gpt-5.5"}
+	handoffs := buildCatalogHandoffs(cfg, nil, HandoffFeatures{Enabled: true})
+	if len(handoffs) != 0 {
+		t.Fatalf("len(handoffs) = %d, want 0", len(handoffs))
 	}
 }
 

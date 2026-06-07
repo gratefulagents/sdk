@@ -66,6 +66,7 @@ type Config struct {
 	ToolAccess             agentsdk.ToolAccessLevel
 	PermissionMode         policy.PermissionMode
 	CommandSandboxConfig   *sdksandbox.Config
+	Features               *Features
 
 	EnableTools              bool
 	EnableMCP                bool
@@ -215,23 +216,26 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 		return nil, fmt.Errorf("runtime builder is nil")
 	}
 	cfg := b.cfg.normalized()
-	if cfg.EnableProjectState {
+	features := resolveFeatures(cfg)
+	if features.value.ProjectState.needsStore() {
 		b.emitStatus("loading project state")
 		store, err := b.projectStateStore(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
 		cfg.ProjectStateStore = store
-		b.emitStatus("priming project state")
-		if prime, err := store.PrimeContext(ctx, sdkprojectstate.PrimeOptions{
-			Actor:        projectStateActor(cfg),
-			ActiveTaskID: cfg.ProjectStateActiveTaskID,
-			ReadyLimit:   8,
-			MemoryLimit:  8,
-		}); err != nil {
-			b.emitLog("project state warning: " + err.Error())
-		} else if strings.TrimSpace(prime) != "" {
-			cfg.WorkingStateText = strings.Join(nonEmptyStrings(cfg.WorkingStateText, prime), "\n\n")
+		if features.value.ProjectState.PrimeContext {
+			b.emitStatus("priming project state")
+			if prime, err := store.PrimeContext(ctx, sdkprojectstate.PrimeOptions{
+				Actor:        projectStateActor(cfg),
+				ActiveTaskID: cfg.ProjectStateActiveTaskID,
+				ReadyLimit:   8,
+				MemoryLimit:  8,
+			}); err != nil {
+				b.emitLog("project state warning: " + err.Error())
+			} else if strings.TrimSpace(prime) != "" {
+				cfg.WorkingStateText = strings.Join(nonEmptyStrings(cfg.WorkingStateText, prime), "\n\n")
+			}
 		}
 	}
 
@@ -241,11 +245,11 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 		return nil, err
 	}
 
-	tracker := agentsdk.NewProgressTracker(agentsdk.WithTracingProcessor(cfg.TracingProcessor))
+	tracker := agentsdk.NewProgressTracker(agentsdk.WithTracingProcessor(tracingProcessor(cfg, features)))
 	tracker.SetSession(sessionNumber(cfg), runtimePhase(cfg))
 
 	var toolBundle ToolBundle
-	if cfg.EnableTools || cfg.EnableSubAgents {
+	if shouldBuildToolBundle(features) {
 		b.emitStatus("initializing tools")
 		toolBundle, err = BuildToolBundle(ctx, cfg)
 		if err != nil {
@@ -257,7 +261,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 
 	hooks := agentsdk.NewPlatformHooks(tracker, nil)
 	var eventStream *agentsdk.EventStream
-	if cfg.EventWriter != nil {
+	if cfg.EventWriter != nil && features.value.Runtime.EventStream {
 		eventStream = agentsdk.NewSessionEventStream(cfg.EventWriter, agentsdk.SessionEventStreamOptions{
 			Session: sessionNumber(cfg),
 			Phase:   runtimePhase(cfg),
@@ -270,7 +274,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 	if state == nil {
 		state = NewSessionState()
 	}
-	if cfg.EnableSubAgents {
+	if features.value.SubAgents.asyncEnabled() {
 		agentTools = attachAsyncSubAgentTools(cfg, state, runner, tracker, eventStream, agent, agentTools, specialistAgents)
 	}
 	names := toolNames(agentTools)
@@ -360,8 +364,9 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 
 func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 	mode := permissionMode(cfg)
+	features := resolveFeatures(cfg)
 	bundle := ToolBundle{}
-	if cfg.EnableProjectState && cfg.ProjectStateStore == nil {
+	if features.value.ProjectState.needsStore() && cfg.ProjectStateStore == nil {
 		select {
 		case <-ctx.Done():
 			return bundle, ctx.Err()
@@ -378,7 +383,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		}
 		cfg.ProjectStateStore = store
 	}
-	if !cfg.DisableDefaultTools {
+	if features.value.Tools.hasRegistryTools() {
 		registryOptions := []sdktools.RegistryOption{
 			sdktools.WithPermissionMode(mode),
 			sdktools.WithPrivateNetworkURLs(cfg.AllowPrivateNetworkURLs),
@@ -386,39 +391,39 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		if cfg.CommandSandboxConfig != nil {
 			registryOptions = append(registryOptions, sdktools.WithCommandSandboxConfig(*cfg.CommandSandboxConfig))
 		}
-		if cfg.EnableAsyncShell {
+		if features.value.Tools.AsyncShell {
 			registryOptions = append(registryOptions, sdktools.WithAsyncShellTools())
 		}
-		if cfg.DisableWebTools {
+		if !features.value.Tools.WebFetch {
 			registryOptions = append(registryOptions, sdktools.WithoutWebTools())
 		}
 		registry := sdktools.NewRegistry(cfg.WorkDir, registryOptions...)
-		bundle.Tools = append(bundle.Tools, registry.Tools()...)
+		bundle.Tools = append(bundle.Tools, filterNamedTools(registry.Tools(), registryToolNames(features.value.Tools))...)
 		bundle.Closers = append(bundle.Closers, registry.Closers()...)
 	}
-	if !cfg.DisableSignalTools {
-		bundle.Tools = append(bundle.Tools, signalTools(cfg)...)
+	if features.value.Tools.hasSignals() {
+		bundle.Tools = append(bundle.Tools, signalTools(cfg, features.value.Tools.Signals)...)
 	}
-	if cfg.EnableProjectState && cfg.ProjectStateStore != nil {
-		bundle.Tools = append(bundle.Tools, sdkprojectstatetools.Tools(cfg.ProjectStateStore, projectStateActor(cfg))...)
+	if cfg.ProjectStateStore != nil && (features.value.ProjectState.TaskTools || features.value.ProjectState.MemoryTools || features.value.ProjectState.PrimeTool) {
+		bundle.Tools = append(bundle.Tools, projectStateTools(cfg, features.value.ProjectState)...)
 	}
-	bundle.Tools = append(bundle.Tools, cfg.ExtraTools...)
-	bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
+	if features.value.Tools.ExtraTools {
+		bundle.Tools = append(bundle.Tools, cfg.ExtraTools...)
+	}
+	if features.value.Tools.VisionAnalyzer {
+		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
+	}
 
-	if cfg.EnableMCP {
+	if features.value.MCP.Enabled && features.value.MCP.hasServerSelection() && features.value.MCP.hasToolSelection() {
 		var manager *sdkmcp.Manager
 		var err error
 		managerOptions := []sdkmcp.ManagerOption{sdkmcp.WithPermissionMode(mode)}
 		if cfg.CommandSandboxConfig != nil {
 			managerOptions = append(managerOptions, sdkmcp.WithCommandExecutor(sdksandbox.DefaultWithConfig(*cfg.CommandSandboxConfig)))
 		}
-		if cfg.MCPConfig != nil {
-			manager, err = sdkmcp.NewManagerFromConfig(ctx, cfg.WorkDir, *cfg.MCPConfig, managerOptions...)
-		} else {
-			manager, err = sdkmcp.NewManager(ctx, cfg.WorkDir, managerOptions...)
-		}
+		manager, err = buildMCPManager(ctx, cfg, features.value.MCP, managerOptions...)
 		if manager != nil {
-			bundle.Tools = append(bundle.Tools, sdkmcp.BuildTools(manager)...)
+			bundle.Tools = append(bundle.Tools, filterMCPTools(sdkmcp.BuildTools(manager), features.value.MCP)...)
 			bundle.MCPServers = manager.ConnectedServerNames()
 			bundle.Closers = append(bundle.Closers, manager)
 		}
@@ -499,20 +504,25 @@ func BuildAgent(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*ag
 
 func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*agentsdk.Agent, []agentsdk.Tool, []agentsdk.Tool, map[string]*agentsdk.Agent) {
 	cfg = cfg.normalized()
+	features := resolveFeatures(cfg)
 	var tools []agentsdk.Tool
 	var specialistTools []agentsdk.Tool
 	var specialistAgents map[string]*agentsdk.Agent
-	if cfg.EnableTools {
+	if parentToolSurfaceEnabled(features) {
 		tools = append(tools, cloneTools(hostBundle.Tools)...)
 	}
-	if cfg.EnableSubAgents {
+	if features.value.SubAgents.enabled() {
 		catalog := cfg.RoleCatalog
-		if len(catalog) == 0 {
+		if len(catalog) == 0 && features.value.SubAgents.GenericFallback {
 			catalog = agentsdk.RoleCatalog{{
 				Name:        "agent",
 				Description: "Generic sub-agent. Instructions come entirely from the parent's prompt.",
 				ToolAccess:  "full",
 			}}
+		}
+		modeSnapshot := cfg.ModeSnapshot
+		if !features.value.Modes.ModelRouting {
+			modeSnapshot = nil
 		}
 		specialists := agentsdk.BuildSpecialistToolsFromCatalog(catalog, agentsdk.SpecialistBuildOptions{
 			Runner:            runner,
@@ -520,12 +530,14 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 			BaseModel:         cfg.Model,
 			Provider:          modelRoutingProvider(cfg),
 			BaseModelSettings: modelSettings(cfg),
-			ModeSnapshot:      cfg.ModeSnapshot,
+			ModeSnapshot:      modeSnapshot,
 			OutputExtractor:   cfg.SpecialistOutputExtractor,
 		})
-		specialistTools = cloneTools(specialists.Tools)
 		specialistAgents = specialists.Agents
-		tools = append(tools, specialistTools...)
+		if features.value.SubAgents.SyncTools {
+			specialistTools = cloneTools(specialists.Tools)
+			tools = append(tools, specialistTools...)
+		}
 	}
 
 	agent := &agentsdk.Agent{
@@ -535,26 +547,23 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 		Tools:         tools,
 		MCPServers:    cloneStrings(hostBundle.MCPServers),
 		InstructionsFn: func(_ *agentsdk.RunContext, a *agentsdk.Agent) string {
-			workspace := agentsdk.BuildWorkspaceContext(cfg.WorkDir, cfg.ToolAccess)
-			budget := agentsdk.BuildRunBudgetContext(cfg.MaxTurns)
-			delegation := agentsdk.BuildDelegationGuide(a)
-			return strings.Join(nonEmptyStrings(
+			blocks := []string{
 				cfg.Instructions,
-				delegation,
-				"Session mode: "+string(cfg.SessionMode),
-				"Active mode: "+modeLabel(cfg),
-				"Active phase: "+runtimePhase(cfg),
-				agentsdk.BuildPhaseTrackingDirective(cfg.ModeSnapshot),
-				workspace,
-				budget,
-			), "\n\n")
+				agentsdk.BuildDelegationGuide(a),
+			}
+			blocks = append(blocks, modeInstructionBlocks(cfg, features)...)
+			blocks = append(blocks,
+				runtimeWorkspaceContext(cfg, a.Tools, features),
+				agentsdk.BuildRunBudgetContext(cfg.MaxTurns),
+			)
+			return strings.Join(nonEmptyStrings(blocks...), "\n\n")
 		},
 	}
 	if cfg.OutputSchema != nil {
 		agent.OutputType = cfg.OutputSchema
 	}
-	if cfg.EnableHandoffs {
-		agent.Handoffs = buildCatalogHandoffs(cfg, specialistAgents)
+	if features.value.Handoffs.Enabled {
+		agent.Handoffs = buildCatalogHandoffs(cfg, specialistAgents, features.value.Handoffs)
 	}
 	return agent, tools, specialistTools, specialistAgents
 }
@@ -564,7 +573,7 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 // Targets are resolved from the already-built specialist agents (which carry
 // the role's instructions and HandoffDescription). When no catalog specialists
 // are available, it falls back to a single generic handoff specialist.
-func buildCatalogHandoffs(cfg Config, specialistAgents map[string]*agentsdk.Agent) []*agentsdk.Handoff {
+func buildCatalogHandoffs(cfg Config, specialistAgents map[string]*agentsdk.Agent, features HandoffFeatures) []*agentsdk.Handoff {
 	var handoffs []*agentsdk.Handoff
 	seen := map[string]bool{}
 	for _, role := range cfg.RoleCatalog {
@@ -590,6 +599,9 @@ func buildCatalogHandoffs(cfg Config, specialistAgents map[string]*agentsdk.Agen
 	}
 	if len(handoffs) > 0 {
 		return handoffs
+	}
+	if !features.GenericFallback {
+		return nil
 	}
 	specialist := &agentsdk.Agent{
 		Name:               "specialist",
@@ -627,6 +639,7 @@ func sanitizeHandoffName(name string) string {
 }
 
 func attachAsyncSubAgentTools(cfg Config, state *SessionState, runner *agentsdk.Runner, tracker *agentsdk.ProgressTracker, eventStream *agentsdk.EventStream, agent *agentsdk.Agent, agentTools []agentsdk.Tool, specialistAgents map[string]*agentsdk.Agent) []agentsdk.Tool {
+	features := resolveFeatures(cfg)
 	if agent == nil || len(specialistAgents) == 0 {
 		return agentTools
 	}
@@ -642,7 +655,7 @@ func attachAsyncSubAgentTools(cfg Config, state *SessionState, runner *agentsdk.
 		CompactionConfig: runCompactionConfig(cfg),
 		MaxTurns:         cfg.SubAgentMaxTurns,
 	})
-	asyncTools := agentsdk.BuildSubAgentTaskTools(scheduler, defaultAsyncSubAgent(specialistAgents))
+	asyncTools := filterNamedTools(agentsdk.BuildSubAgentTaskTools(scheduler, defaultAsyncSubAgent(specialistAgents)), asyncSubAgentToolNames(features.value.SubAgents.Async))
 	agent.Tools = append(agent.Tools, asyncTools...)
 	return append(agentTools, asyncTools...)
 }
@@ -670,16 +683,17 @@ func projectStateActor(cfg Config) string {
 
 func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 	cfg = cfg.normalized()
+	features := resolveFeatures(cfg)
 	return agentsdk.RunConfig{
 		MaxTurns:         cfg.MaxTurns,
 		SubAgentMaxTurns: cfg.SubAgentMaxTurns,
 		Hooks:            hooks,
 		ModelSettings:    runModelSettings(cfg),
-		TracingProcessor: cfg.TracingProcessor,
+		TracingProcessor: tracingProcessor(cfg, features),
 		Trace:            cfg.Trace,
 		ParentSpanID:     cfg.ParentSpanID,
 
-		ImmediateInputPoller:      cfg.ImmediateInputPoller,
+		ImmediateInputPoller:      immediateInputPoller(cfg, features),
 		CompactionConfig:          runCompactionConfig(cfg),
 		CompactionRecorder:        runCompactionRecorder(cfg),
 		CompactionFailureReporter: cfg.CompactionFailureReporter,
@@ -696,8 +710,9 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 		Phase:                  runtimePhase(cfg),
 		ToolPolicy:             toolPolicy(cfg),
 		MaxConcurrentSubAgents: cfg.MaxConcurrentSubAgents,
-		ForceFinalSummaryTurn:  cfg.ForceFinalSummary,
+		ForceFinalSummaryTurn:  features.value.Runtime.ForceFinalSummary,
 		Debug:                  cfg.Debug,
+		UntrustedToolOutputs:   untrustedToolOutputs(features),
 	}
 }
 
@@ -784,17 +799,25 @@ func defaultProviderFromModel(model string) string {
 	return strings.TrimSpace(prefix)
 }
 
-func signalTools(cfg Config) []agentsdk.Tool {
-	return []agentsdk.Tool{
-		&sdksignal.AskUserQuestionTool{},
-		&sdksignal.PresentPlanTool{},
-		&sdksignal.FinishTool{},
-		&sdksignal.SetPhaseTool{
+func signalTools(cfg Config, features SignalFeatures) []agentsdk.Tool {
+	var tools []agentsdk.Tool
+	if features.AskUserQuestion {
+		tools = append(tools, &sdksignal.AskUserQuestionTool{})
+	}
+	if features.PresentPlan {
+		tools = append(tools, &sdksignal.PresentPlanTool{})
+	}
+	if features.Finish {
+		tools = append(tools, &sdksignal.FinishTool{})
+	}
+	if features.SetPhase {
+		tools = append(tools, &sdksignal.SetPhaseTool{
 			Phases:        signalPhaseOptions(cfg),
 			CurrentPhase:  cfg.ActivePhase,
 			PauseOnChange: true,
-		},
+		})
 	}
+	return tools
 }
 
 func signalPhaseOptions(cfg Config) []sdksignal.PhaseOption {
@@ -813,25 +836,263 @@ func signalPhaseOptions(cfg Config) []sdksignal.PhaseOption {
 	return out
 }
 
+func parentToolSurfaceEnabled(features resolvedFeatures) bool {
+	f := features.value
+	return f.Tools.hasRegistryTools() ||
+		f.Tools.hasSignals() ||
+		f.Tools.ExtraTools ||
+		(f.MCP.Enabled && f.MCP.hasServerSelection() && f.MCP.hasToolSelection()) ||
+		f.ProjectState.TaskTools ||
+		f.ProjectState.MemoryTools ||
+		f.ProjectState.PrimeTool
+}
+
+func registryToolNames(features ToolFeatures) map[string]bool {
+	names := map[string]bool{}
+	add := func(enabled bool, values ...string) {
+		if !enabled {
+			return
+		}
+		for _, value := range values {
+			names[value] = true
+		}
+	}
+	add(features.ListFiles, "list_files")
+	add(features.ReadFile, "read_file")
+	add(features.Glob, "glob")
+	add(features.Grep, "grep")
+	add(features.LSP, "LSP")
+	add(features.Bash, "Bash")
+	add(features.Write, "Write")
+	add(features.Edit, "Edit")
+	add(features.WebFetch, "WebFetch")
+	add(features.AsyncShell, "BashStart", "BashPoll", "BashKill")
+	return names
+}
+
+func projectStateTools(cfg Config, features ProjectStateFeatures) []agentsdk.Tool {
+	allowed := map[string]bool{}
+	if features.TaskTools {
+		for _, name := range []string{
+			"task_create",
+			"task_ready",
+			"task_show",
+			"task_update",
+			"task_claim",
+			"task_close",
+			"task_comment",
+			"task_link",
+		} {
+			allowed[name] = true
+		}
+	}
+	if features.MemoryTools {
+		for _, name := range []string{
+			"memory_remember",
+			"memory_recall",
+			"memory_list",
+			"memory_update",
+			"memory_delete",
+			"memory_stats",
+		} {
+			allowed[name] = true
+		}
+	}
+	if features.PrimeTool {
+		allowed["prime_context"] = true
+	}
+	return filterNamedTools(sdkprojectstatetools.Tools(cfg.ProjectStateStore, projectStateActor(cfg)), allowed)
+}
+
+func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {
+	names := map[string]bool{}
+	add := func(enabled bool, name string) {
+		if enabled {
+			names[name] = true
+		}
+	}
+	add(features.Spawn, "spawn_subagent_task")
+	add(features.Run, "run_subagent_task")
+	add(features.Graph, "spawn_subagent_graph")
+	add(features.List, "list_subagent_tasks")
+	add(features.Status, "get_subagent_task_status")
+	add(features.Activity, "get_subagent_activity")
+	add(features.TaskGraph, "get_subagent_task_graph")
+	add(features.Message, "send_message_to_subagent_task")
+	add(features.Collect, "collect_subagent_result")
+	add(features.Cancel, "cancel_subagent_task")
+	return names
+}
+
+func filterNamedTools(tools []agentsdk.Tool, allowed map[string]bool) []agentsdk.Tool {
+	if len(allowed) == 0 {
+		return nil
+	}
+	out := make([]agentsdk.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
+		if allowed[tool.Name()] {
+			out = append(out, tool)
+		}
+	}
+	return out
+}
+
+func buildMCPManager(ctx context.Context, cfg Config, features MCPFeatures, opts ...sdkmcp.ManagerOption) (*sdkmcp.Manager, error) {
+	if features.AllowAllServers {
+		if cfg.MCPConfig != nil {
+			return sdkmcp.NewManagerFromConfig(ctx, cfg.WorkDir, *cfg.MCPConfig, opts...)
+		}
+		return sdkmcp.NewManager(ctx, cfg.WorkDir, opts...)
+	}
+	allowedServers := stringSet(features.AllowedServers)
+	if len(allowedServers) == 0 {
+		return nil, nil
+	}
+	mcpCfg, exists, err := loadMCPConfigForRuntime(cfg)
+	if err != nil || !exists {
+		return nil, err
+	}
+	filtered := sdkmcp.Config{MCPServers: map[string]sdkmcp.ServerConfig{}}
+	for name, server := range mcpCfg.MCPServers {
+		if allowedServers[name] {
+			filtered.MCPServers[name] = server
+		}
+	}
+	if len(filtered.MCPServers) == 0 {
+		return nil, nil
+	}
+	return sdkmcp.NewManagerFromConfig(ctx, cfg.WorkDir, filtered, opts...)
+}
+
+func loadMCPConfigForRuntime(cfg Config) (sdkmcp.Config, bool, error) {
+	if cfg.MCPConfig != nil {
+		return *cfg.MCPConfig, true, nil
+	}
+	return sdkmcp.LoadConfig(sdkmcp.ConfigPathForWorkDir(cfg.WorkDir))
+}
+
+func filterMCPTools(tools []agentsdk.Tool, features MCPFeatures) []agentsdk.Tool {
+	allowedTools := stringSet(features.AllowedTools)
+	out := make([]agentsdk.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
+		switch typed := tool.(type) {
+		case *sdkmcp.DynamicTool:
+			if features.AllowAllTools || allowedTools[typed.Descriptor.QualifiedName] || allowedTools[typed.Descriptor.ToolName] {
+				out = append(out, tool)
+			}
+		case *sdkmcp.ListResourcesTool, *sdkmcp.ReadResourceTool:
+			if features.ResourceTools {
+				out = append(out, tool)
+			}
+		default:
+			if features.AllowAllTools || allowedTools[tool.Name()] {
+				out = append(out, tool)
+			}
+		}
+	}
+	return out
+}
+
+func stringSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out[trimmed] = true
+		}
+	}
+	return out
+}
+
+func runtimeWorkspaceContext(cfg Config, tools []agentsdk.Tool, features resolvedFeatures) string {
+	if !features.strict {
+		return agentsdk.BuildWorkspaceContext(cfg.WorkDir, cfg.ToolAccess)
+	}
+	if strings.TrimSpace(cfg.WorkDir) == "" {
+		return ""
+	}
+	names := toolNames(tools)
+	toolList := "none"
+	if len(names) > 0 {
+		toolList = strings.Join(names, ", ")
+	}
+	return fmt.Sprintf(`<environment>
+Working directory: %s
+All file paths are relative to this directory. Use relative paths instead of absolute paths.
+Tool access: %s
+Available tools include: %s.
+</environment>`, cfg.WorkDir, cfg.ToolAccess, toolList)
+}
+
+func modeInstructionBlocks(cfg Config, features resolvedFeatures) []string {
+	if !features.value.Modes.Instructions && !features.value.Modes.PhaseTracking {
+		return nil
+	}
+	var blocks []string
+	if features.value.Modes.Instructions {
+		blocks = append(blocks,
+			"Session mode: "+string(cfg.SessionMode),
+			"Active mode: "+modeLabel(cfg),
+			"Active phase: "+runtimePhase(cfg),
+		)
+	}
+	if features.value.Modes.PhaseTracking {
+		blocks = append(blocks, agentsdk.BuildPhaseTrackingDirective(cfg.ModeSnapshot))
+	}
+	return blocks
+}
+
+func tracingProcessor(cfg Config, features resolvedFeatures) agentsdk.TracingProcessor {
+	if !features.value.Runtime.Tracing {
+		return nil
+	}
+	return cfg.TracingProcessor
+}
+
+func immediateInputPoller(cfg Config, features resolvedFeatures) agentsdk.ImmediateInputPoller {
+	if !features.value.Runtime.ImmediateInputPolling {
+		return nil
+	}
+	return cfg.ImmediateInputPoller
+}
+
+func untrustedToolOutputs(features resolvedFeatures) *bool {
+	if !features.strict {
+		return nil
+	}
+	value := features.value.Runtime.UntrustedToolOutputs
+	return &value
+}
+
 func modelSettings(cfg Config) agentsdk.ModelSettings {
 	settings := agentsdk.ModeRoutingSettings(cfg.Reasoning, cfg.Verbosity)
 	if cfg.MaxTokens > 0 {
 		settings.MaxTokens = cfg.MaxTokens
 	}
-	parallel := true
+	parallel := resolveFeatures(cfg).value.Runtime.ParallelToolCalls
 	settings.ParallelToolCalls = &parallel
 	return settings
 }
 
 func runModelSettings(cfg Config) agentsdk.ModelSettings {
 	if cfg.ModelSettings != nil {
-		return *cfg.ModelSettings
+		settings := *cfg.ModelSettings
+		if settings.ParallelToolCalls == nil {
+			parallel := resolveFeatures(cfg).value.Runtime.ParallelToolCalls
+			settings.ParallelToolCalls = &parallel
+		}
+		return settings
 	}
 	return modelSettings(cfg)
 }
 
 func compactionConfig(cfg Config) agentsdk.CompactionConfig {
-	if !cfg.EnableCompaction {
+	if !resolveFeatures(cfg).value.Runtime.Compaction {
 		return agentsdk.CompactionConfig{}
 	}
 	trigger, target := agentsdk.CompactionDefaultsForModel(cfg.Model)
@@ -877,7 +1138,7 @@ func runHandoffHistory(cfg Config) agentsdk.HandoffHistoryConfig {
 		return *cfg.HandoffHistory
 	}
 	return agentsdk.HandoffHistoryConfig{
-		Enabled:             cfg.EnableCompaction,
+		Enabled:             resolveFeatures(cfg).value.Runtime.HandoffHistory,
 		MaxTokens:           2400,
 		TargetTokens:        1200,
 		PreserveRecentItems: 6,
@@ -886,7 +1147,7 @@ func runHandoffHistory(cfg Config) agentsdk.HandoffHistoryConfig {
 }
 
 func retryPolicy(cfg Config) *agentsdk.RetryPolicy {
-	if !cfg.EnableRetry {
+	if !resolveFeatures(cfg).value.Runtime.Retry {
 		return nil
 	}
 	policy := agentsdk.DefaultRetryPolicy()
@@ -897,7 +1158,7 @@ func retryPolicy(cfg Config) *agentsdk.RetryPolicy {
 
 func toolInputGuardrails(cfg Config) []agentsdk.ToolInputGuardrail {
 	var out []agentsdk.ToolInputGuardrail
-	if cfg.EnableGuardrails {
+	if resolveFeatures(cfg).value.Guardrails.Builtin {
 		out = append(out, guardrails.BuiltinToolInputGuardrails()...)
 	}
 	out = append(out, cfg.ToolInputRules...)
@@ -906,7 +1167,7 @@ func toolInputGuardrails(cfg Config) []agentsdk.ToolInputGuardrail {
 
 func toolOutputGuardrails(cfg Config) []agentsdk.ToolOutputGuardrail {
 	var out []agentsdk.ToolOutputGuardrail
-	if cfg.EnableGuardrails {
+	if resolveFeatures(cfg).value.Guardrails.Builtin {
 		out = append(out, guardrails.BuiltinToolOutputGuardrails()...)
 	}
 	out = append(out, cfg.ToolOutputRules...)
@@ -914,11 +1175,12 @@ func toolOutputGuardrails(cfg Config) []agentsdk.ToolOutputGuardrail {
 }
 
 func toolPolicy(cfg Config) *agentsdk.ToolPolicy {
-	if !cfg.EnableApproval && cfg.ToolTimeout <= 0 {
+	approval := resolveFeatures(cfg).value.Runtime.Approval
+	if !approval && cfg.ToolTimeout <= 0 {
 		return nil
 	}
 	return &agentsdk.ToolPolicy{
-		ApprovalRequired: cfg.EnableApproval,
+		ApprovalRequired: approval,
 		DefaultTimeout:   cfg.ToolTimeout,
 	}
 }

@@ -155,6 +155,9 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 
 	for _, serverName := range serverNames {
 		srvCfg := cfg.MCPServers[serverName]
+		if srvCfg.Enabled != nil && !*srvCfg.Enabled {
+			continue
+		}
 
 		transportType := strings.TrimSpace(srvCfg.Type)
 		if transportType != "" && !strings.EqualFold(transportType, "stdio") {
@@ -177,6 +180,9 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 
 		for _, tool := range tools {
 			if tool == nil {
+				continue
+			}
+			if !serverToolAllowed(srvCfg, tool.Name) {
 				continue
 			}
 
@@ -207,6 +213,19 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 
 func trustedMCPReadOnly(cfg ServerConfig, tool *mcpsdk.Tool) bool {
 	return cfg.TrustReadOnlyHint && tool != nil && tool.Annotations != nil && tool.Annotations.ReadOnlyHint
+}
+
+func serverToolAllowed(cfg ServerConfig, toolName string) bool {
+	if len(cfg.AllowedTools) == 0 {
+		return true
+	}
+	toolName = strings.TrimSpace(toolName)
+	for _, allowed := range cfg.AllowedTools {
+		if strings.TrimSpace(allowed) == toolName {
+			return true
+		}
+	}
+	return false
 }
 
 func mcpToolTitle(tool *mcpsdk.Tool) string {
