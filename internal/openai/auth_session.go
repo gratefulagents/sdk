@@ -28,8 +28,7 @@ const (
 
 const (
 	openAIBetaResponsesExperimental = "responses=experimental"
-	oauthRefreshExpiryMargin        = 5 * time.Minute
-	oauthRefreshInterval            = 55 * time.Minute
+	oauthRefreshInterval            = 8 * 24 * time.Hour
 
 	DefaultCodexClientVersion = "0.125.0"
 	DefaultOAuthClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -420,11 +419,6 @@ func (s *OpenAIAuthSession) sdkAPIKey() string {
 func shouldRefreshOAuthAccessToken(accessToken string, lastRefresh time.Time, now time.Time) bool {
 	if strings.TrimSpace(accessToken) == "" {
 		return true
-	}
-	if exp, ok := accessTokenExpiry(accessToken); ok {
-		if exp.Before(now.Add(oauthRefreshExpiryMargin)) || exp.Equal(now.Add(oauthRefreshExpiryMargin)) {
-			return true
-		}
 	}
 	if !lastRefresh.IsZero() && (lastRefresh.Before(now.Add(-oauthRefreshInterval)) || lastRefresh.Equal(now.Add(-oauthRefreshInterval))) {
 		return true

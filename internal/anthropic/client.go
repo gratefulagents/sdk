@@ -26,7 +26,7 @@ const (
 	maxRetryAfterSeconds = 5 * 60
 )
 
-// Client wraps Anthropic API calls using API key authentication.
+// Client wraps Anthropic API calls.
 type Client struct {
 	sdk sdk.Client
 
@@ -42,6 +42,8 @@ type Option func(*clientConfig)
 type clientConfig struct {
 	baseURL       string
 	maxConcurrent int
+	authToken     string
+	oauth         bool
 }
 
 // WithBaseURL overrides the API base URL.
@@ -54,7 +56,17 @@ func WithMaxConcurrent(n int) Option {
 	return func(c *clientConfig) { c.maxConcurrent = n }
 }
 
-// NewClient creates a new Anthropic API client using an API key.
+// WithOAuthToken configures the client to authenticate with an Anthropic OAuth
+// access token instead of an API key.
+func WithOAuthToken(token string) Option {
+	return func(c *clientConfig) {
+		c.authToken = strings.TrimSpace(token)
+		c.oauth = true
+	}
+}
+
+// NewClient creates a new Anthropic API client using an API key or OAuth
+// access token.
 func NewClient(apiKey string, opts ...Option) *Client {
 	cfg := &clientConfig{maxConcurrent: defaultMaxConcurrent}
 	for _, opt := range opts {
@@ -63,10 +75,17 @@ func NewClient(apiKey string, opts ...Option) *Client {
 
 	sessionID := uuid.New().String()
 	sdkOpts := []option.RequestOption{
-		option.WithAPIKey(apiKey),
 		option.WithMaxRetries(0), // We handle retries ourselves
 		option.WithHeader("x-app", "cli"),
 		option.WithHeader("X-Claude-Code-Session-Id", sessionID),
+	}
+	if cfg.oauth {
+		sdkOpts = append(sdkOpts,
+			option.WithAuthToken(cfg.authToken),
+			option.WithHeaderAdd("anthropic-beta", "oauth-2025-04-20"),
+		)
+	} else {
+		sdkOpts = append(sdkOpts, option.WithAPIKey(apiKey))
 	}
 	if cfg.baseURL != "" {
 		sdkOpts = append(sdkOpts, option.WithBaseURL(cfg.baseURL))

@@ -45,8 +45,9 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 		return newOpenAIProviderFromSpec(spec)
 	case "anthropic":
 		return sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-			BaseURL: baseURLForProvider(spec, DefaultProviderAnthropic),
-			APIKey:  apiKeyForProvider(spec, DefaultProviderAnthropic),
+			BaseURL:  baseURLForProvider(spec, DefaultProviderAnthropic),
+			APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
+			AuthMode: authModeForAnthropicProvider(spec),
 		}), nil
 	case "openrouter":
 		return newOpenAICompatibleProviderFromSpec("openrouter", spec), nil
@@ -116,8 +117,9 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 	}
 	mp.Register(DefaultProviderOpenAI, openAIProvider)
 	mp.Register(DefaultProviderAnthropic, sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-		BaseURL: baseURLForProvider(spec, DefaultProviderAnthropic),
-		APIKey:  apiKeyForProvider(spec, DefaultProviderAnthropic),
+		BaseURL:  baseURLForProvider(spec, DefaultProviderAnthropic),
+		APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
+		AuthMode: authModeForAnthropicProvider(spec),
 	}))
 	for _, provider := range []string{"openrouter", "gemini", "groq", "local"} {
 		mp.Register(provider, newOpenAICompatibleProviderFromSpec(provider, spec))
@@ -146,6 +148,18 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 		AuthMode:       sdkopenai.AuthModeAPIKey,
 		ModelFallbacks: modelFallbacks,
 	})
+}
+
+func authModeForAnthropicProvider(spec ProviderSpec) string {
+	authMode := strings.ToLower(strings.TrimSpace(spec.AuthMode))
+	if authMode != "oauth" {
+		return authMode
+	}
+	provider := normalizeProviderName(spec.Provider)
+	if provider == DefaultProviderAnthropic || defaultProviderForSpec(spec) == DefaultProviderAnthropic {
+		return authMode
+	}
+	return ""
 }
 
 func defaultProviderForSpec(spec ProviderSpec) string {

@@ -77,6 +77,10 @@ Notes:
   result shapes. When that happens, the test failure is the signal. The
   feature inventory below documents which guarantees are SDK-level vs.
   provider-specific.
+- Anthropic OAuth is supported by the provider runtime when the host supplies
+  a refreshed access token (`ProviderConfig{AuthMode: "oauth"}`), but the live
+  Anthropic example suite still uses `ANTHROPIC_API_KEY` because token
+  acquisition and refresh are host responsibilities.
 
 ### Per-suite env requirements
 

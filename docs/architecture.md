@@ -25,8 +25,8 @@ flowchart TD
 - `pkg/agentsdk`: public runtime API, aliases, conversation helpers, session helpers, guardrails, specialists, progress, tracing, and event helpers.
 - `internal/agent`: core runner implementation. Public callers should use `pkg/agentsdk`.
 - `pkg/agentsdk/providers`: provider factory and provider-facing public packages.
-- `pkg/agentsdk/providers/openai`: OpenAI-compatible provider, auth helpers, metadata helpers, compaction helpers, and cost helpers.
-- `pkg/agentsdk/providers/anthropic`: Anthropic provider and helpers.
+- `pkg/agentsdk/providers/openai`: OpenAI-compatible provider, API-key and Codex OAuth auth helpers, metadata helpers, compaction helpers, and cost helpers.
+- `pkg/agentsdk/providers/anthropic`: Anthropic provider and helpers for API-key and OAuth bearer-token auth.
 - `internal/openai` and `internal/anthropic`: provider implementation details.
 - `pkg/agentsdk/tools`: default tool registry plus built-in tool packages.
 - `pkg/agentsdk/mcp`: `.mcp.json` loading, stdio manager, MCP tool/resource wrapping, result formatting, and break-glass helpers.

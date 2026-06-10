@@ -55,7 +55,7 @@ Each feature links to a focused doc with a runnable example.
 | --- | --- |
 | [Agent runtime](examples/features/agent_runtime/README.md) | Multi-turn loop with tools, handoffs, approvals, retries, usage, and hooks. |
 | [Model abstraction](examples/features/model_abstraction/README.md) | Custom `Model`/`ModelProvider`, `MultiProvider`, and provider-prefixed routing. |
-| [Providers](examples/features/providers/README.md) | OpenAI (Responses/Chat), OpenAI OAuth, Anthropic, OpenRouter, local gateways. |
+| [Providers](examples/features/providers/README.md) | OpenAI (Responses/Chat), OpenAI OAuth, Anthropic API key/OAuth, OpenRouter, local gateways. |
 | [Tools](examples/features/tools/README.md) | `FunctionTool`, JSON schemas, approvals, and tool policies. |
 | [Tool registry](examples/features/tools_registry/README.md) | Permission-aware built-in tools: shell, fs, search, git, LSP, web, and more. |
 | [MCP](examples/features/mcp/README.md) | Load `.mcp.json` stdio servers and expose their tools and resources. |

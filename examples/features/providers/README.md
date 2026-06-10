@@ -26,10 +26,25 @@ ANTHROPIC_API_KEY=sk-...     go test -run TestMultiProvider   ./examples/feature
 
 Optional overrides: `ANTHROPIC_LIVE_MODEL`, `ANTHROPIC_BASE_URL`, `OPENROUTER_LIVE_MODEL`, `OPENROUTER_BASE_URL`.
 
+## Anthropic OAuth
+
+The Anthropic provider accepts either an API key or a host-supplied OAuth access token. For OAuth, pass the access token as `APIKey` and set `AuthMode: "oauth"`:
+
+```go
+provider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
+	APIKey:   anthropicOAuthAccessToken,
+	AuthMode: "oauth",
+})
+```
+
+The SDK then sends `Authorization: Bearer <token>` and the Anthropic OAuth beta header instead of `x-api-key`. Hosts remain responsible for acquiring and refreshing Anthropic OAuth tokens. When using `providers.NewProviderFromConfig` with `Provider: "multi"`, `AuthMode: "oauth"` applies to Anthropic only when Anthropic is the selected/default provider; Anthropic fallback providers continue to use their configured API key.
+
+For the lower-level Anthropic client, use `sdkanthropic.WithOAuthToken(token)` with `sdkanthropic.NewClient`.
+
 How to use this feature:
 
 - Use `sdkopenai.NewProviderWithConfig` for OpenAI, OpenAI-compatible gateways, OpenRouter, or local `/v1` servers.
-- Use `sdkanthropic.NewProviderWithConfig` for Anthropic.
+- Use `sdkanthropic.NewProviderWithConfig` for Anthropic API-key or OAuth bearer-token auth.
 - Pass the provider to `agentsdk.NewRunnerWithProvider`.
 - Use `sdkopenai.NewClient` plus `sdkopenai.NewModelWithClient` when a gateway model ID contains slashes and should be sent untouched.
 - Use `sdkopenai.ValidateChatCompletionsModel` before forcing Chat Completions mode.

@@ -13,13 +13,15 @@ import (
 
 // AnthropicProvider implements ModelProvider for the Anthropic API.
 type AnthropicProvider struct {
-	apiKey  string
-	baseURL string
+	apiKey   string
+	baseURL  string
+	authMode string
 }
 
 type ProviderConfig struct {
-	APIKey  string
-	BaseURL string
+	APIKey   string
+	BaseURL  string
+	AuthMode string
 }
 
 // NewAnthropicProvider creates a provider that must be configured with an API
@@ -30,14 +32,15 @@ func NewAnthropicProvider() *AnthropicProvider {
 
 func NewAnthropicProviderWithConfig(cfg ProviderConfig) *AnthropicProvider {
 	return &AnthropicProvider{
-		apiKey:  strings.TrimSpace(cfg.APIKey),
-		baseURL: strings.TrimSpace(cfg.BaseURL),
+		apiKey:   strings.TrimSpace(cfg.APIKey),
+		baseURL:  strings.TrimSpace(cfg.BaseURL),
+		authMode: strings.ToLower(strings.TrimSpace(cfg.AuthMode)),
 	}
 }
 
 func (p *AnthropicProvider) GetModel(name string) (agentsdk.Model, error) {
 	name = agentsdk.ResolveModelForProvider(name, "anthropic")
-	m, err := newAnthropicModel(p.apiKey, p.baseURL)
+	m, err := newAnthropicModel(p.apiKey, p.baseURL, p.authMode)
 	if err != nil {
 		return nil, err
 	}
@@ -53,14 +56,17 @@ type AnthropicModel struct {
 	model  string
 }
 
-func newAnthropicModel(apiKey, baseURL string) (*AnthropicModel, error) {
+func newAnthropicModel(apiKey, baseURL, authMode string) (*AnthropicModel, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
-		return nil, &agentsdk.AgentError{Message: "Anthropic API key is required"}
+		return nil, &agentsdk.AgentError{Message: "Anthropic credential is required"}
 	}
 	var opts []internalanthropic.Option
 	if baseURL != "" {
 		opts = append(opts, internalanthropic.WithBaseURL(baseURL))
+	}
+	if strings.EqualFold(authMode, "oauth") {
+		opts = append(opts, internalanthropic.WithOAuthToken(apiKey))
 	}
 	client := internalanthropic.NewClient(apiKey, opts...)
 	return &AnthropicModel{client: client}, nil

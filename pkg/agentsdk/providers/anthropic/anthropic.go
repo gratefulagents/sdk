@@ -73,6 +73,10 @@ func WithMaxConcurrent(n int) ClientOption {
 	return internalanthropic.WithMaxConcurrent(n)
 }
 
+func WithOAuthToken(token string) ClientOption {
+	return internalanthropic.WithOAuthToken(token)
+}
+
 func NewTextBlock(text string) ContentBlock {
 	return internalanthropic.NewTextBlock(text)
 }
