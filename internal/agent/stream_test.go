@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -277,5 +278,32 @@ func TestProgressTracker_DrainPendingEvents(t *testing.T) {
 	events2 := tracker.DrainPendingEvents()
 	if len(events2) != 0 {
 		t.Errorf("expected no pending events after drain, got %d", len(events2))
+	}
+}
+
+func TestTruncateMiddle(t *testing.T) {
+	short := "short text"
+	if got := TruncateMiddle(short, 100); got != short {
+		t.Errorf("short input should be unchanged, got %q", got)
+	}
+
+	long := strings.Repeat("a", 500) + "MIDDLE" + strings.Repeat("z", 500)
+	got := TruncateMiddle(long, 200)
+	if len([]rune(got)) > 230 { // marker slack
+		t.Errorf("truncated output too long: %d", len(got))
+	}
+	if !strings.HasPrefix(got, "aaa") {
+		t.Errorf("head not preserved: %q", got[:20])
+	}
+	if !strings.HasSuffix(got, "zzz") {
+		t.Errorf("tail not preserved: %q", got[len(got)-20:])
+	}
+	if !strings.Contains(got, "elided") {
+		t.Errorf("missing elision marker: %q", got)
+	}
+
+	// n <= 0 means no truncation.
+	if got := TruncateMiddle(long, 0); got != long {
+		t.Error("n=0 should disable truncation")
 	}
 }

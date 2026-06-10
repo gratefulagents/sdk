@@ -669,3 +669,105 @@ func TestContainsAny(t *testing.T) {
 		t.Error("should not match empty string")
 	}
 }
+
+func TestSubAgentActivity_RecordToolEnd_TracksReads(t *testing.T) {
+	a := NewSubAgentActivity()
+
+	a.RecordToolEnd("read_file", "internal/agent/runner.go", false, 10)
+	a.RecordToolEnd("read_file", "internal/agent/runner.go", false, 10) // duplicate
+	a.RecordToolEnd("read_file", "cmd/agent/plan.go", false, 10)
+	a.RecordToolEnd("read_file", "broken.go", true, 10) // error — not tracked
+	a.RecordToolEnd("read_file", "", false, 10)         // no path — not tracked
+
+	snap := a.Snapshot(false)
+	if len(snap.FilesRead) != 2 {
+		t.Fatalf("expected 2 files read, got %d: %v", len(snap.FilesRead), snap.FilesRead)
+	}
+	if snap.FilesRead[0] != "internal/agent/runner.go" || snap.FilesRead[1] != "cmd/agent/plan.go" {
+		t.Errorf("unexpected files read: %v", snap.FilesRead)
+	}
+}
+
+func TestSubAgentRegistrySpawnUsesShortTaskIDs(t *testing.T) {
+	model := &mockModel{responses: []*ModelResponse{
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+	}}
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"analyst": {Name: "analyst"}},
+	})
+	taskID, err := registry.SpawnAsync(context.Background(), "analyst", "task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(taskID, "task_") {
+		t.Fatalf("task ID %q missing task_ prefix", taskID)
+	}
+	if len(taskID) != len("task_")+8 {
+		t.Fatalf("task ID %q should be short (task_ + 8 chars), got len %d", taskID, len(taskID))
+	}
+}
+
+func TestSubAgentRegistryConcurrentConfigureAndSpawn(t *testing.T) {
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{
+		Agents: map[string]*Agent{"a": {Name: "a"}},
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			registry.Configure(SubAgentRegistryConfig{
+				Agents:        map[string]*Agent{"a": {Name: "a"}},
+				MaxConcurrent: 2,
+			})
+			registry.SetAllowedAgents([]string{"a"})
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		// Unknown agent: exercises the locked r.agents read without launching goroutines.
+		_, _ = registry.SpawnAsyncWithOptions(context.Background(), "missing", "msg", SubAgentSpawnOptions{})
+	}
+	<-done
+}
+
+func TestSubAgentRegistryBroadcastWakesAllWaiters(t *testing.T) {
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{})
+	registry.tasks["task_wait"] = &subAgentTaskEntry{
+		task: SubAgentTask{ID: "task_wait", Status: SubAgentTaskRunning, StartedAt: time.Now()},
+	}
+	registry.order = append(registry.order, "task_wait")
+
+	const waiters = 4
+	results := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			task, err := registry.WaitForTask(context.Background(), "task_wait", 5000)
+			if err != nil {
+				results <- err
+				return
+			}
+			if !task.IsTerminal() {
+				results <- context.DeadlineExceeded
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	registry.setTerminal("task_wait", SubAgentTaskCompleted, "ok", "", time.Second, 0, 0)
+
+	// All waiters must wake from the single state change well before the 5s
+	// wait deadline — the old buffered-1 channel woke only one of them.
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatalf("waiter %d failed: %v", i, err)
+			}
+		case <-deadline:
+			t.Fatalf("waiter %d not woken by broadcast", i)
+		}
+	}
+}

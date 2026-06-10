@@ -140,7 +140,7 @@ func (a *SubAgentActivity) RecordToolStart(toolName, inputSummary string) {
 
 	// Infer current step from tool name.
 	switch toolName {
-	case "LSP":
+	case "LSP", "read_file", "list_files", "glob", "grep":
 		a.currentStep = "exploring"
 	case "Edit", "Write":
 		a.currentStep = "implementing"
@@ -165,6 +165,14 @@ func (a *SubAgentActivity) RecordToolEnd(toolName, inputSummary string, isError 
 		if _, exists := a.filesWrittenSet[inputSummary]; !exists {
 			a.filesWrittenSet[inputSummary] = struct{}{}
 			a.filesWritten = append(a.filesWritten, inputSummary)
+		}
+	}
+
+	// Track file reads.
+	if toolName == "read_file" && inputSummary != "" && !isError {
+		if _, exists := a.filesReadSet[inputSummary]; !exists {
+			a.filesReadSet[inputSummary] = struct{}{}
+			a.filesRead = append(a.filesRead, inputSummary)
 		}
 	}
 
@@ -251,7 +259,7 @@ type SubAgentRegistry struct {
 	mu          sync.Mutex
 	tasks       map[string]*subAgentTaskEntry
 	order       []string      // insertion-ordered task IDs
-	changed     chan struct{} // signaled on any status change
+	changed     chan struct{} // broadcast channel: closed and replaced on any status change; guarded by mu
 	sem         chan struct{} // concurrency semaphore (nil = unlimited)
 	runner      *Runner
 	allAgents   map[string]*Agent // full set of agents (never modified after init)
@@ -285,7 +293,7 @@ type SubAgentRegistryConfig struct {
 func NewSubAgentRegistry(cfg SubAgentRegistryConfig) *SubAgentRegistry {
 	r := &SubAgentRegistry{
 		tasks:            make(map[string]*subAgentTaskEntry),
-		changed:          make(chan struct{}, 1),
+		changed:          make(chan struct{}),
 		runner:           cfg.Runner,
 		allAgents:        cfg.Agents,
 		agents:           cfg.Agents,
@@ -355,7 +363,11 @@ func (r *SubAgentRegistry) Configure(cfg SubAgentRegistryConfig) {
 	r.compactionConfig = cfg.CompactionConfig
 	r.maxTurns = effectiveSubAgentMaxTurns(cfg.MaxTurns)
 	if cfg.MaxConcurrent > 0 {
-		r.sem = make(chan struct{}, cfg.MaxConcurrent)
+		// Keep the existing semaphore when capacity is unchanged so tasks
+		// already holding or queued for slots keep consistent accounting.
+		if cap(r.sem) != cfg.MaxConcurrent {
+			r.sem = make(chan struct{}, cfg.MaxConcurrent)
+		}
 	} else {
 		r.sem = nil
 	}
@@ -389,12 +401,24 @@ func (r *SubAgentRegistry) SetAllowedAgents(allowed []string) {
 	r.agents = filtered
 }
 
-// signalChange notifies any waiters that a task status changed.
+// signalChange wakes all waiters by closing the broadcast channel and
+// installing a fresh one. Unlike a buffered-1 channel (where one waiter
+// consumes the only signal and the rest sleep until their fallback tickers
+// fire), close() reaches every blocked waiter immediately.
 func (r *SubAgentRegistry) signalChange() {
-	select {
-	case r.changed <- struct{}{}:
-	default:
-	}
+	r.mu.Lock()
+	close(r.changed)
+	r.changed = make(chan struct{})
+	r.mu.Unlock()
+}
+
+// changeChan returns the current broadcast channel. Capture it BEFORE checking
+// task state: any change after the capture closes this exact channel, so a
+// check-then-wait sequence can never miss a wakeup.
+func (r *SubAgentRegistry) changeChan() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.changed
 }
 
 func uniqueNonEmptyStrings(values []string) []string {
@@ -440,10 +464,11 @@ func (r *SubAgentRegistry) waitForDependencies(ctx context.Context, taskID strin
 	}
 
 	r.setStatus(taskID, SubAgentTaskWaiting, "", "")
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
+		// Capture the broadcast channel before inspecting state so a change
+		// between the check and the wait still wakes this loop.
+		ch := r.changeChan()
 		done, waitingOn, failedDeps, depTasks := r.dependencyState(dependsOn, policy)
 		r.setWaitingOn(taskID, waitingOn)
 		if len(failedDeps) > 0 {
@@ -459,7 +484,7 @@ func (r *SubAgentRegistry) waitForDependencies(ctx context.Context, taskID strin
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-ticker.C:
+		case <-ch:
 		}
 	}
 }
@@ -529,12 +554,12 @@ func BuildSubAgentDependencyContext(tasks []SubAgentTask) string {
 		b.WriteString(string(task.Status))
 		if task.Result != "" {
 			b.WriteString("\nResult:\n")
-			b.WriteString(Truncate(task.Result, 4000))
+			b.WriteString(TruncateMiddle(task.Result, 4000))
 			b.WriteByte('\n')
 		}
 		if task.Error != "" {
 			b.WriteString("\nError:\n")
-			b.WriteString(Truncate(task.Error, 1200))
+			b.WriteString(TruncateMiddle(task.Error, 1200))
 			b.WriteByte('\n')
 		}
 	}
@@ -563,12 +588,12 @@ func BuildSubAgentResultsContext(tasks []SubAgentTask) string {
 		b.WriteString(string(task.Status))
 		if task.Result != "" {
 			b.WriteString("\nResult:\n")
-			b.WriteString(Truncate(task.Result, 8000))
+			b.WriteString(TruncateMiddle(task.Result, 8000))
 			b.WriteByte('\n')
 		}
 		if task.Error != "" {
 			b.WriteString("\nError:\n")
-			b.WriteString(Truncate(task.Error, 1600))
+			b.WriteString(TruncateMiddle(task.Error, 1600))
 			b.WriteByte('\n')
 		}
 	}
@@ -637,22 +662,40 @@ func (r *SubAgentRegistry) SpawnAsync(ctx context.Context, agentName, message st
 	})
 }
 
+// taskRunSnapshot captures the registry configuration a task needs at spawn
+// time. Tasks run against this immutable snapshot so concurrent Configure /
+// SetAllowedAgents calls (hosts reconfigure per user turn) cannot race with
+// in-flight task goroutines.
+type taskRunSnapshot struct {
+	runner           *Runner
+	tracker          *ProgressTracker
+	eventStream      *EventStream
+	workDir          string
+	toolAccessLevel  ToolAccessLevel
+	toolPolicy       *ToolPolicy
+	compactionConfig CompactionConfig
+	maxTurns         int
+	sem              chan struct{}
+}
+
+// newSubAgentTaskID returns a short unique task ID. Short IDs cost the parent
+// model fewer tokens every time it references the task (depends_on, steering,
+// status lookups) and are less error-prone to re-type than full UUIDs.
+// Caller must hold r.mu.
+func (r *SubAgentRegistry) newSubAgentTaskID() string {
+	for {
+		id := "task_" + uuid.NewString()[:8]
+		if _, exists := r.tasks[id]; !exists {
+			return id
+		}
+	}
+}
+
 // SpawnAsyncWithOptions launches a sub-agent with dependency and context
 // forwarding controls. Dependencies must be existing task IDs; use the
 // spawn_subagent_graph tool when callers want to describe a whole DAG by
 // logical keys in one call.
 func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName, message string, opts SubAgentSpawnOptions) (string, error) {
-	agent, ok := r.agents[agentName]
-	if !ok {
-		available := make([]string, 0, len(r.agents))
-		for name := range r.agents {
-			available = append(available, name)
-		}
-		return "", fmt.Errorf("unknown agent %q; available: %v", agentName, available)
-	}
-
-	taskID := "task_" + uuid.NewString()
-
 	// Capture the parent call ID from the current tool execution context so
 	// host activity views can link the spawned task to its parent.
 	parentCallID := ParentCallIDFromContext(ctx)
@@ -664,6 +707,30 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		includeDependencyResults = *opts.IncludeDependencyResults
 	}
 
+	// Use an independent context so sub-agent tasks survive the parent turn's
+	// context lifecycle. The parent tool call context expires when the tool
+	// returns, but the async task must keep running across turns.
+	taskCtx, cancel := context.WithCancel(context.Background())
+
+	r.mu.Lock()
+	agent, ok := r.agents[agentName]
+	if !ok {
+		available := make([]string, 0, len(r.agents))
+		for name := range r.agents {
+			available = append(available, name)
+		}
+		r.mu.Unlock()
+		cancel()
+		return "", fmt.Errorf("unknown agent %q; available: %v", agentName, available)
+	}
+	for _, depID := range dependsOn {
+		if _, ok := r.tasks[depID]; !ok {
+			r.mu.Unlock()
+			cancel()
+			return "", fmt.Errorf("dependency task %q not found", depID)
+		}
+	}
+	taskID := r.newSubAgentTaskID()
 	entry := &subAgentTaskEntry{
 		task: SubAgentTask{
 			ID:               taskID,
@@ -677,29 +744,19 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		activity:                 NewSubAgentActivity(),
 		includeDependencyResults: includeDependencyResults,
 		autoJoin:                 true,
+		cancel:                   cancel,
 	}
-
-	// Use an independent context so sub-agent tasks survive the parent turn's
-	// context lifecycle. The parent tool call context expires when the tool
-	// returns, but the async task must keep running across turns.
-	taskCtx, cancel := context.WithCancel(context.Background())
-	entry.cancel = cancel
-
-	r.mu.Lock()
-	for _, depID := range dependsOn {
-		if depID == taskID {
-			r.mu.Unlock()
-			cancel()
-			return "", fmt.Errorf("task cannot depend on itself")
-		}
-		if _, ok := r.tasks[depID]; !ok {
-			r.mu.Unlock()
-			cancel()
-			return "", fmt.Errorf("dependency task %q not found", depID)
-		}
+	snap := taskRunSnapshot{
+		runner:           r.runner,
+		tracker:          r.tracker,
+		eventStream:      r.eventStream,
+		workDir:          r.workDir,
+		toolAccessLevel:  r.toolAccessLevel,
+		toolPolicy:       r.toolPolicy,
+		compactionConfig: r.compactionConfig,
+		maxTurns:         r.maxTurns,
+		sem:              r.sem,
 	}
-	compactionConfig := r.compactionConfig
-	maxTurns := r.maxTurns
 	r.tasks[taskID] = entry
 	r.order = append(r.order, taskID)
 	taskSnapshot := entry.task
@@ -713,8 +770,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		agent,
 		message,
 		opts.ToolAccessOverride,
-		compactionConfig,
-		maxTurns,
+		snap,
 		TraceFromContext(ctx),
 		TracingProcessorFromContext(ctx),
 		SpanParentIDFromContext(ctx),
@@ -724,7 +780,9 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 }
 
 // runTask executes the sub-agent in a goroutine with semaphore gating.
-func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, toolAccessOverride ToolAccessLevel, compactionConfig CompactionConfig, maxTurns int, trace *Trace, processor TracingProcessor, parentSpanID string) {
+// All registry-level configuration is read from the spawn-time snapshot so the
+// task never races with concurrent registry reconfiguration.
+func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, toolAccessOverride ToolAccessLevel, snap taskRunSnapshot, trace *Trace, processor TracingProcessor, parentSpanID string) {
 	dependencyContext, waitErr := r.waitForDependencies(ctx, taskID)
 	if waitErr != nil {
 		duration := r.taskDuration(taskID)
@@ -736,11 +794,11 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		}
 		errMsg := fmt.Sprintf("agent %q %s before start: %v", ag.Name, statusLabel, waitErr)
 		r.setTerminal(taskID, status, "", errMsg, duration, 0, 0)
-		if r.tracker != nil {
-			r.tracker.RecordSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, Usage{}, "", nil, nil)
+		if snap.tracker != nil {
+			snap.tracker.RecordSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, Usage{}, "", nil, nil)
 		}
-		if r.eventStream != nil {
-			r.eventStream.EmitSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, duration.Milliseconds(), 0, false, 0, statusLabel, "")
+		if snap.eventStream != nil {
+			snap.eventStream.EmitSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, duration.Milliseconds(), 0, false, 0, statusLabel, "")
 		}
 		return
 	}
@@ -748,41 +806,40 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		message = message + "\n\n" + dependencyContext
 	}
 
-	// Acquire semaphore slot if concurrency-limited.
-	r.mu.Lock()
-	sem := r.sem
-	r.mu.Unlock()
-	if sem != nil {
+	// Acquire semaphore slot if concurrency-limited. The semaphore is captured
+	// at spawn time so a slot is always released into the same channel it was
+	// acquired from, even if the registry is reconfigured mid-task.
+	if snap.sem != nil {
 		select {
-		case sem <- struct{}{}:
+		case snap.sem <- struct{}{}:
 		case <-ctx.Done():
 			r.setStatus(taskID, SubAgentTaskCancelled, "", "context cancelled before start")
 			return
 		}
-		defer func() { <-sem }()
+		defer func() { <-snap.sem }()
 	}
 
 	r.setStatus(taskID, SubAgentTaskRunning, "", "")
 
 	// Record sub-agent start in the parent progress tracker and/or event stream.
 	var childHooks RunHooks
-	if r.tracker != nil || r.eventStream != nil {
+	if snap.tracker != nil || snap.eventStream != nil {
 		description := Truncate(message, 160)
 
 		var childTracker *ProgressTracker
-		if r.tracker != nil {
-			r.tracker.RecordSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, "async", message)
-			childTracker = NewChildTracker(r.tracker, taskID)
+		if snap.tracker != nil {
+			snap.tracker.RecordSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, "async", message)
+			childTracker = NewChildTracker(snap.tracker, taskID)
 			if parentSpanID != "" {
 				childTracker.SetRootSpanID(parentSpanID)
 			}
 		}
 
 		var childES *EventStream
-		if r.eventStream != nil {
+		if snap.eventStream != nil {
 			// Emit subagent start to EventStream for host activity views.
-			r.eventStream.EmitSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, message)
-			childES = NewChildEventStream(r.eventStream, taskID)
+			snap.eventStream.EmitSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, message)
+			childES = NewChildEventStream(snap.eventStream, taskID)
 		}
 
 		childHooks = NewPlatformHooks(childTracker, childES)
@@ -794,7 +851,7 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		r.mu.Unlock()
 	}
 	if childHooks == nil {
-		childHooks = r.runner.DefaultHooks
+		childHooks = snap.runner.DefaultHooks
 	}
 
 	items := []RunItem{{
@@ -807,12 +864,11 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	// H4: clamp the child to ≤ parent. Hosts can downgrade (full → read-only)
 	// but never upgrade (read-only → full); attempted upgrades are downgraded
 	// with a warning instead of rejected so flows keep working.
-	childToolAccess := NormalizeToolAccessLevel(r.toolAccessLevel)
+	childToolAccess := NormalizeToolAccessLevel(snap.toolAccessLevel)
 	if toolAccessOverride != "" {
 		toolAccessOverride = NormalizeToolAccessLevel(toolAccessOverride)
 		if childToolAccess == ToolAccessLevelReadOnly && toolAccessOverride != ToolAccessLevelReadOnly {
-			log.Printf("[subagent_registry] clamping child %q tool_access from %q to parent's %q (cannot escalate above parent)", taskID, toolAccessOverride, r.toolAccessLevel)
-			childToolAccess = ToolAccessLevelReadOnly
+			log.Printf("[subagent_registry] clamping child %q tool_access from %q to parent's %q (cannot escalate above parent)", taskID, toolAccessOverride, childToolAccess)
 		} else {
 			childToolAccess = toolAccessOverride
 		}
@@ -824,21 +880,21 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	// instead of /workspace/repo/foo), get "outside workspace" errors on
 	// reads, and incorrectly conclude they lack write tools.
 	childAgent := ag.Clone()
-	if r.workDir != "" {
-		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(r.workDir, childToolAccess)
+	if snap.workDir != "" {
+		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(snap.workDir, childToolAccess)
 	}
-	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(maxTurns)
+	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(snap.maxTurns)
 
 	startedAt := time.Now()
 	childCtx := WithTaskID(ctx, taskID)
-	result, err := r.runner.Run(childCtx, childAgent, items, RunConfig{
+	result, err := snap.runner.Run(childCtx, childAgent, items, RunConfig{
 		Hooks:                 childHooks,
-		MaxTurns:              maxTurns,
-		SubAgentMaxTurns:      maxTurns,
-		WorkDir:               r.workDir,
+		MaxTurns:              snap.maxTurns,
+		SubAgentMaxTurns:      snap.maxTurns,
+		WorkDir:               snap.workDir,
 		ToolAccessLevel:       childToolAccess,
-		ToolPolicy:            r.toolPolicy,
-		CompactionConfig:      compactionConfig,
+		ToolPolicy:            snap.toolPolicy,
+		CompactionConfig:      snap.compactionConfig,
 		Trace:                 trace,
 		ParentSpanID:          parentSpanID,
 		TracingProcessor:      processor,
@@ -861,11 +917,11 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		errMsg := fmt.Sprintf("agent %q %s: %v", ag.Name, statusLabel, err)
 		filesRead, filesWritten := r.getTaskFileActivity(taskID)
 		r.setTerminal(taskID, finalStatus, "", errMsg, duration, 0, 0)
-		if r.tracker != nil {
-			r.tracker.RecordSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, Usage{}, "", filesRead, filesWritten)
+		if snap.tracker != nil {
+			snap.tracker.RecordSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, Usage{}, "", filesRead, filesWritten)
 		}
-		if r.eventStream != nil {
-			r.eventStream.EmitSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, 0, 0, false, 0, statusLabel, "")
+		if snap.eventStream != nil {
+			snap.eventStream.EmitSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, 0, 0, false, 0, statusLabel, "")
 		}
 		return
 	}
@@ -897,12 +953,12 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		CacheReadTokens:   result.Usage.CacheReadTokens,
 		CacheCreateTokens: result.Usage.CacheCreateTokens,
 	}
-	costUsd, costKnown := estimateRunResultCost(result, r.runner.model)
+	costUsd, costKnown := estimateRunResultCost(result, snap.runner.model)
 	numTurns := len(result.RawResponses)
 	r.setTerminal(taskID, finalStatus, text, "", duration, toolCount, totalTokens)
-	if r.tracker != nil {
-		r.tracker.RecordSubagentProgress(taskID, toolCount, totalTokens, duration.Milliseconds(), "")
-		r.tracker.RecordSubagentCompleted(
+	if snap.tracker != nil {
+		snap.tracker.RecordSubagentProgress(taskID, toolCount, totalTokens, duration.Milliseconds(), "")
+		snap.tracker.RecordSubagentCompleted(
 			taskID, status, text,
 			costUsd,
 			numTurns,
@@ -910,8 +966,8 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			filesRead, filesWritten,
 		)
 	}
-	if r.eventStream != nil {
-		r.eventStream.EmitSubagentCompleted(taskID, status, text, toolCount, totalTokens, duration.Milliseconds(), costUsd, costKnown, int32(numTurns), "", text)
+	if snap.eventStream != nil {
+		snap.eventStream.EmitSubagentCompleted(taskID, status, text, toolCount, totalTokens, duration.Milliseconds(), costUsd, costKnown, int32(numTurns), "", text)
 	}
 }
 
@@ -1088,6 +1144,10 @@ func (r *SubAgentRegistry) drainQueuedMessages(taskID string) []RunItem {
 // WaitForAny blocks until any task changes state or the timeout expires.
 // Returns the changed task or nil on timeout.
 func (r *SubAgentRegistry) WaitForAny(ctx context.Context, timeoutMS int64) (*SubAgentTask, error) {
+	// Capture the broadcast channel before the fast-path check so a change
+	// racing with the check still wakes the wait below.
+	ch := r.changeChan()
+
 	// Fast path: if no tasks are active, return the most recent terminal task
 	// immediately. This avoids blocking when all work is already done and
 	// signals have been consumed.
@@ -1107,11 +1167,8 @@ func (r *SubAgentRegistry) WaitForAny(ctx context.Context, timeoutMS int64) (*Su
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	// Don't drain stale signals — a spurious wake just costs one extra tool
-	// call, whereas draining can lose a real completion signal when multiple
-	// tasks finish between calls (signals collapse in the buffered-1 channel).
 	select {
-	case <-r.changed:
+	case <-ch:
 		// Something changed — find the most recently changed terminal task.
 		r.mu.Lock()
 		defer r.mu.Unlock()
@@ -1153,10 +1210,9 @@ func waitContext(ctx context.Context, timeoutMS int64) (context.Context, context
 func (r *SubAgentRegistry) WaitForTask(ctx context.Context, taskID string, timeoutMS int64) (*SubAgentTask, error) {
 	waitCtx, cancel := waitContext(ctx, timeoutMS)
 	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
+		ch := r.changeChan()
 		task, err := r.GetStatus(taskID)
 		if err != nil {
 			return nil, err
@@ -1166,8 +1222,7 @@ func (r *SubAgentRegistry) WaitForTask(ctx context.Context, taskID string, timeo
 		}
 
 		select {
-		case <-r.changed:
-		case <-ticker.C:
+		case <-ch:
 		case <-waitCtx.Done():
 			latest, statusErr := r.GetStatus(taskID)
 			if statusErr == nil {
@@ -1186,10 +1241,9 @@ func (r *SubAgentRegistry) WaitForTasks(ctx context.Context, taskIDs []string, t
 	}
 	waitCtx, cancel := waitContext(ctx, timeoutMS)
 	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
+		ch := r.changeChan()
 		tasks, done, err := r.tasksByID(taskIDs)
 		if err != nil {
 			return nil, err
@@ -1199,8 +1253,7 @@ func (r *SubAgentRegistry) WaitForTasks(ctx context.Context, taskIDs []string, t
 		}
 
 		select {
-		case <-r.changed:
-		case <-ticker.C:
+		case <-ch:
 		case <-waitCtx.Done():
 			tasks, _, _ := r.tasksByID(taskIDs)
 			return tasks, waitCtx.Err()
@@ -1237,6 +1290,7 @@ func (r *SubAgentRegistry) WaitForUndeliveredResults(ctx context.Context) ([]Sub
 	heartbeatEmitted := false
 
 	for {
+		ch := r.changeChan()
 		tasks, active := r.undeliveredResultState(false)
 		if !active {
 			if len(tasks) == 0 {
@@ -1251,7 +1305,7 @@ func (r *SubAgentRegistry) WaitForUndeliveredResults(ctx context.Context) ([]Sub
 		}
 
 		select {
-		case <-r.changed:
+		case <-ch:
 		case <-heartbeat.C:
 			r.EmitActiveTaskStatuses("managed_wait")
 		case <-ctx.Done():
@@ -1372,20 +1426,27 @@ func (r *SubAgentRegistry) Cancel(taskID string) error {
 	entry.task.Duration = time.Since(entry.task.StartedAt)
 	entry.task.WaitingOn = nil
 	duration := entry.task.Duration
+	es := r.eventStream
 	r.mu.Unlock()
 
 	if cancelFn != nil {
 		cancelFn()
 	}
-	if r.eventStream != nil {
-		r.eventStream.EmitSubagentCompleted(taskID, string(SubAgentTaskCancelled), errMsg, 0, 0, duration.Milliseconds(), 0, false, 0, string(SubAgentTaskCancelled), "")
+	if es != nil {
+		es.EmitSubagentCompleted(taskID, string(SubAgentTaskCancelled), errMsg, 0, 0, duration.Milliseconds(), 0, false, 0, string(SubAgentTaskCancelled), "")
 	}
 	r.signalChange()
 	return nil
 }
 
 func (r *SubAgentRegistry) emitTaskStatus(task SubAgentTask, message, parentCallID string) {
-	if r == nil || r.eventStream == nil {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	es := r.eventStream
+	r.mu.Unlock()
+	if es == nil {
 		return
 	}
 	ev := subagentTaskContentEvent(task, message)
@@ -1393,7 +1454,7 @@ func (r *SubAgentRegistry) emitTaskStatus(task SubAgentTask, message, parentCall
 		ev.ToolUseID = parentCallID
 		ev.ParentCallID = parentCallID
 	}
-	r.eventStream.Emit(ev)
+	es.Emit(ev)
 }
 
 func sameStringSlice(a, b []string) bool {

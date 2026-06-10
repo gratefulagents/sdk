@@ -128,16 +128,9 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		return ToolResult{Content: "message is required", IsError: true}, nil
 	}
 
-	// Clone the agent and inject workspace context so the sub-agent knows its
-	// working directory and stays inside it (instead of searching from /).
+	// Clone the agent; workspace context is injected after the child tool
+	// access level is resolved below (the nested run config may clamp it).
 	childAgent := t.agent.Clone()
-	if workDir != "" {
-		childToolAccess := ToolAccessLevelFull
-		if t.IsReadOnly() {
-			childToolAccess = ToolAccessLevelReadOnly
-		}
-		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(workDir, childToolAccess)
-	}
 
 	// Run the nested agent, inheriting the runner's default hooks so sub-agent
 	// tool events appear in the parent's activity log.
@@ -192,6 +185,12 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		TracingProcessor:      processor,
 		ForceFinalSummaryTurn: true,
 	}
+	// Child tool access defaults to the wrapper's effective access; the parent
+	// run's level (inherited below) can only clamp it further, never widen it.
+	childToolAccess := ToolAccessLevelFull
+	if t.IsReadOnly() {
+		childToolAccess = ToolAccessLevelReadOnly
+	}
 	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
 		runConfig.MaxTurns = nestedCfg.MaxTurns
 		runConfig.SubAgentMaxTurns = nestedCfg.MaxTurns
@@ -199,6 +198,19 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		runConfig.CompactionRecorder = nestedCfg.CompactionRecorder
 		runConfig.CompactionFailureReporter = nestedCfg.CompactionFailureReporter
 		runConfig.HandoffHistory = nestedCfg.HandoffHistory
+		// Inherit the parent's tool policy and security settings so nested
+		// runs cannot bypass approval requirements, untrusted-output tagging,
+		// or output caps that the host configured on the parent run.
+		runConfig.ToolPolicy = nestedCfg.ToolPolicy
+		runConfig.UntrustedToolOutputs = nestedCfg.UntrustedToolOutputs
+		runConfig.MaxToolOutputBytes = nestedCfg.MaxToolOutputBytes
+		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
+			childToolAccess = ToolAccessLevelReadOnly
+		}
+	}
+	runConfig.ToolAccessLevel = childToolAccess
+	if workDir != "" {
+		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(workDir, childToolAccess)
 	}
 	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(runConfig.MaxTurns)
 	result, err := t.runner.Run(childCtx, childAgent, items, runConfig)

@@ -118,6 +118,14 @@ type subAgentFinalJoinStateProvider interface {
 	HasPendingSubAgentFinalJoin() bool
 }
 
+// subAgentResultPoller exposes a non-blocking drain of terminal, undelivered
+// managed sub-agent results. The runner polls it at every turn boundary so the
+// parent can incorporate early results while slower siblings keep running,
+// instead of receiving everything in one batch at final-join.
+type subAgentResultPoller interface {
+	PollSubAgentResults() []RunItem
+}
+
 // checkDuplicateToolNames returns an error if any two tools share a name
 // (finding M4). Duplicate registrations cause non-deterministic dispatch and
 // can be exploited to shadow safe tools with malicious ones.
@@ -352,6 +360,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		tools := prepareToolsForRun(currentAgent.GetAllTools(runCtx), cfg, runCtx)
 		if dupErr := checkDuplicateToolNames(tools); dupErr != nil {
 			return nil, dupErr
+		}
+		// Incremental delivery: inject terminal managed sub-agent results as
+		// soon as they are available so the parent can act on fast tasks while
+		// slower siblings keep running, instead of receiving everything at
+		// final-join.
+		if pollItems := pollSubAgentResultItems(tools); len(pollItems) > 0 {
+			currentInput = append(currentInput, pollItems...)
+			allItems = append(allItems, pollItems...)
+			emitRunItems(streamEvents, pollItems)
 		}
 		pendingSubAgentJoin := hasPendingSubAgentFinalJoin(tools)
 		if cfg.ForceFinalSummaryTurn && turn == maxTurns-1 && !pendingSubAgentJoin {
@@ -1070,6 +1087,20 @@ func collectSubAgentFinalJoinItems(ctx context.Context, tools []Tool) ([]RunItem
 	return joined, nil
 }
 
+// pollSubAgentResultItems drains already-terminal managed sub-agent results
+// without blocking on still-active tasks.
+func pollSubAgentResultItems(tools []Tool) []RunItem {
+	var items []RunItem
+	for _, tool := range tools {
+		poller, ok := tool.(subAgentResultPoller)
+		if !ok {
+			continue
+		}
+		items = append(items, poller.PollSubAgentResults()...)
+	}
+	return items
+}
+
 func hasPendingSubAgentFinalJoin(tools []Tool) bool {
 	for _, tool := range tools {
 		provider, ok := tool.(subAgentFinalJoinStateProvider)
@@ -1252,6 +1283,13 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 	if maxSubAgents > 0 {
 		sem = make(chan struct{}, maxSubAgents)
 	}
+	// Turn-scoped read/write lock (codex parallel-execution pattern):
+	// parallel-safe tools (read-only and control-flow/sub-agent tools) share a
+	// read lock and run concurrently; mutating tools (Edit, Write, Bash, …)
+	// take the write lock and run exclusively. This prevents two concurrent
+	// tool calls from editing the same file or racing a shell command against
+	// an in-flight edit, while keeping read fan-out and parallel delegation fast.
+	var mutationLock sync.RWMutex
 	wg.Add(len(work))
 	for _, w := range work {
 		go func(w asyncWork) {
@@ -1277,6 +1315,13 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 			if sem != nil && isSubAgent {
 				sem <- struct{}{}
 				defer func() { <-sem }()
+			}
+			if isParallelSafeTool(w.tool) {
+				mutationLock.RLock()
+				defer mutationLock.RUnlock()
+			} else {
+				mutationLock.Lock()
+				defer mutationLock.Unlock()
 			}
 			slots[w.idx] = r.executeSingleTool(ctx, runCtx, agent, w.tool, w.call, cfg)
 		}(w)
@@ -1386,9 +1431,17 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
 	fireAgentHook(agent.Hooks, func(h AgentHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
 
+	// Cap the model-facing output. Hooks, traces, and the event stream above
+	// received the raw content; only the conversation item is truncated so one
+	// oversized tool result cannot flood the context window.
+	content := result.Content
+	if maxBytes := cfg.EffectiveMaxToolOutputBytes(); maxBytes > 0 && len(content) > maxBytes {
+		content = TruncateMiddle(content, maxBytes)
+	}
+
 	res.item = RunItem{
 		Type: RunItemToolOutput, Agent: agent,
-		ToolOutput: &ToolOutputData{CallID: call.ID, Content: result.Content, IsError: result.IsError},
+		ToolOutput: &ToolOutputData{CallID: call.ID, Content: content, IsError: result.IsError},
 	}
 	if outputGuardrailErr != nil {
 		return res
@@ -1404,6 +1457,18 @@ func isToolGuardrailTripwire(err error) bool {
 	}
 	var outputTripwire *ToolOutputGuardrailTripwireTriggered
 	return errors.As(err, &outputTripwire)
+}
+
+// isParallelSafeTool reports whether a tool may run concurrently with other
+// tool calls in the same turn. Read-only tools cannot mutate shared state, and
+// control-flow/sub-agent tools manage their own isolation (sub-agent tasks are
+// instructed to own disjoint files), so both classes share a read lock.
+// Everything else (Edit, Write, Bash, custom mutating tools) runs exclusively.
+func isParallelSafeTool(t Tool) bool {
+	if t == nil {
+		return true
+	}
+	return t.IsReadOnly() || isControlFlowToolInstance(t)
 }
 
 // isControlFlowTool returns true for tools that manage run lifecycle or user interaction.

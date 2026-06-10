@@ -175,6 +175,13 @@ type RunConfig struct {
 	MaxConcurrentSubAgents int             // 0 = unlimited
 	ForceFinalSummaryTurn  bool            // reserve the final turn for a no-tool summary instead of hard-failing
 
+	// MaxToolOutputBytes caps the tool result content fed back to the model as
+	// next-turn input. Oversized outputs are middle-truncated (head and tail
+	// preserved) so conclusions survive. Hooks, traces, and the event stream
+	// still receive the raw output. 0 uses DefaultMaxToolOutputBytes; negative
+	// disables the cap.
+	MaxToolOutputBytes int
+
 	// Debug enables verbose logging (full instructions, tool I/O, conversation items).
 	Debug bool
 
@@ -214,12 +221,31 @@ const DefaultMaxTurns = 100
 // DefaultSubAgentMaxTurns is used when RunConfig.SubAgentMaxTurns is 0.
 const DefaultSubAgentMaxTurns = 50
 
+// DefaultMaxToolOutputBytes caps model-facing tool output when
+// RunConfig.MaxToolOutputBytes is 0. 64 KB (~16K tokens) bounds the context
+// cost of a single pathological tool call while staying generous enough for
+// file reads and command output (codex-cli truncates exec output at ~10K
+// tokens at history-record time for the same reason).
+const DefaultMaxToolOutputBytes = 64 * 1024
+
 // EffectiveMaxTurns returns MaxTurns or DefaultMaxTurns if unset.
 func (c *RunConfig) EffectiveMaxTurns() int {
 	if c.MaxTurns > 0 {
 		return c.MaxTurns
 	}
 	return DefaultMaxTurns
+}
+
+// EffectiveMaxToolOutputBytes returns the model-facing tool output cap.
+// Returns 0 when the cap is disabled (negative configuration).
+func (c *RunConfig) EffectiveMaxToolOutputBytes() int {
+	if c.MaxToolOutputBytes < 0 {
+		return 0
+	}
+	if c.MaxToolOutputBytes == 0 {
+		return DefaultMaxToolOutputBytes
+	}
+	return c.MaxToolOutputBytes
 }
 
 // EffectiveSubAgentMaxTurns returns SubAgentMaxTurns or DefaultSubAgentMaxTurns if unset.

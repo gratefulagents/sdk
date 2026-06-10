@@ -105,6 +105,10 @@ type NestedRunConfig struct {
 	CompactionRecorder        func(tokensBefore, tokensAfter int, summary string)
 	CompactionFailureReporter func(scope, reason string, tokensBefore, tokensAfter int)
 	HandoffHistory            HandoffHistoryConfig
+	ToolAccessLevel           ToolAccessLevel
+	ToolPolicy                *ToolPolicy
+	UntrustedToolOutputs      *bool
+	MaxToolOutputBytes        int
 }
 
 func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
@@ -114,6 +118,10 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 		CompactionRecorder:        cfg.CompactionRecorder,
 		CompactionFailureReporter: cfg.CompactionFailureReporter,
 		HandoffHistory:            cfg.HandoffHistory,
+		ToolAccessLevel:           cfg.ToolAccessLevel,
+		ToolPolicy:                cfg.ToolPolicy,
+		UntrustedToolOutputs:      cfg.UntrustedToolOutputs,
+		MaxToolOutputBytes:        cfg.MaxToolOutputBytes,
 	})
 }
 

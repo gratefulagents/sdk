@@ -95,6 +95,8 @@ func extractToolInputSummary(toolName string, input json.RawMessage) string {
 	switch toolName {
 	case "Edit", "Write":
 		return ExtractFilePath(input)
+	case "read_file":
+		return ExtractPath(input)
 	case "Bash":
 		return ExtractBashCommand(input)
 	case "AskUserQuestion":

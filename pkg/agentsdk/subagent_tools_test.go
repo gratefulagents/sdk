@@ -257,3 +257,95 @@ func TestWaitForSubagentProgressReturnsReportableSnapshot(t *testing.T) {
 		t.Fatalf("progress snapshot leaked final result content: %s", result.Content)
 	}
 }
+
+func TestGetSubagentTaskStatusTruncatesMessageEcho(t *testing.T) {
+	model := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+		},
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+
+	longMessage := strings.Repeat("task packet detail ", 100) // ~1900 chars
+	taskID, err := registry.SpawnAsync(context.Background(), "worker", longMessage, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.WaitForTask(context.Background(), taskID, 5000); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &getSubagentTaskStatusTool{registry: registry}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"task_id":"`+taskID+`"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content)
+	}
+	var view struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &view); err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Message) > 260 {
+		t.Fatalf("status echo should truncate message to ~240 chars, got %d", len(view.Message))
+	}
+	if !strings.HasSuffix(view.Message, "...") {
+		t.Fatalf("truncated message should end with ellipsis: %q", view.Message)
+	}
+}
+
+func TestSubagentResultsDeliveredIncrementallyAtTurnBoundary(t *testing.T) {
+	childModel := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "early child result"}}}},
+		},
+	}
+	childRunner := NewRunnerWithModel(childModel)
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: childRunner,
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+
+	taskID, err := registry.SpawnAsync(context.Background(), "worker", "fast task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.WaitForTask(context.Background(), taskID, 5000); err != nil {
+		t.Fatal(err)
+	}
+
+	// Parent model: a tool-free turn followed by a final answer. The runner
+	// must inject the completed task result before the next model call.
+	parentModel := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent done"}}}},
+		},
+	}
+	parentRunner := NewRunnerWithModel(parentModel)
+	parent := &Agent{Name: "parent", Tools: BuildSubAgentTaskTools(registry, "worker")}
+
+	result, err := parentRunner.Run(context.Background(), parent, []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "supervise"}},
+	}, RunConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injected := false
+	for _, item := range result.NewItems {
+		if item.Type == RunItemMessage && item.Message != nil &&
+			strings.Contains(item.Message.Text, "<sub_agent_results>") &&
+			strings.Contains(item.Message.Text, "early child result") {
+			injected = true
+		}
+	}
+	if !injected {
+		t.Fatal("terminal sub-agent result was not injected incrementally at the turn boundary")
+	}
+}

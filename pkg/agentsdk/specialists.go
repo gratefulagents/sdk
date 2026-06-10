@@ -205,6 +205,7 @@ Use spawn_subagent_graph with return_when="all_complete" for multi-step DAG join
 By default, dependency outputs are passed to downstream tasks as context once all dependencies complete.
 
 STATUS REPORTING: Managed sub-agent progress streams through the runtime while the SDK keeps the parent run open. You do not need to call a polling/wait tool just to check whether tasks are still running.
+Completed task results are delivered to you automatically as soon as each task finishes; act on early results while slower tasks keep running.
 Use get_subagent_activity for deeper detail on a specific task when you need evidence before steering.
 The SDK will not let the parent final-answer while managed sub-agent tasks are still active; keep supervising until results arrive.
 

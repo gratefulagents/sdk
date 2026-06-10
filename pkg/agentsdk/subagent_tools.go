@@ -10,8 +10,10 @@ import (
 
 // BuildSubAgentTaskTools returns the standard async sub-agent suite.
 // Every spawned task is managed by the SDK: the parent run stays open while
-// tasks are active, status is streamed by the runtime, and terminal results are
-// injected once before finalization. Blocking wait/poll tools are intentionally
+// tasks are active, status is streamed by the runtime, and each terminal
+// result is injected into the parent at the next turn boundary as soon as it
+// is available (incremental delivery), with a blocking final-join before
+// finalization for any remaining tasks. Blocking wait/poll tools are intentionally
 // not part of the default model-facing suite; hosts can instantiate them
 // directly for diagnostics or explicit user-driven status checks.
 func BuildSubAgentTaskTools(reg *SubAgentScheduler, defaultAgent string) []Tool {
@@ -128,6 +130,24 @@ func (t *spawnSubagentTaskTool) JoinSubAgentResults(ctx context.Context) ([]RunI
 
 func (t *spawnSubagentTaskTool) HasPendingSubAgentFinalJoin() bool {
 	return t.registry != nil && t.registry.HasPendingFinalJoinTasks()
+}
+
+// PollSubAgentResults drains terminal, undelivered managed task results
+// without blocking. The runner calls this at every turn boundary so the parent
+// receives each result as soon as the task finishes (incremental delivery).
+func (t *spawnSubagentTaskTool) PollSubAgentResults() []RunItem {
+	if t.registry == nil {
+		return nil
+	}
+	results, _ := t.registry.FinalJoinSnapshot()
+	text := BuildSubAgentResultsContext(results)
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return []RunItem{{
+		Type:    RunItemMessage,
+		Message: &MessageOutput{Text: text},
+	}}
 }
 
 // --- run_subagent_task ---------------------------------------------------
@@ -720,7 +740,11 @@ func (t *getSubagentTaskStatusTool) Execute(_ context.Context, input json.RawMes
 	if err != nil {
 		return ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	b, _ := json.MarshalIndent(task, "", "  ")
+	// Echo only a preview of the original task packet: the parent already has
+	// the full message in its own context, so repeating it wastes tokens.
+	view := *task
+	view.Message = Truncate(task.Message, 240)
+	b, _ := json.MarshalIndent(view, "", "  ")
 	return ToolResult{Content: string(b)}, nil
 }
 

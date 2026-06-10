@@ -267,6 +267,7 @@ var (
 	TracingProcessorFromContext         = agent.TracingProcessorFromContext
 	Truncate                            = agent.Truncate
 	TruncateBytes                       = agent.TruncateBytes
+	TruncateMiddle                      = agent.TruncateMiddle
 	ValidSessionModeTransition          = agent.ValidSessionModeTransition
 	WrapWithPolicy                      = agent.WrapWithPolicy
 	WithDescription                     = agent.WithDescription

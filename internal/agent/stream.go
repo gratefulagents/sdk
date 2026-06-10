@@ -358,6 +358,18 @@ func ExtractFilePath(input json.RawMessage) string {
 	return v.FilePath
 }
 
+// ExtractPath extracts the path from tool inputs that use a "path" field
+// (e.g. read_file, list_files).
+func ExtractPath(input json.RawMessage) string {
+	var v struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(input, &v); err != nil {
+		return ""
+	}
+	return v.Path
+}
+
 // ExtractGrepPattern extracts the pattern from a Grep tool call input.
 func ExtractGrepPattern(input json.RawMessage) string {
 	var v struct {
@@ -500,4 +512,26 @@ func Truncate(s string, n int) string {
 		return s
 	}
 	return string(runes[:n-3]) + "..."
+}
+
+// TruncateMiddle truncates s to at most n runes by keeping the head and tail
+// and eliding the middle. Use this for model-facing payloads (sub-agent
+// results, command output) where the conclusion at the end of the text is
+// usually as important as the beginning; tail-truncation would drop it.
+func TruncateMiddle(s string, n int) string {
+	const marker = "\n…[elided %d chars]…\n"
+	runes := []rune(s)
+	if n <= 0 || len(runes) <= n {
+		return s
+	}
+	// Reserve room for the elision marker (estimate generously).
+	reserve := len(marker) + 12
+	if n <= reserve {
+		return string(runes[:n])
+	}
+	keep := n - reserve
+	head := keep * 2 / 3
+	tail := keep - head
+	elided := len(runes) - head - tail
+	return string(runes[:head]) + fmt.Sprintf(marker, elided) + string(runes[len(runes)-tail:])
 }
