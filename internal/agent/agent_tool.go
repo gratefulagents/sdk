@@ -199,9 +199,12 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		runConfig.CompactionFailureReporter = nestedCfg.CompactionFailureReporter
 		runConfig.HandoffHistory = nestedCfg.HandoffHistory
 		// Inherit the parent's tool policy and security settings so nested
-		// runs cannot bypass approval requirements, untrusted-output tagging,
-		// or output caps that the host configured on the parent run.
+		// runs cannot bypass approval requirements, tool guardrails,
+		// untrusted-output tagging, or output caps that the host configured
+		// on the parent run.
 		runConfig.ToolPolicy = nestedCfg.ToolPolicy
+		runConfig.ToolInputGuardrails = nestedCfg.ToolInputGuardrails
+		runConfig.ToolOutputGuardrails = nestedCfg.ToolOutputGuardrails
 		runConfig.UntrustedToolOutputs = nestedCfg.UntrustedToolOutputs
 		runConfig.MaxToolOutputBytes = nestedCfg.MaxToolOutputBytes
 		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {

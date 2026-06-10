@@ -676,6 +676,11 @@ type taskRunSnapshot struct {
 	compactionConfig CompactionConfig
 	maxTurns         int
 	sem              chan struct{}
+	// Tool guardrails inherited from the spawning run's RunConfig (via the
+	// nested-run context) so async tasks cannot bypass the parent's tool
+	// input/output guardrails.
+	toolInputGuardrails  []ToolInputGuardrail
+	toolOutputGuardrails []ToolOutputGuardrail
 }
 
 // newSubAgentTaskID returns a short unique task ID. Short IDs cost the parent
@@ -756,6 +761,10 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		compactionConfig: r.compactionConfig,
 		maxTurns:         r.maxTurns,
 		sem:              r.sem,
+	}
+	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
+		snap.toolInputGuardrails = nestedCfg.ToolInputGuardrails
+		snap.toolOutputGuardrails = nestedCfg.ToolOutputGuardrails
 	}
 	r.tasks[taskID] = entry
 	r.order = append(r.order, taskID)
@@ -894,6 +903,8 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		WorkDir:               snap.workDir,
 		ToolAccessLevel:       childToolAccess,
 		ToolPolicy:            snap.toolPolicy,
+		ToolInputGuardrails:   snap.toolInputGuardrails,
+		ToolOutputGuardrails:  snap.toolOutputGuardrails,
 		CompactionConfig:      snap.compactionConfig,
 		Trace:                 trace,
 		ParentSpanID:          parentSpanID,

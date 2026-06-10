@@ -63,6 +63,28 @@ func (mp *MultiProvider) Close() error {
 	return firstErr
 }
 
+// ModelNameNormalizer is an optional ModelProvider extension. Providers that
+// route by model-name prefix implement it to report the model name that
+// should be sent in API requests after routing.
+type ModelNameNormalizer interface {
+	NormalizeModelName(name string) string
+}
+
+// NormalizeModelName strips the provider prefix only when it routes to a
+// registered provider, preserving model IDs that contain "/" as part of the
+// ID (e.g. "openrouter/anthropic/claude-..." → "anthropic/claude-...", while
+// an unregistered "anthropic/claude-..." prefix stays intact).
+func (mp *MultiProvider) NormalizeModelName(name string) string {
+	prefix, bare := ParseModelPrefix(name)
+	if prefix == "" || bare == "" {
+		return name
+	}
+	if _, ok := mp.providers[prefix]; ok {
+		return bare
+	}
+	return name
+}
+
 // ParseModelPrefix splits a "prefix/model" string into its components.
 // If there is no "/" the prefix is empty and model is the full string.
 func ParseModelPrefix(name string) (prefix, model string) {

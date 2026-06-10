@@ -107,6 +107,8 @@ type NestedRunConfig struct {
 	HandoffHistory            HandoffHistoryConfig
 	ToolAccessLevel           ToolAccessLevel
 	ToolPolicy                *ToolPolicy
+	ToolInputGuardrails       []ToolInputGuardrail
+	ToolOutputGuardrails      []ToolOutputGuardrail
 	UntrustedToolOutputs      *bool
 	MaxToolOutputBytes        int
 }
@@ -120,6 +122,8 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 		HandoffHistory:            cfg.HandoffHistory,
 		ToolAccessLevel:           cfg.ToolAccessLevel,
 		ToolPolicy:                cfg.ToolPolicy,
+		ToolInputGuardrails:       cfg.ToolInputGuardrails,
+		ToolOutputGuardrails:      cfg.ToolOutputGuardrails,
 		UntrustedToolOutputs:      cfg.UntrustedToolOutputs,
 		MaxToolOutputBytes:        cfg.MaxToolOutputBytes,
 	})

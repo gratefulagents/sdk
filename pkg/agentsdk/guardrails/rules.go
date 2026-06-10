@@ -25,6 +25,13 @@ func ToolGuardrailsFromRules(rules []agentsdk.GuardrailRule) ([]agentsdk.ToolInp
 			continue
 		}
 
+		action, actionErr := normalizeRuleAction(rule)
+		if actionErr != nil {
+			errs = append(errs, actionErr)
+			continue
+		}
+		rule.Action = action
+
 		switch rule.Type {
 		case "tool-input":
 			inputGuardrails = append(inputGuardrails, agentsdk.ToolInputGuardrail{
@@ -36,10 +43,27 @@ func ToolGuardrailsFromRules(rules []agentsdk.GuardrailRule) ([]agentsdk.ToolInp
 				Name: fmt.Sprintf("crd:%s", rule.Name),
 				Fn:   MakeToolOutputGuardrailFn(rule, re),
 			})
+		default:
+			errs = append(errs, fmt.Errorf("unknown guardrail rule type %q for rule %q (valid: tool-input, tool-output)", rule.Type, rule.Name))
 		}
 	}
 
 	return inputGuardrails, outputGuardrails, errs
+}
+
+// normalizeRuleAction validates a rule's action. An empty action defaults to
+// "block" (fail closed) and unknown values are rejected so a typo like "deny"
+// cannot silently disable a rule.
+func normalizeRuleAction(rule agentsdk.GuardrailRule) (string, error) {
+	action := strings.ToLower(strings.TrimSpace(rule.Action))
+	switch action {
+	case "":
+		return "block", nil
+	case "block", "warn", "log":
+		return action, nil
+	default:
+		return "", fmt.Errorf("unknown action %q in guardrail rule %q (valid: block, warn, log)", rule.Action, rule.Name)
+	}
 }
 
 func MakeToolInputGuardrailFn(rule agentsdk.GuardrailRule, re *regexp.Regexp) func(*agentsdk.RunContext, *agentsdk.Agent, agentsdk.Tool, json.RawMessage) (*agentsdk.GuardrailResult, error) {
@@ -54,14 +78,15 @@ func MakeToolInputGuardrailFn(rule agentsdk.GuardrailRule, re *regexp.Regexp) fu
 				msg = fmt.Sprintf("Guardrail %q triggered on tool %q", rule.Name, tool.Name())
 			}
 			switch rule.Action {
-			case "block":
-				return &agentsdk.GuardrailResult{Output: msg, TripwireTriggered: true}, nil
 			case "warn":
 				log.Printf("WARN: guardrail %q triggered: %s", rule.Name, msg)
 				return &agentsdk.GuardrailResult{Output: msg}, nil
 			case "log":
 				log.Printf("INFO: guardrail %q triggered: %s", rule.Name, msg)
 				return &agentsdk.GuardrailResult{}, nil
+			default:
+				// "block" and any unvalidated action fail closed.
+				return &agentsdk.GuardrailResult{Output: msg, TripwireTriggered: true}, nil
 			}
 		}
 		return &agentsdk.GuardrailResult{}, nil
@@ -80,14 +105,15 @@ func MakeToolOutputGuardrailFn(rule agentsdk.GuardrailRule, re *regexp.Regexp) f
 				msg = fmt.Sprintf("Guardrail %q triggered on tool %q output", rule.Name, tool.Name())
 			}
 			switch rule.Action {
-			case "block":
-				return &agentsdk.GuardrailResult{Output: msg, TripwireTriggered: true}, nil
 			case "warn":
 				log.Printf("WARN: guardrail %q triggered: %s", rule.Name, msg)
 				return &agentsdk.GuardrailResult{Output: msg}, nil
 			case "log":
 				log.Printf("INFO: guardrail %q triggered: %s", rule.Name, msg)
 				return &agentsdk.GuardrailResult{}, nil
+			default:
+				// "block" and any unvalidated action fail closed.
+				return &agentsdk.GuardrailResult{Output: msg, TripwireTriggered: true}, nil
 			}
 		}
 		return &agentsdk.GuardrailResult{}, nil

@@ -319,6 +319,13 @@ func compileToolGuardrailsFromRules(rules []GuardrailRule) ([]ToolInputGuardrail
 			continue
 		}
 
+		action, actionErr := normalizeGuardrailRuleAction(rule)
+		if actionErr != nil {
+			errs = append(errs, actionErr)
+			continue
+		}
+		rule.Action = action
+
 		switch rule.Type {
 		case "tool-input":
 			inputGuardrails = append(inputGuardrails, ToolInputGuardrail{
@@ -365,8 +372,6 @@ func guardrailResultForRule(rule GuardrailRule, toolName string, output bool) *G
 	}
 
 	switch rule.Action {
-	case "block":
-		return &GuardrailResult{Output: msg, TripwireTriggered: true}
 	case "warn":
 		log.Printf("WARN: guardrail %q triggered: %s", rule.Name, msg)
 		return &GuardrailResult{Output: msg}
@@ -374,7 +379,23 @@ func guardrailResultForRule(rule GuardrailRule, toolName string, output bool) *G
 		log.Printf("INFO: guardrail %q triggered: %s", rule.Name, msg)
 		return &GuardrailResult{}
 	default:
-		return &GuardrailResult{}
+		// "block" and any unvalidated action fail closed.
+		return &GuardrailResult{Output: msg, TripwireTriggered: true}
+	}
+}
+
+// normalizeGuardrailRuleAction validates a rule's action. An empty action
+// defaults to "block" (fail closed) and unknown values are rejected so a typo
+// like "deny" cannot silently disable a rule.
+func normalizeGuardrailRuleAction(rule GuardrailRule) (string, error) {
+	action := strings.ToLower(strings.TrimSpace(rule.Action))
+	switch action {
+	case "":
+		return "block", nil
+	case "block", "warn", "log":
+		return action, nil
+	default:
+		return "", fmt.Errorf("unknown action %q in guardrail rule %q (valid: block, warn, log)", rule.Action, rule.Name)
 	}
 }
 
@@ -521,7 +542,12 @@ func normalizePermissionMode(mode PermissionMode) PermissionMode {
 		return PermissionModeReadOnly
 	case string(PermissionModeDangerFullAccess):
 		return PermissionModeDangerFullAccess
-	default:
+	case string(PermissionModeWorkspaceWrite), "":
 		return PermissionModeWorkspaceWrite
+	default:
+		// Fail closed: an unrecognized non-empty mode (e.g. a typo like
+		// "workspace-wrte") must not silently grant write access. This
+		// mirrors internal/agent/policy.NormalizePermissionMode.
+		return PermissionModeReadOnly
 	}
 }

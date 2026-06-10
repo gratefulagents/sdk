@@ -74,6 +74,15 @@ func parseStatements(tokens []token) []pipeline {
 	return pipelines
 }
 
+// ClassifyDestructiveCommand reports whether cmdLine is judged destructive by
+// the shared denylist classifier, and why. It is the exported entry point for
+// callers outside the bash tools (e.g. the built-in destructive-command
+// guardrail) that need tokenizer-backed classification without the per-mode
+// git policy applied by IsCommandBlockedForMode.
+func ClassifyDestructiveCommand(cmdLine string) (bool, string) {
+	return classifyDestructive(cmdLine)
+}
+
 // classifyDestructive returns (true, reason) if the command is judged
 // destructive by any of our heuristics. It always operates on decoded tokens
 // produced by the tokenizer, so quoting/escaping/$IFS bypasses are normalized

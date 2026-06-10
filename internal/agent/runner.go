@@ -306,6 +306,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	var allItems []RunItem
 	var allResponses []ModelResponse
 	var llmAttempt int32
+	// turnRetryAttempt counts consecutive failed model calls since the last
+	// successful response. RetryPolicy budgets retries per failing call site,
+	// so the counter resets on success; using the cumulative llmAttempt here
+	// would exhaust the retry budget after MaxRetries successful turns.
+	var turnRetryAttempt int
 	var allToolInputResults []ToolGuardrailResult
 	var allToolOutputResults []ToolGuardrailResult
 
@@ -391,11 +396,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, &AgentError{Message: fmt.Sprintf("resolve model %q", modelName), Cause: resolveErr}
 			}
 			activeModel = resolved
-			// Strip the provider prefix (e.g. "openai/gpt-5.4" → "gpt-5.4")
-			// so the bare model name is sent in API requests.
-			if _, bare := ParseModelPrefix(modelName); bare != "" {
-				modelName = bare
-			}
+			// Strip the provider routing prefix (e.g. "openai/gpt-5.4" →
+			// "gpt-5.4") so the bare model name is sent in API requests.
+			// Model IDs that legitimately contain "/" (e.g. OpenRouter's
+			// "anthropic/claude-...") are preserved.
+			modelName = resolveRequestModelName(r.provider, activeModel, modelName)
 		}
 		if activeModel == nil {
 			return nil, &AgentError{Message: "no model configured: set agent.Model, cfg.ModelOverride, or use NewRunnerWithProvider"}
@@ -535,6 +540,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		resp, err := r.callModel(ctx, activeModel, modelRequest, streamEvents)
 
 		if err != nil {
+			turnRetryAttempt++
 			advice := activeModel.GetRetryAdvice(err)
 			genData.LatencyMS = time.Since(llmStartedAt).Milliseconds()
 			genData.Error = err.Error()
@@ -625,8 +631,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
-			if shouldRetryWithPolicy(cfg.RetryPolicy, int(llmAttempt)) && !retryPolicyBlockedByAdvice(advice) {
-				delay := cfg.RetryPolicy.DelayForAttempt(int(llmAttempt) - 1)
+			if shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
+				delay := cfg.RetryPolicy.DelayForAttempt(turnRetryAttempt - 1)
 				cappedMS := capRetryAfterMS(delay.Milliseconds())
 				delay = time.Duration(cappedMS) * time.Millisecond
 				genData.RetryScheduled = true
@@ -668,6 +674,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 
 		costUSD, costKnown := estimateModelCost(activeModel, resp.Usage)
+		turnRetryAttempt = 0
 		resp.CostUSD = costUSD
 		resp.CostKnown = costKnown
 		genData.PromptTokens = int64(resp.Usage.InputTokens)
@@ -1606,6 +1613,26 @@ func shouldRetryWithPolicy(policy *RetryPolicy, attempt int) bool {
 
 func retryPolicyBlockedByAdvice(advice *ModelRetryAdvice) bool {
 	return advice != nil && !advice.ShouldRetry && strings.TrimSpace(advice.Reason) != ""
+}
+
+// resolveRequestModelName returns the model name to place in API requests
+// after provider routing. Prefix-aware providers (e.g. MultiProvider) decide
+// themselves whether the prefix was consumed for routing; for plain providers
+// the prefix is stripped only when it names the provider itself, so model IDs
+// that contain "/" as part of the ID (e.g. OpenRouter "vendor/model") pass
+// through unchanged.
+func resolveRequestModelName(provider ModelProvider, model Model, name string) string {
+	if normalizer, ok := provider.(ModelNameNormalizer); ok {
+		return normalizer.NormalizeModelName(name)
+	}
+	prefix, bare := ParseModelPrefix(name)
+	if prefix == "" || bare == "" {
+		return name
+	}
+	if model != nil && strings.EqualFold(strings.TrimSpace(prefix), strings.TrimSpace(model.Provider())) {
+		return bare
+	}
+	return name
 }
 
 func isContextCancellation(err error) bool {

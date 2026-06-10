@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 )
 
 // secretSignature describes a single high-confidence credential pattern.
@@ -42,8 +43,17 @@ var secretSignatures = []secretSignature{
 	// without admitting short non-token strings like "ghp_short".
 	{"GitHub token", regexp.MustCompile(`\bgh[psuro]_[A-Za-z0-9]{30,255}\b`)},
 
+	// GitHub fine-grained personal access tokens use the github_pat_ prefix
+	// with a long base62 body (82+ chars in production; accept 36+).
+	{"GitHub fine-grained PAT", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{36,255}\b`)},
+
 	// OpenAI project-scoped keys. The body uses base64url-ish chars.
 	{"OpenAI project key", regexp.MustCompile(`\bsk-proj-[A-Za-z0-9_\-]{20,}\b`)},
+
+	// OpenAI legacy/org keys: "sk-" followed by a long opaque body. The 40+
+	// minimum keeps prose and short identifiers (and the more specific
+	// sk-proj-/sk-ant- forms, matched above) from false-positiving.
+	{"OpenAI API key", regexp.MustCompile(`\bsk-[A-Za-z0-9_\-]{40,}\b`)},
 
 	// Anthropic API keys, optionally including the api03 (or similar) version
 	// segment seen in current production keys.
@@ -99,32 +109,32 @@ func BuiltinToolInputGuardrails() []agentsdk.ToolInputGuardrail {
 					Command string `json:"command"`
 					Cmd     string `json:"cmd"`
 				}
-				// Best-effort decode: guardrails should not fail open on
-				// malformed JSON, but they also shouldn't synthesise an error
-				// here. If unmarshal fails, cmd stays empty and the destructive
-				// pattern check below cleanly returns "no match".
-				_ = json.Unmarshal(input, &params)
+				// Fail closed: a shell-like tool whose input cannot be parsed
+				// cannot be classified, so it must not pass the guardrail.
+				if err := json.Unmarshal(input, &params); err != nil {
+					return &agentsdk.GuardrailResult{
+						Output:            fmt.Sprintf("Blocked: cannot parse shell tool input for destructive-command check: %v", err),
+						TripwireTriggered: true,
+					}, nil
+				}
 				cmd := params.Command
 				if cmd == "" {
 					cmd = params.Cmd
 				}
-				cmdLower := strings.ToLower(cmd)
-
-				destructive := []string{
-					"rm -rf /",
-					"rm -rf /*",
-					"mkfs.",
-					"dd if=/dev/zero",
-					":(){:|:&};:",
-					"chmod -r 777 /",
+				if cmd == "" {
+					return &agentsdk.GuardrailResult{}, nil
 				}
-				for _, pattern := range destructive {
-					if strings.Contains(cmdLower, pattern) {
-						return &agentsdk.GuardrailResult{
-							Output:            fmt.Sprintf("Blocked destructive command: %s", pattern),
-							TripwireTriggered: true,
-						}, nil
-					}
+
+				// Tokenizer-backed classification (shared with the bash tools)
+				// normalizes quoting, escapes, $IFS, ANSI-C $'...', command
+				// substitution, wrappers (sudo/env/bash -c), and chaining
+				// before matching, so naive evasions of a substring denylist
+				// (e.g. `rm -fr /`, `\rm -rf /`, `sudo rm -rf /`) are caught.
+				if blocked, reason := shell.ClassifyDestructiveCommand(cmd); blocked {
+					return &agentsdk.GuardrailResult{
+						Output:            fmt.Sprintf("Blocked destructive command: %s", reason),
+						TripwireTriggered: true,
+					}, nil
 				}
 				return &agentsdk.GuardrailResult{}, nil
 			},
