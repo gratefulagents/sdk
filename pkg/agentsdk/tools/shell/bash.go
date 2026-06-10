@@ -42,7 +42,7 @@ type bashInput struct {
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {
-	return "Executes a bash command and returns its output (stdout and stderr combined). Use for running shell commands, build tools, git operations, and other CLI tasks."
+	return "Executes a bash command and returns its output (stdout and stderr combined). Use for running shell commands, build tools, git operations, and other CLI tasks. Each call runs in a fresh process: cd and environment variables do not persist between calls, so chain dependent steps with && in one command. Disable pagers (git --no-pager, | cat) for interactive-output commands. For long-running commands use BashStart/BashPoll; for interactive programs use the Terminal tool if available."
 }
 
 func (t *BashTool) InputSchema() json.RawMessage {
@@ -272,7 +272,7 @@ func envBoundedInt(key string, fallback, minValue, maxValue int) int {
 }
 
 func bashTruncationNotice(totalBytes int64, capBytes int) string {
-	return fmt.Sprintf("\n[output truncated: captured head/tail from %d bytes; response cap %d bytes; process was not terminated]", totalBytes, capBytes)
+	return fmt.Sprintf("\n[output truncated: %d total bytes produced, response shows head/tail within the %d-byte cap; the process was NOT terminated. Narrow the output instead of re-running unchanged: filter with grep, use head/tail, or write full output to a file and inspect ranges]", totalBytes, capBytes)
 }
 
 // ReadOnlyBashTool is a Bash tool restricted to safe commands and read-only sandboxing.

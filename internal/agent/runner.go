@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,16 @@ Do not ask for more tools or continue exploring.
 </final_turn>`
 
 const compactionCarryForwardPrefix = "[COMPACTION CARRY-FORWARD]"
+
+// completionConfirmationPrompt bounces the first final answer back to the
+// model when RunConfig.RequireCompletionConfirmation is set. Terminus 2 uses
+// the same double-confirm pattern to prevent premature task completion.
+const completionConfirmationPrompt = `[SYSTEM] Before this answer is accepted as final: verify your work now.
+- Re-read the original task and confirm every requirement is satisfied.
+- If there are runnable checks (tests, builds, linters, the command the task asks about), run them and confirm they pass.
+- Confirm any files or artifacts the task requires actually exist with the expected content.
+If anything is unverified or incomplete, continue working instead of finalizing.
+If you are certain the task is complete, provide your final answer again.`
 
 // untrustedToolOutputBegin/End delimit tool result content fed back to the
 // model on subsequent turns. See RunConfig.UntrustedToolOutputs and
@@ -313,6 +324,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	var turnRetryAttempt int
 	var allToolInputResults []ToolGuardrailResult
 	var allToolOutputResults []ToolGuardrailResult
+	// pendingCompletion implements double-confirm completion: the first final
+	// answer triggers a verification turn, only a second consecutive final
+	// answer ends the run (Terminus 2 anti-premature-exit pattern).
+	pendingCompletion := false
+	// consecutiveToolErrorTurns counts tool turns where every executed tool
+	// returned an error; escalation fires at the configured limit.
+	consecutiveToolErrorTurns := 0
+	toolErrorEscalated := false
+	// stopGateBlocks counts consecutive StopGate blocks; the gate is bypassed
+	// once the cap is hit so a broken gate cannot loop forever.
+	stopGateBlocks := 0
+	verifierRan := false
 
 	maxTurns := cfg.EffectiveMaxTurns()
 
@@ -483,10 +506,25 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			taskID = parentCallID
 		}
 
+		// Plan recitation: append a transient plan/goals message as the last
+		// input item of this request only. It is regenerated each turn and
+		// never persisted to history, so the append-only conversation and
+		// cache-stable prefix are preserved while goals stay in the model's
+		// high-attention window.
+		requestInput := currentInput
+		if cfg.PlanRecitation != nil {
+			if recitation := strings.TrimSpace(cfg.PlanRecitation(ctx)); recitation != "" {
+				requestInput = append(append([]RunItem(nil), currentInput...), RunItem{
+					Type:    RunItemMessage,
+					Message: &MessageOutput{Text: "<current_plan>\n" + recitation + "\n</current_plan>"},
+				})
+			}
+		}
+
 		modelRequest := ModelRequest{
 			Model:               modelName,
 			Instructions:        instructions,
-			Input:               currentInput,
+			Input:               requestInput,
 			Tools:               tools,
 			Settings:            settings,
 			OutputSchema:        currentAgent.OutputType,
@@ -763,6 +801,74 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				continue
 			}
 
+			// Double-confirm completion: bounce the first final answer back
+			// with a verification prompt. Tool availability (len(tools) > 0)
+			// guards the forced no-tool final summary turn, where bouncing
+			// would be pointless.
+			if cfg.RequireCompletionConfirmation && !pendingCompletion && len(tools) > 0 {
+				pendingCompletion = true
+				confirmItem := RunItem{
+					Type:    RunItemMessage,
+					Message: &MessageOutput{Text: completionConfirmationPrompt},
+				}
+				currentInput = append(currentInput, newItems...)
+				currentInput = append(currentInput, confirmItem)
+				allItems = append(allItems, confirmItem)
+				emitRunItems(streamEvents, []RunItem{confirmItem})
+				if turn >= maxTurns-1 {
+					maxTurns++
+				}
+				continue
+			}
+
+			// Deterministic stop gate: block finalization with feedback until
+			// the gate passes or the consecutive-block cap is hit.
+			if cfg.StopGate != nil && len(tools) > 0 && stopGateBlocks < cfg.EffectiveStopGateMaxBlocks() {
+				if ok, feedback := cfg.StopGate(ctx, finalOutputText(s.output)); !ok {
+					stopGateBlocks++
+					if strings.TrimSpace(feedback) == "" {
+						feedback = "the finalization check failed; continue working until it passes"
+					}
+					gateItem := RunItem{
+						Type:    RunItemMessage,
+						Message: &MessageOutput{Text: "[SYSTEM] Final answer blocked by the completion gate (" + strconv.Itoa(stopGateBlocks) + "/" + strconv.Itoa(cfg.EffectiveStopGateMaxBlocks()) + "):\n" + feedback},
+					}
+					currentInput = append(currentInput, newItems...)
+					currentInput = append(currentInput, gateItem)
+					allItems = append(allItems, gateItem)
+					emitRunItems(streamEvents, []RunItem{gateItem})
+					if turn >= maxTurns-1 {
+						maxTurns++
+					}
+					continue
+				}
+				stopGateBlocks = 0
+			}
+
+			// Adversarial verification: give a critic one chance to refute
+			// the candidate final answer.
+			if cfg.FinalAnswerVerifier != nil && !verifierRan && len(tools) > 0 {
+				verifierRan = true
+				feedback, vErr := cfg.FinalAnswerVerifier(ctx, finalOutputText(s.output))
+				if vErr != nil {
+					log.Printf("[runner] WARN: final answer verifier failed: %v", vErr)
+				} else if strings.TrimSpace(feedback) != "" {
+					verifyItem := RunItem{
+						Type:    RunItemMessage,
+						Message: &MessageOutput{Text: "[SYSTEM] An independent reviewer examined your answer before finalization and raised these points. Address the valid ones (with tools if needed), then provide your final answer again:\n" + feedback},
+					}
+					currentInput = append(currentInput, newItems...)
+					currentInput = append(currentInput, verifyItem)
+					allItems = append(allItems, verifyItem)
+					emitRunItems(streamEvents, []RunItem{verifyItem})
+					pendingCompletion = false
+					if turn >= maxTurns-1 {
+						maxTurns++
+					}
+					continue
+				}
+			}
+
 			// recordAndPruneResponseCompaction is invoked purely for its side
 			// effect (recording compaction stats / firing the recorder hook);
 			// the pruned slice is unused on the final-output branch because the
@@ -836,12 +942,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			currentInput = nextInput
 			currentAgent = s.target
+			pendingCompletion = false
 
 			handoffSpan.Finish()
 			tp.OnSpanEnd(handoffSpan)
 			trace.AddSpan(handoffSpan)
 
 		case *toolCallStep:
+			pendingCompletion = false
+			stopGateBlocks = 0
 			toolResults, toolInResults, toolOutResults, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
@@ -860,6 +969,41 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			currentInput = append(currentInput, nextTurnToolResults...)
 			currentInput = recordAndPruneResponseCompaction(currentInput)
+
+			// Three-strike escalation: when several consecutive tool turns
+			// produce only errors, inject a corrective note instead of letting
+			// the model keep grinding on a failing approach.
+			if limit := cfg.EffectiveConsecutiveToolErrorLimit(); limit > 0 {
+				outputs, errored := 0, 0
+				for _, tr := range toolResults {
+					if tr.Type == RunItemToolOutput && tr.ToolOutput != nil {
+						outputs++
+						if tr.ToolOutput.IsError {
+							errored++
+						}
+					}
+				}
+				if outputs > 0 {
+					if errored == outputs {
+						consecutiveToolErrorTurns++
+					} else {
+						consecutiveToolErrorTurns = 0
+						toolErrorEscalated = false
+					}
+					if consecutiveToolErrorTurns >= limit && !toolErrorEscalated {
+						toolErrorEscalated = true
+						escalation := RunItem{
+							Type: RunItemMessage,
+							Message: &MessageOutput{Text: fmt.Sprintf(
+								"[SYSTEM] Your last %d tool turns all failed. Stop repeating the same approach. Re-read the error messages above carefully, then either: (1) try a fundamentally different approach or tool, (2) inspect the environment to understand why the calls fail, or (3) if the task is genuinely blocked, report the blocker and what you tried instead of retrying.",
+								consecutiveToolErrorTurns)},
+						}
+						currentInput = append(currentInput, escalation)
+						allItems = append(allItems, escalation)
+						emitRunItems(streamEvents, []RunItem{escalation})
+					}
+				}
+			}
 
 			// Check for tool approval interruptions.
 			for _, tr := range toolResults {
@@ -1143,6 +1287,23 @@ type toolCallStep struct {
 }
 
 func (*toolCallStep) step() {}
+
+// finalOutputText renders a candidate final output as text for StopGate and
+// FinalAnswerVerifier callbacks.
+func finalOutputText(output any) string {
+	switch v := output.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(b)
+	}
+}
 
 // classifyResponse determines what the model wants to do: final output, handoff, or tool calls.
 func classifyResponse(items []RunItem, agent *Agent) responseStep {

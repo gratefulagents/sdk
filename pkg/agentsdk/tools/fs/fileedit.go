@@ -83,7 +83,7 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 	fileContent := string(data)
 	count := strings.Count(fileContent, in.OldString)
 	if count == 0 {
-		return agentsdk.ToolResult{Content: "old_string not found in file", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "old_string not found in file. The match must be byte-exact including whitespace, indentation, and line endings; re-read the relevant lines with read_file and copy them verbatim", IsError: true}, nil
 	}
 	if count > 1 && !in.ReplaceAll {
 		return agentsdk.ToolResult{
@@ -117,7 +117,7 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 func (t *FileEditTool) Name() string { return "Edit" }
 
 func (t *FileEditTool) Description() string {
-	return "Performs exact string replacement in a file. The old_string must match exactly (including whitespace and indentation)."
+	return "Performs exact string replacement in a file. The old_string must match exactly one location (including whitespace and indentation); include enough surrounding lines to make it unique, or set replace_all for intentional multi-site renames. Use Write to create new files; use this for modifying existing ones."
 }
 
 func (t *FileEditTool) InputSchema() json.RawMessage {
@@ -189,7 +189,7 @@ func executeFileEdit(ctx context.Context, input json.RawMessage, workDir string,
 	fileContent := string(content)
 	count := strings.Count(fileContent, in.OldString)
 	if count == 0 {
-		return agentsdk.ToolResult{Content: "old_string not found in file", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "old_string not found in file. The match must be byte-exact including whitespace, indentation, and line endings; re-read the relevant lines with read_file and copy them verbatim", IsError: true}, nil
 	}
 	if count > 1 && !in.ReplaceAll {
 		return agentsdk.ToolResult{

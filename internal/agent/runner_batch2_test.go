@@ -211,3 +211,121 @@ func TestAgentToolInheritsParentToolPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestRequireCompletionConfirmation verifies the first final answer is bounced
+// back with a verification prompt and the second consecutive one finalizes.
+func TestRequireCompletionConfirmation(t *testing.T) {
+	echoTool := &FunctionTool{
+		ToolName:        "check",
+		ToolDescription: "verification tool",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			return "verified", nil
+		},
+	}
+	model := &mockModel{
+		responses: []*ModelResponse{
+			// First final answer — should be bounced.
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "premature answer"}}}},
+			// Model verifies with a tool call — resets pendingCompletion.
+			{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "c1", Name: "check", Input: json.RawMessage(`{}`)}}}},
+			// Final answer again — bounced once more (streak was reset).
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "verified answer"}}}},
+			// Confirmed final answer.
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "confirmed final"}}}},
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
+
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{RequireCompletionConfirmation: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText() != "confirmed final" {
+		t.Fatalf("expected confirmed final answer, got %q", result.FinalText())
+	}
+	confirmations := 0
+	for _, item := range result.NewItems {
+		if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "verify your work now") {
+			confirmations++
+		}
+	}
+	if confirmations != 2 {
+		t.Fatalf("expected 2 confirmation bounces, got %d", confirmations)
+	}
+}
+
+// TestRequireCompletionConfirmationOffByDefault verifies default behavior is
+// unchanged.
+func TestRequireCompletionConfirmationOffByDefault(t *testing.T) {
+	model := &mockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "immediate answer"}}}},
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test"}
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText() != "immediate answer" {
+		t.Fatalf("got %q", result.FinalText())
+	}
+}
+
+// TestPlanRecitationAppendedTransiently verifies the plan is recited as the
+// last input item of each request without being persisted to history.
+func TestPlanRecitationAppendedTransiently(t *testing.T) {
+	tool := &FunctionTool{
+		ToolName:        "noop",
+		ToolDescription: "noop",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn:              func(ctx context.Context, _ json.RawMessage) (string, error) { return "ok", nil },
+	}
+	model := &mockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "c1", Name: "noop", Input: json.RawMessage(`{}`)}}}},
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{tool}}
+
+	calls := 0
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{
+		PlanRecitation: func(context.Context) string {
+			calls++
+			return "1. do the thing (in progress)"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("recitation should run once per model call, got %d", calls)
+	}
+	for i, req := range model.requests {
+		last := req.Input[len(req.Input)-1]
+		if last.Type != RunItemMessage || last.Message == nil || !strings.Contains(last.Message.Text, "<current_plan>") {
+			t.Fatalf("request %d: last input item should be the plan recitation", i)
+		}
+		// Recitation must appear exactly once per request (not accumulate).
+		count := 0
+		for _, item := range req.Input {
+			if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "<current_plan>") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("request %d: expected 1 recitation, got %d", i, count)
+		}
+	}
+	// Not persisted to history.
+	for _, item := range result.NewItems {
+		if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "<current_plan>") {
+			t.Fatal("plan recitation must not be persisted to run history")
+		}
+	}
+}

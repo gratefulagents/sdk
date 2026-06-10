@@ -168,12 +168,52 @@ type RunConfig struct {
 	// It is retained so operator-era callers keep working.
 	ModeInstructions string
 
-	WorkingStateContext    string          // durable working-state summary injected each turn
+	WorkingStateContext    string          // durable working-state summary appended to compaction carry-forward
 	ToolAccessLevel        ToolAccessLevel // controls tool access tier (full/read-only)
 	Phase                  string          // optional host workflow phase label for hooks/observability
 	ToolPolicy             *ToolPolicy     // optional approval and timeout policy applied to tools
 	MaxConcurrentSubAgents int             // 0 = unlimited
 	ForceFinalSummaryTurn  bool            // reserve the final turn for a no-tool summary instead of hard-failing
+
+	// RequireCompletionConfirmation bounces the model's first final answer
+	// back with a verification prompt; only a second consecutive final answer
+	// ends the run. Any tool call or handoff in between resets the
+	// confirmation. Prevents premature completion on long autonomous tasks
+	// (Terminus 2 double-confirm pattern).
+	RequireCompletionConfirmation bool
+
+	// PlanRecitation, when set, is invoked before every model request and its
+	// non-empty return value is appended as the final input message of that
+	// request only — it is never persisted to run history. Reciting the
+	// current plan/goals at the context tail keeps them in the model's
+	// high-attention window (the todo.md recitation pattern) while leaving
+	// the cache-stable instruction prefix and append-only history untouched.
+	PlanRecitation func(ctx context.Context) string
+
+	// ConsecutiveToolErrorLimit escalates when this many consecutive tool
+	// turns produce only errors: the runner injects a corrective note telling
+	// the model to change approach or report the blocker (the 12-factor
+	// three-strike rule). 0 uses DefaultConsecutiveToolErrorLimit; negative
+	// disables escalation.
+	ConsecutiveToolErrorLimit int
+
+	// StopGate is a deterministic finalization gate. When set, it runs on
+	// every candidate final answer; returning ok=false blocks finalization
+	// and feeds the feedback back to the model. After StopGateMaxBlocks
+	// consecutive blocks (default DefaultStopGateMaxBlocks) the gate is
+	// bypassed so a broken gate cannot loop forever (Claude Code stop-hook
+	// pattern). Consecutive-block tracking resets when the model makes
+	// progress with tools.
+	StopGate func(ctx context.Context, finalText string) (ok bool, feedback string)
+	// StopGateMaxBlocks caps consecutive StopGate blocks. 0 = default.
+	StopGateMaxBlocks int
+
+	// FinalAnswerVerifier, when set, reviews the candidate final answer once
+	// per run (after StopGate passes). Non-empty feedback is injected and the
+	// run continues instead of finalizing — typically wired to a read-only
+	// critic sub-agent that tries to refute the result (adversarial
+	// verification). Errors from the verifier are logged and ignored.
+	FinalAnswerVerifier func(ctx context.Context, finalText string) (feedback string, err error)
 
 	// MaxToolOutputBytes caps the tool result content fed back to the model as
 	// next-turn input. Oversized outputs are middle-truncated (head and tail
@@ -227,6 +267,34 @@ const DefaultSubAgentMaxTurns = 50
 // file reads and command output (codex-cli truncates exec output at ~10K
 // tokens at history-record time for the same reason).
 const DefaultMaxToolOutputBytes = 64 * 1024
+
+// DefaultConsecutiveToolErrorLimit is the consecutive all-error tool-turn
+// threshold that triggers a corrective escalation note.
+const DefaultConsecutiveToolErrorLimit = 3
+
+// DefaultStopGateMaxBlocks caps consecutive StopGate blocks before the gate
+// is bypassed.
+const DefaultStopGateMaxBlocks = 8
+
+// EffectiveConsecutiveToolErrorLimit returns the escalation threshold, or 0
+// when escalation is disabled.
+func (c *RunConfig) EffectiveConsecutiveToolErrorLimit() int {
+	if c.ConsecutiveToolErrorLimit < 0 {
+		return 0
+	}
+	if c.ConsecutiveToolErrorLimit == 0 {
+		return DefaultConsecutiveToolErrorLimit
+	}
+	return c.ConsecutiveToolErrorLimit
+}
+
+// EffectiveStopGateMaxBlocks returns the consecutive-block cap for StopGate.
+func (c *RunConfig) EffectiveStopGateMaxBlocks() int {
+	if c.StopGateMaxBlocks > 0 {
+		return c.StopGateMaxBlocks
+	}
+	return DefaultStopGateMaxBlocks
+}
 
 // EffectiveMaxTurns returns MaxTurns or DefaultMaxTurns if unset.
 func (c *RunConfig) EffectiveMaxTurns() int {

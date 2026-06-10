@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.38.0
+	github.com/creack/pty v1.1.24
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	github.com/openai/openai-go/v3 v3.33.0

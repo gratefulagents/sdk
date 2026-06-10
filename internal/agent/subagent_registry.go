@@ -1575,7 +1575,13 @@ A turn is one model response, not one tool call. Tool calls happen inside a turn
 This is a hard ceiling, not a target. Do not try to use the full budget.
 Finish as soon as the requested output is evidence-backed enough to be useful.
 If the task is broader than the remaining budget, stop exploring and return a concise partial summary with: files checked, concrete findings, gaps/unknowns, and recommended next steps.
-</sub_agent_budget>`, maxTurns)
+</sub_agent_budget>
+
+<result_contract>
+Your final message goes back to a coordinating agent, so make it self-contained and concise.
+If your deliverable is large (long reports, generated code listings, full logs), write the complete artifact to a file under the working directory and return a short summary plus the file path instead of pasting everything inline.
+Always state in your final message: what you did, the key findings/decisions, file paths you created or modified, and anything still unresolved.
+</result_contract>`, maxTurns)
 }
 
 // BuildRunBudgetContext tells the top-level agent how large its runner budget

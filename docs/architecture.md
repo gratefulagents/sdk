@@ -53,6 +53,24 @@ flowchart TD
 5. Call `Runner.Run` or `Runner.RunStreamed`.
 6. Observe the run through hooks, event streams, traces, progress snapshots, and returned `RunResult`.
 
+## Prompt Cache Stability
+
+The runner keeps each model request prompt-cache friendly:
+
+- **Stable prefix.** Instructions (agent instructions + `AdditionalInstructions` +
+  output schema + MCP context) and the tool list are byte-stable across turns of a
+  run. Dynamic per-turn content must never be added to instructions; the only
+  sanctioned exception is the no-tool final-summary directive on the last turn.
+- **Append-only history.** Conversation items are only appended within a turn loop;
+  past items are never edited or reordered. Compaction (which rewrites history) is
+  the explicit, observable exception and is recorded via `CompactionRecorder`.
+- **Transient tail content.** Per-turn dynamic context (e.g. `PlanRecitation`)
+  is appended as the final input item of a single request and regenerated each
+  turn rather than persisted, so it never perturbs earlier cached spans.
+
+Hosts using `Agent.InstructionsFn` should return a stable string for the duration
+of a run, or accept the cache cost of changing it.
+
 ## Host Integration
 
 The reusable runtime depends on narrow interfaces instead of prescribing an

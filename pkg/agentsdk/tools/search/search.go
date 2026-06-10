@@ -30,7 +30,7 @@ type ListFilesTool struct{}
 func (t *ListFilesTool) Name() string { return "list_files" }
 
 func (t *ListFilesTool) Description() string {
-	return "List files and directories under a path relative to the working directory."
+	return "List files and directories under a path relative to the working directory. Use glob to find files by name pattern instead of walking directories manually."
 }
 
 func (t *ListFilesTool) InputSchema() json.RawMessage {
@@ -88,7 +88,7 @@ type ReadFileTool struct{}
 func (t *ReadFileTool) Name() string { return "read_file" }
 
 func (t *ReadFileTool) Description() string {
-	return "Read a UTF-8 text file relative to the working directory. Supports line-range slicing."
+	return "Read a UTF-8 text file relative to the working directory. Supports line-range slicing via start_line/end_line — prefer ranged reads for large files instead of re-reading the whole file. Use grep to locate content first, then read the relevant range."
 }
 
 func (t *ReadFileTool) InputSchema() json.RawMessage {
@@ -200,7 +200,7 @@ type GrepTool struct{}
 func (t *GrepTool) Name() string { return "grep" }
 
 func (t *GrepTool) Description() string {
-	return "Search file contents with a regular expression. Returns matching lines with file:line prefixes."
+	return "Search file contents with a regular expression. Returns matching lines with file:line prefixes. Prefer this over running grep/rg through Bash. Escape regex metacharacters when searching for literal code (e.g. use interface\\{\\} to find interface{}). Narrow with a path or pattern when a query would match many files."
 }
 
 func (t *GrepTool) InputSchema() json.RawMessage {

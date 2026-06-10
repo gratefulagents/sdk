@@ -204,6 +204,15 @@ Use run_subagent_task for normal delegate-and-return work.
 Use spawn_subagent_graph with return_when="all_complete" for multi-step DAG joins, or depends_on in spawn_subagent_task for managed downstream work.
 By default, dependency outputs are passed to downstream tasks as context once all dependencies complete.
 
+EFFORT SCALING: Match delegation to task complexity instead of defaulting to maximum fan-out.
+- Simple lookups or single-file questions: answer directly with your own tools, or at most 1 read-only sub-agent.
+- Comparisons or multi-area investigations: 2-4 parallel read-only sub-agents, each owning one distinct question.
+- Large builds or genuinely decomposable implementation work: more sub-agents, but only with disjoint file ownership.
+State an explicit effort budget in each task packet (e.g. "aim for under 10 tool calls") so sub-agents do not over-explore.
+
+ARTIFACTS: For large deliverables (reports, generated code listings, long logs), instruct the sub-agent to write the full output to a file under the working directory and return a concise summary plus the file path.
+Read the file yourself only when needed. Passing lightweight references instead of full content avoids losing information when many results flow through you.
+
 STATUS REPORTING: Managed sub-agent progress streams through the runtime while the SDK keeps the parent run open. You do not need to call a polling/wait tool just to check whether tasks are still running.
 Completed task results are delivered to you automatically as soon as each task finishes; act on early results while slower tasks keep running.
 Use get_subagent_activity for deeper detail on a specific task when you need evidence before steering.

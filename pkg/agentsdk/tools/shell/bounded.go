@@ -81,6 +81,36 @@ func (b *boundedWriter) TotalBytes() int64 {
 	return b.total
 }
 
+// TailSince returns the bytes written after the given absolute stream offset,
+// the new offset (current total), and whether part of the requested range was
+// already discarded by the cap. Used for incremental polling so repeated polls
+// do not re-send output the model has already seen.
+func (b *boundedWriter) TailSince(offset int64) (out []byte, newOffset int64, gap bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= b.total {
+		return nil, b.total, false
+	}
+	newBytes := b.total - offset
+	if !b.capped {
+		start := int64(len(b.buf)) - newBytes
+		if start < 0 {
+			start = 0
+		}
+		return append([]byte(nil), b.buf[start:]...), b.total, false
+	}
+	tail := b.tail
+	if newBytes < int64(len(tail)) {
+		return append([]byte(nil), tail[int64(len(tail))-newBytes:]...), b.total, false
+	}
+	// More new bytes arrived than the cap retains: return what we have and
+	// flag the gap.
+	return append([]byte(nil), tail...), b.total, true
+}
+
 func boundedHeadTailLimits(cap int) (int, int) {
 	if cap <= 1 {
 		return cap, 0

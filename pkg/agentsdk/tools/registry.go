@@ -35,6 +35,9 @@ type Registry struct {
 	commandSandboxConfig    *sandbox.Config
 	asyncShell              bool
 	asyncShellManager       *shell.AsyncManager
+	thinkTool               bool
+	interactiveTerminal     bool
+	terminalManager         *shell.TerminalManager
 }
 
 // RegistryOption configures a Registry.
@@ -70,6 +73,19 @@ func WithCommandSandboxConfig(config sandbox.Config) RegistryOption {
 
 func WithAsyncShellTools() RegistryOption {
 	return func(r *Registry) { r.asyncShell = true }
+}
+
+// WithThinkTool registers the think scratchpad tool, which lets the model
+// record reasoning between actions without changing state.
+func WithThinkTool() RegistryOption {
+	return func(r *Registry) { r.thinkTool = true }
+}
+
+// WithInteractiveTerminal registers the persistent PTY Terminal tool for
+// interactive programs and long-lived foreground processes. Requires a write
+// permission mode; Unix only.
+func WithInteractiveTerminal() RegistryOption {
+	return func(r *Registry) { r.interactiveTerminal = true }
 }
 
 func WithVisionTools(analyzeFn vision.AnalyzeFn) RegistryOption {
@@ -156,6 +172,14 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 		r.Register(&shell.BashPollTool{Manager: manager})
 		r.Register(&shell.BashKillTool{Manager: manager})
 	}
+	if r.interactiveTerminal && r.permissionMode.AllowsWriteTools() {
+		manager := shell.NewTerminalManager(r.bashExecutor())
+		r.terminalManager = manager
+		r.Register(&shell.TerminalTool{Manager: manager, Mode: r.permissionMode})
+	}
+	if r.thinkTool {
+		r.Register(&signal.ThinkTool{})
+	}
 	if r.browser {
 		r.Register(&browser.Tool{AllowPrivateNetworkURLs: r.allowPrivateNetworkURLs})
 	}
@@ -228,10 +252,17 @@ func (r *Registry) Tools() []agentsdk.Tool {
 }
 
 func (r *Registry) Closers() []io.Closer {
-	if r == nil || r.asyncShellManager == nil {
+	if r == nil {
 		return nil
 	}
-	return []io.Closer{r.asyncShellManager}
+	var closers []io.Closer
+	if r.asyncShellManager != nil {
+		closers = append(closers, r.asyncShellManager)
+	}
+	if r.terminalManager != nil {
+		closers = append(closers, r.terminalManager)
+	}
+	return closers
 }
 
 func (r *Registry) Names() []string {

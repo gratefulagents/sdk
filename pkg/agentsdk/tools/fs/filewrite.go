@@ -68,7 +68,7 @@ func (t *WorkspaceWriteFileTool) Execute(ctx context.Context, input json.RawMess
 func (t *FileWriteTool) Name() string { return "Write" }
 
 func (t *FileWriteTool) Description() string {
-	return "Creates or overwrites a file with the given content. Creates parent directories if needed."
+	return "Creates or overwrites a file with the given content. Creates parent directories if needed. Overwrite replaces the entire file — use Edit for targeted changes to existing files so unrelated content is preserved."
 }
 
 func (t *FileWriteTool) InputSchema() json.RawMessage {

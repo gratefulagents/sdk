@@ -35,11 +35,12 @@ type asyncJob struct {
 	output      *boundedWriter
 	done        chan struct{}
 
-	mu       sync.Mutex
-	exitCode int
-	timedOut bool
-	err      error
-	endedAt  time.Time
+	mu         sync.Mutex
+	exitCode   int
+	timedOut   bool
+	err        error
+	endedAt    time.Time
+	pollCursor int64 // absolute output offset consumed by incremental polls
 }
 
 // NewAsyncManager creates a manager for async shell jobs.
@@ -299,8 +300,9 @@ type asyncStartInput struct {
 }
 
 type asyncIDInput struct {
-	ID     string `json:"id"`
-	WaitMS int    `json:"wait_ms"`
+	ID          string `json:"id"`
+	WaitMS      int    `json:"wait_ms"`
+	Incremental *bool  `json:"incremental"`
 }
 
 type asyncJobSnapshot struct {
@@ -316,6 +318,22 @@ type asyncJobSnapshot struct {
 	TimeoutMS   int64  `json:"timeout_ms"`
 	Description string `json:"description,omitempty"`
 	Output      string `json:"output"`
+	Note        string `json:"note,omitempty"`
+}
+
+// consumeNewOutput returns output produced since the previous incremental poll
+// and advances the poll cursor.
+func (j *asyncJob) consumeNewOutput() (string, bool) {
+	j.mu.Lock()
+	cursor := j.pollCursor
+	j.mu.Unlock()
+	out, newOffset, gap := j.output.TailSince(cursor)
+	j.mu.Lock()
+	if newOffset > j.pollCursor {
+		j.pollCursor = newOffset
+	}
+	j.mu.Unlock()
+	return string(out), gap
 }
 
 // BashStartTool starts a long-running shell command in the background.
@@ -377,7 +395,7 @@ type BashPollTool struct {
 func (t *BashPollTool) Name() string { return "BashPoll" }
 
 func (t *BashPollTool) Description() string {
-	return "Polls a background bash job started by BashStart and returns status plus bounded recent output. Optionally waits before returning so long jobs do not require tight polling."
+	return "Polls a background bash job started by BashStart. By default returns only output produced since the previous poll (incremental), plus status. Optionally waits before returning so long jobs do not require tight polling."
 }
 
 func (t *BashPollTool) InputSchema() json.RawMessage {
@@ -385,7 +403,8 @@ func (t *BashPollTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"id": {"type": "string", "description": "Job id returned by BashStart"},
-			"wait_ms": {"type": "number", "description": "Optional milliseconds to wait for the job to finish before returning, max 120000"}
+			"wait_ms": {"type": "number", "description": "Optional milliseconds to wait for the job to finish before returning, max 120000"},
+			"incremental": {"type": "boolean", "description": "Return only output since the previous poll (default true). Set false to get the full bounded output again."}
 		},
 		"required": ["id"]
 	}`)
@@ -414,7 +433,18 @@ func (t *BashPollTool) Execute(ctx context.Context, input json.RawMessage, workD
 		case <-time.After(wait):
 		}
 	}
-	data, err := json.MarshalIndent(job.snapshot(), "", "  ")
+	snap := job.snapshot()
+	if in.Incremental == nil || *in.Incremental {
+		out, gap := job.consumeNewOutput()
+		if out == "" {
+			out = "(no new output since last poll)"
+		}
+		snap.Output = out
+		if gap {
+			snap.Note = "some output between polls exceeded the retention cap and was discarded"
+		}
+	}
+	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error: %v", err), IsError: true}, nil
 	}
