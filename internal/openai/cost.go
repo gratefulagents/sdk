@@ -13,6 +13,11 @@ type ModelPricing struct {
 	OutputPerMillion      float64
 }
 
+// modelPricing holds OpenAI standard-tier list prices in USD per 1M tokens,
+// verified against https://developers.openai.com/api/docs/pricing (2026-06).
+// CachedInputPerMillion is the prompt-cache read rate; OutputPerMillion already
+// covers reasoning tokens (OpenAI includes them in output_tokens). Batch, Flex,
+// and Priority tiers are not modeled. Keep in sync when OpenAI updates pricing.
 var modelPricing = map[string]ModelPricing{
 	"gpt-4.1": {
 		InputPerMillion:       2.0,
@@ -23,6 +28,11 @@ var modelPricing = map[string]ModelPricing{
 		InputPerMillion:       0.4,
 		CachedInputPerMillion: 0.10,
 		OutputPerMillion:      1.6,
+	},
+	"gpt-4.1-nano": {
+		InputPerMillion:       0.1,
+		CachedInputPerMillion: 0.025,
+		OutputPerMillion:      0.4,
 	},
 	"gpt-4o": {
 		InputPerMillion:       2.5,
@@ -39,6 +49,21 @@ var modelPricing = map[string]ModelPricing{
 		CachedInputPerMillion: 0.125,
 		OutputPerMillion:      10.0,
 	},
+	"gpt-5.1-codex": {
+		InputPerMillion:       1.25,
+		CachedInputPerMillion: 0.125,
+		OutputPerMillion:      10.0,
+	},
+	"gpt-5.1-codex-max": {
+		InputPerMillion:       1.25,
+		CachedInputPerMillion: 0.125,
+		OutputPerMillion:      10.0,
+	},
+	"gpt-5.1-codex-mini": {
+		InputPerMillion:       0.25,
+		CachedInputPerMillion: 0.025,
+		OutputPerMillion:      2.0,
+	},
 	"gpt-5.2": {
 		InputPerMillion:       1.75,
 		CachedInputPerMillion: 0.175,
@@ -50,8 +75,9 @@ var modelPricing = map[string]ModelPricing{
 		OutputPerMillion:      14.0,
 	},
 	"gpt-5.3-codex": {
-		InputPerMillion:  2.0,
-		OutputPerMillion: 8.0,
+		InputPerMillion:       1.75,
+		CachedInputPerMillion: 0.175,
+		OutputPerMillion:      14.0,
 	},
 	"gpt-5.3-codex-spark": {
 		InputPerMillion:  0.4,
@@ -68,8 +94,9 @@ var modelPricing = map[string]ModelPricing{
 		OutputPerMillion:      4.50,
 	},
 	"gpt-5.4-nano": {
-		InputPerMillion:  0.15,
-		OutputPerMillion: 0.6,
+		InputPerMillion:       0.2,
+		CachedInputPerMillion: 0.02,
+		OutputPerMillion:      1.25,
 	},
 	"gpt-5.5": {
 		InputPerMillion:       5.0,
@@ -80,6 +107,21 @@ var modelPricing = map[string]ModelPricing{
 		InputPerMillion:       0.25,
 		CachedInputPerMillion: 0.025,
 		OutputPerMillion:      2.0,
+	},
+	"gpt-5": {
+		InputPerMillion:       1.25,
+		CachedInputPerMillion: 0.125,
+		OutputPerMillion:      10.0,
+	},
+	"gpt-5-codex": {
+		InputPerMillion:       1.25,
+		CachedInputPerMillion: 0.125,
+		OutputPerMillion:      10.0,
+	},
+	"gpt-5-nano": {
+		InputPerMillion:       0.05,
+		CachedInputPerMillion: 0.005,
+		OutputPerMillion:      0.4,
 	},
 }
 
