@@ -16,6 +16,7 @@ type CompactConversationResponse = internalopenai.CompactConversationResponse
 type ModelMetadata = internalopenai.ModelMetadata
 type ModelPricing = internalopenai.ModelPricing
 type OAuthSessionConfig = internalopenai.OAuthSessionConfig
+type CustomAuthSessionConfig = internalopenai.CustomAuthSessionConfig
 type Model = OpenAIModel
 type OpenAIAuthSession = internalopenai.OpenAIAuthSession
 type Provider = OpenAIProvider
@@ -56,6 +57,10 @@ func NewClientWithAuthSession(session *AuthSession, opts ...ClientOption) *Clien
 
 func NewAPIKeyAuthSession(apiKey string) *AuthSession {
 	return internalopenai.NewAPIKeyAuthSession(apiKey)
+}
+
+func NewCustomAuthSession(cfg CustomAuthSessionConfig) *AuthSession {
+	return internalopenai.NewCustomAuthSession(cfg)
 }
 
 func NewOAuthAuthSessionFromFile(authJSONPath, accountIDPath string) (*AuthSession, error) {

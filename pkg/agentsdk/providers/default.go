@@ -7,8 +7,13 @@ import (
 )
 
 const (
-	DefaultProviderOpenAI    = "openai"
-	DefaultProviderAnthropic = "anthropic"
+	DefaultProviderOpenAI     = "openai"
+	DefaultProviderAnthropic  = "anthropic"
+	DefaultProviderOpenRouter = "openrouter"
+	DefaultProviderGemini     = "gemini"
+	DefaultProviderGroq       = "groq"
+	DefaultProviderLocal      = "local"
+	DefaultProviderCopilot    = "copilot"
 )
 
 // NewDefaultMultiProvider creates a MultiProvider with OpenAI and Anthropic

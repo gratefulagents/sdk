@@ -825,12 +825,12 @@ func normalizeBaseURL(raw string) string {
 	path := strings.TrimSuffix(strings.TrimSpace(u.Path), "/")
 	path = strings.TrimSuffix(path, "/chat/completions")
 	path = strings.TrimSuffix(path, "/responses")
-	if path == "" {
+	if path == "" && !isGitHubCopilotHost(u.Host) {
 		path = "/v1"
 	}
 	// Only force /v1 suffix for standard OpenAI-compatible API hosts.
-	// The ChatGPT backend API (chatgpt.com) uses a non-versioned path.
-	if !isChatGPTBackendHost(u.Host) && !strings.Contains(path, "/v1") {
+	// The ChatGPT backend API and GitHub Copilot API use non-versioned paths.
+	if !isChatGPTBackendHost(u.Host) && !isGitHubCopilotHost(u.Host) && !strings.Contains(path, "/v1") {
 		path = strings.TrimSuffix(path, "/") + "/v1"
 	}
 	u.Path = path
@@ -838,6 +838,10 @@ func normalizeBaseURL(raw string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return strings.TrimSuffix(u.String(), "/")
+}
+
+func isGitHubCopilotHost(host string) bool {
+	return strings.EqualFold(strings.TrimSpace(host), "api.githubcopilot.com")
 }
 
 func normalizeCompletionsURL(rawBaseURL, normalizedBaseURL string) string {

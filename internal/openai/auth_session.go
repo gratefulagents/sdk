@@ -50,6 +50,14 @@ type OpenAIAuthSession struct {
 	mode   AuthMode
 	apiKey string
 	oauth  *oauthSessionState
+	custom *customAuthSessionState
+}
+
+type CustomAuthSessionConfig struct {
+	RequestHeaders  func(context.Context) (map[string]string, error)
+	Refresh         func(context.Context) error
+	SupportsRefresh func() bool
+	SDKAPIKey       string
 }
 
 type OAuthSessionConfig struct {
@@ -81,6 +89,14 @@ type oauthSessionState struct {
 	refreshDisabled bool
 }
 
+type customAuthSessionState struct {
+	refreshGroup singleflight.Group
+	headers      func(context.Context) (map[string]string, error)
+	refresh      func(context.Context) error
+	supports     func() bool
+	sdkAPIKey    string
+}
+
 type oauthAuthFile struct {
 	Tokens      oauthAuthTokens `json:"tokens"`
 	LastRefresh string          `json:"last_refresh"`
@@ -101,6 +117,18 @@ type oauthRefreshResponse struct {
 
 func NewAPIKeyAuthSession(apiKey string) *OpenAIAuthSession {
 	return &OpenAIAuthSession{mode: AuthModeAPIKey, apiKey: strings.TrimSpace(apiKey)}
+}
+
+func NewCustomAuthSession(cfg CustomAuthSessionConfig) *OpenAIAuthSession {
+	return &OpenAIAuthSession{
+		mode: AuthModeAPIKey,
+		custom: &customAuthSessionState{
+			headers:   cfg.RequestHeaders,
+			refresh:   cfg.Refresh,
+			supports:  cfg.SupportsRefresh,
+			sdkAPIKey: strings.TrimSpace(cfg.SDKAPIKey),
+		},
+	}
 }
 
 func CodexClientVersion() string {
@@ -204,6 +232,12 @@ func (s *OpenAIAuthSession) RequestHeaders(ctx context.Context) (map[string]stri
 	if s == nil {
 		return nil, fmt.Errorf("auth session is required")
 	}
+	if s.custom != nil {
+		if s.custom.headers == nil {
+			return nil, fmt.Errorf("custom auth session headers function is required")
+		}
+		return s.custom.headers(ctx)
+	}
 	switch s.mode {
 	case AuthModeOAuth:
 		if err := s.ensureOAuthAccessToken(ctx); err != nil {
@@ -226,6 +260,9 @@ func (s *OpenAIAuthSession) RequestHeaders(ctx context.Context) (map[string]stri
 }
 
 func (s *OpenAIAuthSession) SupportsRefresh() bool {
+	if s != nil && s.custom != nil {
+		return s.custom.supports != nil && s.custom.supports()
+	}
 	if s == nil || s.mode != AuthModeOAuth || s.oauth == nil {
 		return false
 	}
@@ -248,6 +285,15 @@ func (s *OpenAIAuthSession) DisableRefresh() {
 }
 
 func (s *OpenAIAuthSession) Refresh(ctx context.Context) error {
+	if s != nil && s.custom != nil {
+		if !s.SupportsRefresh() || s.custom.refresh == nil {
+			return nil
+		}
+		_, err, _ := s.custom.refreshGroup.Do("refresh", func() (any, error) {
+			return nil, s.custom.refresh(ctx)
+		})
+		return err
+	}
 	if !s.SupportsRefresh() {
 		return nil
 	}
@@ -409,6 +455,12 @@ func (s *OpenAIAuthSession) RefreshAndSerialize(ctx context.Context, accountIDOv
 func (s *OpenAIAuthSession) sdkAPIKey() string {
 	if s == nil {
 		return ""
+	}
+	if s.custom != nil {
+		if s.custom.sdkAPIKey != "" {
+			return s.custom.sdkAPIKey
+		}
+		return "custom-placeholder"
 	}
 	if s.mode == AuthModeOAuth {
 		return "oauth-placeholder"

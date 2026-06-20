@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -28,10 +29,19 @@ type ProviderSpec struct {
 	ProviderAPIModes         map[string]string
 	// ModelFallbacks is an ordered list of fallback model identifiers sent as
 	// the OpenRouter "models" array so the provider retries the next model when
-	// one is unavailable. Applies to OpenAI-compatible providers (openrouter,
-	// gemini, groq, local, openai-api). Empty disables fallback routing.
+	// one is unavailable. It is only forwarded to OpenRouter; other
+	// OpenAI-compatible providers ignore it. Empty disables fallback routing.
 	ModelFallbacks []string
 }
+
+var openAICompatibleProviderNames = []string{
+	DefaultProviderOpenRouter,
+	DefaultProviderGemini,
+	DefaultProviderGroq,
+	DefaultProviderLocal,
+}
+
+const defaultCopilotBaseURL = "https://api.githubcopilot.com"
 
 func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	provider := strings.ToLower(strings.TrimSpace(spec.Provider))
@@ -41,22 +51,18 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	switch provider {
 	case "multi":
 		return newMultiProviderFromSpec(spec)
-	case "openai":
+	case DefaultProviderOpenAI:
 		return newOpenAIProviderFromSpec(spec)
-	case "anthropic":
+	case DefaultProviderAnthropic:
 		return sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
 			BaseURL:  baseURLForProvider(spec, DefaultProviderAnthropic),
 			APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
 			AuthMode: authModeForAnthropicProvider(spec),
 		}), nil
-	case "openrouter":
-		return newOpenAICompatibleProviderFromSpec("openrouter", spec), nil
-	case "gemini":
-		return newOpenAICompatibleProviderFromSpec("gemini", spec), nil
-	case "groq":
-		return newOpenAICompatibleProviderFromSpec("groq", spec), nil
-	case "local":
-		return newOpenAICompatibleProviderFromSpec("local", spec), nil
+	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderLocal:
+		return newOpenAICompatibleProviderFromSpec(provider, spec), nil
+	case DefaultProviderCopilot:
+		return newCopilotProviderFromSpec(spec), nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", spec.Provider)
 	}
@@ -121,9 +127,10 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 		APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
 		AuthMode: authModeForAnthropicProvider(spec),
 	}))
-	for _, provider := range []string{"openrouter", "gemini", "groq", "local"} {
+	for _, provider := range openAICompatibleProviderNames {
 		mp.Register(provider, newOpenAICompatibleProviderFromSpec(provider, spec))
 	}
+	mp.Register(DefaultProviderCopilot, newCopilotProviderFromSpec(spec))
 	return mp, nil
 }
 
@@ -131,23 +138,58 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 	provider = normalizeProviderName(provider)
 	baseURL := firstNonEmpty(baseURLForProvider(spec, provider), defaultBaseURLForProvider(provider))
 	apiKey := apiKeyForProvider(spec, provider)
-	if provider == "local" {
-		apiKey = firstNonEmpty(apiKey, "local-key")
+	if fallbackKey := defaultAPIKeyForProvider(provider); fallbackKey != "" {
+		apiKey = firstNonEmpty(apiKey, fallbackKey)
 	}
 	// Model fallbacks are sent as the request-body "models" array, which is an
 	// OpenRouter routing feature. Other OpenAI-compatible backends may reject an
 	// unknown "models" field, so only forward fallbacks to OpenRouter.
 	var modelFallbacks []string
-	if provider == "openrouter" {
+	if provider == DefaultProviderOpenRouter {
 		modelFallbacks = spec.ModelFallbacks
 	}
 	return sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
+		ProviderName:   provider,
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
 		APIMode:        apiModeForProvider(spec, provider, "chat-completions"),
 		AuthMode:       sdkopenai.AuthModeAPIKey,
 		ModelFallbacks: modelFallbacks,
 	})
+}
+
+func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
+	apiKey := apiKeyForProvider(spec, DefaultProviderCopilot)
+	baseURL := firstNonEmpty(baseURLForProvider(spec, DefaultProviderCopilot), defaultCopilotBaseURL)
+	session := sdkopenai.NewCustomAuthSession(sdkopenai.CustomAuthSessionConfig{
+		SDKAPIKey: "copilot-placeholder",
+		RequestHeaders: func(context.Context) (map[string]string, error) {
+			token := strings.TrimSpace(apiKey)
+			if token == "" {
+				return nil, fmt.Errorf("Copilot API token is required")
+			}
+			return copilotRequestHeaders(token), nil
+		},
+	})
+	return sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
+		ProviderName: DefaultProviderCopilot,
+		BaseURL:      baseURL,
+		AuthMode:     sdkopenai.AuthModeAPIKey,
+		APIMode:      apiModeForProvider(spec, DefaultProviderCopilot, "chat-completions"),
+		AuthSession:  session,
+	})
+}
+
+func copilotRequestHeaders(token string) map[string]string {
+	return map[string]string{
+		"Authorization":          "Bearer " + strings.TrimSpace(token),
+		"Copilot-Integration-Id": "vscode-chat",
+		"Editor-Version":         "gratefulagents-sdk/unknown",
+		"Editor-Plugin-Version":  "gratefulagents-sdk/unknown",
+		"OpenAI-Organization":    "github-copilot",
+		"OpenAI-Intent":          "conversation-panel",
+		"User-Agent":             "GitHubCopilotChat/0.23.0",
+	}
 }
 
 func authModeForAnthropicProvider(spec ProviderSpec) string {
@@ -247,14 +289,25 @@ func lookupProviderValue(values map[string]string, provider string) string {
 
 func defaultBaseURLForProvider(provider string) string {
 	switch normalizeProviderName(provider) {
-	case "openrouter":
+	case DefaultProviderOpenRouter:
 		return "https://openrouter.ai/api/v1"
-	case "gemini":
+	case DefaultProviderGemini:
 		return "https://generativelanguage.googleapis.com/v1beta/openai"
-	case "groq":
+	case DefaultProviderGroq:
 		return "https://api.groq.com/openai/v1"
-	case "local":
+	case DefaultProviderLocal:
 		return "http://localhost:11434/v1"
+	case DefaultProviderCopilot:
+		return defaultCopilotBaseURL
+	default:
+		return ""
+	}
+}
+
+func defaultAPIKeyForProvider(provider string) string {
+	switch normalizeProviderName(provider) {
+	case DefaultProviderLocal:
+		return "local-key"
 	default:
 		return ""
 	}

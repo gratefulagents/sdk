@@ -19,6 +19,7 @@ import (
 )
 
 type OpenAIProvider struct {
+	providerName   string
 	baseURL        string                  // optional override (for gemini, openrouter, groq)
 	apiKey         string                  // optional API key override
 	authMode       internalopenai.AuthMode // "oauth" or "" (api-key)
@@ -28,11 +29,12 @@ type OpenAIProvider struct {
 }
 
 type ProviderConfig struct {
-	BaseURL     string
-	APIKey      string
-	AuthMode    AuthMode
-	APIMode     string
-	AuthSession *AuthSession
+	ProviderName string
+	BaseURL      string
+	APIKey       string
+	AuthMode     AuthMode
+	APIMode      string
+	AuthSession  *AuthSession
 	// ModelFallbacks is an ordered list of fallback model identifiers sent as
 	// the OpenRouter "models" array so the provider retries the next model when
 	// one is unavailable. Empty disables fallback routing.
@@ -49,6 +51,7 @@ func NewOpenAIProviderWithBaseURL(baseURL string) *OpenAIProvider {
 
 func NewOpenAIProviderWithConfig(cfg ProviderConfig) *OpenAIProvider {
 	return &OpenAIProvider{
+		providerName:   strings.TrimSpace(cfg.ProviderName),
 		baseURL:        strings.TrimSpace(cfg.BaseURL),
 		apiKey:         strings.TrimSpace(cfg.APIKey),
 		authMode:       cfg.AuthMode,
@@ -59,20 +62,30 @@ func NewOpenAIProviderWithConfig(cfg ProviderConfig) *OpenAIProvider {
 }
 
 func (p *OpenAIProvider) GetModel(name string) (agentsdk.Model, error) {
-	name = agentsdk.ResolveModelForProvider(name, "openai")
+	providerName := strings.TrimSpace(p.providerName)
+	if providerName == "" {
+		providerName = "openai"
+	}
+	if prefix, bare := agentsdk.ParseModelPrefix(name); prefix != "" && strings.EqualFold(prefix, providerName) {
+		name = bare
+	} else {
+		name = agentsdk.ResolveModelForProvider(name, "openai")
+	}
 	m, err := newOpenAIModelFromConfig(p.baseURL, p.authMode, p.apiMode, p.apiKey, p.authSession, p.modelFallbacks)
 	if err != nil {
 		return nil, err
 	}
 	m.model = name
+	m.providerName = providerName
 	return m, nil
 }
 
 func (p *OpenAIProvider) Close() error { return nil }
 
 type OpenAIModel struct {
-	client *internalopenai.Client
-	model  string
+	client       *internalopenai.Client
+	model        string
+	providerName string
 }
 
 func newOpenAIModelFromConfig(baseURL string, authMode internalopenai.AuthMode, apiMode string, apiKey string, session *internalopenai.OpenAIAuthSession, modelFallbacks []string) (*OpenAIModel, error) {
@@ -116,7 +129,12 @@ func NewOpenAIModelWithClient(client *internalopenai.Client) *OpenAIModel {
 	return &OpenAIModel{client: client}
 }
 
-func (m *OpenAIModel) Provider() string { return "openai" }
+func (m *OpenAIModel) Provider() string {
+	if m != nil && strings.TrimSpace(m.providerName) != "" {
+		return strings.TrimSpace(m.providerName)
+	}
+	return "openai"
+}
 
 func (m *OpenAIModel) SupportsContextCompaction() bool {
 	return m != nil && m.client != nil && m.client.SupportsResponseCompaction()

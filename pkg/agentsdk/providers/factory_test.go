@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,72 @@ func TestNewProviderFromConfigSupportsLocal(t *testing.T) {
 	}
 	if provider == nil {
 		t.Fatal("provider is nil")
+	}
+}
+
+func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {
+	var gotPath, gotModel string
+	gotHeaders := http.Header{}
+	var decodeErr error
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		gotPath = r.URL.Path
+		var body struct {
+			Model string `json:"model"`
+		}
+		decodeErr = json.NewDecoder(r.Body).Decode(&body)
+		gotModel = body.Model
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_test","object":"chat.completion","created":0,"model":"copilot-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:         "multi",
+		DefaultProvider:  DefaultProviderCopilot,
+		Model:            DefaultProviderCopilot + "/gpt-4.1",
+		ProviderAPIKeys:  map[string]string{DefaultProviderCopilot: "copilot-token"},
+		ProviderBaseURLs: map[string]string{DefaultProviderCopilot: srv.URL + "/chat/completions"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel(DefaultProviderCopilot + "/gpt-4.1")
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+	if got := model.Provider(); got != DefaultProviderCopilot {
+		t.Fatalf("Provider() = %q, want %q", got, DefaultProviderCopilot)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Input: []agentsdk.RunItem{{
+			Type:    agentsdk.RunItemMessage,
+			Message: &agentsdk.MessageOutput{Text: "hello"},
+		}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if decodeErr != nil {
+		t.Fatalf("decode request body: %v", decodeErr)
+	}
+	if gotPath != "/chat/completions" {
+		t.Fatalf("path = %q, want /chat/completions", gotPath)
+	}
+	if got := gotHeaders.Get("Authorization"); got != "Bearer copilot-token" {
+		t.Fatalf("Authorization = %q, want Bearer copilot-token", got)
+	}
+	if got := gotHeaders.Get("Copilot-Integration-Id"); got != "vscode-chat" {
+		t.Fatalf("Copilot-Integration-Id = %q, want vscode-chat", got)
+	}
+	if got := gotHeaders.Get("OpenAI-Organization"); got != "github-copilot" {
+		t.Fatalf("OpenAI-Organization = %q, want github-copilot", got)
+	}
+	if got := gotHeaders.Get("OpenAI-Intent"); got != "conversation-panel" {
+		t.Fatalf("OpenAI-Intent = %q, want conversation-panel", got)
+	}
+	if gotModel != "gpt-4.1" {
+		t.Fatalf("model = %q, want gpt-4.1", gotModel)
 	}
 }
 
