@@ -156,7 +156,11 @@ func headerProviderMiddleware(provider func(context.Context) (map[string]string,
 	}
 }
 
-// CreateMessage sends a non-streaming request to the Messages API.
+// CreateMessage sends a request to the Messages API and returns the complete
+// assembled response. It streams under the hood (accumulating into a single
+// message) so it never trips the SDK's non-streaming guard, which rejects plain
+// requests whose max_tokens could take longer than 10 minutes — the failure
+// observed for sub-agents on Copilot's /v1/messages shim.
 func (c *Client) CreateMessage(ctx context.Context, req CreateMessageRequest) (*CreateMessageResponse, error) {
 	return c.createMessageSDK(ctx, req)
 }
@@ -173,11 +177,21 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 
 	var resp *CreateMessageResponse
 	err := c.doWithRetry(ctx, func(ctx context.Context) error {
-		msg, err := c.sdk.Beta.Messages.New(ctx, params, betas...)
-		if err != nil {
+		// Stream and accumulate rather than calling the blocking endpoint:
+		// Beta.Messages.New refuses requests whose max_tokens could exceed the
+		// 10-minute non-streaming limit. Streaming has no such cap, and the
+		// SDK's own accumulator reassembles the identical final message.
+		stream := c.sdk.Beta.Messages.NewStreaming(ctx, params, betas...)
+		var acc sdk.BetaMessage
+		for stream.Next() {
+			if err := acc.Accumulate(stream.Current()); err != nil {
+				return err
+			}
+		}
+		if err := stream.Err(); err != nil {
 			return err
 		}
-		resp = fromSDKBetaMessage(msg)
+		resp = fromSDKBetaMessage(&acc)
 		return nil
 	})
 	if err != nil {
