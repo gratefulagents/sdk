@@ -249,7 +249,7 @@ func (m *OpenAIModel) GetRetryAdvice(err error) *agentsdk.ModelRetryAdvice {
 	if errors.As(err, &responseFailed) {
 		return &agentsdk.ModelRetryAdvice{
 			ShouldRetry: responseFailed.Retryable(),
-			Reason:      responseFailed.NonRetryableReason(),
+			Reason:      responseFailed.Reason(),
 		}
 	}
 	return &agentsdk.ModelRetryAdvice{ShouldRetry: false}

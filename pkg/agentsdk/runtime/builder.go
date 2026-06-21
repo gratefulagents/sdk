@@ -45,6 +45,11 @@ type Config struct {
 	// OpenAI-compatible providers (e.g. OpenRouter) to retry the next model when
 	// one is unavailable. Empty disables fallback routing.
 	ModelFallbacks []string
+	// FallbackModels is an ordered list of SDK-level fallback model identifiers.
+	// When a model call fails with a rate-limit or quota-style error, the runner
+	// retries the request through the next model, including cross-provider models
+	// such as "anthropic/claude-sonnet-4-6" or "copilot/gpt-4.1".
+	FallbackModels []string
 
 	WorkDir      string
 	AgentName    string
@@ -177,6 +182,7 @@ func (s *SessionState) configureSubAgentScheduler(cfg agentsdk.SubAgentScheduler
 // ModeOverrides are runtime settings derived from a mode template snapshot.
 type ModeOverrides struct {
 	Model                  string
+	FallbackModels         []string
 	Reasoning              string
 	ModelSettings          agentsdk.ModelSettings
 	MaxTurns               int
@@ -528,6 +534,7 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 			Runner:            runner,
 			Tools:             cloneTools(hostBundle.Tools),
 			BaseModel:         cfg.Model,
+			FallbackModels:    cloneStrings(cfg.FallbackModels),
 			Provider:          modelRoutingProvider(cfg),
 			BaseModelSettings: modelSettings(cfg),
 			ModeSnapshot:      modeSnapshot,
@@ -541,11 +548,12 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 	}
 
 	agent := &agentsdk.Agent{
-		Name:          firstNonEmpty(cfg.AgentName, "agent"),
-		Model:         cfg.Model,
-		ModelSettings: modelSettings(cfg),
-		Tools:         tools,
-		MCPServers:    cloneStrings(hostBundle.MCPServers),
+		Name:           firstNonEmpty(cfg.AgentName, "agent"),
+		Model:          cfg.Model,
+		FallbackModels: cloneStrings(cfg.FallbackModels),
+		ModelSettings:  modelSettings(cfg),
+		Tools:          tools,
+		MCPServers:     cloneStrings(hostBundle.MCPServers),
 		InstructionsFn: func(_ *agentsdk.RunContext, a *agentsdk.Agent) string {
 			blocks := []string{
 				cfg.Instructions,
@@ -689,6 +697,7 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 		SubAgentMaxTurns: cfg.SubAgentMaxTurns,
 		Hooks:            hooks,
 		ModelSettings:    runModelSettings(cfg),
+		FallbackModels:   cloneStrings(cfg.FallbackModels),
 		TracingProcessor: tracingProcessor(cfg, features),
 		Trace:            cfg.Trace,
 		ParentSpanID:     cfg.ParentSpanID,
@@ -726,6 +735,7 @@ func ModeOverridesFromSnapshot(spec *sdkmode.TemplateSpec, instructionsOverride 
 		if strings.TrimSpace(spec.ModelRouting.DefaultModel) != "" {
 			out.Model = strings.TrimSpace(spec.ModelRouting.DefaultModel)
 		}
+		out.FallbackModels = cloneStrings(spec.ModelRouting.FallbackModels)
 		if strings.TrimSpace(spec.ModelRouting.ReasoningLevel) != "" {
 			out.Reasoning = strings.TrimSpace(spec.ModelRouting.ReasoningLevel)
 			out.ModelSettings = out.ModelSettings.Merge(agentsdk.ModeRoutingSettings(out.Reasoning, ""))

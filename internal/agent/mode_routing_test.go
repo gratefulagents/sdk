@@ -30,11 +30,13 @@ func TestModeReasoningSettings(t *testing.T) {
 func TestResolveRoleModeRouting(t *testing.T) {
 	routing := &ModeModelRouting{
 		DefaultModel:   "openai/gpt-5.4",
+		FallbackModels: []string{"anthropic/claude-sonnet-4-6"},
 		ReasoningLevel: string(ReasoningMedium),
 		TextVerbosity:  string(TextVerbosityLow),
 		RoleOverrides: map[string]ModeRoleModelRouting{
 			"architect": {
 				Model:          "anthropic/claude-sonnet-4-6",
+				FallbackModels: []string{"copilot/gpt-4.1"},
 				ReasoningLevel: string(ReasoningHigh),
 				TextVerbosity:  string(TextVerbosityHigh),
 			},
@@ -44,6 +46,9 @@ func TestResolveRoleModeRouting(t *testing.T) {
 	architect := ResolveRoleModeRouting("openai/gpt-5.3-codex", "openai", "architect", routing)
 	if architect.Model != "anthropic/claude-sonnet-4-6" {
 		t.Fatalf("architect model = %q, want anthropic/claude-sonnet-4-6", architect.Model)
+	}
+	if len(architect.FallbackModels) != 1 || architect.FallbackModels[0] != "copilot/gpt-4.1" {
+		t.Fatalf("architect fallbacks = %#v", architect.FallbackModels)
 	}
 	if architect.ReasoningLevel != "high" || architect.ModelSettings.ThinkingBudget != 8192 {
 		t.Fatalf("architect reasoning = %q budget=%d", architect.ReasoningLevel, architect.ModelSettings.ThinkingBudget)
@@ -55,6 +60,9 @@ func TestResolveRoleModeRouting(t *testing.T) {
 	planner := ResolveRoleModeRouting("openai/gpt-5.3-codex", "openai", "planner", routing)
 	if planner.Model != "openai/gpt-5.4" {
 		t.Fatalf("planner model = %q, want openai/gpt-5.4", planner.Model)
+	}
+	if len(planner.FallbackModels) != 1 || planner.FallbackModels[0] != "anthropic/claude-sonnet-4-6" {
+		t.Fatalf("planner fallbacks = %#v", planner.FallbackModels)
 	}
 	if planner.ReasoningLevel != "medium" || planner.ModelSettings.ThinkingBudget != 4096 {
 		t.Fatalf("planner reasoning = %q budget=%d", planner.ReasoningLevel, planner.ModelSettings.ThinkingBudget)

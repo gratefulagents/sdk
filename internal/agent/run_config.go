@@ -126,6 +126,7 @@ type RunConfig struct {
 	Hooks            RunHooks      // run-level lifecycle hooks
 	ModelSettings    ModelSettings // override agent's model settings
 	ModelOverride    string        // override agent's model name
+	FallbackModels   []string      // ordered cross-provider fallback models for failed model calls
 	TracingDisabled  bool
 	TracingProcessor TracingProcessor // export spans to external systems
 

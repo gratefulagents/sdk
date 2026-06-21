@@ -110,6 +110,10 @@ type GenerationSpanData struct {
 	Error                        string
 	RetryScheduled               bool
 	RetryAfterMS                 int64
+	FallbackScheduled            bool
+	FallbackFromModel            string
+	FallbackToModel              string
+	FallbackReason               string
 	FailureKind                  string
 	ToolCount                    int32
 	InputItemCount               int32

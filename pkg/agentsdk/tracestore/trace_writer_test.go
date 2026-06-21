@@ -33,6 +33,10 @@ func TestAddSpanDataGenerationUsesCurrentFields(t *testing.T) {
 		LatencyMS:          987,
 		Success:            true,
 		RetryScheduled:     false,
+		FallbackScheduled:  true,
+		FallbackFromModel:  "openai/gpt-5.4",
+		FallbackToModel:    "anthropic/claude-sonnet-4-6",
+		FallbackReason:     "rate_limit",
 		ToolCount:          4,
 		InputItemCount:     2,
 		OutputItemCount:    1,
@@ -54,6 +58,9 @@ func TestAddSpanDataGenerationUsesCurrentFields(t *testing.T) {
 	}
 	if got := entry["model"]; got != "gpt-5.4" {
 		t.Fatalf("model = %v, want gpt-5.4", got)
+	}
+	if got := entry["fallback_to_model"]; got != "anthropic/claude-sonnet-4-6" {
+		t.Fatalf("fallback_to_model = %v", got)
 	}
 	if got := entry["input_tokens"]; got != int64(101) {
 		t.Fatalf("input_tokens = %v, want 101", got)

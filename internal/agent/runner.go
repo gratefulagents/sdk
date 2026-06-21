@@ -322,6 +322,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// so the counter resets on success; using the cumulative llmAttempt here
 	// would exhaust the retry budget after MaxRetries successful turns.
 	var turnRetryAttempt int
+	activeFallbackModels := map[*Agent]string{}
 	var allToolInputResults []ToolGuardrailResult
 	var allToolOutputResults []ToolGuardrailResult
 	// pendingCompletion implements double-confirm completion: the first final
@@ -406,24 +407,29 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		settings := currentAgent.ModelSettings.Merge(cfg.ModelSettings)
 
 		// Resolve model name.
-		modelName := currentAgent.Model
+		primaryModelName := currentAgent.Model
 		if cfg.ModelOverride != "" {
-			modelName = cfg.ModelOverride
+			primaryModelName = cfg.ModelOverride
 		}
+		requestedModelName := primaryModelName
+		if fallbackModel := strings.TrimSpace(activeFallbackModels[currentAgent]); fallbackModel != "" {
+			requestedModelName = fallbackModel
+		}
+		modelName := requestedModelName
 
 		// Resolve model via provider if available (per-call resolution).
 		activeModel := r.model
 		if r.provider != nil {
-			resolved, resolveErr := r.provider.GetModel(modelName)
+			resolved, resolveErr := r.provider.GetModel(requestedModelName)
 			if resolveErr != nil {
-				return nil, &AgentError{Message: fmt.Sprintf("resolve model %q", modelName), Cause: resolveErr}
+				return nil, &AgentError{Message: fmt.Sprintf("resolve model %q", requestedModelName), Cause: resolveErr}
 			}
 			activeModel = resolved
 			// Strip the provider routing prefix (e.g. "openai/gpt-5.4" →
 			// "gpt-5.4") so the bare model name is sent in API requests.
 			// Model IDs that legitimately contain "/" (e.g. OpenRouter's
 			// "anthropic/claude-...") are preserved.
-			modelName = resolveRequestModelName(r.provider, activeModel, modelName)
+			modelName = resolveRequestModelName(r.provider, activeModel, requestedModelName)
 		}
 		if activeModel == nil {
 			return nil, &AgentError{Message: "no model configured: set agent.Model, cfg.ModelOverride, or use NewRunnerWithProvider"}
@@ -494,7 +500,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnLLMStart(runCtx, currentAgent) })
 
 		llmAttempt++
-		modelIdentity := NormalizeModelIdentity(modelName, activeModel.Provider())
+		modelIdentity := NormalizeModelIdentity(requestedModelName, activeModel.Provider())
 		parentCallID := ParentCallIDFromContext(runCtx.Context())
 		taskID := TaskIDFromContext(runCtx.Context())
 		llmScope := "top_level"
@@ -643,6 +649,30 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					continue
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 					cfg.CompactionFailureReporter("run", reason, before, after)
+				}
+			}
+
+			if r.provider != nil && shouldFallbackModelCall(err, advice) {
+				if fallbackModel, ok := nextFallbackModel(primaryModelName, requestedModelName, effectiveFallbackModels(currentAgent, cfg)); ok {
+					activeFallbackModels[currentAgent] = fallbackModel
+					reason := fallbackReason(advice)
+					if reason == "" {
+						reason = genData.FailureKind
+					}
+					genData.FallbackScheduled = true
+					genData.FallbackFromModel = requestedModelName
+					genData.FallbackToModel = fallbackModel
+					genData.FallbackReason = reason
+					genData.Status = "fallback"
+					genSpan.Data = genData
+					ev := attemptFailureEvent(attemptEvent("fallback"), genData)
+					ev.RetryPlanned = true
+					ev.FallbackPlanned = true
+					ev.FallbackFromModel = requestedModelName
+					ev.FallbackToModel = fallbackModel
+					ev.FallbackReason = reason
+					emitLLMAttemptEvent(cfg.Hooks, ev)
+					continue
 				}
 			}
 
@@ -1177,6 +1207,7 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 		return nil, err
 	}
 	var streamedResp *ModelResponse
+	outputCommitted := false
 	for ev := range stream.Events {
 		select {
 		case <-ctx.Done():
@@ -1185,6 +1216,7 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 		}
 		switch ev.Type {
 		case ModelStreamDelta:
+			outputCommitted = true
 			select {
 			case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}:
 			case <-ctx.Done():
@@ -1194,7 +1226,13 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 			streamedResp = ev.Response
 		case ModelStreamError:
 			if ev.Error != nil {
+				if outputCommitted {
+					return nil, &streamOutputCommittedError{cause: ev.Error}
+				}
 				return nil, ev.Error
+			}
+			if outputCommitted {
+				return nil, &streamOutputCommittedError{cause: fmt.Errorf("model stream failed")}
 			}
 			return nil, fmt.Errorf("model stream failed")
 		}
@@ -1860,6 +1898,10 @@ func attemptFailureEvent(event ContentEvent, data *GenerationSpanData) ContentEv
 	event.AttemptLatencyMs = data.LatencyMS
 	event.FailureKind = data.FailureKind
 	event.Reason = data.FailureKind
+	event.FallbackPlanned = data.FallbackScheduled
+	event.FallbackFromModel = data.FallbackFromModel
+	event.FallbackToModel = data.FallbackToModel
+	event.FallbackReason = data.FallbackReason
 	if data.FailureKind != "" {
 		event.Message = data.FailureKind
 	}

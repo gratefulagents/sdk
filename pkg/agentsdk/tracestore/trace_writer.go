@@ -398,6 +398,10 @@ func addGenerationSpanData(entry map[string]any, d agent.GenerationSpanData) {
 	entry["success"] = d.Success
 	entry["retry_scheduled"] = d.RetryScheduled
 	entry["retry_after_ms"] = d.RetryAfterMS
+	entry["fallback_scheduled"] = d.FallbackScheduled
+	entry["fallback_from_model"] = d.FallbackFromModel
+	entry["fallback_to_model"] = d.FallbackToModel
+	entry["fallback_reason"] = d.FallbackReason
 	entry["failure_kind"] = d.FailureKind
 	entry["tool_count"] = d.ToolCount
 	entry["input_item_count"] = d.InputItemCount

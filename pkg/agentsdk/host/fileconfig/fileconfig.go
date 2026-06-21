@@ -477,6 +477,7 @@ func (t transitionSpec) toSDK() sdkmode.Transition {
 
 type modelRoutingSpec struct {
 	DefaultModel   string                          `yaml:"defaultModel"`
+	FallbackModels []string                        `yaml:"fallbackModels"`
 	ReasoningLevel string                          `yaml:"reasoningLevel"`
 	TextVerbosity  string                          `yaml:"textVerbosity"`
 	RoleOverrides  map[string]roleModelRoutingSpec `yaml:"roleOverrides"`
@@ -485,6 +486,7 @@ type modelRoutingSpec struct {
 func (r modelRoutingSpec) toSDK() *sdkmode.ModelRouting {
 	out := &sdkmode.ModelRouting{
 		DefaultModel:   strings.TrimSpace(r.DefaultModel),
+		FallbackModels: cloneTrimmedStrings(r.FallbackModels),
 		ReasoningLevel: strings.TrimSpace(r.ReasoningLevel),
 		TextVerbosity:  strings.TrimSpace(r.TextVerbosity),
 		RoleOverrides:  map[string]sdkmode.RoleModelRouting{},
@@ -499,17 +501,30 @@ func (r modelRoutingSpec) toSDK() *sdkmode.ModelRouting {
 }
 
 type roleModelRoutingSpec struct {
-	Model          string `yaml:"model"`
-	ReasoningLevel string `yaml:"reasoningLevel"`
-	TextVerbosity  string `yaml:"textVerbosity"`
+	Model          string   `yaml:"model"`
+	FallbackModels []string `yaml:"fallbackModels"`
+	ReasoningLevel string   `yaml:"reasoningLevel"`
+	TextVerbosity  string   `yaml:"textVerbosity"`
 }
 
 func (r roleModelRoutingSpec) toSDK() sdkmode.RoleModelRouting {
 	return sdkmode.RoleModelRouting{
 		Model:          strings.TrimSpace(r.Model),
+		FallbackModels: cloneTrimmedStrings(r.FallbackModels),
 		ReasoningLevel: strings.TrimSpace(r.ReasoningLevel),
 		TextVerbosity:  strings.TrimSpace(r.TextVerbosity),
 	}
+}
+
+func cloneTrimmedStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 type constraintsSpec struct {

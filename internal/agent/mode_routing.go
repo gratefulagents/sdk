@@ -28,6 +28,7 @@ const (
 // ModeModelRouting contains SDK-native model routing knobs.
 type ModeModelRouting struct {
 	DefaultModel   string
+	FallbackModels []string
 	ReasoningLevel string
 	TextVerbosity  string
 	RoleOverrides  map[string]ModeRoleModelRouting
@@ -36,6 +37,7 @@ type ModeModelRouting struct {
 // ModeRoleModelRouting contains routing overrides for one specialist role.
 type ModeRoleModelRouting struct {
 	Model          string
+	FallbackModels []string
 	ReasoningLevel string
 	TextVerbosity  string
 }
@@ -44,6 +46,7 @@ type ModeRoleModelRouting struct {
 // after applying mode defaults, role overrides, and reasoning settings.
 type ModeRoutingResolution struct {
 	Model          string
+	FallbackModels []string
 	ReasoningLevel string
 	TextVerbosity  string
 	ModelSettings  ModelSettings
@@ -53,6 +56,7 @@ type ModeRoutingResolution struct {
 // agent from the mode's default routing.
 func ResolveModeRouting(baseModel, provider string, routing *ModeModelRouting) ModeRoutingResolution {
 	model := strings.TrimSpace(baseModel)
+	var fallbacks []string
 	reasoning := ModeReasoningLevel("")
 	verbosity := ModeTextVerbosity("")
 
@@ -60,6 +64,7 @@ func ResolveModeRouting(baseModel, provider string, routing *ModeModelRouting) M
 		if override := strings.TrimSpace(routing.DefaultModel); override != "" {
 			model = override
 		}
+		fallbacks = cloneNonEmptyStrings(routing.FallbackModels)
 		reasoning = normalizeModeReasoningLevel(routing.ReasoningLevel)
 		verbosity = normalizeModeTextVerbosity(routing.TextVerbosity)
 	}
@@ -67,9 +72,11 @@ func ResolveModeRouting(baseModel, provider string, routing *ModeModelRouting) M
 	if resolved := ResolveModelForProvider(model, provider); resolved != "" {
 		model = resolved
 	}
+	fallbacks = resolveFallbackModelsForProvider(fallbacks, provider)
 
 	return ModeRoutingResolution{
 		Model:          model,
+		FallbackModels: fallbacks,
 		ReasoningLevel: string(reasoning),
 		TextVerbosity:  string(verbosity),
 		ModelSettings:  ModeRoutingSettings(reasoning, verbosity),
@@ -94,6 +101,9 @@ func ResolveRoleModeRouting(
 					resolved.Model = mapped
 				}
 			}
+			if len(override.FallbackModels) > 0 {
+				resolved.FallbackModels = resolveFallbackModelsForProvider(cloneNonEmptyStrings(override.FallbackModels), provider)
+			}
 			if level := normalizeModeReasoningLevel(override.ReasoningLevel); level != "" {
 				resolved.ReasoningLevel = string(level)
 				resolved.ModelSettings = resolved.ModelSettings.Merge(ModeReasoningSettings(level))
@@ -106,6 +116,24 @@ func ResolveRoleModeRouting(
 	}
 
 	return resolved
+}
+
+func resolveFallbackModelsForProvider(models []string, provider string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if mapped := ResolveModelForProvider(model, provider); mapped != "" {
+			model = mapped
+		}
+		out = append(out, model)
+	}
+	return out
 }
 
 // ModeReasoningSettings converts a reasoning level into concrete provider

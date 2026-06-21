@@ -84,8 +84,9 @@ func TestBuildSpecialistToolsFromCatalogAppliesAccessAndRouting(t *testing.T) {
 		BaseModel: "base-model",
 		Provider:  "openai",
 		ModeSnapshot: &sdkmode.TemplateSpec{ModelRouting: &sdkmode.ModelRouting{
+			FallbackModels: []string{"anthropic/claude-sonnet-4-6"},
 			RoleOverrides: map[string]sdkmode.RoleModelRouting{
-				"researcher": {Model: "role-model"},
+				"researcher": {Model: "role-model", FallbackModels: []string{"copilot/gpt-4.1"}},
 			},
 		}},
 	})
@@ -96,6 +97,9 @@ func TestBuildSpecialistToolsFromCatalogAppliesAccessAndRouting(t *testing.T) {
 	}
 	if agent.Model != "role-model" {
 		t.Fatalf("agent.Model = %q, want role-model", agent.Model)
+	}
+	if len(agent.FallbackModels) != 1 || agent.FallbackModels[0] != "copilot/gpt-4.1" {
+		t.Fatalf("agent.FallbackModels = %#v", agent.FallbackModels)
 	}
 	if len(agent.Tools) != 1 || agent.Tools[0].Name() != "Read" {
 		t.Fatalf("agent.Tools = %#v, want only read tool", agent.Tools)

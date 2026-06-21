@@ -18,6 +18,7 @@ type Agent struct {
 	Instructions       string                                     // static instructions
 	InstructionsFn     func(ctx *RunContext, agent *Agent) string // dynamic instructions (used if set)
 	Model              string                                     // model name, resolved to Model impl at runtime
+	FallbackModels     []string                                   // ordered cross-provider fallback models for failed model calls
 	ModelSettings      ModelSettings
 	Tools              []Tool
 	MCPServers         []string   // host-provided MCP server names for prompt context

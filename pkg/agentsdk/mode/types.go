@@ -77,6 +77,7 @@ type Constraints struct {
 
 type ModelRouting struct {
 	DefaultModel   string
+	FallbackModels []string
 	ReasoningLevel string
 	TextVerbosity  string
 	RoleOverrides  map[string]RoleModelRouting
@@ -84,6 +85,7 @@ type ModelRouting struct {
 
 type RoleModelRouting struct {
 	Model          string
+	FallbackModels []string
 	ReasoningLevel string
 	TextVerbosity  string
 }

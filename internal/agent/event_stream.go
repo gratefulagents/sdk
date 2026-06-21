@@ -59,6 +59,10 @@ type ContentEvent struct {
 	AttemptLatencyMs    int64  `json:"attempt_latency_ms,omitempty"`
 	RetryPlanned        bool   `json:"retry_planned,omitempty"`
 	RetryAfterMs        int64  `json:"retry_after_ms,omitempty"`
+	FallbackPlanned     bool   `json:"fallback_planned,omitempty"`
+	FallbackFromModel   string `json:"fallback_from_model,omitempty"`
+	FallbackToModel     string `json:"fallback_to_model,omitempty"`
+	FallbackReason      string `json:"fallback_reason,omitempty"`
 	FailureKind         string `json:"failure_kind,omitempty"`
 
 	// Subagent status

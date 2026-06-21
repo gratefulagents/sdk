@@ -261,6 +261,13 @@ func (e *ResponseFailedError) NonRetryableReason() string {
 	if e == nil || e.Retryable() {
 		return ""
 	}
+	return e.Reason()
+}
+
+func (e *ResponseFailedError) Reason() string {
+	if e == nil {
+		return ""
+	}
 	return firstNonEmpty(e.Code, e.IncompleteReason, e.Status)
 }
 

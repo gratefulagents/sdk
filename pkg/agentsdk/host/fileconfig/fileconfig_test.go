@@ -31,11 +31,15 @@ spec:
   autonomous: false
   modelRouting:
     defaultModel: openai/gpt-5.5
+    fallbackModels:
+      - anthropic/claude-sonnet-4-6
     reasoningLevel: xhigh
     textVerbosity: low
     roleOverrides:
       planner:
         model: openai/gpt-5.4
+        fallbackModels:
+          - copilot/gpt-4.1
         reasoningLevel: high
   phases:
     - id: scoping
@@ -86,6 +90,12 @@ Plan carefully.
 	}
 	if snapshot == nil || snapshot.ModelRouting == nil || snapshot.ModelRouting.RoleOverrides["planner"].ReasoningLevel != "high" {
 		t.Fatalf("snapshot routing = %+v", snapshot)
+	}
+	if len(snapshot.ModelRouting.FallbackModels) != 1 || snapshot.ModelRouting.FallbackModels[0] != "anthropic/claude-sonnet-4-6" {
+		t.Fatalf("snapshot default fallbacks = %#v", snapshot.ModelRouting.FallbackModels)
+	}
+	if got := snapshot.ModelRouting.RoleOverrides["planner"].FallbackModels; len(got) != 1 || got[0] != "copilot/gpt-4.1" {
+		t.Fatalf("planner fallbacks = %#v", got)
 	}
 	if snapshot.Constraints == nil || snapshot.Constraints.MaxTurns != 120 || snapshot.ResetTo == nil || snapshot.ResetTo.Name != "chat" {
 		t.Fatalf("snapshot constraints/reset = %+v", snapshot)

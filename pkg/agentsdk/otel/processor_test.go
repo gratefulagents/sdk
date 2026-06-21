@@ -25,13 +25,17 @@ func TestMapSpanData_Generation(t *testing.T) {
 		CostUSD:           0.0123,
 		CostKnown:         true,
 		Success:           true,
+		FallbackScheduled: true,
+		FallbackFromModel: "openai/gpt-4",
+		FallbackToModel:   "anthropic/claude-sonnet-4-6",
+		FallbackReason:    "rate_limit",
 	})
 	name, attrs := mapSpanData(s)
 	if name != "llm.generation" {
 		t.Errorf("expected llm.generation, got %s", name)
 	}
-	if len(attrs) != 30 {
-		t.Errorf("expected 30 attrs, got %d", len(attrs))
+	if len(attrs) != 34 {
+		t.Errorf("expected 34 attrs, got %d", len(attrs))
 	}
 }
 

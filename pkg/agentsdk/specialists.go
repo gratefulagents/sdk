@@ -9,11 +9,12 @@ import (
 
 // RoleSpec is the SDK-native shape for a specialist role.
 type RoleSpec struct {
-	Name          string
-	Description   string
-	Instructions  string
-	ToolAccess    string
-	ModelOverride string
+	Name           string
+	Description    string
+	Instructions   string
+	ToolAccess     string
+	ModelOverride  string
+	FallbackModels []string
 }
 
 type RoleCatalog []RoleSpec
@@ -24,6 +25,7 @@ type SpecialistBuildOptions struct {
 	Runner            *Runner
 	Tools             []Tool
 	BaseModel         string
+	FallbackModels    []string
 	Provider          string
 	BaseModelSettings ModelSettings
 	ModeSnapshot      *sdkmode.TemplateSpec
@@ -133,6 +135,7 @@ func ModeRoutingFromTemplateSpec(spec *sdkmode.TemplateSpec) *ModeModelRouting {
 	}
 	out := &ModeModelRouting{
 		DefaultModel:   spec.ModelRouting.DefaultModel,
+		FallbackModels: append([]string(nil), spec.ModelRouting.FallbackModels...),
 		ReasoningLevel: spec.ModelRouting.ReasoningLevel,
 		TextVerbosity:  spec.ModelRouting.TextVerbosity,
 	}
@@ -141,6 +144,7 @@ func ModeRoutingFromTemplateSpec(spec *sdkmode.TemplateSpec) *ModeModelRouting {
 		for name, override := range spec.ModelRouting.RoleOverrides {
 			out.RoleOverrides[name] = ModeRoleModelRouting{
 				Model:          override.Model,
+				FallbackModels: append([]string(nil), override.FallbackModels...),
 				ReasoningLevel: override.ReasoningLevel,
 				TextVerbosity:  override.TextVerbosity,
 			}
@@ -244,6 +248,7 @@ func BuildSpecialistsFromCatalog(catalog RoleCatalog) []*Agent {
 			Name:               role.Name,
 			Instructions:       role.Instructions,
 			Model:              role.ModelOverride,
+			FallbackModels:     append([]string(nil), role.FallbackModels...),
 			HandoffDescription: role.Description,
 		})
 	}
@@ -269,14 +274,21 @@ func BuildSpecialistToolsFromCatalog(catalog RoleCatalog, opts SpecialistBuildOp
 		seen[name] = true
 
 		model := opts.BaseModel
+		fallbackModels := append([]string(nil), opts.FallbackModels...)
 		settings := opts.BaseModelSettings
 		if strings.TrimSpace(role.ModelOverride) != "" {
 			model = strings.TrimSpace(role.ModelOverride)
+		}
+		if len(role.FallbackModels) > 0 {
+			fallbackModels = append([]string(nil), role.FallbackModels...)
 		}
 		if routing != nil {
 			resolved := ResolveRoleModeRouting(model, opts.Provider, name, routing)
 			if strings.TrimSpace(resolved.Model) != "" {
 				model = resolved.Model
+			}
+			if len(resolved.FallbackModels) > 0 {
+				fallbackModels = append([]string(nil), resolved.FallbackModels...)
 			}
 			settings = settings.Merge(resolved.ModelSettings)
 		}
@@ -287,6 +299,7 @@ func BuildSpecialistToolsFromCatalog(catalog RoleCatalog, opts SpecialistBuildOp
 			Name:               name,
 			Instructions:       role.Instructions,
 			Model:              model,
+			FallbackModels:     fallbackModels,
 			ModelSettings:      settings,
 			Tools:              filteredTools,
 			HandoffDescription: role.Description,

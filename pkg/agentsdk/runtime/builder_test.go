@@ -660,6 +660,7 @@ func TestModeOverridesFromSnapshot(t *testing.T) {
 		Instructions: "snapshot instructions",
 		ModelRouting: &sdkmode.ModelRouting{
 			DefaultModel:   "gpt-special",
+			FallbackModels: []string{"anthropic/claude-sonnet-4-6"},
 			ReasoningLevel: "high",
 			TextVerbosity:  "low",
 		},
@@ -672,6 +673,9 @@ func TestModeOverridesFromSnapshot(t *testing.T) {
 
 	if overrides.Model != "gpt-special" {
 		t.Fatalf("Model = %q", overrides.Model)
+	}
+	if len(overrides.FallbackModels) != 1 || overrides.FallbackModels[0] != "anthropic/claude-sonnet-4-6" {
+		t.Fatalf("FallbackModels = %#v", overrides.FallbackModels)
 	}
 	if overrides.Reasoning != "high" || overrides.ModelSettings.ReasoningEffort != "high" || overrides.ModelSettings.TextVerbosity != "low" {
 		t.Fatalf("model settings = %+v reasoning=%q", overrides.ModelSettings, overrides.Reasoning)
