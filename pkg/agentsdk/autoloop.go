@@ -1,7 +1,10 @@
 package agentsdk
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 )
 
@@ -21,6 +24,7 @@ const (
 type AutoTracker struct {
 	consecutiveNoToolTurns int
 	recentToolCalls        []string
+	recentToolSignatures   []string
 	recentErrors           []string
 	toolCallCount          int
 }
@@ -37,10 +41,12 @@ func (t *AutoTracker) Update(newItems []RunItem) {
 		return
 	}
 	var turnToolCalls []string
+	var turnToolSignatures []string
 	var turnErrors []string
 	for _, item := range newItems {
 		if item.Type == RunItemToolCall && item.ToolCall != nil {
 			turnToolCalls = append(turnToolCalls, item.ToolCall.Name)
+			turnToolSignatures = append(turnToolSignatures, toolCallSignature(item.ToolCall.Name, item.ToolCall.Input))
 		}
 		if item.Type == RunItemToolOutput && item.ToolOutput != nil && item.ToolOutput.IsError {
 			msg := item.ToolOutput.Content
@@ -58,10 +64,12 @@ func (t *AutoTracker) Update(newItems []RunItem) {
 	}
 	t.toolCallCount += len(turnToolCalls)
 
-	for _, call := range turnToolCalls {
+	for i, call := range turnToolCalls {
 		t.recentToolCalls = append(t.recentToolCalls, call)
+		t.recentToolSignatures = append(t.recentToolSignatures, turnToolSignatures[i])
 		if len(t.recentToolCalls) > autoTrackerMaxRecentTools {
 			t.recentToolCalls = t.recentToolCalls[1:]
+			t.recentToolSignatures = t.recentToolSignatures[1:]
 		}
 	}
 	for _, errText := range turnErrors {
@@ -102,30 +110,59 @@ func (t *AutoTracker) consecutiveSameError() (int, string) {
 	return count, last
 }
 
+// detectRepetitiveCycle reports whether the recent tool calls form a repeating
+// cycle of *identical* calls. Calls are compared on an argument-aware signature
+// (tool name + input), so ordinary exploration - reading several different
+// files, or alternating grep/read across distinct targets - is not mistaken for
+// a loop. The returned slice contains the tool names of the detected cycle for
+// human-readable reporting.
 func (t *AutoTracker) detectRepetitiveCycle() (bool, []string) {
 	if t == nil {
 		return false, nil
 	}
-	calls := t.recentToolCalls
+	sigs := t.recentToolSignatures
+	names := t.recentToolCalls
+	if len(sigs) != len(names) {
+		return false, nil
+	}
 	for cycleLen := 2; cycleLen <= 3; cycleLen++ {
 		needed := cycleLen * 2
-		if len(calls) < needed {
+		if len(sigs) < needed {
 			continue
 		}
-		tail := calls[len(calls)-needed:]
-		cycle := tail[:cycleLen]
+		tailSigs := sigs[len(sigs)-needed:]
+		tailNames := names[len(names)-needed:]
+		cycle := tailSigs[:cycleLen]
 		match := true
 		for i := 0; i < needed; i++ {
-			if tail[i] != cycle[i%cycleLen] {
+			if tailSigs[i] != cycle[i%cycleLen] {
 				match = false
 				break
 			}
 		}
 		if match {
-			return true, cycle
+			return true, tailNames[:cycleLen]
 		}
 	}
 	return false, nil
+}
+
+// toolCallSignature returns a compact, argument-aware identity for a tool call
+// so that two calls are considered "the same" only when both the tool name and
+// the (whitespace-normalized) input match.
+func toolCallSignature(name string, input json.RawMessage) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte{0})
+	if len(input) > 0 {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, input); err == nil {
+			_, _ = h.Write(buf.Bytes())
+		} else {
+			_, _ = h.Write(input)
+		}
+	}
+	return fmt.Sprintf("%s:%x", name, h.Sum64())
 }
 
 // CheckCircuitBreakers reports hard-stop autonomous loop conditions.
