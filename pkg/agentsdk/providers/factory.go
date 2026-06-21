@@ -199,9 +199,10 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		return openAIProvider
 	}
 	anthropicProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-		BaseURL:        copilotAnthropicBaseURL(baseURL),
-		BearerToken:    strings.TrimSpace(apiKey),
-		RequestHeaders: anthropicHeaders,
+		BaseURL:          copilotAnthropicBaseURL(baseURL),
+		BearerToken:      strings.TrimSpace(apiKey),
+		RequestHeaders:   anthropicHeaders,
+		AdaptiveThinking: true,
 	})
 	return &copilotProvider{
 		openai:    openAIProvider,

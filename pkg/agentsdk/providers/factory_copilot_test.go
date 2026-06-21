@@ -109,6 +109,52 @@ func TestCopilotRoutesClaudeToAnthropicMessages(t *testing.T) {
 	}
 }
 
+// TestCopilotClaudeUsesAdaptiveThinking verifies the Copilot Claude path sends
+// thinking.type=adaptive + output_config.effort (mapped from reasoning effort)
+// instead of thinking.type=enabled, which Copilot's /v1/messages shim rejects.
+func TestCopilotClaudeUsesAdaptiveThinking(t *testing.T) {
+	var body struct {
+		Thinking     map[string]any `json:"thinking"`
+		OutputConfig map[string]any `json:"output_config"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4.8","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:         DefaultProviderCopilot,
+		Model:            "claude-opus-4.8",
+		ProviderAPIKeys:  map[string]string{DefaultProviderCopilot: "copilot-token"},
+		ProviderBaseURLs: map[string]string{DefaultProviderCopilot: srv.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("claude-opus-4.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Model:    "claude-opus-4.8",
+		Settings: agentsdk.ModelSettings{ThinkingBudget: 8000, ReasoningEffort: "xhigh"},
+		Input:    []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if got, _ := body.Thinking["type"].(string); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive (enabled is rejected by Copilot)", got)
+	}
+	if _, hasBudget := body.Thinking["budget_tokens"]; hasBudget {
+		t.Fatalf("thinking must not carry budget_tokens on the Copilot adaptive path: %v", body.Thinking)
+	}
+	if got, _ := body.OutputConfig["effort"].(string); got != "xhigh" {
+		t.Fatalf("output_config.effort = %q, want xhigh (mapped from reasoning effort)", got)
+	}
+}
+
 // TestCopilotRoutesNonClaudeToChatCompletions verifies non-Claude models still
 // use the OpenAI chat-completions path.
 func TestCopilotRoutesNonClaudeToChatCompletions(t *testing.T) {

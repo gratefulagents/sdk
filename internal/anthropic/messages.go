@@ -23,6 +23,12 @@ type CreateMessageRequest struct {
 	Betas         []string         `json:"-"` // Converted to SDK beta headers
 	OutputSchema  *OutputSchema    `json:"-"`
 
+	// OutputEffort maps to the Messages API output_config.effort field
+	// ("low", "medium", "high", "xhigh", "max"). Used with adaptive thinking on
+	// gateways (e.g. GitHub Copilot's /v1/messages shim) that control reasoning
+	// via effort rather than a fixed token budget. Empty leaves it unset.
+	OutputEffort string `json:"-"`
+
 	// OpenRouter chat-completions shim only: reasoning effort label
 	// ("none", "minimal", "low", "medium", "high", "xhigh"). "none" disables
 	// reasoning entirely. Empty leaves the provider/model default. Carried into
@@ -48,9 +54,19 @@ type OutputSchema struct {
 
 // ThinkingConfig enables extended thinking.
 type ThinkingConfig struct {
-	Type         string `json:"type"` // "enabled"
-	BudgetTokens int    `json:"budget_tokens"`
+	Type         string `json:"type"`                    // "enabled" | "adaptive" | "disabled"
+	BudgetTokens int    `json:"budget_tokens,omitempty"` // for "enabled"
+	Display      string `json:"display,omitempty"`       // for "adaptive": "summarized" | "omitted"
 }
+
+// OutputEffort values map to the Messages API output_config.effort field.
+const (
+	OutputEffortLow    = "low"
+	OutputEffortMedium = "medium"
+	OutputEffortHigh   = "high"
+	OutputEffortXHigh  = "xhigh"
+	OutputEffortMax    = "max"
+)
 
 // ToolChoice controls tool selection behavior.
 type ToolChoice struct {
@@ -116,11 +132,31 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 	}
 
 	// Convert thinking config.
-	if r.Thinking != nil && r.Thinking.Type == "enabled" {
-		params.Thinking = sdk.BetaThinkingConfigParamUnion{
-			OfEnabled: &sdk.BetaThinkingConfigEnabledParam{
-				BudgetTokens: int64(r.Thinking.BudgetTokens),
-			},
+	if r.Thinking != nil {
+		switch r.Thinking.Type {
+		case "enabled":
+			params.Thinking = sdk.BetaThinkingConfigParamUnion{
+				OfEnabled: &sdk.BetaThinkingConfigEnabledParam{
+					BudgetTokens: int64(r.Thinking.BudgetTokens),
+				},
+			}
+		case "adaptive":
+			adaptive := &sdk.BetaThinkingConfigAdaptiveParam{}
+			if r.Thinking.Display != "" {
+				adaptive.Display = sdk.BetaThinkingConfigAdaptiveDisplay(r.Thinking.Display)
+			}
+			params.Thinking = sdk.BetaThinkingConfigParamUnion{OfAdaptive: adaptive}
+		case "disabled":
+			params.Thinking = sdk.BetaThinkingConfigParamUnion{
+				OfDisabled: &sdk.BetaThinkingConfigDisabledParam{},
+			}
+		}
+	}
+
+	// Convert output effort (output_config.effort), used with adaptive thinking.
+	if r.OutputEffort != "" {
+		params.OutputConfig = sdk.BetaOutputConfigParam{
+			Effort: sdk.BetaOutputConfigEffort(r.OutputEffort),
 		}
 	}
 

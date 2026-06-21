@@ -13,11 +13,12 @@ import (
 
 // AnthropicProvider implements ModelProvider for the Anthropic API.
 type AnthropicProvider struct {
-	apiKey         string
-	baseURL        string
-	authMode       string
-	bearerToken    string
-	requestHeaders func(context.Context) (map[string]string, error)
+	apiKey           string
+	baseURL          string
+	authMode         string
+	bearerToken      string
+	requestHeaders   func(context.Context) (map[string]string, error)
+	adaptiveThinking bool
 }
 
 type ProviderConfig struct {
@@ -31,6 +32,11 @@ type ProviderConfig struct {
 	// RequestHeaders, when set, supplies per-request headers (gateway auth and
 	// integration headers) via SDK middleware.
 	RequestHeaders func(context.Context) (map[string]string, error)
+	// AdaptiveThinking makes the provider emit adaptive thinking
+	// (thinking.type=adaptive + output_config.effort) instead of a fixed
+	// thinking-budget. Required by GitHub Copilot's /v1/messages shim for newer
+	// Claude models, which reject thinking.type=enabled.
+	AdaptiveThinking bool
 }
 
 // NewAnthropicProvider creates a provider that must be configured with an API
@@ -41,11 +47,12 @@ func NewAnthropicProvider() *AnthropicProvider {
 
 func NewAnthropicProviderWithConfig(cfg ProviderConfig) *AnthropicProvider {
 	return &AnthropicProvider{
-		apiKey:         strings.TrimSpace(cfg.APIKey),
-		baseURL:        strings.TrimSpace(cfg.BaseURL),
-		authMode:       strings.ToLower(strings.TrimSpace(cfg.AuthMode)),
-		bearerToken:    strings.TrimSpace(cfg.BearerToken),
-		requestHeaders: cfg.RequestHeaders,
+		apiKey:           strings.TrimSpace(cfg.APIKey),
+		baseURL:          strings.TrimSpace(cfg.BaseURL),
+		authMode:         strings.ToLower(strings.TrimSpace(cfg.AuthMode)),
+		bearerToken:      strings.TrimSpace(cfg.BearerToken),
+		requestHeaders:   cfg.RequestHeaders,
+		adaptiveThinking: cfg.AdaptiveThinking,
 	}
 }
 
@@ -62,6 +69,7 @@ func (p *AnthropicProvider) GetModel(name string) (agentsdk.Model, error) {
 		return nil, err
 	}
 	m.model = name
+	m.adaptiveThinking = p.adaptiveThinking
 	return m, nil
 }
 
@@ -69,8 +77,9 @@ func (p *AnthropicProvider) Close() error { return nil }
 
 // AnthropicModel implements Model using the Anthropic API.
 type AnthropicModel struct {
-	client *internalanthropic.Client
-	model  string
+	client           *internalanthropic.Client
+	model            string
+	adaptiveThinking bool
 }
 
 type anthropicModelConfig struct {
@@ -198,7 +207,19 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 		apiReq.MaxTokens = 16384
 	}
 
-	if req.Settings.ThinkingBudget > 0 {
+	if m.adaptiveThinking {
+		// Gateways such as Copilot's /v1/messages shim reject thinking.type=enabled
+		// for newer Claude models and instead control reasoning via adaptive
+		// thinking + output_config.effort. Emit that shape whenever reasoning is
+		// requested (a thinking budget or an explicit effort).
+		if effort := mapReasoningEffortToAnthropic(req.Settings.ReasoningEffort); effort != "" {
+			apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
+			apiReq.OutputEffort = effort
+		} else if req.Settings.ThinkingBudget > 0 {
+			apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
+			apiReq.OutputEffort = string(internalanthropic.OutputEffortMedium)
+		}
+	} else if req.Settings.ThinkingBudget > 0 {
 		apiReq.Thinking = &internalanthropic.ThinkingConfig{
 			Type:         "enabled",
 			BudgetTokens: req.Settings.ThinkingBudget,
@@ -218,6 +239,26 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 	apiReq.Messages = itemsToAnthropicMessages(req.Input)
 
 	return apiReq
+}
+
+// mapReasoningEffortToAnthropic maps a host reasoning-effort label to a Messages
+// API output_config.effort value. Returns "" when no effort is requested
+// (including "none"), so callers can decide whether to fall back to a default.
+func mapReasoningEffortToAnthropic(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low":
+		return internalanthropic.OutputEffortLow
+	case "medium":
+		return internalanthropic.OutputEffortMedium
+	case "high":
+		return internalanthropic.OutputEffortHigh
+	case "xhigh":
+		return internalanthropic.OutputEffortXHigh
+	case "max":
+		return internalanthropic.OutputEffortMax
+	default:
+		return ""
+	}
 }
 
 // itemsToAnthropicMessages converts RunItems to Anthropic message format.
