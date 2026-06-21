@@ -99,8 +99,15 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	sessionID := uuid.New().String()
 	sdkOpts := []option.RequestOption{
 		option.WithMaxRetries(0), // We handle retries ourselves
-		option.WithHeader("x-app", "cli"),
-		option.WithHeader("X-Claude-Code-Session-Id", sessionID),
+	}
+	// x-app / X-Claude-Code-Session-Id are first-party Anthropic (Claude Code)
+	// headers. Anthropic-compatible gateways such as GitHub Copilot don't expect
+	// them, so only send them on the direct Anthropic API (api-key / oauth).
+	if cfg.bearerToken == "" {
+		sdkOpts = append(sdkOpts,
+			option.WithHeader("x-app", "cli"),
+			option.WithHeader("X-Claude-Code-Session-Id", sessionID),
+		)
 	}
 	switch {
 	case cfg.oauth:
@@ -345,7 +352,7 @@ func toRequestError(err error) *RequestError {
 	if errors.As(err, &sdkErr) {
 		reqErr := &RequestError{
 			StatusCode: sdkErr.StatusCode,
-			Body:       string(sdkErr.DumpResponse(false)),
+			Body:       string(sdkErr.DumpResponse(true)),
 		}
 		if sdkErr.Response != nil {
 			reqErr.retryAfter = parseRetryAfterSeconds(sdkErr.Response.Header)

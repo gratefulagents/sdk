@@ -162,16 +162,23 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 	apiKey := apiKeyForProvider(spec, DefaultProviderCopilot)
 	baseURL := firstNonEmpty(baseURLForProvider(spec, DefaultProviderCopilot), defaultCopilotBaseURL)
-	copilotHeaders := func(context.Context) (map[string]string, error) {
+	openAIHeaders := func(context.Context) (map[string]string, error) {
 		token := strings.TrimSpace(apiKey)
 		if token == "" {
 			return nil, fmt.Errorf("Copilot API token is required")
 		}
-		return copilotRequestHeaders(token), nil
+		return copilotRequestHeaders(token, false), nil
+	}
+	anthropicHeaders := func(context.Context) (map[string]string, error) {
+		token := strings.TrimSpace(apiKey)
+		if token == "" {
+			return nil, fmt.Errorf("Copilot API token is required")
+		}
+		return copilotRequestHeaders(token, true), nil
 	}
 	session := sdkopenai.NewCustomAuthSession(sdkopenai.CustomAuthSessionConfig{
 		SDKAPIKey:      "copilot-placeholder",
-		RequestHeaders: copilotHeaders,
+		RequestHeaders: openAIHeaders,
 	})
 	openAIProvider := sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
 		ProviderName: DefaultProviderCopilot,
@@ -181,20 +188,20 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		AuthSession:  session,
 	})
 	// Claude models served through Copilot are routed to Copilot's
-	// Anthropic-compatible /v1/messages endpoint instead of chat-completions.
-	// The OpenAI->Anthropic chat translation drops Claude's native tool_use /
-	// stop_reason semantics (it reports finish_reason="tool_calls" with no tool
-	// calls on plain narration turns), which made the agent loop misbehave. The
-	// native Messages endpoint preserves them. Set
-	// GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT=1 to force the legacy
-	// chat-completions path (escape hatch if the Messages endpoint regresses).
+	// Anthropic-compatible /v1/messages shim instead of chat-completions. The
+	// OpenAI->Anthropic chat translation reports finish_reason="tool_calls"
+	// with no tool calls on plain narration turns, corrupting tool_use /
+	// stop_reason semantics; the Messages shim preserves them. This mirrors
+	// opencode, which routes Copilot Claude models through @ai-sdk/anthropic.
+	// Set GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT=1 to force the legacy
+	// chat-completions path.
 	if copilotClaudeViaChat() {
 		return openAIProvider
 	}
 	anthropicProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
 		BaseURL:        copilotAnthropicBaseURL(baseURL),
 		BearerToken:    strings.TrimSpace(apiKey),
-		RequestHeaders: copilotHeaders,
+		RequestHeaders: anthropicHeaders,
 	})
 	return &copilotProvider{
 		openai:    openAIProvider,
@@ -266,16 +273,36 @@ func copilotAnthropicBaseURL(baseURL string) string {
 	return strings.TrimRight(b, "/")
 }
 
-func copilotRequestHeaders(token string) map[string]string {
-	return map[string]string{
+// Copilot client identity headers, aligned with the values used by opencode and
+// the copilot-api proxy so the gateway treats requests like the VS Code Copilot
+// Chat client.
+const (
+	copilotChatVersion      = "0.26.7"
+	copilotEditorVersion    = "vscode/1.99.3"
+	copilotGitHubAPIVersion = "2026-06-01"
+	// copilotAnthropicBeta is the beta opencode enables for Claude models on
+	// Copilot's /v1/messages shim.
+	copilotAnthropicBeta = "interleaved-thinking-2025-05-14"
+)
+
+// copilotRequestHeaders returns the headers GitHub Copilot expects, matching the
+// set sent by opencode/copilot-api. When forAnthropic is true it adds the
+// anthropic-beta header required by Copilot's /v1/messages shim for Claude.
+func copilotRequestHeaders(token string, forAnthropic bool) map[string]string {
+	headers := map[string]string{
 		"Authorization":          "Bearer " + strings.TrimSpace(token),
 		"Copilot-Integration-Id": "vscode-chat",
-		"Editor-Version":         "gratefulagents-sdk/unknown",
-		"Editor-Plugin-Version":  "gratefulagents-sdk/unknown",
-		"OpenAI-Organization":    "github-copilot",
-		"OpenAI-Intent":          "conversation-panel",
-		"User-Agent":             "GitHubCopilotChat/0.23.0",
+		"Editor-Version":         copilotEditorVersion,
+		"Editor-Plugin-Version":  "copilot-chat/" + copilotChatVersion,
+		"User-Agent":             "GitHubCopilotChat/" + copilotChatVersion,
+		"Openai-Intent":          "conversation-edits",
+		"X-GitHub-Api-Version":   copilotGitHubAPIVersion,
+		"X-Initiator":            "agent",
 	}
+	if forAnthropic {
+		headers["anthropic-beta"] = copilotAnthropicBeta
+	}
+	return headers
 }
 
 func authModeForAnthropicProvider(spec ProviderSpec) string {

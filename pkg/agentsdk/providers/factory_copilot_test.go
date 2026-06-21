@@ -95,6 +95,15 @@ func TestCopilotRoutesClaudeToAnthropicMessages(t *testing.T) {
 	if got := gotHeaders.Get("Copilot-Integration-Id"); got != "vscode-chat" {
 		t.Fatalf("Copilot-Integration-Id = %q, want vscode-chat", got)
 	}
+	if got := gotHeaders.Get("anthropic-beta"); got != copilotAnthropicBeta {
+		t.Fatalf("anthropic-beta = %q, want %q (interleaved-thinking, per opencode)", got, copilotAnthropicBeta)
+	}
+	if got := gotHeaders.Get("X-GitHub-Api-Version"); got != copilotGitHubAPIVersion {
+		t.Fatalf("X-GitHub-Api-Version = %q, want %q", got, copilotGitHubAPIVersion)
+	}
+	if got := gotHeaders.Get("X-Initiator"); got != "agent" {
+		t.Fatalf("X-Initiator = %q, want agent", got)
+	}
 	if gotModel != "claude-opus-4.8" {
 		t.Fatalf("model = %q, want claude-opus-4.8 (no name mangling)", gotModel)
 	}
