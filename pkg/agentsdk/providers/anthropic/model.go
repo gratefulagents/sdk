@@ -13,15 +13,24 @@ import (
 
 // AnthropicProvider implements ModelProvider for the Anthropic API.
 type AnthropicProvider struct {
-	apiKey   string
-	baseURL  string
-	authMode string
+	apiKey         string
+	baseURL        string
+	authMode       string
+	bearerToken    string
+	requestHeaders func(context.Context) (map[string]string, error)
 }
 
 type ProviderConfig struct {
 	APIKey   string
 	BaseURL  string
 	AuthMode string
+	// BearerToken authenticates with "Authorization: Bearer <token>" without
+	// Anthropic's x-api-key / oauth-beta headers. Used for Anthropic-compatible
+	// gateways such as GitHub Copilot's /v1/messages endpoint.
+	BearerToken string
+	// RequestHeaders, when set, supplies per-request headers (gateway auth and
+	// integration headers) via SDK middleware.
+	RequestHeaders func(context.Context) (map[string]string, error)
 }
 
 // NewAnthropicProvider creates a provider that must be configured with an API
@@ -32,15 +41,23 @@ func NewAnthropicProvider() *AnthropicProvider {
 
 func NewAnthropicProviderWithConfig(cfg ProviderConfig) *AnthropicProvider {
 	return &AnthropicProvider{
-		apiKey:   strings.TrimSpace(cfg.APIKey),
-		baseURL:  strings.TrimSpace(cfg.BaseURL),
-		authMode: strings.ToLower(strings.TrimSpace(cfg.AuthMode)),
+		apiKey:         strings.TrimSpace(cfg.APIKey),
+		baseURL:        strings.TrimSpace(cfg.BaseURL),
+		authMode:       strings.ToLower(strings.TrimSpace(cfg.AuthMode)),
+		bearerToken:    strings.TrimSpace(cfg.BearerToken),
+		requestHeaders: cfg.RequestHeaders,
 	}
 }
 
 func (p *AnthropicProvider) GetModel(name string) (agentsdk.Model, error) {
 	name = agentsdk.ResolveModelForProvider(name, "anthropic")
-	m, err := newAnthropicModel(p.apiKey, p.baseURL, p.authMode)
+	m, err := newAnthropicModel(anthropicModelConfig{
+		apiKey:         p.apiKey,
+		baseURL:        p.baseURL,
+		authMode:       p.authMode,
+		bearerToken:    p.bearerToken,
+		requestHeaders: p.requestHeaders,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -56,19 +73,38 @@ type AnthropicModel struct {
 	model  string
 }
 
-func newAnthropicModel(apiKey, baseURL, authMode string) (*AnthropicModel, error) {
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
+type anthropicModelConfig struct {
+	apiKey         string
+	baseURL        string
+	authMode       string
+	bearerToken    string
+	requestHeaders func(context.Context) (map[string]string, error)
+}
+
+func newAnthropicModel(cfg anthropicModelConfig) (*AnthropicModel, error) {
+	apiKey := strings.TrimSpace(cfg.apiKey)
+	bearer := strings.TrimSpace(cfg.bearerToken)
+	credential := apiKey
+	if credential == "" {
+		credential = bearer
+	}
+	if credential == "" {
 		return nil, &agentsdk.AgentError{Message: "Anthropic credential is required"}
 	}
 	var opts []internalanthropic.Option
-	if baseURL != "" {
-		opts = append(opts, internalanthropic.WithBaseURL(baseURL))
+	if cfg.baseURL != "" {
+		opts = append(opts, internalanthropic.WithBaseURL(cfg.baseURL))
 	}
-	if strings.EqualFold(authMode, "oauth") {
-		opts = append(opts, internalanthropic.WithOAuthToken(apiKey))
+	switch {
+	case strings.EqualFold(cfg.authMode, "oauth"):
+		opts = append(opts, internalanthropic.WithOAuthToken(credential))
+	case bearer != "":
+		opts = append(opts, internalanthropic.WithBearerToken(bearer))
 	}
-	client := internalanthropic.NewClient(apiKey, opts...)
+	if cfg.requestHeaders != nil {
+		opts = append(opts, internalanthropic.WithRequestHeaderProvider(cfg.requestHeaders))
+	}
+	client := internalanthropic.NewClient(credential, opts...)
 	return &AnthropicModel{client: client}, nil
 }
 
@@ -308,8 +344,7 @@ func (m *AnthropicModel) convertResponse(resp *internalanthropic.CreateMessageRe
 			CacheReadTokens:   resp.Usage.CacheReadInputTokens,
 			CacheCreateTokens: resp.Usage.CacheCreationInputTokens,
 		},
-		Raw:        resp,
-		StopReason: string(resp.StopReason),
+		Raw: resp,
 	}
 }
 

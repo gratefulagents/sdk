@@ -44,6 +44,8 @@ type clientConfig struct {
 	maxConcurrent int
 	authToken     string
 	oauth         bool
+	bearerToken   string
+	headerProvider func(context.Context) (map[string]string, error)
 }
 
 // WithBaseURL overrides the API base URL.
@@ -65,6 +67,27 @@ func WithOAuthToken(token string) Option {
 	}
 }
 
+// WithBearerToken authenticates with an "Authorization: Bearer <token>" header
+// and, unlike WithOAuthToken, does NOT add the Anthropic OAuth beta header.
+// It is intended for Anthropic-compatible gateways such as GitHub Copilot's
+// /v1/messages endpoint, which expect a bearer token but reject Anthropic's
+// first-party x-api-key / oauth headers.
+func WithBearerToken(token string) Option {
+	return func(c *clientConfig) {
+		c.authToken = strings.TrimSpace(token)
+		c.oauth = false
+		c.bearerToken = strings.TrimSpace(token)
+	}
+}
+
+// WithRequestHeaderProvider injects per-request headers via SDK middleware. The
+// provider is invoked for every request, so callers can supply gateway auth and
+// integration headers that may rotate between calls (mirrors the OpenAI custom
+// auth session). Returned headers overwrite any same-named headers.
+func WithRequestHeaderProvider(fn func(context.Context) (map[string]string, error)) Option {
+	return func(c *clientConfig) { c.headerProvider = fn }
+}
+
 // NewClient creates a new Anthropic API client using an API key or OAuth
 // access token.
 func NewClient(apiKey string, opts ...Option) *Client {
@@ -79,13 +102,21 @@ func NewClient(apiKey string, opts ...Option) *Client {
 		option.WithHeader("x-app", "cli"),
 		option.WithHeader("X-Claude-Code-Session-Id", sessionID),
 	}
-	if cfg.oauth {
+	switch {
+	case cfg.oauth:
 		sdkOpts = append(sdkOpts,
 			option.WithAuthToken(cfg.authToken),
 			option.WithHeaderAdd("anthropic-beta", "oauth-2025-04-20"),
 		)
-	} else {
+	case cfg.bearerToken != "":
+		// Bearer auth for Anthropic-compatible gateways (e.g. Copilot). No
+		// x-api-key and no oauth beta header.
+		sdkOpts = append(sdkOpts, option.WithAuthToken(cfg.bearerToken))
+	default:
 		sdkOpts = append(sdkOpts, option.WithAPIKey(apiKey))
+	}
+	if cfg.headerProvider != nil {
+		sdkOpts = append(sdkOpts, option.WithMiddleware(headerProviderMiddleware(cfg.headerProvider)))
 	}
 	if cfg.baseURL != "" {
 		sdkOpts = append(sdkOpts, option.WithBaseURL(cfg.baseURL))
@@ -100,6 +131,21 @@ func NewClient(apiKey string, opts ...Option) *Client {
 		sdk:       sdk.NewClient(sdkOpts...),
 		sessionID: sessionID,
 		sem:       sem,
+	}
+}
+
+// headerProviderMiddleware returns SDK middleware that overwrites request
+// headers with the values supplied by provider on every call.
+func headerProviderMiddleware(provider func(context.Context) (map[string]string, error)) option.Middleware {
+	return func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+		headers, err := provider(req.Context())
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return next(req)
 	}
 }
 

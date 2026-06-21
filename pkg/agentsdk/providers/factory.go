@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
@@ -161,23 +162,108 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 	apiKey := apiKeyForProvider(spec, DefaultProviderCopilot)
 	baseURL := firstNonEmpty(baseURLForProvider(spec, DefaultProviderCopilot), defaultCopilotBaseURL)
+	copilotHeaders := func(context.Context) (map[string]string, error) {
+		token := strings.TrimSpace(apiKey)
+		if token == "" {
+			return nil, fmt.Errorf("Copilot API token is required")
+		}
+		return copilotRequestHeaders(token), nil
+	}
 	session := sdkopenai.NewCustomAuthSession(sdkopenai.CustomAuthSessionConfig{
-		SDKAPIKey: "copilot-placeholder",
-		RequestHeaders: func(context.Context) (map[string]string, error) {
-			token := strings.TrimSpace(apiKey)
-			if token == "" {
-				return nil, fmt.Errorf("Copilot API token is required")
-			}
-			return copilotRequestHeaders(token), nil
-		},
+		SDKAPIKey:      "copilot-placeholder",
+		RequestHeaders: copilotHeaders,
 	})
-	return sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
+	openAIProvider := sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
 		ProviderName: DefaultProviderCopilot,
 		BaseURL:      baseURL,
 		AuthMode:     sdkopenai.AuthModeAPIKey,
 		APIMode:      apiModeForProvider(spec, DefaultProviderCopilot, "chat-completions"),
 		AuthSession:  session,
 	})
+	// Claude models served through Copilot are routed to Copilot's
+	// Anthropic-compatible /v1/messages endpoint instead of chat-completions.
+	// The OpenAI->Anthropic chat translation drops Claude's native tool_use /
+	// stop_reason semantics (it reports finish_reason="tool_calls" with no tool
+	// calls on plain narration turns), which made the agent loop misbehave. The
+	// native Messages endpoint preserves them. Set
+	// GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT=1 to force the legacy
+	// chat-completions path (escape hatch if the Messages endpoint regresses).
+	if copilotClaudeViaChat() {
+		return openAIProvider
+	}
+	anthropicProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
+		BaseURL:        copilotAnthropicBaseURL(baseURL),
+		BearerToken:    strings.TrimSpace(apiKey),
+		RequestHeaders: copilotHeaders,
+	})
+	return &copilotProvider{
+		openai:    openAIProvider,
+		anthropic: anthropicProvider,
+	}
+}
+
+// copilotClaudeViaChat reports whether the legacy chat-completions path should
+// be forced for Claude models on Copilot, via
+// GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT (1/true/yes/on).
+func copilotClaudeViaChat() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// copilotProvider routes Claude models to the Anthropic Messages API and all
+// other models to the OpenAI chat-completions API, both backed by GitHub
+// Copilot.
+type copilotProvider struct {
+	openai    agentsdk.ModelProvider
+	anthropic agentsdk.ModelProvider
+}
+
+func (p *copilotProvider) GetModel(name string) (agentsdk.Model, error) {
+	if isClaudeModelName(name) {
+		return p.anthropic.GetModel(name)
+	}
+	return p.openai.GetModel(name)
+}
+
+func (p *copilotProvider) Close() error {
+	var err error
+	if p.anthropic != nil {
+		if cerr := p.anthropic.Close(); cerr != nil {
+			err = cerr
+		}
+	}
+	if p.openai != nil {
+		if cerr := p.openai.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
+// isClaudeModelName reports whether a model identifier names a Claude model,
+// ignoring any "provider/" routing prefix (e.g. "copilot/claude-sonnet-4.5").
+func isClaudeModelName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.HasPrefix(name, "claude")
+}
+
+// copilotAnthropicBaseURL derives the host root for Copilot's Anthropic
+// Messages endpoint from a base URL that may carry an OpenAI path suffix. The
+// Anthropic SDK appends "/v1/messages" itself, so any trailing "/chat/completions"
+// or "/v1" segment must be stripped.
+func copilotAnthropicBaseURL(baseURL string) string {
+	b := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	b = strings.TrimSuffix(b, "/chat/completions")
+	b = strings.TrimRight(b, "/")
+	b = strings.TrimSuffix(b, "/v1")
+	return strings.TrimRight(b, "/")
 }
 
 func copilotRequestHeaders(token string) map[string]string {

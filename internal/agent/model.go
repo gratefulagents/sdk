@@ -46,12 +46,6 @@ type ModelResponse struct {
 	Raw       any     // provider-specific raw response for debugging
 	CostUSD   float64 // estimated cost in USD (set by runner after model returns)
 	CostKnown bool    // whether cost estimate is considered reliable
-	// StopReason is the provider's normalized stop reason for the call (e.g.
-	// "tool_use", "end_turn", "max_tokens"). It is advisory and may be empty
-	// for providers that do not surface one. The runner uses it to detect
-	// responses that signalled tool calls but arrived without any (dropped in
-	// transit), so it can re-request instead of finalizing on an empty turn.
-	StopReason string
 }
 
 // CompactionResult is the provider-native compacted context window.
