@@ -88,6 +88,13 @@ func TestToAnthropicResponseRejectsEmptyOutput(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no output content") {
 		t.Fatalf("error = %v, want no output content", err)
 	}
+	var failed *ResponseFailedError
+	if !errors.As(err, &failed) {
+		t.Fatalf("error type = %T, want ResponseFailedError", err)
+	}
+	if !failed.Retryable() {
+		t.Fatalf("empty output under a non-terminal status should be retryable: %+v", failed)
+	}
 }
 
 func TestToAnthropicResponsePreservesFailedResponseReason(t *testing.T) {

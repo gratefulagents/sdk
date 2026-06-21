@@ -308,7 +308,8 @@ func (m *AnthropicModel) convertResponse(resp *internalanthropic.CreateMessageRe
 			CacheReadTokens:   resp.Usage.CacheReadInputTokens,
 			CacheCreateTokens: resp.Usage.CacheCreationInputTokens,
 		},
-		Raw: resp,
+		Raw:        resp,
+		StopReason: string(resp.StopReason),
 	}
 }
 

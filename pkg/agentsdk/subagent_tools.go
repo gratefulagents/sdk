@@ -757,33 +757,52 @@ type collectSubagentResultTool struct {
 
 func (t *collectSubagentResultTool) Name() string { return "collect_subagent_result" }
 func (t *collectSubagentResultTool) Description() string {
-	return "Get the final output of a completed async sub-agent task. Returns an error if the task is not yet terminal. Managed parent runs receive final-join results automatically."
+	return "Wait for an async sub-agent task to finish and return its final output. Blocks (without polling or consuming model turns) until the task is terminal, then returns its result. Managed parent runs also receive results automatically at each turn boundary, so prefer continuing other work over calling this; use it only when you must have a specific task's result before proceeding."
 }
 func (t *collectSubagentResultTool) IsReadOnly() bool { return true }
 func (t *collectSubagentResultTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"task_id": {"type": "string", "description": "Task ID to collect results from."}
+			"task_id": {"type": "string", "description": "Task ID to collect results from."},
+			"timeout_ms": {"type": "integer", "description": "Optional max time to wait in milliseconds. Omit or 0 to wait until the task finishes (or the run is cancelled)."}
 		},
 		"required": ["task_id"]
 	}`)
 }
-func (t *collectSubagentResultTool) Execute(_ context.Context, input json.RawMessage, _ string) (ToolResult, error) {
+func (t *collectSubagentResultTool) Execute(ctx context.Context, input json.RawMessage, _ string) (ToolResult, error) {
 	var params struct {
-		TaskID string `json:"task_id"`
+		TaskID    string `json:"task_id"`
+		TimeoutMS int64  `json:"timeout_ms"`
 	}
 	if err := json.Unmarshal(input, &params); err != nil {
 		return ToolResult{Content: fmt.Sprintf("invalid input: %v", err), IsError: true}, nil
 	}
-	task, err := t.registry.CollectResult(params.TaskID)
+	if strings.TrimSpace(params.TaskID) == "" {
+		return ToolResult{Content: "task_id is required", IsError: true}, nil
+	}
+	// Block until the task is terminal instead of returning "still running".
+	// WaitForTask is event-driven (no polling), so the parent waits without
+	// burning model turns while the sub-agent runs.
+	task, waitErr := t.registry.WaitForTask(ctx, params.TaskID, params.TimeoutMS)
+	if waitErr != nil {
+		detail := waitErr.Error()
+		if task != nil {
+			detail = fmt.Sprintf("sub-agent wait failed (task still %s): %v", task.Status, waitErr)
+		}
+		return ToolResult{Content: detail, IsError: true}, nil
+	}
+	delivered, err := t.registry.CollectResult(params.TaskID)
 	if err != nil {
 		return ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	if task.Status == SubAgentTaskFailed {
-		return ToolResult{Content: fmt.Sprintf("Task failed: %s", task.Error), IsError: true}, nil
+	if delivered.Status == SubAgentTaskFailed {
+		return ToolResult{Content: fmt.Sprintf("Task failed: %s", delivered.Error), IsError: true}, nil
 	}
-	return ToolResult{Content: task.Result}, nil
+	if delivered.Status == SubAgentTaskCancelled {
+		return ToolResult{Content: fmt.Sprintf("Task cancelled: %s", delivered.Error), IsError: true}, nil
+	}
+	return ToolResult{Content: delivered.Result}, nil
 }
 
 // --- cancel_subagent_task ------------------------------------------------

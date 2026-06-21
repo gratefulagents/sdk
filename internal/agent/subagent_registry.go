@@ -1572,6 +1572,7 @@ func BuildSubAgentBudgetContext(maxTurns int) string {
 	return fmt.Sprintf(`<sub_agent_budget>
 Turn budget: %d LLM turns for this sub-agent.
 A turn is one model response, not one tool call. Tool calls happen inside a turn.
+Act, don't announce: when you intend to use tools, include those tool calls in the SAME turn. Never end a turn with only a statement of intent ("I'll start by…", "Let me…"); a turn that contains no tool calls is treated as your final answer and ends the task.
 This is a hard ceiling, not a target. Do not try to use the full budget.
 Finish as soon as the requested output is evidence-backed enough to be useful.
 If the task is broader than the remaining budget, stop exploring and return a concise partial summary with: files checked, concrete findings, gaps/unknowns, and recommended next steps.

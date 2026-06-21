@@ -31,6 +31,14 @@ const completionConfirmationPrompt = `[SYSTEM] Before this answer is accepted as
 If anything is unverified or incomplete, continue working instead of finalizing.
 If you are certain the task is complete, provide your final answer again.`
 
+// droppedToolCallNudge is injected when a model response signalled tool calls
+// (stop_reason == "tool_use") but arrived with none — a known failure mode on
+// proxied/streamed Claude responses where the tool_use blocks are lost in
+// transit and only a leading "I'll start by…" preamble survives. classifyResponse
+// would otherwise treat that preamble as a final answer, so a sub-agent
+// "completes" on turn 1 having done nothing. Re-prompt instead of finalizing.
+const droppedToolCallNudge = `[SYSTEM] Your previous response indicated tool calls (stop_reason=tool_use) but none were received — they were dropped in transit, not by you. Re-issue the tool calls you intended now. Do not just describe what you will do; actually call the tools.`
+
 // untrustedToolOutputBegin/End delimit tool result content fed back to the
 // model on subsequent turns. See RunConfig.UntrustedToolOutputs and
 // docs/security.md.
@@ -42,6 +50,12 @@ const (
 // maxRetryAfterMS caps any caller- or provider-supplied retry delay so a
 // single misbehaving advice value can't stall the run for hours. See finding M1.
 const maxRetryAfterMS = int64(5 * 60 * 1000) // 5 minutes
+
+// maxToolCallRecoveryAttempts bounds how many times a single run will
+// re-request after a response signalled tool_use but arrived with no tool
+// calls. Recovery re-rolls the turn with a corrective nudge; the cap ensures a
+// deterministically-truncating provider still terminates.
+const maxToolCallRecoveryAttempts = 2
 
 // capRetryAfterMS returns the retry delay clamped to maxRetryAfterMS. It logs
 // when capping is applied so operators can detect runaway advice values.
@@ -336,6 +350,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// stopGateBlocks counts consecutive StopGate blocks; the gate is bypassed
 	// once the cap is hit so a broken gate cannot loop forever.
 	stopGateBlocks := 0
+	// toolCallRecoveryAttempts counts how many times this run has re-requested
+	// after a response signalled tool_use but arrived with no tool calls
+	// (dropped in transit). Capped so a deterministically-broken response can
+	// still finalize instead of looping forever.
+	toolCallRecoveryAttempts := 0
 	verifierRan := false
 
 	maxTurns := cfg.EffectiveMaxTurns()
@@ -814,6 +833,29 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// Classify the response.
 		step := classifyResponse(newItems, currentAgent)
 
+		// Dropped-tool-call recovery: a response that signalled tool_use but
+		// classified as a final output means the tool calls were lost in
+		// transit (only a leading preamble survived). Finalizing here would end
+		// the run on an empty turn — the failure mode where a sub-agent
+		// "completes" on turn 1 having done nothing. Re-request with a
+		// corrective nudge instead, bounded by maxToolCallRecoveryAttempts.
+		if _, isFinal := step.(*finalOutputStep); isFinal &&
+			strings.EqualFold(resp.StopReason, "tool_use") &&
+			toolCallRecoveryAttempts < maxToolCallRecoveryAttempts {
+			toolCallRecoveryAttempts++
+			log.Printf("[runner] agent %q returned stop_reason=tool_use with no tool calls (dropped in transit); re-requesting (recovery %d/%d)",
+				currentAgent.Name, toolCallRecoveryAttempts, maxToolCallRecoveryAttempts)
+			nudge := RunItem{Type: RunItemMessage, Message: &MessageOutput{Text: droppedToolCallNudge}}
+			currentInput = append(currentInput, newItems...)
+			currentInput = append(currentInput, nudge)
+			allItems = append(allItems, nudge)
+			emitRunItems(streamEvents, []RunItem{nudge})
+			if turn >= maxTurns-1 {
+				maxTurns++
+			}
+			continue
+		}
+
 		switch s := step.(type) {
 		case *finalOutputStep:
 			joinItems, joinErr := collectSubAgentFinalJoinItems(ctx, tools)
@@ -981,6 +1023,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		case *toolCallStep:
 			pendingCompletion = false
 			stopGateBlocks = 0
+			toolCallRecoveryAttempts = 0
 			toolResults, toolInResults, toolOutResults, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr

@@ -405,6 +405,51 @@ func TestDefaultExecutorDisabledModeCanExplicitlySkipReadOnlySandbox(t *testing.
 	}
 }
 
+func TestDefaultExecutorAutoModeReadOnlyFallsBackToLocalWhenOptedIn(t *testing.T) {
+	if subprocessSandboxAvailable() {
+		t.Skip("enforcing sandbox available on this platform; the fallback path is for non-linux dev hosts")
+	}
+	cmd, err := DefaultWithConfig(Config{Mode: "auto", AllowUnsafeReadOnlyLocal: true}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v, want LocalExecutor fallback for read-only on non-linux", err)
+	}
+	if cmd == nil {
+		t.Fatal("Build() command = nil")
+	}
+}
+
+func TestDefaultExecutorAutoModeReadOnlyFailsClosedWithoutOptIn(t *testing.T) {
+	if subprocessSandboxAvailable() {
+		t.Skip("enforcing sandbox available on this platform; the fail-closed path is for non-linux dev hosts")
+	}
+	_, err := DefaultWithConfig(Config{Mode: "auto"}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		t.Fatal("Build() error = nil; read-only must fail closed without AllowUnsafeReadOnlyLocal")
+	}
+	if !strings.Contains(err.Error(), "subprocess sandbox") {
+		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
+	}
+}
+
+func TestConfigFromEnvParsesAllowUnsafeReadOnlyLocal(t *testing.T) {
+	t.Setenv(SandboxAllowUnsafeReadOnlyLocalEnv, "1")
+	if !ConfigFromEnv().AllowUnsafeReadOnlyLocal {
+		t.Fatalf("ConfigFromEnv().AllowUnsafeReadOnlyLocal = false, want true")
+	}
+	t.Setenv(SandboxAllowUnsafeReadOnlyLocalEnv, "")
+	if ConfigFromEnv().AllowUnsafeReadOnlyLocal {
+		t.Fatalf("ConfigFromEnv().AllowUnsafeReadOnlyLocal = true with empty env, want false")
+	}
+}
+
 func TestBubblewrapArgsWorkDirEscapesConfiguredRootViaDotDot(t *testing.T) {
 	// /workspace/../etc cleans to /etc — escape attempt. Even though /workspace
 	// is the configured root, the resolved workdir is outside it; the executor

@@ -56,6 +56,7 @@ func TestBuildSubAgentBudgetContext(t *testing.T) {
 		"not one tool call",
 		"hard ceiling, not a target",
 		"partial summary",
+		"Act, don't announce",
 	} {
 		if !strings.Contains(ctx, want) {
 			t.Fatalf("expected budget context to contain %q, got %s", want, ctx)

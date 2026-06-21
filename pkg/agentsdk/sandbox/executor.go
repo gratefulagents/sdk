@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,12 @@ const (
 	SandboxExtraReadOnlyPathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RO_PATHS"
 	SandboxExtraWritablePathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RW_PATHS"
 	SandboxExtraEnvEnv           = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_ENV"
+	// SandboxAllowUnsafeReadOnlyLocalEnv opts a host into running read-only
+	// commands through the advisory LocalExecutor when the enforcing subprocess
+	// sandbox is unavailable on this platform (e.g. macOS/Windows dev hosts,
+	// where bubblewrap does not exist). It is a developer convenience, not a
+	// security boundary, so it defaults off and must be set explicitly.
+	SandboxAllowUnsafeReadOnlyLocalEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_ALLOW_UNSAFE_READONLY_LOCAL"
 
 	sandboxModeAuto     = "auto"
 	sandboxModeDisabled = "disabled"
@@ -111,6 +118,7 @@ func SandboxConfigEnvNames() []string {
 		SandboxExtraReadOnlyPathsEnv,
 		SandboxExtraWritablePathsEnv,
 		SandboxExtraEnvEnv,
+		SandboxAllowUnsafeReadOnlyLocalEnv,
 	}
 }
 
@@ -119,14 +127,15 @@ func SandboxConfigEnvNames() []string {
 // it for backwards-compatible worker-pod configuration.
 func ConfigFromEnv() Config {
 	return Config{
-		Mode:               os.Getenv(SandboxModeEnv),
-		Path:               os.Getenv(SandboxPathEnv),
-		PathPrepend:        splitPathList(os.Getenv(SandboxPathPrependEnv)),
-		PathAppend:         splitPathList(os.Getenv(SandboxPathAppendEnv)),
-		ExtraReadOnlyPaths: splitPathList(os.Getenv(SandboxExtraReadOnlyPathsEnv)),
-		ExtraWritablePaths: splitPathList(os.Getenv(SandboxExtraWritablePathsEnv)),
-		ExtraEnv:           sandboxExtraEnvFromEnv(os.Getenv(SandboxExtraEnvEnv)),
-		GOROOT:             os.Getenv("GOROOT"),
+		Mode:                     os.Getenv(SandboxModeEnv),
+		Path:                     os.Getenv(SandboxPathEnv),
+		PathPrepend:              splitPathList(os.Getenv(SandboxPathPrependEnv)),
+		PathAppend:               splitPathList(os.Getenv(SandboxPathAppendEnv)),
+		ExtraReadOnlyPaths:       splitPathList(os.Getenv(SandboxExtraReadOnlyPathsEnv)),
+		ExtraWritablePaths:       splitPathList(os.Getenv(SandboxExtraWritablePathsEnv)),
+		ExtraEnv:                 sandboxExtraEnvFromEnv(os.Getenv(SandboxExtraEnvEnv)),
+		GOROOT:                   os.Getenv("GOROOT"),
+		AllowUnsafeReadOnlyLocal: envFlag(os.Getenv(SandboxAllowUnsafeReadOnlyLocalEnv)),
 	}
 }
 
@@ -185,7 +194,16 @@ func (e defaultExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, err
 		return BubblewrapExecutor{Config: config}.Build(ctx, req)
 	case sandboxModeAuto:
 		if config.RunningInKubernetes || policy.NormalizePermissionMode(string(req.PermissionMode)) == policy.PermissionModeReadOnly {
-			return BubblewrapExecutor{Config: config}.Build(ctx, req)
+			// Read-only and in-cluster workloads need the enforcing subprocess
+			// sandbox. When it is unavailable on this platform (no bubblewrap —
+			// e.g. macOS/Windows dev hosts) and the host explicitly opted into
+			// advisory local execution, fall back to LocalExecutor so commands
+			// can still run. Otherwise fail closed via the BubblewrapExecutor,
+			// which returns a descriptive "requires linux" error.
+			if subprocessSandboxAvailable() || !config.AllowUnsafeReadOnlyLocal {
+				return BubblewrapExecutor{Config: config}.Build(ctx, req)
+			}
+			return LocalExecutor{Config: config}.Build(ctx, req)
 		}
 		return LocalExecutor{Config: config}.Build(ctx, req)
 	default:
@@ -207,6 +225,30 @@ func normalizeConfig(config Config) Config {
 	config.Path = strings.TrimSpace(config.Path)
 	config.GOROOT = strings.TrimSpace(config.GOROOT)
 	return config
+}
+
+// subprocessSandboxAvailable reports whether the enforcing bubblewrap sandbox
+// can run on this platform. It is currently linux-only; on other platforms the
+// BubblewrapExecutor fails with a "requires linux" error.
+func subprocessSandboxAvailable() bool {
+	return runtime.GOOS == "linux"
+}
+
+// envFlag parses a boolean-ish environment value ("1", "true", "yes", "on").
+func envFlag(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if b, err := strconv.ParseBool(value); err == nil {
+		return b
+	}
+	switch strings.ToLower(value) {
+	case "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // LocalExecutor is the compatibility fallback. It never inherits the parent

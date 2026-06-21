@@ -210,6 +210,10 @@ type ResponseFailedError struct {
 	Code             string
 	Message          string
 	IncompleteReason string
+	// EmptyOutput marks a response that returned no usable output content under
+	// an otherwise non-terminal status (e.g. "completed" with empty content) —
+	// a transient provider glitch worth retrying.
+	EmptyOutput bool
 }
 
 func (e *ResponseFailedError) Error() string {
@@ -242,6 +246,9 @@ func (e *ResponseFailedError) Error() string {
 func (e *ResponseFailedError) Retryable() bool {
 	if e == nil {
 		return false
+	}
+	if e.EmptyOutput {
+		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Code)) {
 	case "server_error", "rate_limit_exceeded", "vector_store_timeout":
@@ -1383,7 +1390,14 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 			if isFailedResponseStatus(resp.Status) || isIncompleteResponseStatus(resp.Status) {
 				return nil, responseFailedError(resp)
 			}
-			return nil, fmt.Errorf("responses api returned no output content (id=%q status=%q)", resp.ID, resp.Status)
+			// Empty content under an otherwise non-terminal status is a
+			// transient provider glitch; return a typed retryable error so the
+			// runner re-requests instead of failing the run outright.
+			emptyErr := responseFailedError(resp)
+			if rfe, ok := emptyErr.(*ResponseFailedError); ok {
+				rfe.EmptyOutput = true
+			}
+			return nil, emptyErr
 		}
 		out.Content = append(out.Content, anthropic.NewTextBlock(fallback))
 	}
