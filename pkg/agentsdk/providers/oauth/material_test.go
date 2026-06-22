@@ -110,6 +110,21 @@ func TestParseCopilotAuthJSONGitHubHostShape(t *testing.T) {
 	}
 }
 
+func TestParseCopilotAuthJSONGitHubAppsShape(t *testing.T) {
+	auth, err := ParseCopilotAuthJSON([]byte(`{
+		"github.com:Iv1.b507a08c87ecfe98": {
+			"oauth_token": "github-oauth",
+			"user": "octocat"
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("ParseCopilotAuthJSON() error = %v", err)
+	}
+	if auth.OAuthToken != "github-oauth" {
+		t.Fatalf("OAuthToken = %q, want github-oauth", auth.OAuthToken)
+	}
+}
+
 func TestCopilotNeedsRefresh(t *testing.T) {
 	now := time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC)
 	if !CopilotNeedsRefresh(CopilotAuth{

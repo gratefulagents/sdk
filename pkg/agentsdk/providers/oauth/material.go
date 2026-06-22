@@ -149,7 +149,7 @@ func ParseCopilotAuthJSON(data []byte) (CopilotAuth, error) {
 	}
 
 	tokens := mapValue(root, "tokens")
-	githubDotCom := mapValue(root, "github.com")
+	githubDotCom := copilotHostCredential(root)
 	copilot := mapValue(root, "copilot")
 	auth := CopilotAuth{
 		OAuthToken: firstNonEmpty(
@@ -269,6 +269,35 @@ func mapValue(m map[string]any, key string) map[string]any {
 	}
 	child, _ := m[key].(map[string]any)
 	return child
+}
+
+// copilotHostCredential locates the GitHub host credential entry within a
+// Copilot apps.json/hosts.json document. It prefers an exact "github.com" key,
+// then any "github.com:<client_id>" enterprise/app key, and finally any child
+// object that carries an oauth_token or token.
+func copilotHostCredential(root map[string]any) map[string]any {
+	if exact := mapValue(root, "github.com"); exact != nil {
+		return exact
+	}
+	for key, value := range root {
+		if key != "github.com" && !strings.HasPrefix(key, "github.com:") {
+			continue
+		}
+		child, _ := value.(map[string]any)
+		if child != nil {
+			return child
+		}
+	}
+	for _, value := range root {
+		child, _ := value.(map[string]any)
+		if child == nil {
+			continue
+		}
+		if stringValue(child, "oauth_token") != "" || stringValue(child, "token") != "" {
+			return child
+		}
+	}
+	return nil
 }
 
 func valueOf(m map[string]any, key string) any {
