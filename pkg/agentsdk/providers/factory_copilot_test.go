@@ -150,8 +150,8 @@ func TestCopilotClaudeUsesAdaptiveThinking(t *testing.T) {
 	if _, hasBudget := body.Thinking["budget_tokens"]; hasBudget {
 		t.Fatalf("thinking must not carry budget_tokens on the Copilot adaptive path: %v", body.Thinking)
 	}
-	if got, _ := body.OutputConfig["effort"].(string); got != "xhigh" {
-		t.Fatalf("output_config.effort = %q, want xhigh (mapped from reasoning effort)", got)
+	if got, _ := body.OutputConfig["effort"].(string); got != "max" {
+		t.Fatalf("output_config.effort = %q, want max (host xhigh maps to Anthropic max; xhigh is rejected by some Claude models)", got)
 	}
 }
 

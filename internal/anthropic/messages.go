@@ -60,6 +60,10 @@ type ThinkingConfig struct {
 }
 
 // OutputEffort values map to the Messages API output_config.effort field.
+// The supported subset is model-specific: some Claude models (e.g.
+// claude-sonnet-4.6) accept only [low medium high max] and reject "xhigh".
+// Host reasoning therefore maps its top tier to "max" rather than "xhigh"; see
+// mapReasoningEffortToAnthropic.
 const (
 	OutputEffortLow    = "low"
 	OutputEffortMedium = "medium"
