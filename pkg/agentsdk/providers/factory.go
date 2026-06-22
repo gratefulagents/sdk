@@ -33,6 +33,42 @@ type ProviderSpec struct {
 	// one is unavailable. It is only forwarded to OpenRouter; other
 	// OpenAI-compatible providers ignore it. Empty disables fallback routing.
 	ModelFallbacks []string
+	// Routes declares named provider instances registered under arbitrary
+	// routing prefixes, on top of the canonical provider set. Routes let a
+	// single MultiProvider expose the same base provider under multiple
+	// prefixes with independent auth/credentials, so callers can route by model
+	// prefix (e.g. "anthropic/..." vs "anthropic-oauth/...") to select API-key
+	// vs OAuth per request. A non-empty Routes list implies multi-provider
+	// behavior regardless of Provider.
+	Routes []ProviderRoute
+}
+
+// ProviderRoute declares a single provider instance registered under an
+// arbitrary routing prefix. Routes are registered after the canonical provider
+// set, so a route whose Prefix matches a canonical provider name (e.g.
+// "anthropic") overrides that default registration.
+type ProviderRoute struct {
+	// Prefix is the routing key matched against a model's "prefix/model"
+	// segment. When empty it defaults to Provider.
+	Prefix string
+	// Provider is the base provider type to build (e.g. "openai", "anthropic",
+	// "copilot", "openrouter"). Required; "multi" is not allowed.
+	Provider string
+	BaseURL  string
+	APIKey   string
+	// AuthMode selects the auth scheme for this route (e.g. "oauth" or
+	// "api_key"). Empty uses the provider's default (API key). For OAuth, the
+	// token is supplied via APIKey for anthropic/copilot, or via the
+	// OpenAIOAuth* fields for openai.
+	AuthMode string
+	APIMode  string
+
+	// OpenAI OAuth configuration, used when Provider is "openai" and AuthMode
+	// is "oauth".
+	OpenAIOAuthPath          string
+	OpenAIOAuthAccountID     string
+	OpenAIOAuthAccountIDPath string
+	OpenAIAuthSession        *sdkopenai.AuthSession
 }
 
 var openAICompatibleProviderNames = []string{
@@ -48,6 +84,12 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	provider := strings.ToLower(strings.TrimSpace(spec.Provider))
 	if provider == "" {
 		provider = DefaultProviderOpenAI
+	}
+	// Named routes require a MultiProvider for prefix-based dispatch, so a
+	// non-empty Routes list upgrades any single-provider config to multi while
+	// preserving the configured provider as the default route.
+	if len(spec.Routes) > 0 {
+		provider = "multi"
 	}
 	switch provider {
 	case "multi":
@@ -132,7 +174,52 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 		mp.Register(provider, newOpenAICompatibleProviderFromSpec(provider, spec))
 	}
 	mp.Register(DefaultProviderCopilot, newCopilotProviderFromSpec(spec))
+	if err := registerProviderRoutes(mp, spec.Routes); err != nil {
+		return nil, err
+	}
 	return mp, nil
+}
+
+// registerProviderRoutes builds and registers each named route on the
+// MultiProvider. Routes are applied after the canonical providers, so a route
+// prefix matching a canonical name overrides that default registration.
+func registerProviderRoutes(mp *agentsdk.MultiProvider, routes []ProviderRoute) error {
+	for _, route := range routes {
+		base := normalizeProviderName(route.Provider)
+		if base == "" {
+			return fmt.Errorf("provider route %q: Provider is required", route.Prefix)
+		}
+		if base == "multi" {
+			return fmt.Errorf("provider route %q: Provider %q is not allowed", route.Prefix, route.Provider)
+		}
+		prefix := normalizeProviderName(route.Prefix)
+		if prefix == "" {
+			prefix = base
+		}
+		routeProvider, err := NewProviderFromConfig(specForRoute(route, base))
+		if err != nil {
+			return fmt.Errorf("provider route %q: %w", prefix, err)
+		}
+		mp.Register(prefix, routeProvider)
+	}
+	return nil
+}
+
+// specForRoute converts a ProviderRoute into a single-provider ProviderSpec so
+// route construction reuses the canonical per-provider builders (including
+// OAuth session loading and base-URL defaults).
+func specForRoute(route ProviderRoute, base string) ProviderSpec {
+	return ProviderSpec{
+		Provider:                 base,
+		BaseURL:                  route.BaseURL,
+		APIKey:                   route.APIKey,
+		AuthMode:                 route.AuthMode,
+		APIMode:                  route.APIMode,
+		OpenAIOAuthPath:          route.OpenAIOAuthPath,
+		OpenAIOAuthAccountID:     route.OpenAIOAuthAccountID,
+		OpenAIOAuthAccountIDPath: route.OpenAIOAuthAccountIDPath,
+		OpenAIAuthSession:        route.OpenAIAuthSession,
+	}
 }
 
 func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) agentsdk.ModelProvider {

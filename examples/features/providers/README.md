@@ -39,6 +39,24 @@ provider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
 
 The SDK then sends `Authorization: Bearer <token>` and the Anthropic OAuth beta header instead of `x-api-key`. Hosts remain responsible for acquiring and refreshing Anthropic OAuth tokens. When using `providers.NewProviderFromConfig` with `Provider: "multi"`, `AuthMode: "oauth"` applies to Anthropic only when Anthropic is the selected/default provider; Anthropic fallback providers continue to use their configured API key.
 
+## Routing the same provider under multiple auths (`Routes`)
+
+To expose one base provider under several prefixes with independent auth — e.g. API key vs OAuth for the same backend — declare `Routes` on the `ProviderSpec`. Each route is registered under its `Prefix`, so callers select the auth by model prefix at request time. A non-empty `Routes` list implies multi-provider behavior, and a route whose `Prefix` matches a canonical name (e.g. `anthropic`) overrides that default registration.
+
+```go
+provider, _ := providers.NewProviderFromConfig(providers.ProviderSpec{
+	Provider: "anthropic",
+	Routes: []providers.ProviderRoute{
+		{Prefix: "anthropic", Provider: "anthropic", APIKey: anthropicAPIKey},
+		{Prefix: "anthropic-oauth", Provider: "anthropic", AuthMode: "oauth", APIKey: anthropicOAuthToken},
+	},
+})
+// "anthropic/<model>"       → x-api-key
+// "anthropic-oauth/<model>" → Authorization: Bearer + OAuth beta
+```
+
+Per-agent/role selection is then just the model string: a role with `ModelOverride: "anthropic-oauth/claude-opus-4.8"` uses OAuth while `"anthropic/claude-sonnet-4.5"` uses the API key. Prefixed `FallbackModels` resolve through the same routing, so you can also fail over across auths (e.g. OAuth subscription → API key on rate limit).
+
 For the lower-level Anthropic client, use `sdkanthropic.WithOAuthToken(token)` with `sdkanthropic.NewClient`.
 
 How to use this feature:

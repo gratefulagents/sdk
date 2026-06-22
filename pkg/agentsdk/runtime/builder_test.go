@@ -10,6 +10,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	sdkmcp "github.com/gratefulagents/sdk/pkg/agentsdk/mcp"
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
+	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
@@ -33,6 +34,9 @@ func TestProviderSpecCarriesExplicitMultiProviderConfig(t *testing.T) {
 		ProviderAPIKeys:          map[string]string{"anthropic": "sk-ant-test"},
 		ProviderBaseURLs:         map[string]string{"gemini": "https://gemini.example.test/v1"},
 		ProviderAPIModes:         map[string]string{"gemini": "chat-completions"},
+		Routes: []sdkproviders.ProviderRoute{
+			{Prefix: "anthropic-oauth", Provider: "anthropic", AuthMode: "oauth", APIKey: "anthropic-oauth-token"},
+		},
 	})
 	if spec.Provider != "multi" || spec.DefaultProvider != "openai" {
 		t.Fatalf("provider config = %q/%q, want multi/openai", spec.Provider, spec.DefaultProvider)
@@ -45,6 +49,9 @@ func TestProviderSpecCarriesExplicitMultiProviderConfig(t *testing.T) {
 	}
 	if spec.ProviderBaseURLs["gemini"] != "https://gemini.example.test/v1" {
 		t.Fatalf("ProviderBaseURLs = %#v", spec.ProviderBaseURLs)
+	}
+	if len(spec.Routes) != 1 || spec.Routes[0].Prefix != "anthropic-oauth" || spec.Routes[0].AuthMode != "oauth" {
+		t.Fatalf("Routes = %#v", spec.Routes)
 	}
 }
 

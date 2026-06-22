@@ -262,3 +262,112 @@ func TestNewProviderFromConfigMultiUsesConfiguredDefaultProvider(t *testing.T) {
 		t.Fatalf("Provider() = %q, want anthropic", got)
 	}
 }
+
+// TestNewProviderFromConfigRoutesAnthropicDualAuth verifies a single provider
+// (anthropic) can be exposed under two prefixes with independent auth: the
+// canonical "anthropic" route using an API key (x-api-key) and a custom
+// "anthropic-oauth" route using OAuth (Authorization: Bearer + oauth beta). A
+// non-empty Routes list also upgrades the single-provider spec to multi.
+func TestNewProviderFromConfigRoutesAnthropicDualAuth(t *testing.T) {
+	anthropicResponse := []byte(`{
+		"id":"msg_test",
+		"type":"message",
+		"role":"assistant",
+		"content":[{"type":"text","text":"ok"}],
+		"model":"claude-sonnet-4-5",
+		"stop_reason":"end_turn",
+		"usage":{"input_tokens":1,"output_tokens":1}
+	}`)
+
+	var keyAuth, keyAPIKey string
+	keySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		keyAuth = r.Header.Get("Authorization")
+		keyAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(anthropicResponse)
+	}))
+	defer keySrv.Close()
+
+	var oauthAuth, oauthAPIKey, oauthBeta string
+	oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oauthAuth = r.Header.Get("Authorization")
+		oauthAPIKey = r.Header.Get("x-api-key")
+		oauthBeta = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(anthropicResponse)
+	}))
+	defer oauthSrv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider: "anthropic",
+		Routes: []ProviderRoute{
+			{Prefix: "anthropic", Provider: "anthropic", APIKey: "anthropic-api-key", BaseURL: keySrv.URL},
+			{Prefix: "anthropic-oauth", Provider: "anthropic", AuthMode: "oauth", APIKey: "anthropic-oauth-token", BaseURL: oauthSrv.URL},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	respond := func(modelName string) {
+		t.Helper()
+		model, err := provider.GetModel(modelName)
+		if err != nil {
+			t.Fatalf("GetModel(%q) error = %v", modelName, err)
+		}
+		if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+			Model: "claude-sonnet-4-5",
+			Input: []agentsdk.RunItem{{
+				Type:    agentsdk.RunItemMessage,
+				Message: &agentsdk.MessageOutput{Text: "hello"},
+			}},
+		}); err != nil {
+			t.Fatalf("GetResponse(%q) error = %v", modelName, err)
+		}
+	}
+
+	respond("anthropic/claude-sonnet-4-5")
+	if keyAPIKey != "anthropic-api-key" {
+		t.Fatalf("api-key route x-api-key = %q, want anthropic-api-key", keyAPIKey)
+	}
+	if keyAuth != "" {
+		t.Fatalf("api-key route Authorization = %q, want empty", keyAuth)
+	}
+
+	respond("anthropic-oauth/claude-sonnet-4-5")
+	if oauthAuth != "Bearer anthropic-oauth-token" {
+		t.Fatalf("oauth route Authorization = %q, want Bearer anthropic-oauth-token", oauthAuth)
+	}
+	if oauthAPIKey != "" {
+		t.Fatalf("oauth route x-api-key = %q, want empty", oauthAPIKey)
+	}
+	if !strings.Contains(oauthBeta, "oauth-2025-04-20") {
+		t.Fatalf("oauth route anthropic-beta = %q, want oauth-2025-04-20", oauthBeta)
+	}
+}
+
+func TestNewProviderFromConfigRouteRequiresProvider(t *testing.T) {
+	_, err := NewProviderFromConfig(ProviderSpec{
+		Provider: "multi",
+		Routes:   []ProviderRoute{{Prefix: "anthropic-oauth"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for route without Provider")
+	}
+	if !strings.Contains(err.Error(), "Provider is required") {
+		t.Fatalf("error = %v, want Provider is required", err)
+	}
+}
+
+func TestNewProviderFromConfigRouteRejectsMultiProvider(t *testing.T) {
+	_, err := NewProviderFromConfig(ProviderSpec{
+		Provider: "multi",
+		Routes:   []ProviderRoute{{Prefix: "nested", Provider: "multi"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for route with Provider multi")
+	}
+	if !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("error = %v, want not allowed", err)
+	}
+}

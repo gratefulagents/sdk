@@ -41,6 +41,11 @@ type Config struct {
 	ProviderAPIKeys          map[string]string
 	ProviderBaseURLs         map[string]string
 	ProviderAPIModes         map[string]string
+	// Routes declares named provider instances registered under arbitrary
+	// routing prefixes, letting the same base provider be exposed under
+	// multiple prefixes with independent auth (e.g. "anthropic" via API key and
+	// "anthropic-oauth" via OAuth). Callers select the auth by model prefix.
+	Routes []sdkproviders.ProviderRoute
 	// ModelFallbacks is an ordered list of fallback model identifiers used by
 	// OpenAI-compatible providers (e.g. OpenRouter) to retry the next model when
 	// one is unavailable. Empty disables fallback routing.
@@ -365,6 +370,7 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 		ProviderBaseURLs:         cloneStringMap(cfg.ProviderBaseURLs),
 		ProviderAPIModes:         cloneStringMap(cfg.ProviderAPIModes),
 		ModelFallbacks:           append([]string(nil), cfg.ModelFallbacks...),
+		Routes:                   append([]sdkproviders.ProviderRoute(nil), cfg.Routes...),
 	}
 }
 
