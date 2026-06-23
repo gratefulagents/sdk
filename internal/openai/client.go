@@ -972,7 +972,17 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 	}
 
 	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-		params.Reasoning = sharedReasoningFromBudget(req.Thinking.BudgetTokens)
+		reasoning := sharedReasoningFromBudget(req.Thinking.BudgetTokens)
+		// Request a reasoning summary so models that withhold raw reasoning
+		// (gpt-5, o-series, codex) still surface human-readable reasoning text via
+		// response.reasoning_summary_text events. Effort "minimal" yields no
+		// reasoning, so a summary is pointless there. The Codex /responses backend
+		// rejects this field; maybeNormalizeCodexResponsesBody strips it (the
+		// backend emits summaries natively).
+		if reasoning.Effort != "minimal" {
+			reasoning.Summary = shared.ReasoningSummaryAuto
+		}
+		params.Reasoning = reasoning
 		// Include encrypted reasoning tokens for multi-turn with store=false.
 		params.Include = append(params.Include, responses.ResponseIncludable("reasoning.encrypted_content"))
 	}
@@ -1202,15 +1212,11 @@ func sharedReasoningFromBudget(budget int) shared.ReasoningParam {
 	case budget >= 2048:
 		effort = "low"
 	}
-	// Request a reasoning summary so models that withhold raw reasoning (gpt-5,
-	// o-series, codex) still surface human-readable reasoning text via
-	// response.reasoning_summary_text events. Effort "minimal" produces no
-	// reasoning, so a summary is pointless and may be rejected there.
-	out := shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}
-	if effort != "minimal" {
-		out.Summary = shared.ReasoningSummaryAuto
-	}
-	return out
+	// Effort only. The reasoning summary is added by the caller (toResponseParams)
+	// so it is scoped to the standard Responses request and never leaks into the
+	// Codex compaction request (/responses/compact), which the codex backend
+	// normalizer does not sanitize.
+	return shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}
 }
 
 func systemPromptText(system []anthropic.SystemBlock) string {

@@ -914,8 +914,36 @@ func TestToResponseParams_IncludesReasoningWhenThinkingEnabled(t *testing.T) {
 	if string(params.Reasoning.Effort) != "xhigh" {
 		t.Fatalf("Reasoning effort = %q, want xhigh", params.Reasoning.Effort)
 	}
+	if string(params.Reasoning.Summary) != "auto" {
+		t.Fatalf("Reasoning summary = %q, want auto (surfaces reasoning summaries)", params.Reasoning.Summary)
+	}
 	if params.Text.Verbosity != responses.ResponseTextConfigVerbosityLow {
 		t.Fatalf("Text verbosity = %q, want low", params.Text.Verbosity)
+	}
+}
+
+// TestToCompactParams_OmitsReasoningSummary guards against the Codex 400: the
+// compaction request goes to /responses/compact, which the codex backend
+// normalizer does not sanitize, so reasoning.summary must never be added there.
+func TestToCompactParams_OmitsReasoningSummary(t *testing.T) {
+	req := anthropic.CreateMessageRequest{
+		Model:    "gpt-5.3-codex",
+		Messages: []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+		Thinking: &anthropic.ThinkingConfig{BudgetTokens: 16000},
+	}
+	params, err := toCompactParams(req, true)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "\"summary\"") {
+		t.Fatalf("compaction request must not contain reasoning.summary (Codex 400): %s", raw)
+	}
+	if !strings.Contains(string(raw), "\"effort\"") {
+		t.Fatalf("compaction request should still carry reasoning.effort: %s", raw)
 	}
 }
 

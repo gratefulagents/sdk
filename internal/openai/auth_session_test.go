@@ -526,6 +526,44 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 		}
 	})
 
+	t.Run("strips reasoning.summary but keeps effort for chatgpt backend", func(t *testing.T) {
+		req := makeReq("chatgpt.com", "/backend-api/codex/responses",
+			`{"model":"gpt-5.3-codex","reasoning":{"effort":"high","summary":"auto"}}`)
+		maybeNormalizeCodexResponsesBody(req, oauthSession)
+		body := readBody(req)
+		reasoning, ok := body["reasoning"].(map[string]any)
+		if !ok {
+			t.Fatalf("reasoning object should be preserved, got %v", body["reasoning"])
+		}
+		if _, ok := reasoning["summary"]; ok {
+			t.Error("reasoning.summary must be stripped for the Codex backend (causes 400)")
+		}
+		if reasoning["effort"] != "high" {
+			t.Errorf("reasoning.effort must be preserved, got %v", reasoning["effort"])
+		}
+	})
+
+	t.Run("drops empty reasoning object after summary strip", func(t *testing.T) {
+		req := makeReq("chatgpt.com", "/backend-api/codex/responses",
+			`{"model":"gpt-5.3-codex","reasoning":{"summary":"auto"}}`)
+		maybeNormalizeCodexResponsesBody(req, oauthSession)
+		body := readBody(req)
+		if _, ok := body["reasoning"]; ok {
+			t.Errorf("reasoning object with only summary should be dropped, got %v", body["reasoning"])
+		}
+	})
+
+	t.Run("preserves reasoning.summary for standard api", func(t *testing.T) {
+		req := makeReq("api.openai.com", "/v1/responses",
+			`{"model":"gpt-5.4","reasoning":{"effort":"high","summary":"auto"}}`)
+		maybeNormalizeCodexResponsesBody(req, oauthSession)
+		body := readBody(req)
+		reasoning, ok := body["reasoning"].(map[string]any)
+		if !ok || reasoning["summary"] != "auto" {
+			t.Errorf("reasoning.summary should be preserved for standard API, got %v", body["reasoning"])
+		}
+	})
+
 	t.Run("collects SSE when caller did not set stream", func(t *testing.T) {
 		req := makeReq("chatgpt.com", "/backend-api/codex/responses",
 			`{"model":"gpt-5.4","instructions":"hi"}`)

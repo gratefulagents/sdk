@@ -688,6 +688,17 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	delete(body, "truncation")
 	delete(body, "prompt_cache_retention")
 	delete(body, "include")
+	// The Codex endpoint rejects reasoning.summary / generate_summary (a 400),
+	// even though the standard Responses API accepts them. It emits reasoning
+	// summaries natively, so strip only the summary controls and keep
+	// reasoning.effort intact.
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		delete(reasoning, "summary")
+		delete(reasoning, "generate_summary")
+		if len(reasoning) == 0 {
+			delete(body, "reasoning")
+		}
+	}
 	if _, ok := body["store"]; !ok {
 		body["store"] = false
 	}
