@@ -79,6 +79,7 @@ const (
 	ModelStreamItemDone                             // complete item ready
 	ModelStreamComplete                             // stream finished
 	ModelStreamError                                // terminal stream error
+	ModelStreamReasoningDelta                       // partial reasoning/thinking content
 )
 
 // ModelStreamEvent is a single event from a streaming model call.

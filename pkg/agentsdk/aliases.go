@@ -151,6 +151,8 @@ const (
 	ModelStreamComplete = agent.ModelStreamComplete
 	ModelStreamError    = agent.ModelStreamError
 
+	ModelStreamReasoningDelta = agent.ModelStreamReasoningDelta
+
 	StreamEventRawResponse  = agent.StreamEventRawResponse
 	StreamEventRunItem      = agent.StreamEventRunItem
 	StreamEventAgentUpdated = agent.StreamEventAgentUpdated

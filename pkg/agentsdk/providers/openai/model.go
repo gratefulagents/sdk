@@ -693,7 +693,7 @@ func wrapAnthropicStyleStream(stream anthropicStyleStream) *agentsdk.ModelStream
 						}
 					case "thinking_delta":
 						events <- agentsdk.ModelStreamEvent{
-							Type:  agentsdk.ModelStreamDelta,
+							Type:  agentsdk.ModelStreamReasoningDelta,
 							Delta: evt.Delta.Thinking,
 						}
 					}

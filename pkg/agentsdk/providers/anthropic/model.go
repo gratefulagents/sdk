@@ -428,7 +428,7 @@ func (m *AnthropicModel) wrapStream(reader *internalanthropic.StreamReader) *age
 						}
 					case "thinking_delta":
 						events <- agentsdk.ModelStreamEvent{
-							Type:  agentsdk.ModelStreamDelta,
+							Type:  agentsdk.ModelStreamReasoningDelta,
 							Delta: evt.Delta.Thinking,
 						}
 					}

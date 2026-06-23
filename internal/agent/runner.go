@@ -1255,6 +1255,12 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
+		case ModelStreamReasoningDelta:
+			select {
+			case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		case ModelStreamComplete:
 			streamedResp = ev.Response
 		case ModelStreamError:
