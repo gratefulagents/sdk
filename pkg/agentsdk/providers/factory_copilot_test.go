@@ -32,11 +32,11 @@ func TestIsClaudeModelName(t *testing.T) {
 
 func TestCopilotAnthropicBaseURL(t *testing.T) {
 	cases := map[string]string{
-		"https://api.githubcopilot.com":                   "https://api.githubcopilot.com",
-		"https://api.githubcopilot.com/":                  "https://api.githubcopilot.com",
-		"https://api.githubcopilot.com/chat/completions":  "https://api.githubcopilot.com",
-		"https://api.githubcopilot.com/v1":                "https://api.githubcopilot.com",
-		"https://host/v1/chat/completions":                "https://host",
+		"https://api.githubcopilot.com":                  "https://api.githubcopilot.com",
+		"https://api.githubcopilot.com/":                 "https://api.githubcopilot.com",
+		"https://api.githubcopilot.com/chat/completions": "https://api.githubcopilot.com",
+		"https://api.githubcopilot.com/v1":               "https://api.githubcopilot.com",
+		"https://host/v1/chat/completions":               "https://host",
 	}
 	for in, want := range cases {
 		if got := copilotAnthropicBaseURL(in); got != want {
@@ -49,6 +49,7 @@ func TestCopilotAnthropicBaseURL(t *testing.T) {
 // served through Copilot is sent to the Anthropic /v1/messages endpoint with
 // Copilot bearer auth + integration headers, instead of chat-completions.
 func TestCopilotRoutesClaudeToAnthropicMessages(t *testing.T) {
+	t.Setenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES", "1")
 	var gotPath, gotModel string
 	gotHeaders := http.Header{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +114,7 @@ func TestCopilotRoutesClaudeToAnthropicMessages(t *testing.T) {
 // thinking.type=adaptive + output_config.effort (mapped from reasoning effort)
 // instead of thinking.type=enabled, which Copilot's /v1/messages shim rejects.
 func TestCopilotClaudeUsesAdaptiveThinking(t *testing.T) {
+	t.Setenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES", "1")
 	var body struct {
 		Thinking     map[string]any `json:"thinking"`
 		OutputConfig map[string]any `json:"output_config"`
@@ -171,10 +173,9 @@ func TestCopilotRoutesNonClaudeToChatCompletions(t *testing.T) {
 	}
 }
 
-// TestCopilotClaudeViaChatEscapeHatch verifies the env override forces Claude
-// back onto the chat-completions path.
-func TestCopilotClaudeViaChatEscapeHatch(t *testing.T) {
-	t.Setenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT", "1")
+// TestCopilotClaudeDefaultsToChatCompletions verifies Claude on Copilot routes
+// to the chat-completions path by default (required for visible reasoning).
+func TestCopilotClaudeDefaultsToChatCompletions(t *testing.T) {
 	provider := newCopilotProviderFromSpec(ProviderSpec{
 		Provider:        DefaultProviderCopilot,
 		ProviderAPIKeys: map[string]string{DefaultProviderCopilot: "copilot-token"},
@@ -184,6 +185,23 @@ func TestCopilotClaudeViaChatEscapeHatch(t *testing.T) {
 		t.Fatalf("GetModel() error = %v", err)
 	}
 	if got := model.Provider(); got != DefaultProviderCopilot {
-		t.Fatalf("Provider() = %q, want %q (escape hatch must use chat-completions)", got, DefaultProviderCopilot)
+		t.Fatalf("Provider() = %q, want %q (Claude must default to chat-completions)", got, DefaultProviderCopilot)
+	}
+}
+
+// TestCopilotClaudeViaMessagesEscapeHatch verifies the env override routes Claude
+// back onto the Anthropic /v1/messages path.
+func TestCopilotClaudeViaMessagesEscapeHatch(t *testing.T) {
+	t.Setenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES", "1")
+	provider := newCopilotProviderFromSpec(ProviderSpec{
+		Provider:        DefaultProviderCopilot,
+		ProviderAPIKeys: map[string]string{DefaultProviderCopilot: "copilot-token"},
+	})
+	model, err := provider.GetModel("claude-opus-4.8")
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+	if got := model.Provider(); got != "anthropic" {
+		t.Fatalf("Provider() = %q, want anthropic (escape hatch must use /v1/messages)", got)
 	}
 }

@@ -346,6 +346,7 @@ type ResponsesStreamReader struct {
 	blockIndex       int
 	outputPhases     map[int]string
 	deltaEmitted     map[int]bool
+	blockStopped     map[int]bool
 	err              error
 }
 
@@ -395,6 +396,16 @@ func (r *ResponsesStreamReader) markDelta(idx int) {
 		r.deltaEmitted = make(map[int]bool)
 	}
 	r.deltaEmitted[idx] = true
+}
+
+// markStopped records that a content_block_stop was emitted for the given block
+// index, so a later event (e.g. output_item.done for reasoning) does not emit a
+// duplicate stop that would double-count the block.
+func (r *ResponsesStreamReader) markStopped(idx int) {
+	if r.blockStopped == nil {
+		r.blockStopped = make(map[int]bool)
+	}
+	r.blockStopped[idx] = true
 }
 
 func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEventUnion) {
@@ -512,6 +523,32 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 			},
 		})
 
+	case "response.reasoning_summary_text.delta":
+		// gpt-5 / o-series / codex emit a human-readable reasoning summary
+		// instead of raw reasoning_text. Surface it as thinking. The reasoning
+		// block is closed by response.output_item.done (a summary may have
+		// multiple parts under one reasoning item).
+		r.markDelta(int(evt.OutputIndex))
+		r.emit(anthropic.StreamEvent{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: int(evt.OutputIndex),
+			Delta: &anthropic.DeltaBlock{
+				Type:     "thinking_delta",
+				Text:     evt.Delta,
+				Thinking: evt.Delta,
+			},
+		})
+
+	case "response.reasoning_summary_text.done":
+		// Fallback for backends that deliver the summary only on ".done".
+		if !r.deltaEmitted[int(evt.OutputIndex)] && evt.Text != "" {
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: int(evt.OutputIndex),
+				Delta: &anthropic.DeltaBlock{Type: "thinking_delta", Text: evt.Text, Thinking: evt.Text},
+			})
+		}
+
 	case "response.output_text.done",
 		"response.function_call_arguments.done",
 		"response.reasoning_text.done":
@@ -554,6 +591,7 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 			Type:  anthropic.EventContentBlockStop,
 			Index: idx,
 		})
+		r.markStopped(idx)
 
 	case "response.output_item.done":
 		if (evt.Item.Type == "reasoning" || evt.Item.Type == "compaction") && strings.TrimSpace(evt.Item.EncryptedContent) != "" {
@@ -569,6 +607,17 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 					EncryptedContent: evt.Item.EncryptedContent,
 				},
 			})
+		}
+		// Reasoning items whose only content is a summary (no reasoning_text.done)
+		// are not closed elsewhere; close them here so the thinking block, its
+		// summary text, and any encrypted content are emitted exactly once.
+		if evt.Item.Type == "reasoning" && !r.blockStopped[int(evt.OutputIndex)] {
+			idx := int(evt.OutputIndex)
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockStop,
+				Index: idx,
+			})
+			r.markStopped(idx)
 		}
 
 	case "response.completed":
@@ -707,7 +756,12 @@ func (c *Client) CreateMessageStream(ctx context.Context, req anthropic.CreateMe
 		return &ResponsesStreamReader{stream: stream}, nil
 	}
 
-	// Chat Completions fallback: use buffered approach.
+	// Chat Completions: GitHub Copilot supports real SSE streaming and only
+	// exposes plaintext reasoning (message.reasoning_text) on this path, so
+	// stream it live. Other chat-only providers keep the buffered replay.
+	if isGitHubCopilotHost(hostFromURL(c.completionsURL)) {
+		return c.createChatStream(ctx, req)
+	}
 	resp, err := c.CreateMessage(ctx, req)
 	if err != nil {
 		return nil, err
@@ -1148,7 +1202,15 @@ func sharedReasoningFromBudget(budget int) shared.ReasoningParam {
 	case budget >= 2048:
 		effort = "low"
 	}
-	return shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}
+	// Request a reasoning summary so models that withhold raw reasoning (gpt-5,
+	// o-series, codex) still surface human-readable reasoning text via
+	// response.reasoning_summary_text events. Effort "minimal" produces no
+	// reasoning, so a summary is pointless and may be rejected there.
+	out := shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}
+	if effort != "minimal" {
+		out.Summary = shared.ReasoningSummaryAuto
+	}
+	return out
 }
 
 func systemPromptText(system []anthropic.SystemBlock) string {
@@ -1903,13 +1965,23 @@ func sanitizeLogBody(body string) string {
 }
 
 type chatCompletionRequest struct {
-	Model          string        `json:"model"`
-	Models         []string      `json:"models,omitempty"`
-	Messages       []chatMessage `json:"messages"`
-	MaxTokens      int           `json:"max_tokens,omitempty"`
-	Tools          []chatToolDef `json:"tools,omitempty"`
-	ResponseFormat any           `json:"response_format,omitempty"`
-	Reasoning      any           `json:"reasoning,omitempty"`
+	Model          string             `json:"model"`
+	Models         []string           `json:"models,omitempty"`
+	Messages       []chatMessage      `json:"messages"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Tools          []chatToolDef      `json:"tools,omitempty"`
+	ResponseFormat any                `json:"response_format,omitempty"`
+	Reasoning      any                `json:"reasoning,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *chatStreamOptions `json:"stream_options,omitempty"`
+	// ReasoningEffort is GitHub Copilot's flat reasoning control (distinct from
+	// the nested OpenRouter "reasoning" object above). Copilot returns plaintext
+	// reasoning in message.reasoning_text only when this is sent.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+}
+
+type chatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type chatMessage struct {
@@ -1917,6 +1989,11 @@ type chatMessage struct {
 	Content    any            `json:"content,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	// Copilot-specific reasoning round-trip fields. ReasoningText is only sent
+	// back when ReasoningOpaque (the encrypted multi-turn signature) is present,
+	// mirroring opencode's github-copilot chat adapter.
+	ReasoningText   string `json:"reasoning_text,omitempty"`
+	ReasoningOpaque string `json:"reasoning_opaque,omitempty"`
 }
 
 type chatToolDef struct {
@@ -2092,11 +2169,19 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 		case anthropic.RoleAssistant:
 			var textParts []string
 			var toolCalls []chatToolCall
+			var reasoningText, reasoningOpaque string
 			for _, block := range m.Content {
 				switch block.Type {
 				case "text":
 					if strings.TrimSpace(block.Text) != "" {
 						textParts = append(textParts, block.Text)
+					}
+				case "thinking":
+					if reasoningText == "" {
+						reasoningText = block.Thinking
+					}
+					if reasoningOpaque == "" {
+						reasoningOpaque = block.Signature
 					}
 				case "tool_use":
 					args := strings.TrimSpace(string(block.Input))
@@ -2121,6 +2206,12 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 			if len(toolCalls) > 0 {
 				msg.ToolCalls = toolCalls
 			}
+			// Copilot multi-turn reasoning: only resend reasoning_text alongside
+			// its encrypted signature, matching opencode's chat adapter.
+			if reasoningOpaque != "" {
+				msg.ReasoningOpaque = reasoningOpaque
+				msg.ReasoningText = reasoningText
+			}
 			if msg.Content == nil && len(msg.ToolCalls) == 0 {
 				msg.Content = ""
 			}
@@ -2139,17 +2230,25 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 	choice := resp.Choices[0]
 
 	out := &anthropic.CreateMessageResponse{
-		ID:         resp.ID,
-		Type:       "message",
-		Role:       anthropic.RoleAssistant,
-		Model:      resp.Model,
-		StopReason: mapFinishReason(choice.FinishReason),
+		ID:    resp.ID,
+		Type:  "message",
+		Role:  anthropic.RoleAssistant,
+		Model: resp.Model,
 	}
 	if resp.Usage != nil {
 		out.Usage = anthropic.Usage{
 			InputTokens:  resp.Usage.PromptTokens,
 			OutputTokens: resp.Usage.CompletionTokens,
 		}
+	}
+
+	// Reasoning first: Copilot returns plaintext reasoning in reasoning_text and
+	// the encrypted multi-turn signature in reasoning_opaque. Emit a thinking
+	// block so it surfaces as a reasoning item and round-trips on later turns.
+	if reasoning := strings.TrimSpace(choice.Message.ReasoningText); reasoning != "" {
+		block := anthropic.NewThinkingBlock(choice.Message.ReasoningText)
+		block.Signature = choice.Message.ReasoningOpaque
+		out.Content = append(out.Content, block)
 	}
 
 	text := extractTextContent(choice.Message.Content)
@@ -2165,13 +2264,7 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 		out.Content = append(out.Content, anthropic.NewToolUseBlock(id, tc.Function.Name, args))
 	}
 
-	if out.StopReason == "" {
-		if len(choice.Message.ToolCalls) > 0 {
-			out.StopReason = anthropic.StopReasonToolUse
-		} else {
-			out.StopReason = anthropic.StopReasonEndTurn
-		}
-	}
+	out.StopReason = chatStopReason(choice.FinishReason, len(choice.Message.ToolCalls) > 0)
 
 	return out, nil
 }
@@ -2200,10 +2293,18 @@ func extractTextContent(content any) string {
 	}
 }
 
-func mapFinishReason(reason string) anthropic.StopReason {
-	switch reason {
-	case "tool_calls":
+// chatStopReason derives the Anthropic stop reason from a chat-completions
+// finish_reason and whether the turn actually produced tool calls. GitHub
+// Copilot reports finish_reason="tool_calls" on plain narration turns that have
+// no tool calls; mapping those to tool_use corrupts the agent loop (it waits for
+// tool outputs that never arrive). When no tool calls are present, such turns
+// are treated as end_turn. This is what previously forced Claude-on-Copilot onto
+// the /v1/messages shim.
+func chatStopReason(reason string, hasToolCalls bool) anthropic.StopReason {
+	if hasToolCalls {
 		return anthropic.StopReasonToolUse
+	}
+	switch reason {
 	case "length":
 		return anthropic.StopReasonMaxTokens
 	default:
@@ -2248,6 +2349,26 @@ func responseToEvents(resp *anthropic.CreateMessageResponse) []anthropic.StreamE
 					Text: block.Text,
 				},
 			})
+		case "thinking":
+			events = append(events, anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: i,
+				Delta: &anthropic.DeltaBlock{
+					Type:     "thinking_delta",
+					Thinking: block.Thinking,
+					Text:     block.Thinking,
+				},
+			})
+			if block.Signature != "" {
+				events = append(events, anthropic.StreamEvent{
+					Type:  anthropic.EventContentBlockDelta,
+					Index: i,
+					Delta: &anthropic.DeltaBlock{
+						Type:      "signature_delta",
+						Signature: block.Signature,
+					},
+				})
+			}
 		case "tool_use":
 			events = append(events, anthropic.StreamEvent{
 				Type:  anthropic.EventContentBlockDelta,

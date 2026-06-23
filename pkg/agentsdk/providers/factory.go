@@ -274,15 +274,17 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		APIMode:      apiModeForProvider(spec, DefaultProviderCopilot, "chat-completions"),
 		AuthSession:  session,
 	})
-	// Claude models served through Copilot are routed to Copilot's
-	// Anthropic-compatible /v1/messages shim instead of chat-completions. The
-	// OpenAI->Anthropic chat translation reports finish_reason="tool_calls"
-	// with no tool calls on plain narration turns, corrupting tool_use /
-	// stop_reason semantics; the Messages shim preserves them. This mirrors
-	// opencode, which routes Copilot Claude models through @ai-sdk/anthropic.
-	// Set GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT=1 to force the legacy
-	// chat-completions path.
-	if copilotClaudeViaChat() {
+	// Claude models on Copilot default to the chat-completions path. It is the
+	// only Copilot endpoint that returns plaintext reasoning (message.reasoning_text
+	// + reasoning_opaque); the Anthropic /v1/messages shim returns signature-only
+	// thinking even with the interleaved-thinking beta. The chat path derives
+	// stop_reason from actual tool calls, so the narration-turn tool_calls quirk
+	// that previously forced /v1/messages no longer corrupts the agent loop.
+	//
+	// Set GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES=1 to route Claude back through
+	// the Anthropic Messages shim (native tool_use semantics, but no visible
+	// reasoning).
+	if !copilotClaudeViaMessages() {
 		return openAIProvider
 	}
 	anthropicProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
@@ -297,11 +299,12 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 	}
 }
 
-// copilotClaudeViaChat reports whether the legacy chat-completions path should
-// be forced for Claude models on Copilot, via
-// GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT (1/true/yes/on).
-func copilotClaudeViaChat() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_CHAT"))) {
+// copilotClaudeViaMessages reports whether Claude models on Copilot should be
+// routed through the Anthropic /v1/messages shim instead of the default
+// chat-completions path, via GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES
+// (1/true/yes/on). The default chat path is required for visible reasoning.
+func copilotClaudeViaMessages() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES"))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:

@@ -1007,6 +1007,67 @@ func TestResponsesStreamReader_PreservesMessagePhase(t *testing.T) {
 	}
 }
 
+// TestResponsesStreamReader_TranslatesReasoningSummary verifies that gpt-5 /
+// codex reasoning summaries (response.reasoning_summary_text.*) surface as a
+// single thinking block, closed exactly once by output_item.done.
+func TestResponsesStreamReader_TranslatesReasoningSummary(t *testing.T) {
+	reader := &ResponsesStreamReader{}
+
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:     "response.created",
+		Response: responses.Response{ID: "resp_1", Model: "gpt-5.4"},
+	})
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:        "response.output_item.added",
+		OutputIndex: 0,
+		Item:        responses.ResponseOutputItemUnion{Type: "reasoning", ID: "rs_1"},
+	})
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:        "response.reasoning_summary_text.delta",
+		OutputIndex: 0,
+		Delta:       "Analyzing ",
+	})
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:        "response.reasoning_summary_text.delta",
+		OutputIndex: 0,
+		Delta:       "the request.",
+	})
+	// Per-part done with full text: ignored because deltas were already emitted.
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:        "response.reasoning_summary_text.done",
+		OutputIndex: 0,
+		Text:        "Analyzing the request.",
+	})
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:        "response.output_item.done",
+		OutputIndex: 0,
+		Item:        responses.ResponseOutputItemUnion{Type: "reasoning", ID: "rs_1"},
+	})
+	reader.translateEvent(responses.ResponseStreamEventUnion{
+		Type:     "response.completed",
+		Response: responses.Response{ID: "resp_1", Model: "gpt-5.4", Usage: responses.ResponseUsage{InputTokens: 3, OutputTokens: 7}},
+	})
+
+	assembler := anthropic.NewStreamAssembler()
+	for _, ev := range reader.buf {
+		assembler.Add(ev)
+	}
+	resp := assembler.Response()
+
+	var thinking []anthropic.ContentBlock
+	for _, b := range resp.Content {
+		if b.Type == "thinking" {
+			thinking = append(thinking, b)
+		}
+	}
+	if len(thinking) != 1 {
+		t.Fatalf("thinking blocks = %d, want exactly 1 (no double-close): %+v", len(thinking), resp.Content)
+	}
+	if thinking[0].Thinking != "Analyzing the request." {
+		t.Fatalf("summary text = %q, want 'Analyzing the request.'", thinking[0].Thinking)
+	}
+}
+
 func TestResponsesStreamReader_IgnoresContainerDoneEvents(t *testing.T) {
 	reader := &ResponsesStreamReader{}
 
