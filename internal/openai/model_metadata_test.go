@@ -38,6 +38,55 @@ func TestParseModelMetadataCodexShape(t *testing.T) {
 	}
 }
 
+func TestParseModelMetadataCopilotCapabilitiesShape(t *testing.T) {
+	// GitHub Copilot's /models response advertises bare IDs in the OpenAI
+	// data[] shape but nests real limits under capabilities.limits.
+	models, err := parseModelMetadata([]byte(`{
+		"data": [{
+			"id": "gpt-5.3-codex-spark",
+			"capabilities": {
+				"family": "gpt-5",
+				"limits": {
+					"max_context_window_tokens": 128000,
+					"max_prompt_tokens": 96000,
+					"max_output_tokens": 32000
+				}
+			}
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("parseModelMetadata returned error: %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("got %d models, want 1", len(models))
+	}
+	got := models[0]
+	if got.ID != "gpt-5.3-codex-spark" {
+		t.Fatalf("ID = %q, want gpt-5.3-codex-spark", got.ID)
+	}
+	if got.ContextWindow != 128000 || got.ResolvedContextWindow() != 128000 {
+		t.Fatalf("context window = %d resolved=%d, want 128000", got.ContextWindow, got.ResolvedContextWindow())
+	}
+	if got.MaxOutputTokens != 32000 {
+		t.Fatalf("max output tokens = %d, want 32000", got.MaxOutputTokens)
+	}
+}
+
+func TestParseModelMetadataCopilotFallsBackToMaxPromptTokens(t *testing.T) {
+	models, err := parseModelMetadata([]byte(`{
+		"data": [{
+			"id": "some-model",
+			"capabilities": {"limits": {"max_prompt_tokens": 200000}}
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("parseModelMetadata returned error: %v", err)
+	}
+	if got := models[0]; got.ContextWindow != 200000 {
+		t.Fatalf("context window = %d, want 200000 (max_prompt_tokens fallback)", got.ContextWindow)
+	}
+}
+
 func TestModelMetadataEndpointAppendsCodexClientVersion(t *testing.T) {
 	session := &OpenAIAuthSession{mode: AuthModeOAuth}
 	got := modelMetadataEndpoint("https://chatgpt.com/backend-api/codex/responses", session)

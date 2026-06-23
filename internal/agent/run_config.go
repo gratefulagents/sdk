@@ -3,11 +3,53 @@ package agent
 import (
 	"context"
 	"strings"
+	"time"
 )
+
+// DefaultModelCallTimeout bounds a single model generation attempt when
+// RunConfig.ModelCallTimeout is 0. It is generous enough for slow,
+// high-reasoning generations over large contexts, but finite so a hung
+// provider connection can never freeze a run indefinitely.
+const DefaultModelCallTimeout = 10 * time.Minute
+
+// effectiveModelCallTimeout resolves the per-attempt model-call timeout:
+// 0 uses DefaultModelCallTimeout; a negative value disables the timeout.
+func effectiveModelCallTimeout(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d == 0 {
+		return DefaultModelCallTimeout
+	}
+	return d
+}
+
+// modelCallContext derives a per-attempt context for a single model call so a
+// hung provider request cannot freeze the run. The returned cancel func must
+// always be called. When the timeout is disabled it returns the parent context
+// unchanged with a no-op cancel.
+func modelCallContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if to := effectiveModelCallTimeout(timeout); to > 0 {
+		return context.WithTimeout(ctx, to)
+	}
+	return ctx, func() {}
+}
 
 // ImmediateInputPoller injects user messages at runner interruptible boundaries.
 // Returned items should usually be user message RunItems (Agent == nil).
 type ImmediateInputPoller func(context.Context) ([]RunItem, error)
+
+// CompactionModelResolver resolves model-specific compaction thresholds for a
+// (possibly provider-prefixed) model name. It returns tuned trigger/target
+// token thresholds — typically derived from authoritative provider metadata
+// (the /models endpoint), falling back to CompactionDefaultsForModel. ok=false
+// means "use the configured defaults unchanged".
+//
+// The runner consults this once per turn against the model actually being used,
+// so a sub-agent running a different model than its parent compacts at its own
+// model's context window instead of inheriting the parent's thresholds.
+// Implementations must be safe for concurrent use and should cache results.
+type CompactionModelResolver func(ctx context.Context, model string) (triggerTokens, targetTokens int, ok bool)
 
 // CompactionConfig controls proactive context compaction.
 type CompactionConfig struct {
@@ -34,27 +76,42 @@ func DefaultCompactionConfig() CompactionConfig {
 // CompactionDefaultsForModel returns tuned compaction thresholds based on the
 // model's context window. Trigger fires when ~10% of context remains (90% used).
 // Target compacts down to ~50% of context window.
+//
+// This is the STATIC fallback used only when authoritative provider metadata
+// (the /models endpoint) is unavailable for the model. It deliberately errs
+// toward SMALLER windows for unknown/small variants: over-compaction merely
+// wastes a little context, but under-compaction lets a run blow past the real
+// limit and hang (see the gpt-5.3-codex-spark freeze). Small fast variants
+// (-spark/-nano/-mini/-lite/-flash) are therefore capped conservatively even
+// though some of them advertise larger windows; provider metadata overrides
+// these when present.
 func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) {
 	_, unprefixed := ParseModelPrefix(model)
 	m := strings.ToLower(strings.TrimSpace(unprefixed))
 	switch {
-	// Mini models: ~128K context → trigger at 115K, target 64K
-	case strings.Contains(m, "mini"):
-		return 115000, 64000
-	// GPT-5.5 / GPT-5.4: ~1M context → trigger at 900K, target 500K
+	// Small/fast variants (e.g. gpt-5.3-codex-spark, *-nano, *-mini, *-lite,
+	// *-flash): assume a ~128K context and compact conservatively. Checked
+	// FIRST so e.g. "gpt-5.3-codex-spark" does not fall through to the
+	// "gpt-5.3-codex" 1M branch below.
+	case strings.Contains(m, "spark"),
+		strings.Contains(m, "nano"),
+		strings.Contains(m, "mini"),
+		strings.Contains(m, "lite"),
+		strings.Contains(m, "flash"):
+		return 110000, 60000
+	// GPT-5.x / codex (non-spark) on Copilot/OpenAI are ~400K context (not the
+	// ~1M once assumed): trigger ~360K (90%), target ~200K (50%). Providers
+	// that genuinely expose ~1M are corrected upward by provider metadata.
 	case strings.HasPrefix(m, "gpt-5.5"):
-		return 900000, 500000
+		return 360000, 200000
 	case strings.HasPrefix(m, "gpt-5.4"):
-		return 900000, 500000
-	// GPT-5.3-codex: ~1M context → trigger at 900K, target 500K
+		return 360000, 200000
 	case strings.HasPrefix(m, "gpt-5.3-codex"):
-		return 900000, 500000
-	// GPT-5.2-codex: ~1M context → trigger at 900K, target 500K
+		return 360000, 200000
 	case strings.HasPrefix(m, "gpt-5.2-codex"):
-		return 900000, 500000
-	// GPT-5.2 / GPT-5.1: ~1M context → trigger at 900K, target 500K
+		return 360000, 200000
 	case strings.HasPrefix(m, "gpt-5.2"), strings.HasPrefix(m, "gpt-5.1"):
-		return 900000, 500000
+		return 360000, 200000
 	// Claude Opus 4: 200K context → trigger at 180K, target 100K
 	case strings.Contains(m, "opus-4"):
 		return 180000, 100000
@@ -142,6 +199,7 @@ type RunConfig struct {
 
 	ImmediateInputPoller      ImmediateInputPoller
 	CompactionConfig          CompactionConfig
+	CompactionModelResolver   CompactionModelResolver
 	CompactionRecorder        func(tokensBefore, tokensAfter int, summary string)
 	CompactionFailureReporter func(scope, reason string, tokensBefore, tokensAfter int)
 	CompactionCarryForward    func(ctx context.Context) string
@@ -237,6 +295,15 @@ type RunConfig struct {
 	// where wrapping would interfere with downstream formatting). See
 	// docs/security.md.
 	UntrustedToolOutputs *bool
+
+	// ModelCallTimeout bounds a single model generation attempt (including the
+	// provider-native compaction call). A hung or unresponsive provider request
+	// is cancelled after this duration so the attempt fails (and is then
+	// retried/fallen-back per policy) instead of freezing the run forever — the
+	// failure mode that previously required a kill -9. The timeout applies
+	// per-attempt, so retries each get a fresh budget. 0 uses
+	// DefaultModelCallTimeout; negative disables the per-call timeout.
+	ModelCallTimeout time.Duration
 }
 
 // ShouldTagUntrustedToolOutputs reports whether tool outputs should be tagged

@@ -361,10 +361,13 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 	for _, tool := range bundle.Agent.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"agent_agent", "spawn_subagent_task", "spawn_subagent_graph", "collect_subagent_result"} {
+	for _, want := range []string{"agent_agent", "spawn_subagent_task", "spawn_subagent_graph"} {
 		if !names[want] {
 			t.Fatalf("missing sub-agent tool %q; names=%v", want, toolNames(bundle.Agent.Tools))
 		}
+	}
+	if names["collect_subagent_result"] {
+		t.Fatalf("collect_subagent_result was removed but is still registered; names=%v", toolNames(bundle.Agent.Tools))
 	}
 	if names["wait_for_subagent_progress"] || names["wait_for_subagent_change"] {
 		t.Fatalf("default runtime should not expose polling wait tools; names=%v", toolNames(bundle.Agent.Tools))

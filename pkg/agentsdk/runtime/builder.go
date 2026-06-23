@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/guardrails"
@@ -112,10 +113,17 @@ type Config struct {
 	ProjectStateActiveTaskID string
 	ProjectStateStore        sdkprojectstate.Store
 
-	Trace                     *agentsdk.Trace
-	ParentSpanID              string
-	ImmediateInputPoller      agentsdk.ImmediateInputPoller
-	CompactionConfig          *agentsdk.CompactionConfig
+	Trace                *agentsdk.Trace
+	ParentSpanID         string
+	ImmediateInputPoller agentsdk.ImmediateInputPoller
+	CompactionConfig     *agentsdk.CompactionConfig
+	// CompactionModelResolver, when set, resolves per-model compaction
+	// thresholds (typically from authoritative provider /models metadata with a
+	// static fallback) so each agent — including sub-agents on different models
+	// than the parent — compacts at its own model's context window. When nil the
+	// builder synthesizes a default resolver from OpenAIAuthSession + BaseURL,
+	// falling back to the static CompactionDefaultsForModel table.
+	CompactionModelResolver   agentsdk.CompactionModelResolver
 	CompactionRecorder        func(tokensBefore, tokensAfter int, summary string)
 	CompactionFailureReporter func(scope, reason string, tokensBefore, tokensAfter int)
 	CompactionCarryForward    func(context.Context) string
@@ -658,16 +666,17 @@ func attachAsyncSubAgentTools(cfg Config, state *SessionState, runner *agentsdk.
 		return agentTools
 	}
 	scheduler := state.configureSubAgentScheduler(agentsdk.SubAgentSchedulerConfig{
-		MaxConcurrent:    cfg.MaxConcurrentSubAgents,
-		Runner:           runner,
-		Agents:           specialistAgents,
-		Tracker:          tracker,
-		EventStream:      eventStream,
-		WorkDir:          cfg.WorkDir,
-		ToolAccessLevel:  cfg.ToolAccess,
-		ToolPolicy:       toolPolicy(cfg),
-		CompactionConfig: runCompactionConfig(cfg),
-		MaxTurns:         cfg.SubAgentMaxTurns,
+		MaxConcurrent:           cfg.MaxConcurrentSubAgents,
+		Runner:                  runner,
+		Agents:                  specialistAgents,
+		Tracker:                 tracker,
+		EventStream:             eventStream,
+		WorkDir:                 cfg.WorkDir,
+		ToolAccessLevel:         cfg.ToolAccess,
+		ToolPolicy:              toolPolicy(cfg),
+		CompactionConfig:        runCompactionConfig(cfg),
+		CompactionModelResolver: compactionModelResolver(cfg),
+		MaxTurns:                cfg.SubAgentMaxTurns,
 	})
 	asyncTools := filterNamedTools(agentsdk.BuildSubAgentTaskTools(scheduler, defaultAsyncSubAgent(specialistAgents)), asyncSubAgentToolNames(features.value.SubAgents.Async))
 	agent.Tools = append(agent.Tools, asyncTools...)
@@ -710,6 +719,7 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 
 		ImmediateInputPoller:      immediateInputPoller(cfg, features),
 		CompactionConfig:          runCompactionConfig(cfg),
+		CompactionModelResolver:   compactionModelResolver(cfg),
 		CompactionRecorder:        runCompactionRecorder(cfg),
 		CompactionFailureReporter: cfg.CompactionFailureReporter,
 		CompactionCarryForward:    runCompactionCarryForward(cfg),
@@ -935,7 +945,6 @@ func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {
 	add(features.Activity, "get_subagent_activity")
 	add(features.TaskGraph, "get_subagent_task_graph")
 	add(features.Message, "send_message_to_subagent_task")
-	add(features.Collect, "collect_subagent_result")
 	add(features.Cancel, "cancel_subagent_task")
 	return names
 }
@@ -1127,6 +1136,41 @@ func runCompactionConfig(cfg Config) agentsdk.CompactionConfig {
 		return *cfg.CompactionConfig
 	}
 	return compactionConfig(cfg)
+}
+
+// compactionModelResolver returns a per-model compaction threshold resolver.
+// Priority: caller-provided resolver → authoritative provider /models metadata
+// (when an OpenAI-compatible auth session + base URL are available) → static
+// CompactionDefaultsForModel. The static fallback always returns a value, so the
+// resolver is authoritative for the model actually being used and sub-agents
+// stop inheriting the parent model's thresholds.
+func compactionModelResolver(cfg Config) agentsdk.CompactionModelResolver {
+	if !resolveFeatures(cfg).value.Runtime.Compaction {
+		return nil
+	}
+	if cfg.CompactionModelResolver != nil {
+		return cfg.CompactionModelResolver
+	}
+	var meta *sdkopenai.CompactionMetadataResolver
+	if baseURL := strings.TrimSpace(cfg.BaseURL); baseURL != "" && cfg.OpenAIAuthSession != nil {
+		meta = sdkopenai.NewCompactionMetadataResolver(baseURL, cfg.OpenAIAuthSession)
+	}
+	return func(ctx context.Context, model string) (int, int, bool) {
+		if meta != nil {
+			// Bound the (one-time, cached) metadata fetch so a hung /models
+			// endpoint can never stall the runner; fall back to static on miss.
+			lookupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			m, ok := meta.Lookup(lookupCtx, model)
+			cancel()
+			if ok {
+				if trigger, target, ok := sdkopenai.CompactionDefaultsFromModelMetadata(m); ok {
+					return trigger, target, true
+				}
+			}
+		}
+		trigger, target := agentsdk.CompactionDefaultsForModel(model)
+		return trigger, target, true
+	}
 }
 
 func runCompactionRecorder(cfg Config) func(tokensBefore, tokensAfter int, summary string) {

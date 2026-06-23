@@ -11,6 +11,7 @@ type AgentOption = agent.AgentOption
 type AgentSpanData = agent.AgentSpanData
 type CompactionConfig = agent.CompactionConfig
 type CompactionData = agent.CompactionData
+type CompactionModelResolver = agent.CompactionModelResolver
 type CompactionResult = agent.CompactionResult
 type CompactionSpanData = agent.CompactionSpanData
 type ContentEvent = agent.ContentEvent

@@ -295,9 +295,12 @@ func TestLiveOpenAIOAuthRuntimeBuilderChatLoopHandoffsSyncAndAsyncSubagents(t *t
 	if err != nil || activityResult.IsError || !strings.Contains(activityResult.Content, `"agent": "async_worker"`) {
 		t.Fatalf("activity result=%+v err=%v", activityResult, err)
 	}
-	collectResult := waitForSubagentResult(t, ctx, toolByName(t, asyncTools, "collect_subagent_result"), spawned.TaskID)
-	if collectResult.IsError || normalizeText(collectResult.Content) != "async nested live ok" {
-		t.Fatalf("collect async sub-agent result=%+v", collectResult)
+	// Results auto-deliver to managed parents; here we read the terminal task's
+	// result directly from the scheduler (the same path auto-delivery uses)
+	// now that the blocking collect_subagent_result tool has been removed.
+	collected, err := scheduler.CollectResult(spawned.TaskID)
+	if err != nil || normalizeText(collected.Result) != "async nested live ok" {
+		t.Fatalf("collect async sub-agent result=%+v err=%v", collected, err)
 	}
 }
 
@@ -1578,24 +1581,6 @@ func toolByName(t *testing.T, tools []agentsdk.Tool, name string) agentsdk.Tool 
 	}
 	t.Fatalf("tool %q missing; got %v", name, names)
 	return nil
-}
-
-func waitForSubagentResult(t *testing.T, ctx context.Context, collectTool agentsdk.Tool, taskID string) agentsdk.ToolResult {
-	t.Helper()
-	deadline := time.Now().Add(75 * time.Second)
-	for {
-		result, err := collectTool.Execute(ctx, json.RawMessage(fmt.Sprintf(`{"task_id":%q}`, taskID)), "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !result.IsError || !strings.Contains(result.Content, "still running") {
-			return result
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("sub-agent task %s did not finish before deadline; last result=%+v", taskID, result)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
 }
 
 func tinyPNG() []byte {

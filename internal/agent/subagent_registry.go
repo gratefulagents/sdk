@@ -269,41 +269,44 @@ type SubAgentRegistry struct {
 	workDir     string
 
 	// RunConfig fields inherited from the parent orchestrator.
-	toolAccessLevel  ToolAccessLevel
-	toolPolicy       *ToolPolicy
-	compactionConfig CompactionConfig
-	maxTurns         int
+	toolAccessLevel         ToolAccessLevel
+	toolPolicy              *ToolPolicy
+	compactionConfig        CompactionConfig
+	compactionModelResolver CompactionModelResolver
+	maxTurns                int
 }
 
 // SubAgentRegistryConfig configures the registry.
 type SubAgentRegistryConfig struct {
-	MaxConcurrent    int // 0 = unlimited
-	Runner           *Runner
-	Agents           map[string]*Agent // name → agent
-	Tracker          *ProgressTracker
-	EventStream      *EventStream
-	WorkDir          string
-	ToolAccessLevel  ToolAccessLevel
-	ToolPolicy       *ToolPolicy
-	CompactionConfig CompactionConfig
-	MaxTurns         int
+	MaxConcurrent           int // 0 = unlimited
+	Runner                  *Runner
+	Agents                  map[string]*Agent // name → agent
+	Tracker                 *ProgressTracker
+	EventStream             *EventStream
+	WorkDir                 string
+	ToolAccessLevel         ToolAccessLevel
+	ToolPolicy              *ToolPolicy
+	CompactionConfig        CompactionConfig
+	CompactionModelResolver CompactionModelResolver
+	MaxTurns                int
 }
 
 // NewSubAgentRegistry creates a new registry for tracking async sub-agent tasks.
 func NewSubAgentRegistry(cfg SubAgentRegistryConfig) *SubAgentRegistry {
 	r := &SubAgentRegistry{
-		tasks:            make(map[string]*subAgentTaskEntry),
-		changed:          make(chan struct{}),
-		runner:           cfg.Runner,
-		allAgents:        cfg.Agents,
-		agents:           cfg.Agents,
-		tracker:          cfg.Tracker,
-		eventStream:      cfg.EventStream,
-		workDir:          cfg.WorkDir,
-		toolAccessLevel:  NormalizeToolAccessLevel(cfg.ToolAccessLevel),
-		toolPolicy:       cfg.ToolPolicy,
-		compactionConfig: cfg.CompactionConfig,
-		maxTurns:         effectiveSubAgentMaxTurns(cfg.MaxTurns),
+		tasks:                   make(map[string]*subAgentTaskEntry),
+		changed:                 make(chan struct{}),
+		runner:                  cfg.Runner,
+		allAgents:               cfg.Agents,
+		agents:                  cfg.Agents,
+		tracker:                 cfg.Tracker,
+		eventStream:             cfg.EventStream,
+		workDir:                 cfg.WorkDir,
+		toolAccessLevel:         NormalizeToolAccessLevel(cfg.ToolAccessLevel),
+		toolPolicy:              cfg.ToolPolicy,
+		compactionConfig:        cfg.CompactionConfig,
+		compactionModelResolver: cfg.CompactionModelResolver,
+		maxTurns:                effectiveSubAgentMaxTurns(cfg.MaxTurns),
 	}
 	if cfg.MaxConcurrent > 0 {
 		r.sem = make(chan struct{}, cfg.MaxConcurrent)
@@ -361,6 +364,7 @@ func (r *SubAgentRegistry) Configure(cfg SubAgentRegistryConfig) {
 	r.toolAccessLevel = NormalizeToolAccessLevel(cfg.ToolAccessLevel)
 	r.toolPolicy = cfg.ToolPolicy
 	r.compactionConfig = cfg.CompactionConfig
+	r.compactionModelResolver = cfg.CompactionModelResolver
 	r.maxTurns = effectiveSubAgentMaxTurns(cfg.MaxTurns)
 	if cfg.MaxConcurrent > 0 {
 		// Keep the existing semaphore when capacity is unchanged so tasks
@@ -667,15 +671,16 @@ func (r *SubAgentRegistry) SpawnAsync(ctx context.Context, agentName, message st
 // SetAllowedAgents calls (hosts reconfigure per user turn) cannot race with
 // in-flight task goroutines.
 type taskRunSnapshot struct {
-	runner           *Runner
-	tracker          *ProgressTracker
-	eventStream      *EventStream
-	workDir          string
-	toolAccessLevel  ToolAccessLevel
-	toolPolicy       *ToolPolicy
-	compactionConfig CompactionConfig
-	maxTurns         int
-	sem              chan struct{}
+	runner                  *Runner
+	tracker                 *ProgressTracker
+	eventStream             *EventStream
+	workDir                 string
+	toolAccessLevel         ToolAccessLevel
+	toolPolicy              *ToolPolicy
+	compactionConfig        CompactionConfig
+	compactionModelResolver CompactionModelResolver
+	maxTurns                int
+	sem                     chan struct{}
 	// Tool guardrails inherited from the spawning run's RunConfig (via the
 	// nested-run context) so async tasks cannot bypass the parent's tool
 	// input/output guardrails.
@@ -752,15 +757,16 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		cancel:                   cancel,
 	}
 	snap := taskRunSnapshot{
-		runner:           r.runner,
-		tracker:          r.tracker,
-		eventStream:      r.eventStream,
-		workDir:          r.workDir,
-		toolAccessLevel:  r.toolAccessLevel,
-		toolPolicy:       r.toolPolicy,
-		compactionConfig: r.compactionConfig,
-		maxTurns:         r.maxTurns,
-		sem:              r.sem,
+		runner:                  r.runner,
+		tracker:                 r.tracker,
+		eventStream:             r.eventStream,
+		workDir:                 r.workDir,
+		toolAccessLevel:         r.toolAccessLevel,
+		toolPolicy:              r.toolPolicy,
+		compactionConfig:        r.compactionConfig,
+		compactionModelResolver: r.compactionModelResolver,
+		maxTurns:                r.maxTurns,
+		sem:                     r.sem,
 	}
 	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
 		snap.toolInputGuardrails = nestedCfg.ToolInputGuardrails
@@ -897,19 +903,20 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	startedAt := time.Now()
 	childCtx := WithTaskID(ctx, taskID)
 	result, err := snap.runner.Run(childCtx, childAgent, items, RunConfig{
-		Hooks:                 childHooks,
-		MaxTurns:              snap.maxTurns,
-		SubAgentMaxTurns:      snap.maxTurns,
-		WorkDir:               snap.workDir,
-		ToolAccessLevel:       childToolAccess,
-		ToolPolicy:            snap.toolPolicy,
-		ToolInputGuardrails:   snap.toolInputGuardrails,
-		ToolOutputGuardrails:  snap.toolOutputGuardrails,
-		CompactionConfig:      snap.compactionConfig,
-		Trace:                 trace,
-		ParentSpanID:          parentSpanID,
-		TracingProcessor:      processor,
-		ForceFinalSummaryTurn: true,
+		Hooks:                   childHooks,
+		MaxTurns:                snap.maxTurns,
+		SubAgentMaxTurns:        snap.maxTurns,
+		WorkDir:                 snap.workDir,
+		ToolAccessLevel:         childToolAccess,
+		ToolPolicy:              snap.toolPolicy,
+		ToolInputGuardrails:     snap.toolInputGuardrails,
+		ToolOutputGuardrails:    snap.toolOutputGuardrails,
+		CompactionConfig:        snap.compactionConfig,
+		CompactionModelResolver: snap.compactionModelResolver,
+		Trace:                   trace,
+		ParentSpanID:            parentSpanID,
+		TracingProcessor:        processor,
+		ForceFinalSummaryTurn:   true,
 		ImmediateInputPoller: func(context.Context) ([]RunItem, error) {
 			return r.drainQueuedMessages(taskID), nil
 		},

@@ -117,7 +117,6 @@ var controlFlowToolNames = map[string]struct{}{
 	"wait_for_subagent_progress":    {},
 	"wait_for_subagent_change":      {},
 	"send_message_to_subagent_task": {},
-	"collect_subagent_result":       {},
 	"cancel_subagent_task":          {},
 }
 
@@ -435,6 +434,22 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			return nil, &AgentError{Message: "no model configured: set agent.Model, cfg.ModelOverride, or use NewRunnerWithProvider"}
 		}
 
+		// Resolve compaction thresholds for the model actually being used this
+		// turn. Sub-agents (and active fallback models) run different models
+		// than the parent, so a fixed parent-derived threshold would either
+		// over-compact or — far worse — never fire before a smaller model's
+		// real context limit, letting the run blow past it and hang (the
+		// gpt-5.3-codex-spark freeze). The resolver consults authoritative
+		// provider metadata with a static fallback and is cached, so calling it
+		// each turn is cheap.
+		compactionCfg := cfg.CompactionConfig
+		if cfg.CompactionModelResolver != nil && compactionCfg.Enabled {
+			if trigger, target, ok := cfg.CompactionModelResolver(ctx, requestedModelName); ok && trigger > 0 {
+				compactionCfg.TriggerTokens = trigger
+				compactionCfg.TargetTokens = target
+			}
+		}
+
 		requestOverheadTokens := estimateModelRequestOverheadTokens(instructions, tools, settings)
 		compactRequest := ModelRequest{
 			Model:        modelName,
@@ -444,7 +459,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			Settings:     settings,
 			OutputSchema: currentAgent.OutputType,
 		}
-		if compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(ctx, activeModel, compactRequest, requestOverheadTokens, cfg.CompactionConfig, false); ok {
+		compactCtx, compactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+		compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
+		compactCancel()
+		if ok {
 			var carryForward string
 			currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
 			if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
@@ -459,7 +477,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if compactErr != nil {
 				log.Printf("[runner] WARN: provider compaction failed; falling back to local compaction: %v", compactErr)
 			}
-			if compacted, before, after, ok, reason := MaybeCompactRunItemsForRequest(currentInput, cfg.CompactionConfig, requestOverheadTokens); ok {
+			if compacted, before, after, ok, reason := MaybeCompactRunItemsForRequest(currentInput, compactionCfg, requestOverheadTokens); ok {
 				var carryForward string
 				currentInput, carryForward = applyCompactionCarryForward(ctx, compacted, currentInput, cfg)
 				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
@@ -534,7 +552,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			Tools:               tools,
 			Settings:            settings,
 			OutputSchema:        currentAgent.OutputType,
-			CompactionThreshold: modelCompactionThreshold(activeModel, cfg.CompactionConfig),
+			CompactionThreshold: modelCompactionThreshold(activeModel, compactionCfg),
 		}
 		requestSnapshot := BuildLLMRequestSnapshot(currentAgent.Name, modelRequest)
 		genData := &GenerationSpanData{
@@ -579,9 +597,21 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		emitLLMAttemptEvent(cfg.Hooks, attemptEvent("started"))
 		tp.OnSpanStart(genSpan)
 
-		// Call model.
+		// Call model under a per-attempt timeout so a hung or unresponsive
+		// provider connection cannot freeze the run forever. The timeout is
+		// derived from the run context, so real cancellation still propagates.
 		llmStartedAt := time.Now()
-		resp, err := r.callModel(ctx, activeModel, modelRequest, streamEvents)
+		callCtx, callCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents)
+		callCancel()
+		// A per-attempt timeout (our derived deadline fired while the parent
+		// run context is still alive) is a transient provider hang, not a user
+		// cancellation: let it flow through the normal retry/fallback path
+		// instead of terminating the run.
+		perCallTimeout := err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
+		if perCallTimeout {
+			err = fmt.Errorf("model call exceeded per-attempt timeout: %w", err)
+		}
 
 		if err != nil {
 			turnRetryAttempt++
@@ -595,7 +625,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			tp.OnSpanEnd(genSpan)
 			trace.AddSpan(genSpan)
 
-			if isContextCancellation(err) {
+			if isContextCancellation(err) && !perCallTimeout {
 				ev := attemptFailureEvent(attemptEvent("failed"), genData)
 				emitLLMAttemptEvent(cfg.Hooks, ev)
 				return nil, err
@@ -610,7 +640,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					Settings:     settings,
 					OutputSchema: currentAgent.OutputType,
 				}
-				if compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(ctx, activeModel, forcedRequest, requestOverheadTokens, cfg.CompactionConfig, true); ok {
+				forcedCompactCtx, forcedCompactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+				compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(forcedCompactCtx, activeModel, forcedRequest, requestOverheadTokens, compactionCfg, true)
+				forcedCompactCancel()
+				if ok {
 					var carryForward string
 					currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
 					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
@@ -629,7 +662,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					log.Printf("[runner] WARN: provider compaction after context error failed; falling back to local compaction: %v", compactErr)
 				}
 
-				forcedCfg := cfg.CompactionConfig.normalized()
+				forcedCfg := compactionCfg.normalized()
 				beforeEstimate := estimateRunItemsTokens(currentInput)
 				forcedCfg.TriggerTokens = 1
 				forcedCfg.TargetTokens = minInt(forcedCfg.TargetTokens, maxInt(1, beforeEstimate/2))

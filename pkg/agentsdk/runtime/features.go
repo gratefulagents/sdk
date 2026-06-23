@@ -68,7 +68,6 @@ type AsyncSubAgentFeatures struct {
 	Activity  bool
 	TaskGraph bool
 	Message   bool
-	Collect   bool
 	Cancel    bool
 }
 
@@ -160,7 +159,6 @@ func legacyFeatures(cfg Config) Features {
 				Activity:  cfg.EnableSubAgents,
 				TaskGraph: cfg.EnableSubAgents,
 				Message:   cfg.EnableSubAgents,
-				Collect:   cfg.EnableSubAgents,
 				Cancel:    cfg.EnableSubAgents,
 			},
 		},
@@ -222,7 +220,7 @@ func (f SubAgentFeatures) asyncEnabled() bool {
 }
 
 func (f AsyncSubAgentFeatures) any() bool {
-	return f.Spawn || f.Run || f.Graph || f.List || f.Status || f.Activity || f.TaskGraph || f.Message || f.Collect || f.Cancel
+	return f.Spawn || f.Run || f.Graph || f.List || f.Status || f.Activity || f.TaskGraph || f.Message || f.Cancel
 }
 
 func shouldBuildToolBundle(features resolvedFeatures) bool {

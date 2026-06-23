@@ -20,6 +20,7 @@ type ModelMetadata struct {
 	ID                            string
 	ContextWindow                 int
 	MaxContextWindow              int
+	MaxOutputTokens               int
 	AutoCompactTokenLimit         int
 	EffectiveContextWindowPercent int
 }
@@ -154,6 +155,17 @@ func parseModelMetadata(body []byte) ([]ModelMetadata, error) {
 	var payload struct {
 		Data []struct {
 			ID string `json:"id"`
+			// GitHub Copilot's /models returns capability limits nested under
+			// each model. Parsing these lets the SDK derive real per-model
+			// context windows (and output caps) for Copilot, which otherwise
+			// only advertises bare model IDs in the OpenAI /v1/models shape.
+			Capabilities struct {
+				Limits struct {
+					MaxContextWindowTokens int `json:"max_context_window_tokens"`
+					MaxPromptTokens        int `json:"max_prompt_tokens"`
+					MaxOutputTokens        int `json:"max_output_tokens"`
+				} `json:"limits"`
+			} `json:"capabilities"`
 		} `json:"data"`
 		Models []struct {
 			Slug                          string `json:"slug"`
@@ -188,7 +200,17 @@ func parseModelMetadata(body []byte) ([]ModelMetadata, error) {
 			if id == "" {
 				continue
 			}
-			models = append(models, ModelMetadata{ID: id})
+			limits := item.Capabilities.Limits
+			contextWindow := limits.MaxContextWindowTokens
+			if contextWindow == 0 {
+				contextWindow = limits.MaxPromptTokens
+			}
+			models = append(models, ModelMetadata{
+				ID:               id,
+				ContextWindow:    contextWindow,
+				MaxContextWindow: limits.MaxContextWindowTokens,
+				MaxOutputTokens:  limits.MaxOutputTokens,
+			})
 		}
 	}
 
