@@ -543,6 +543,31 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 		}
 	})
 
+	t.Run("remaps unsupported reasoning effort for chatgpt backend", func(t *testing.T) {
+		cases := map[string]string{"xhigh": "max", "minimal": "low", "high": "high", "low": "low", "medium": "medium"}
+		for in, want := range cases {
+			req := makeReq("chatgpt.com", "/backend-api/codex/responses",
+				`{"model":"gpt-5.3-codex","reasoning":{"effort":"`+in+`"}}`)
+			maybeNormalizeCodexResponsesBody(req, oauthSession)
+			body := readBody(req)
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil || reasoning["effort"] != want {
+				t.Errorf("effort %q -> %v, want %q (Codex supports only [low medium high max])", in, reasoning["effort"], want)
+			}
+		}
+	})
+
+	t.Run("does not remap reasoning effort for standard api", func(t *testing.T) {
+		req := makeReq("api.openai.com", "/v1/responses",
+			`{"model":"gpt-5.4","reasoning":{"effort":"xhigh"}}`)
+		maybeNormalizeCodexResponsesBody(req, oauthSession)
+		body := readBody(req)
+		reasoning, _ := body["reasoning"].(map[string]any)
+		if reasoning == nil || reasoning["effort"] != "xhigh" {
+			t.Errorf("standard API must keep effort=xhigh, got %v", body["reasoning"])
+		}
+	})
+
 	t.Run("drops empty reasoning object after summary strip", func(t *testing.T) {
 		req := makeReq("chatgpt.com", "/backend-api/codex/responses",
 			`{"model":"gpt-5.3-codex","reasoning":{"summary":"auto"}}`)

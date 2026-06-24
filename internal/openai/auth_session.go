@@ -690,11 +690,17 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	delete(body, "include")
 	// The Codex endpoint rejects reasoning.summary / generate_summary (a 400),
 	// even though the standard Responses API accepts them. It emits reasoning
-	// summaries natively, so strip only the summary controls and keep
-	// reasoning.effort intact.
+	// summaries natively, so strip only the summary controls. It also rejects
+	// reasoning.effort values outside [low medium high max] (e.g. "xhigh" and
+	// "minimal", which the standard API accepts), so remap those.
 	if reasoning, ok := body["reasoning"].(map[string]any); ok {
 		delete(reasoning, "summary")
 		delete(reasoning, "generate_summary")
+		if effort, ok := reasoning["effort"].(string); ok {
+			if remapped := codexReasoningEffort(effort); remapped != effort {
+				reasoning["effort"] = remapped
+			}
+		}
 		if len(reasoning) == 0 {
 			delete(body, "reasoning")
 		}
@@ -735,6 +741,21 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(normalized)), nil }
 	req.ContentLength = int64(len(normalized))
 	return !callerSetStream
+}
+
+// codexReasoningEffort maps a reasoning effort label to the set the ChatGPT
+// Codex backend accepts: [low medium high max]. The standard Responses API also
+// accepts "minimal" and "xhigh", which the Codex backend rejects with a 400
+// ("invalid_reasoning_effort"), so collapse those to the nearest supported tier.
+func codexReasoningEffort(effort string) string {
+	switch effort {
+	case "xhigh":
+		return "max"
+	case "minimal":
+		return "low"
+	default:
+		return effort
+	}
 }
 
 func maybeFinalizeCodexResponse(req *http.Request, resp *http.Response, forcedStream bool, session *OpenAIAuthSession) (*http.Response, error) {
