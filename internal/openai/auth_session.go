@@ -684,25 +684,24 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	}
 
 	delete(body, "max_output_tokens")
-	// ChatGPT backend rejects API-only params.
+	// Codex manages its own output budget and does not use these standard
+	// Responses params; opencode/codex-cli omit them too.
 	delete(body, "truncation")
 	delete(body, "prompt_cache_retention")
-	delete(body, "include")
-	// The Codex endpoint rejects reasoning.summary / generate_summary (a 400),
-	// even though the standard Responses API accepts them. It emits reasoning
-	// summaries natively, so strip only the summary controls. It also rejects
-	// reasoning.effort values outside [low medium high max] (e.g. "xhigh" and
-	// "minimal", which the standard API accepts), so remap those.
+	// NOTE: do NOT strip "include". With store=false (required below) plus
+	// reasoning, the Responses API requires include=["reasoning.encrypted_content"]
+	// so the client receives the encrypted reasoning to round-trip on the next
+	// turn; stripping it makes Codex reject the request. opencode and codex-cli
+	// both send it.
+	//
+	// Codex rejects reasoning.effort values outside [low medium high max]
+	// ("xhigh"/"minimal", which the standard API accepts), so remap those. It
+	// DOES accept reasoning.summary (and emits summaries), so keep it.
 	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		delete(reasoning, "summary")
-		delete(reasoning, "generate_summary")
 		if effort, ok := reasoning["effort"].(string); ok {
 			if remapped := codexReasoningEffort(effort); remapped != effort {
 				reasoning["effort"] = remapped
 			}
-		}
-		if len(reasoning) == 0 {
-			delete(body, "reasoning")
 		}
 	}
 	if _, ok := body["store"]; !ok {
@@ -759,12 +758,37 @@ func codexReasoningEffort(effort string) string {
 }
 
 func maybeFinalizeCodexResponse(req *http.Request, resp *http.Response, forcedStream bool, session *OpenAIAuthSession) (*http.Response, error) {
+	logCodexErrorBody(req, resp, session)
 	finalResp, err := maybeCollectSSE(resp, forcedStream)
 	if err != nil {
 		return nil, err
 	}
 	maybeNormalizeCodexCompactResponse(req, finalResp, session)
 	return finalResp, nil
+}
+
+// logCodexErrorBody surfaces the response body for a failed Codex request so the
+// exact rejection reason (e.g. "invalid_reasoning_effort", a missing required
+// field) is visible in logs instead of an opaque "400 Bad Request". It reads and
+// restores the body so downstream error handling still sees it.
+func logCodexErrorBody(req *http.Request, resp *http.Response, session *OpenAIAuthSession) {
+	if session == nil || session.mode != AuthModeOAuth || resp == nil || req == nil || req.URL == nil {
+		return
+	}
+	if !isChatGPTBackendHost(req.URL.Host) || resp.StatusCode < 400 {
+		return
+	}
+	if resp.Body == nil {
+		log.Printf("[openai] codex error: status=%d url=%s (empty body)", resp.StatusCode, req.URL.Path)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	log.Printf("[openai] codex error: status=%d url=%s body=%s", resp.StatusCode, req.URL.Path, strings.TrimSpace(string(body)))
 }
 
 // ChatGPT's Codex compact endpoint can return JSON without a JSON content type.
