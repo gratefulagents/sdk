@@ -692,18 +692,10 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	// reasoning, the Responses API requires include=["reasoning.encrypted_content"]
 	// so the client receives the encrypted reasoning to round-trip on the next
 	// turn; stripping it makes Codex reject the request. opencode and codex-cli
-	// both send it.
-	//
-	// Codex rejects reasoning.effort values outside [low medium high max]
-	// ("xhigh"/"minimal", which the standard API accepts), so remap those. It
-	// DOES accept reasoning.summary (and emits summaries), so keep it.
-	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok {
-			if remapped := codexReasoningEffort(effort); remapped != effort {
-				reasoning["effort"] = remapped
-			}
-		}
-	}
+	// both send it. reasoning.effort and reasoning.summary are passed through
+	// untouched: OpenAI models accept [none minimal low medium high xhigh] (the
+	// values the SDK produces). "max" is the Anthropic/Claude vocabulary and is
+	// never sent on this path.
 	if _, ok := body["store"]; !ok {
 		body["store"] = false
 	}
@@ -740,21 +732,6 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(normalized)), nil }
 	req.ContentLength = int64(len(normalized))
 	return !callerSetStream
-}
-
-// codexReasoningEffort maps a reasoning effort label to the set the ChatGPT
-// Codex backend accepts: [low medium high max]. The standard Responses API also
-// accepts "minimal" and "xhigh", which the Codex backend rejects with a 400
-// ("invalid_reasoning_effort"), so collapse those to the nearest supported tier.
-func codexReasoningEffort(effort string) string {
-	switch effort {
-	case "xhigh":
-		return "max"
-	case "minimal":
-		return "low"
-	default:
-		return effort
-	}
 }
 
 func maybeFinalizeCodexResponse(req *http.Request, resp *http.Response, forcedStream bool, session *OpenAIAuthSession) (*http.Response, error) {

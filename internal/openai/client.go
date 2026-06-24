@@ -1087,11 +1087,7 @@ func toCompactParams(req anthropic.CreateMessageRequest, includeCodexExtras bool
 			extras["parallel_tool_calls"] = true
 		}
 		if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-			reasoning := sharedReasoningFromBudget(req.Thinking.BudgetTokens)
-			// This branch only runs for the Codex backend, which rejects effort
-			// values outside [low medium high max]; map xhigh/minimal accordingly.
-			reasoning.Effort = shared.ReasoningEffort(codexReasoningEffort(string(reasoning.Effort)))
-			extras["reasoning"] = reasoning
+			extras["reasoning"] = sharedReasoningFromBudget(req.Thinking.BudgetTokens)
 		}
 		if verbosity := normalizeTextVerbosity(req.TextVerbosity); verbosity != "" {
 			extras["text"] = responses.ResponseTextConfigParam{

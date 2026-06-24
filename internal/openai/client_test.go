@@ -407,8 +407,8 @@ func TestToCompactParamsCodexExtras(t *testing.T) {
 		t.Fatalf("parallel_tool_calls = %v, want true", body["parallel_tool_calls"])
 	}
 	reasoning, ok := body["reasoning"].(map[string]any)
-	if !ok || reasoning["effort"] != "max" {
-		t.Fatalf("reasoning = %#v, want effort=max (xhigh remapped for Codex compact endpoint)", body["reasoning"])
+	if !ok || reasoning["effort"] != "xhigh" {
+		t.Fatalf("reasoning = %#v, want effort=xhigh (OpenAI accepts xhigh; no remap)", body["reasoning"])
 	}
 	text, ok := body["text"].(map[string]any)
 	if !ok || text["verbosity"] != "low" {
@@ -529,8 +529,8 @@ func TestCompactConversationUsesCodexBackendJSON(t *testing.T) {
 		t.Fatalf("tool properties = %#v, want empty object", toolParams["properties"])
 	}
 	reasoning, ok := body["reasoning"].(map[string]any)
-	if !ok || reasoning["effort"] != "low" {
-		t.Fatalf("reasoning = %#v, want low (minimal remapped for Codex compact endpoint)", body["reasoning"])
+	if !ok || reasoning["effort"] != "minimal" {
+		t.Fatalf("reasoning = %#v, want minimal (OpenAI accepts minimal; no remap)", body["reasoning"])
 	}
 	text, ok := body["text"].(map[string]any)
 	if !ok || text["verbosity"] != "medium" {
@@ -940,18 +940,18 @@ func TestToCompactParams_OmitsReasoningSummary(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	if strings.Contains(string(raw), "\"summary\"") {
-		t.Fatalf("compaction request must not contain reasoning.summary (Codex 400): %s", raw)
+		t.Fatalf("compaction request must not contain reasoning.summary: %s", raw)
 	}
 	if !strings.Contains(string(raw), "\"effort\"") {
 		t.Fatalf("compaction request should still carry reasoning.effort: %s", raw)
 	}
-	// budget 16000 -> "xhigh", which the Codex backend rejects; compaction must
-	// downgrade it to "max" since /responses/compact bypasses the HTTP normalizer.
-	if strings.Contains(string(raw), "xhigh") {
-		t.Fatalf("compaction effort must be remapped from xhigh to max for Codex: %s", raw)
+	// budget 16000 -> "xhigh". OpenAI accepts xhigh (not "max", which is the
+	// Anthropic vocabulary), so the effort is passed through unchanged.
+	if !strings.Contains(string(raw), "xhigh") {
+		t.Fatalf("compaction effort should be xhigh (OpenAI vocab, no remap): %s", raw)
 	}
-	if !strings.Contains(string(raw), "\"max\"") {
-		t.Fatalf("compaction effort should be max (remapped from xhigh): %s", raw)
+	if strings.Contains(string(raw), "\"max\"") {
+		t.Fatalf("compaction effort must not be 'max' (Anthropic-only vocabulary): %s", raw)
 	}
 }
 

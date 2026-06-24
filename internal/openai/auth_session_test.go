@@ -550,16 +550,17 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 		}
 	})
 
-	t.Run("remaps unsupported reasoning effort for chatgpt backend", func(t *testing.T) {
-		cases := map[string]string{"xhigh": "max", "minimal": "low", "high": "high", "low": "low", "medium": "medium"}
-		for in, want := range cases {
+	t.Run("passes reasoning effort through unchanged for chatgpt backend", func(t *testing.T) {
+		// OpenAI models accept [none minimal low medium high xhigh]. "max" is the
+		// Anthropic/Claude vocabulary and is never sent here, so no remap is done.
+		for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh"} {
 			req := makeReq("chatgpt.com", "/backend-api/codex/responses",
-				`{"model":"gpt-5.3-codex","reasoning":{"effort":"`+in+`"}}`)
+				`{"model":"gpt-5.4-mini","reasoning":{"effort":"`+effort+`"}}`)
 			maybeNormalizeCodexResponsesBody(req, oauthSession)
 			body := readBody(req)
 			reasoning, _ := body["reasoning"].(map[string]any)
-			if reasoning == nil || reasoning["effort"] != want {
-				t.Errorf("effort %q -> %v, want %q (Codex supports only [low medium high max])", in, reasoning["effort"], want)
+			if reasoning == nil || reasoning["effort"] != effort {
+				t.Errorf("effort %q -> %v, want unchanged (OpenAI accepts xhigh, not max)", effort, reasoning["effort"])
 			}
 		}
 	})
