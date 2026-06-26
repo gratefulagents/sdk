@@ -382,6 +382,14 @@ func isForbiddenWritePath(p string) bool {
 	if p == "" {
 		return false
 	}
+	// Standard safe pseudo-device files are always valid redirect/tee targets
+	// (e.g. "2>/dev/null", ">/dev/stderr"). Writing to them discards data or
+	// routes it to an existing stream; it is never destructive. Without this,
+	// the universally-common "2>/dev/null" idiom is blocked, which forces agents
+	// to rewrite/retry exploration commands and wastes tool calls.
+	if isSafeDeviceFile(p) {
+		return false
+	}
 	if strings.HasPrefix(p, "/etc/") || p == "/etc" {
 		return true
 	}
@@ -398,6 +406,19 @@ func isForbiddenWritePath(p string) bool {
 		return true
 	}
 	return false
+}
+
+// isSafeDeviceFile reports whether p is a standard pseudo-device that is always
+// safe to use as a redirect/tee target. /dev/fd/N and /dev/std* route to the
+// process's own streams; /dev/null and /dev/zero discard writes.
+func isSafeDeviceFile(p string) bool {
+	switch p {
+	case "/dev/null", "/dev/zero", "/dev/full", "/dev/tty",
+		"/dev/stdin", "/dev/stdout", "/dev/stderr",
+		"/dev/random", "/dev/urandom":
+		return true
+	}
+	return strings.HasPrefix(p, "/dev/fd/")
 }
 
 func mentionsForbiddenSystemFile(s string) bool {
