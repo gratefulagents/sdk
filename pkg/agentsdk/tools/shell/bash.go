@@ -341,12 +341,13 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 
 	// Universal destructive-command checks (apply when not danger-full-access).
 	if readOnly || workspaceWrite {
+		// classifyDestructive recurses into command substitutions ($()/backticks),
+		// and the git policy below scans inside them too, so a substitution grants
+		// no capability its inner command would not already have at top level.
+		// We therefore allow command substitution itself (e.g. wc -l $(find ...)),
+		// relying on those recursive checks plus the sandbox for enforcement.
 		if blocked, reason := classifyDestructive(command); blocked {
 			return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, reason)
-		}
-		// Any command substitution is suspicious in restricted modes.
-		if hasAnyCommandSubstitution(command) {
-			return true, fmt.Sprintf("Command blocked in %s mode: command substitution / backticks not allowed", mode)
 		}
 	}
 
@@ -368,15 +369,6 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 	}
 
 	return false, ""
-}
-
-func hasAnyCommandSubstitution(cmdLine string) bool {
-	for _, t := range tokenize(cmdLine) {
-		if t.HasCmdSub {
-			return true
-		}
-	}
-	return false
 }
 
 // IsPushToProtectedBranch detects git push commands that target main or

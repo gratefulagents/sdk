@@ -9,10 +9,11 @@ import (
 
 // command represents one program invocation inside a pipeline (no |/;/&& yet).
 type command struct {
-	argv      []string
-	hasCmdSub bool
-	cmdSubs   []string
-	redirects []redirect
+	argv       []string
+	hasCmdSub  bool
+	headCmdSub bool // the head token (argv[0]) is produced by a substitution
+	cmdSubs    []string
+	redirects  []redirect
 }
 
 type redirect struct {
@@ -47,6 +48,9 @@ func parseStatements(tokens []token) []pipeline {
 	for i < len(tokens) {
 		t := tokens[i]
 		if !t.IsOperator {
+			if len(cmd.argv) == 0 && t.HasCmdSub {
+				cmd.headCmdSub = true
+			}
 			cmd.argv = append(cmd.argv, t.Value)
 			if t.HasCmdSub {
 				cmd.hasCmdSub = true
@@ -134,6 +138,19 @@ func classifyCommand(cmd command) (bool, string) {
 	cmd.argv = argv
 	head := cmd.argv[0]
 	base := strings.ToLower(basename(head))
+
+	// Command substitution can inject flags/targets that the static destructive
+	// checks below cannot see (e.g. `rm $(echo -rf) /` expands to `rm -rf /`).
+	// Block it only when the head is a statically-checked destructive binary, a
+	// shell interpreter, or itself produced by a substitution (so the command is
+	// unknowable). Benign uses like `wc -l $(find ...)` are allowed; destructive
+	// commands inside the substitution are still caught by the cmdSubs recursion
+	// above.
+	if cmd.hasCmdSub {
+		if base == "" || cmd.headCmdSub || isCmdSubEvasionRisk(base) {
+			return true, "command substitution in a file-mutating command is not allowed"
+		}
+	}
 
 	// Recurse into shells / eval invoked with -c "...".
 	if base == "eval" {
@@ -376,6 +393,24 @@ func isShellInterpreter(arg string) bool {
 		return true
 	}
 	return false
+}
+
+// isCmdSubEvasionRisk reports whether a command head is one whose static
+// destructive checks (recursive rm, chmod/chown -R at root, dd to device,
+// mkfs, tee to protected paths) could be defeated by hiding flags or targets
+// inside a command substitution (e.g. `rm $(echo -rf) /`). Command substitution
+// is blocked for these heads; for all other commands it is permitted because
+// the substitution cannot turn a non-destructive program destructive, and any
+// destructive command inside the substitution is caught by recursion.
+func isCmdSubEvasionRisk(base string) bool {
+	switch base {
+	case "rm", "rmdir", "chmod", "chown", "chgrp", "dd", "tee", "shred", "truncate":
+		return true
+	}
+	if strings.HasPrefix(base, "mkfs") {
+		return true
+	}
+	return isShellInterpreter(base)
 }
 
 func isForbiddenWritePath(p string) bool {
