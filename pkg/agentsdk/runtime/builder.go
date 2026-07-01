@@ -414,6 +414,9 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		if features.value.Tools.AsyncShell {
 			registryOptions = append(registryOptions, sdktools.WithAsyncShellTools())
 		}
+		if features.value.Tools.AttachRepository {
+			registryOptions = append(registryOptions, sdktools.WithAttachRepositoryTool())
+		}
 		if !features.value.Tools.WebFetch {
 			registryOptions = append(registryOptions, sdktools.WithoutWebTools())
 		}
@@ -893,6 +896,7 @@ func registryToolNames(features ToolFeatures) map[string]bool {
 	add(features.Edit, "Edit")
 	add(features.WebFetch, "WebFetch")
 	add(features.AsyncShell, "BashStart", "BashPoll", "BashKill")
+	add(features.AttachRepository, "attach_repository")
 	return names
 }
 

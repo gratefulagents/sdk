@@ -9,6 +9,7 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
+	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 )
 
@@ -94,6 +95,17 @@ func TestNewRegistryRetainsWorkDir(t *testing.T) {
 	r := NewRegistry(dir)
 	if got := r.WorkDir(); got != dir {
 		t.Fatalf("WorkDir() = %q, want %q", got, dir)
+	}
+}
+
+func TestNewRegistryWithAttachRepositoryTool(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithAttachRepositoryTool(sdkgit.WithAttachRepositoryDefaultBaseBranch("main")))
+	tool := r.Get("attach_repository")
+	if tool == nil {
+		t.Fatalf("registry missing attach_repository; names=%v", r.Names())
+	}
+	if tool.IsReadOnly() {
+		t.Fatalf("attach_repository reported read-only")
 	}
 }
 

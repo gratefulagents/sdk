@@ -154,19 +154,31 @@ type fakeRunner struct {
 	ghOut    map[string]string
 	gitErr   map[string]error
 	ghErr    map[string]error
+	gitFn    func(context.Context, string, ...string) (string, error)
+	ghFn     func(context.Context, string, ...string) (string, error)
 	gitCalls []string
 	ghCalls  []string
+	gitDirs  []string
+	ghDirs   []string
 }
 
-func (r *fakeRunner) RunGit(_ context.Context, _ string, args ...string) (string, error) {
+func (r *fakeRunner) RunGit(ctx context.Context, workDir string, args ...string) (string, error) {
 	key := strings.Join(args, " ")
 	r.gitCalls = append(r.gitCalls, key)
+	r.gitDirs = append(r.gitDirs, workDir)
+	if r.gitFn != nil {
+		return r.gitFn(ctx, workDir, args...)
+	}
 	return r.gitOut[key], r.gitErr[key]
 }
 
-func (r *fakeRunner) RunGH(_ context.Context, _ string, args ...string) (string, error) {
+func (r *fakeRunner) RunGH(ctx context.Context, workDir string, args ...string) (string, error) {
 	key := strings.Join(args, " ")
 	r.ghCalls = append(r.ghCalls, key)
+	r.ghDirs = append(r.ghDirs, workDir)
+	if r.ghFn != nil {
+		return r.ghFn(ctx, workDir, args...)
+	}
 	return r.ghOut[key], r.ghErr[key]
 }
 

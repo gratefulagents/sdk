@@ -84,6 +84,10 @@ func (t *CreatePullRequestTool) InputSchema() json.RawMessage {
 				"type": "string",
 				"description": "Target branch to merge into (e.g. main). If empty, uses repo default."
 			},
+			"repo_path": {
+				"type": "string",
+				"description": "Workspace-relative path to the git repository, for example repos/<alias>. Defaults to the workspace root for callers that still use a single root repository."
+			},
 			"draft": {
 				"type": "boolean",
 				"description": "Create as draft PR. Defaults to false."
@@ -103,6 +107,7 @@ type createPullRequestInput struct {
 	Title      string `json:"title"`
 	Body       string `json:"body"`
 	BaseBranch string `json:"base_branch"`
+	RepoPath   string `json:"repo_path"`
 	Draft      bool   `json:"draft"`
 }
 
@@ -117,23 +122,27 @@ func (t *CreatePullRequestTool) Execute(ctx context.Context, input json.RawMessa
 	if err := json.Unmarshal(input, &in); err != nil {
 		return prError("Invalid input: " + err.Error())
 	}
+	repoDir, err := resolveRepositoryWorkDir(workDir, in.RepoPath)
+	if err != nil {
+		return prError("repo_path rejected: " + err.Error())
+	}
 
 	runner := t.runner()
-	statusOut, err := runner.RunGit(ctx, workDir, "status", "--porcelain")
+	statusOut, err := runner.RunGit(ctx, repoDir, "status", "--porcelain")
 	if err == nil && strings.TrimSpace(statusOut) != "" {
-		if _, err := runner.RunGit(ctx, workDir, "add", "-A"); err != nil {
+		if _, err := runner.RunGit(ctx, repoDir, "add", "-A"); err != nil {
 			return prError("git add failed: " + err.Error())
 		}
 		msg := in.Title
 		if msg == "" {
 			msg = "changes from agent run"
 		}
-		if _, err := runner.RunGit(ctx, workDir, "commit", "--no-verify", "-m", msg); err != nil {
+		if _, err := runner.RunGit(ctx, repoDir, "commit", "--no-verify", "-m", msg); err != nil {
 			return prError("git commit failed: " + err.Error())
 		}
 	}
 
-	pushOut, err := runner.RunGit(ctx, workDir, "push", "--no-verify", "-u", "origin", "HEAD")
+	pushOut, err := runner.RunGit(ctx, repoDir, "push", "--no-verify", "-u", "origin", "HEAD")
 	if err != nil {
 		return prError(fmt.Sprintf("git push failed: %s\n%s", err, pushOut))
 	}
@@ -157,16 +166,16 @@ func (t *CreatePullRequestTool) Execute(ctx context.Context, input json.RawMessa
 		args = append(args, "--draft")
 	}
 
-	prOut, err := runner.RunGH(ctx, workDir, args...)
+	prOut, err := runner.RunGH(ctx, repoDir, args...)
 	if err != nil {
-		if prURL, fetchErr := ghPRViewURL(ctx, runner, workDir); fetchErr == nil && prURL != "" {
+		if prURL, fetchErr := ghPRViewURL(ctx, runner, repoDir); fetchErr == nil && prURL != "" {
 			t.recordPR(ctx, prURL)
 			return prSuccess(prURL, "PR already exists")
 		}
 		return prError(fmt.Sprintf("gh pr create failed: %s\n%s", err, prOut))
 	}
 
-	prURL, fetchErr := ghPRViewURL(ctx, runner, workDir)
+	prURL, fetchErr := ghPRViewURL(ctx, runner, repoDir)
 	if fetchErr != nil || prURL == "" {
 		prURL = strings.TrimSpace(prOut)
 	}
@@ -255,6 +264,10 @@ func (t *CreateIssueTool) InputSchema() json.RawMessage {
 				"type": "array",
 				"items": { "type": "string" },
 				"description": "GitHub usernames to assign to the issue."
+			},
+			"repo_path": {
+				"type": "string",
+				"description": "Workspace-relative path to the git repository, for example repos/<alias>. Defaults to the workspace root for callers that still use a single root repository."
 			}
 		},
 		"required": ["title"]
@@ -273,6 +286,7 @@ type createIssueInput struct {
 	Body      string   `json:"body"`
 	Labels    []string `json:"labels"`
 	Assignees []string `json:"assignees"`
+	RepoPath  string   `json:"repo_path"`
 }
 
 type createIssueOutput struct {
@@ -289,6 +303,10 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 	if strings.TrimSpace(in.Title) == "" {
 		return issueError("title is required")
 	}
+	repoDir, err := resolveRepositoryWorkDir(workDir, in.RepoPath)
+	if err != nil {
+		return issueError("repo_path rejected: " + err.Error())
+	}
 
 	args := []string{"issue", "create", "--title", in.Title}
 	if in.Body != "" {
@@ -301,7 +319,7 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 		args = append(args, "--assignee", assignee)
 	}
 
-	out, err := t.runner().RunGH(ctx, workDir, args...)
+	out, err := t.runner().RunGH(ctx, repoDir, args...)
 	if err != nil {
 		return issueError(fmt.Sprintf("gh issue create failed: %s\n%s", err, out))
 	}

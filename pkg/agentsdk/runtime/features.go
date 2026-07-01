@@ -17,19 +17,20 @@ type Features struct {
 }
 
 type ToolFeatures struct {
-	ListFiles      bool
-	ReadFile       bool
-	Glob           bool
-	Grep           bool
-	LSP            bool
-	Bash           bool
-	Write          bool
-	Edit           bool
-	WebFetch       bool
-	AsyncShell     bool
-	ExtraTools     bool
-	VisionAnalyzer bool
-	Signals        SignalFeatures
+	ListFiles        bool
+	ReadFile         bool
+	Glob             bool
+	Grep             bool
+	LSP              bool
+	Bash             bool
+	Write            bool
+	Edit             bool
+	WebFetch         bool
+	AsyncShell       bool
+	AttachRepository bool
+	ExtraTools       bool
+	VisionAnalyzer   bool
+	Signals          SignalFeatures
 }
 
 type SignalFeatures struct {
@@ -192,7 +193,7 @@ func legacyFeatures(cfg Config) Features {
 }
 
 func (f ToolFeatures) hasRegistryTools() bool {
-	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.WebFetch || f.AsyncShell
+	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.WebFetch || f.AsyncShell || f.AttachRepository
 }
 
 func (f ToolFeatures) hasSignals() bool {

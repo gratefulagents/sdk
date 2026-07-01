@@ -11,6 +11,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/fs"
+	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	memorytool "github.com/gratefulagents/sdk/pkg/agentsdk/tools/memory"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
@@ -38,6 +39,7 @@ type Registry struct {
 	thinkTool               bool
 	interactiveTerminal     bool
 	terminalManager         *shell.TerminalManager
+	attachRepositoryTool    *sdkgit.AttachRepositoryTool
 }
 
 // RegistryOption configures a Registry.
@@ -99,6 +101,12 @@ func WithVisionToolsWithDetail(analyzeFn vision.AnalyzeWithDetailFn) RegistryOpt
 func WithMemoryStore(store sdkmemory.Store, namespace, sourceRun, repoURL string) RegistryOption {
 	return func(r *Registry) {
 		r.memoryTool = memorytool.New(store, namespace, sourceRun, repoURL)
+	}
+}
+
+func WithAttachRepositoryTool(opts ...sdkgit.AttachRepositoryOption) RegistryOption {
+	return func(r *Registry) {
+		r.attachRepositoryTool = sdkgit.NewAttachRepositoryTool(nil, opts...)
 	}
 }
 
@@ -189,6 +197,9 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	}
 	if r.memoryTool != nil {
 		r.Register(r.memoryTool)
+	}
+	if r.attachRepositoryTool != nil {
+		r.Register(r.attachRepositoryTool)
 	}
 	return r
 }
