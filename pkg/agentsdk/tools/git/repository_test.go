@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -97,7 +98,36 @@ func TestAttachRepositoryCreatesMissingWorkspace(t *testing.T) {
 	}
 }
 
-func TestAttachRepositoryRejectsDuplicateAlias(t *testing.T) {
+func TestAttachRepositoryReusesDuplicateAliasForSameRepository(t *testing.T) {
+	workDir := t.TempDir()
+	runner := &fakeRunner{gitFn: cloneFakeRepo}
+	tool := NewAttachRepositoryTool(runner)
+
+	if result, err := tool.Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo","alias":"same"}`), workDir); err != nil || result.IsError {
+		t.Fatalf("first Execute() result=%+v err=%v", result, err)
+	}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo","alias":"same"}`), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `"status":"already_attached"`) || !strings.Contains(result.Content, `"path":"repos/same"`) {
+		t.Fatalf("result = %s, want already_attached for repos/same", result.Content)
+	}
+	cloneCalls := 0
+	for _, call := range runner.gitCalls {
+		if strings.HasPrefix(call, "clone ") {
+			cloneCalls++
+		}
+	}
+	if cloneCalls != 1 {
+		t.Fatalf("clone calls = %d (%#v), want exactly one clone", cloneCalls, runner.gitCalls)
+	}
+}
+
+func TestAttachRepositoryRejectsDuplicateAliasWithDifferentRepository(t *testing.T) {
 	workDir := t.TempDir()
 	runner := &fakeRunner{gitFn: cloneFakeRepo}
 	tool := NewAttachRepositoryTool(runner)
@@ -109,8 +139,58 @@ func TestAttachRepositoryRejectsDuplicateAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !result.IsError || !strings.Contains(result.Content, "already exists") {
+	if !result.IsError || !strings.Contains(result.Content, "already exists") || !strings.Contains(result.Content, "with origin") {
 		t.Fatalf("result = %+v, want duplicate alias error", result)
+	}
+}
+
+func TestAttachRepositoryRejectsDuplicateAliasThatIsNotGitRepository(t *testing.T) {
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, "repos", "same"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewAttachRepositoryTool(&fakeRunner{}).Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo","alias":"same"}`), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "not a git repository") {
+		t.Fatalf("result = %+v, want non-git duplicate alias error", result)
+	}
+}
+
+func TestSameRepositoryURLMatchesCommonGitHubForms(t *testing.T) {
+	tests := []struct {
+		name string
+		a    string
+		b    string
+		want bool
+	}{
+		{
+			name: "https and ssh",
+			a:    "https://github.com/acme/repo.git",
+			b:    "git@github.com:acme/repo.git",
+			want: true,
+		},
+		{
+			name: "https and ssh url",
+			a:    "https://github.com/acme/repo",
+			b:    "ssh://git@github.com/acme/repo.git",
+			want: true,
+		},
+		{
+			name: "different repo",
+			a:    "https://github.com/acme/repo.git",
+			b:    "https://github.com/acme/other.git",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sameRepositoryURL(tt.a, tt.b); got != tt.want {
+				t.Fatalf("sameRepositoryURL(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -137,18 +217,36 @@ func TestAttachRepositoryExcludesRepoListFromWorkspaceRootGit(t *testing.T) {
 	}
 }
 
-func cloneFakeRepo(_ context.Context, _ string, args ...string) (string, error) {
+func cloneFakeRepo(_ context.Context, workDir string, args ...string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
 	}
 	switch args[0] {
 	case "clone":
+		repoURL := args[len(args)-2]
 		dest := args[len(args)-1]
 		if err := os.MkdirAll(filepath.Join(dest, ".git", "info"), 0o755); err != nil {
 			return "", err
 		}
+		config := "[remote \"origin\"]\n\turl = " + repoURL + "\n"
+		if err := os.WriteFile(filepath.Join(dest, ".git", "config"), []byte(config), 0o644); err != nil {
+			return "", err
+		}
 		if err := os.WriteFile(filepath.Join(dest, "README.md"), []byte("hello\n"), 0o644); err != nil {
 			return "", err
+		}
+	case "remote":
+		if len(args) == 3 && args[1] == "get-url" && args[2] == "origin" {
+			config, err := os.ReadFile(filepath.Join(workDir, ".git", "config"))
+			if err != nil {
+				return "", err
+			}
+			for _, line := range strings.Split(string(config), "\n") {
+				if url, ok := strings.CutPrefix(strings.TrimSpace(line), "url = "); ok {
+					return url + "\n", nil
+				}
+			}
+			return "", fmt.Errorf("origin remote not found")
 		}
 	case "checkout":
 	}

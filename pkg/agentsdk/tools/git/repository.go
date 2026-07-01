@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,8 +155,9 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 	if rel, err := filepath.Rel(storeAbs, dest); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return attachRepositoryError("repository alias resolves outside the repository store")
 	}
+	runner := t.runner()
 	if _, err := os.Stat(dest); err == nil {
-		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s", alias, dest))
+		return attachExistingRepository(ctx, runner, workspaceRoot, dest, repoURL, alias, baseBranch, branchName)
 	} else if !os.IsNotExist(err) {
 		return attachRepositoryError(fmt.Sprintf("checking repository destination: %v", err))
 	}
@@ -163,11 +165,11 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 		return attachRepositoryError(fmt.Sprintf("creating repository store: %v", err))
 	}
 
-	if out, err := cloneRepository(ctx, t.runner(), workspaceRoot, repoURL, dest, baseBranch); err != nil {
+	if out, err := cloneRepository(ctx, runner, workspaceRoot, repoURL, dest, baseBranch); err != nil {
 		return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", err, out))
 	}
 	if branchName != "" {
-		if out, err := t.runner().RunGit(ctx, dest, "checkout", "-B", branchName); err != nil {
+		if out, err := runner.RunGit(ctx, dest, "checkout", "-B", branchName); err != nil {
 			return attachRepositoryError(fmt.Sprintf("git checkout failed: %v\n%s", err, out))
 		}
 	}
@@ -180,18 +182,7 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 		}
 	}
 
-	relPath, err := filepath.Rel(workspaceRoot, dest)
-	if err != nil {
-		return attachRepositoryError(fmt.Sprintf("computing repository path: %v", err))
-	}
-	return attachRepositorySuccess(attachRepositoryOutput{
-		Status:       "attached",
-		Repository:   repoURL,
-		Path:         filepath.ToSlash(relPath),
-		AbsolutePath: dest,
-		BaseBranch:   baseBranch,
-		BranchName:   branchName,
-	})
+	return attachedRepositoryResult(workspaceRoot, dest, "attached", repoURL, baseBranch, branchName)
 }
 
 func repositoryStoreExcludePattern(workspaceRoot, storeAbs string) string {
@@ -216,6 +207,74 @@ func cloneRepository(ctx context.Context, runner CommandRunner, workDir, repoURL
 	}
 	args = append(args, repoURL, dest)
 	return runner.RunGit(ctx, workDir, args...)
+}
+
+func attachExistingRepository(ctx context.Context, runner CommandRunner, workspaceRoot, dest, repoURL, alias, baseBranch, branchName string) (agentsdk.ToolResult, error) {
+	if !isGitRepository(dest) {
+		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s but is not a git repository", alias, dest))
+	}
+
+	origin, err := runner.RunGit(ctx, dest, "remote", "get-url", "origin")
+	if err != nil {
+		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s but its origin could not be read: %v\n%s", alias, dest, err, origin))
+	}
+	origin = strings.TrimSpace(origin)
+	if !sameRepositoryURL(origin, repoURL) {
+		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s with origin %q, not %q", alias, dest, origin, repoURL))
+	}
+
+	return attachedRepositoryResult(workspaceRoot, dest, "already_attached", repoURL, baseBranch, branchName)
+}
+
+func attachedRepositoryResult(workspaceRoot, dest, status, repoURL, baseBranch, branchName string) (agentsdk.ToolResult, error) {
+	relPath, err := filepath.Rel(workspaceRoot, dest)
+	if err != nil {
+		return attachRepositoryError(fmt.Sprintf("computing repository path: %v", err))
+	}
+	return attachRepositorySuccess(attachRepositoryOutput{
+		Status:       status,
+		Repository:   repoURL,
+		Path:         filepath.ToSlash(relPath),
+		AbsolutePath: dest,
+		BaseBranch:   baseBranch,
+		BranchName:   branchName,
+	})
+}
+
+func sameRepositoryURL(a, b string) bool {
+	return canonicalRepositoryURL(a) == canonicalRepositoryURL(b)
+}
+
+func canonicalRepositoryURL(raw string) string {
+	repo := strings.TrimSpace(raw)
+	repo = strings.TrimSuffix(strings.TrimRight(repo, "/"), ".git")
+	if repo == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(repo, "git@") {
+		repo = strings.TrimPrefix(repo, "git@")
+		if host, path, ok := strings.Cut(repo, ":"); ok {
+			return strings.ToLower(host) + "/" + strings.TrimPrefix(path, "/")
+		}
+	}
+
+	if strings.HasPrefix(repo, "ssh://git@") {
+		repo = strings.TrimPrefix(repo, "ssh://git@")
+		if host, path, ok := strings.Cut(repo, "/"); ok {
+			return strings.ToLower(host) + "/" + strings.TrimPrefix(path, "/")
+		}
+	}
+
+	parsed, err := url.Parse(repo)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return strings.ToLower(parsed.Host) + "/" + strings.TrimPrefix(parsed.Path, "/")
+	}
+
+	if strings.HasPrefix(repo, "github.com/") {
+		return "github.com/" + strings.TrimPrefix(repo, "github.com/")
+	}
+	return repo
 }
 
 func resolveRepositoryWorkDir(workDir, repoPath string) (string, error) {
