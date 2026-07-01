@@ -62,10 +62,29 @@ type chatChunkToolCallFn struct {
 }
 
 // createChatStream issues a streaming chat-completions request and returns a
-// reader that translates the SSE chunks into Anthropic-style stream events.
+// reader that translates the SSE chunks into Anthropic-style stream events. It
+// acquires the concurrency semaphore around request setup, so it must only be
+// called by paths that do not already hold it (e.g. CreateMessageStream).
 // Copilot exposes plaintext reasoning only on this path (message.reasoning_text);
 // the /v1/messages shim returns signature-only thinking.
 func (c *Client) createChatStream(ctx context.Context, req anthropic.CreateMessageRequest) (messageStream, error) {
+	// Acquire the concurrency semaphore for the request setup, mirroring the
+	// Responses streaming path. It is released once the reader is constructed.
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.sem }()
+	return c.sendChatStream(ctx, req)
+}
+
+// sendChatStream builds and issues the streaming chat-completions request
+// without touching the concurrency semaphore. Callers that already hold the
+// semaphore — CreateMessage's doWithRetry, via createViaChatCompletions —
+// reuse this path to buffer the streamed response, so re-acquiring the
+// semaphore here would deadlock once in-flight requests reach the limit.
+func (c *Client) sendChatStream(ctx context.Context, req anthropic.CreateMessageRequest) (messageStream, error) {
 	chatReq, err := toChatRequest(req)
 	if err != nil {
 		return nil, err
@@ -93,15 +112,7 @@ func (c *Client) createChatStream(ctx context.Context, req anthropic.CreateMessa
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	// Acquire the concurrency semaphore for the request setup, mirroring the
-	// Responses streaming path. It is released once headers arrive.
-	select {
-	case c.sem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 	resp, err := c.httpClient.Do(httpReq)
-	<-c.sem
 	if err != nil {
 		return nil, fmt.Errorf("http do: %w", err)
 	}

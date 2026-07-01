@@ -672,7 +672,7 @@ func (c *Client) CreateMessage(ctx context.Context, req anthropic.CreateMessageR
 			return err
 		}
 
-		out, err = c.createViaChatCompletions(ctx, chatReq)
+		out, err = c.createViaChatCompletions(ctx, req, chatReq)
 		return err
 	})
 	if err != nil {
@@ -862,7 +862,26 @@ func (c *Client) compactViaCodexBackend(ctx context.Context, params responses.Re
 	return &compacted, nil
 }
 
-func (c *Client) createViaChatCompletions(ctx context.Context, body chatCompletionRequest) (*anthropic.CreateMessageResponse, error) {
+func (c *Client) createViaChatCompletions(ctx context.Context, req anthropic.CreateMessageRequest, body chatCompletionRequest) (*anthropic.CreateMessageResponse, error) {
+	// GitHub Copilot only serializes Claude tool calls over SSE. Its buffered
+	// (non-streaming) chat-completions response reports finish_reason="tool_calls"
+	// with an empty tool_calls array, which toAnthropicResponseFromChat collapses
+	// into an end_turn narration with no tool use — so non-streaming callers
+	// (agent.Runner.Run, e.g. the operator's Slack and project agent runs) never
+	// see the tool call and the model appears to only narrate. Stream the request
+	// and assemble it, mirroring createViaResponses which streams internally "so
+	// callers get the same event path". sendChatStream skips the concurrency
+	// semaphore because doWithRetry already holds it. Other chat-only providers
+	// keep the buffered path.
+	if isGitHubCopilotHost(hostFromURL(c.completionsURL)) {
+		stream, err := c.sendChatStream(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		defer stream.Close()
+		return drainStreamToResponse(stream)
+	}
+
 	raw, err := c.doChatRequest(ctx, body)
 	if err != nil {
 		return nil, err

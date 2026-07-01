@@ -1277,3 +1277,124 @@ func TestDrainStreamPreservesInputTokensWhenDeltaOmitsThem(t *testing.T) {
 		t.Fatalf("usage = %+v, want input=123 output=7", resp.Usage)
 	}
 }
+
+// TestCreateMessageCopilotChatStreamsToolCalls locks in the fix for the
+// operator's Slack/project agent runs narrating instead of calling tools.
+// GitHub Copilot's buffered (non-streaming) chat-completions response for Claude
+// reports finish_reason="tool_calls" with an empty tool_calls array, so the
+// buffered path collapses to end_turn narration with no tool use. The
+// non-streaming CreateMessage entry point (agent.Runner.Run) must stream and
+// assemble the response so tool calls survive. sem capacity 1 also guards
+// against the doWithRetry + sendChatStream semaphore double-acquire deadlock.
+func TestCreateMessageCopilotChatStreamsToolCalls(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","model":"claude-opus-4.8","choices":[{"index":0,"delta":{"role":"assistant"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":"On it — fetching now."}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"WebFetch","arguments":""}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"url\":\"https://example.com\"}"}}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+
+	streamed := false
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		streamed = strings.Contains(string(body), `"stream":true`)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	})
+
+	c := &Client{
+		completionsURL: "https://api.githubcopilot.com/chat/completions",
+		apiMode:        apiModeChat,
+		httpClient:     &http.Client{Transport: transport},
+		sem:            make(chan struct{}, 1),
+	}
+
+	resp, err := c.CreateMessage(context.Background(), anthropic.CreateMessageRequest{
+		Model:     "claude-opus-4.8",
+		MaxTokens: 1024,
+		Messages: []anthropic.Message{{
+			Role:    anthropic.RoleUser,
+			Content: []anthropic.ContentBlock{{Type: "text", Text: "get the weather for bkk"}},
+		}},
+		Tools: []anthropic.ToolDefinition{{
+			Name:        "WebFetch",
+			Description: "fetch a url",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"}}}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+
+	if !streamed {
+		t.Fatalf("Copilot chat request was not streamed (expected stream:true in body)")
+	}
+	if resp.StopReason != anthropic.StopReasonToolUse {
+		t.Fatalf("stop reason = %q, want tool_use", resp.StopReason)
+	}
+
+	var tool *anthropic.ContentBlock
+	for i := range resp.Content {
+		if resp.Content[i].Type == "tool_use" {
+			tool = &resp.Content[i]
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatalf("no tool_use block in assembled response: %+v", resp.Content)
+	}
+	if tool.Name != "WebFetch" {
+		t.Fatalf("tool name = %q, want WebFetch", tool.Name)
+	}
+	if !strings.Contains(string(tool.Input), "example.com") {
+		t.Fatalf("tool input = %s, want url containing example.com", tool.Input)
+	}
+}
+
+// TestCreateMessageNonCopilotChatUsesBufferedPath verifies the streaming detour
+// is Copilot-specific: other chat-only providers keep the buffered JSON path.
+func TestCreateMessageNonCopilotChatUsesBufferedPath(t *testing.T) {
+	streamed := false
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		streamed = strings.Contains(string(body), `"stream":true`)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"c1","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)),
+		}, nil
+	})
+
+	c := &Client{
+		completionsURL: "https://openrouter.ai/api/v1/chat/completions",
+		apiMode:        apiModeChat,
+		httpClient:     &http.Client{Transport: transport},
+		sem:            make(chan struct{}, 1),
+	}
+
+	resp, err := c.CreateMessage(context.Background(), anthropic.CreateMessageRequest{
+		Model:     "gpt-4o",
+		MaxTokens: 256,
+		Messages: []anthropic.Message{{
+			Role:    anthropic.RoleUser,
+			Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if streamed {
+		t.Fatalf("non-Copilot chat request must not be streamed")
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Text != "hi" {
+		t.Fatalf("response content = %+v, want single text block 'hi'", resp.Content)
+	}
+}
