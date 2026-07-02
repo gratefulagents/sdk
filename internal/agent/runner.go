@@ -101,7 +101,6 @@ func isSubAgentTool(t Tool) bool {
 // always allowed regardless of tool access level.
 var controlFlowToolNames = map[string]struct{}{
 	"finish":                        {},
-	"set_phase":                     {},
 	"AskUserQuestion":               {},
 	"present_plan":                  {},
 	"save_plan":                     {},
@@ -498,7 +497,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				handoffNames = append(handoffNames, h.ToolName)
 			}
 			al.Turn(turn, currentAgent.Name, currentAgent.Model)
-			al.Tools(toolNames, handoffNames, cfg.ToolAccessLevel, cfg.Phase)
+			al.Tools(toolNames, handoffNames, cfg.ToolAccessLevel)
 			al.Instructions(instructions)
 			al.InputItems(currentInput)
 			al.TurnEnd(turn)
@@ -556,7 +555,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			Turn:                         int32(turn + 1),
 			Scope:                        llmScope,
 			TaskID:                       taskID,
-			Phase:                        cfg.Phase,
 			ToolCount:                    int32(len(tools)),
 			InputItemCount:               int32(len(currentInput)),
 			InstructionsLength:           int32(len(instructions)),
@@ -1112,9 +1110,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}, nil
 			}
 
-			// Pause when a tool explicitly requests it (e.g. set_phase with
-			// approval gate) or when the LLM called a pause tool like
-			// present_plan or AskUserQuestion.
+			// Pause when a tool explicitly requests it or when the LLM called
+			// a pause tool like present_plan or AskUserQuestion.
 			shouldPause := toolShouldPause
 			if !shouldPause {
 				for _, tc := range s.toolCalls {
@@ -1485,7 +1482,7 @@ type toolCallResult struct {
 	inputGuardrails  []ToolGuardrailResult
 	outputGuardrails []ToolGuardrailResult
 	guardrailErr     error
-	shouldPause      bool // Propagated from ToolResult.ShouldPause (e.g. set_phase approval gate).
+	shouldPause      bool // Propagated from ToolResult.ShouldPause (e.g. a host pause tool).
 }
 
 // executeTools runs all tool calls in parallel and returns the results as RunItems.
@@ -2078,9 +2075,6 @@ func buildCompactionCarryForward(ctx context.Context, cfg RunConfig) string {
 	if !dynamicAdded {
 		if cfg.WorkingStateContext != "" {
 			sections = append(sections, cfg.WorkingStateContext)
-		}
-		if cfg.Phase != "" {
-			sections = append(sections, "Current phase: "+cfg.Phase)
 		}
 	}
 	sections = dedupeCompactionCarryForwardSections(sections)

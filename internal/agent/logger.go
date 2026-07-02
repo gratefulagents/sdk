@@ -39,10 +39,10 @@ func (l *AgentLogger) TurnEnd(turn int) {
 }
 
 // Tools logs tool and handoff summary.
-func (l *AgentLogger) Tools(toolNames []string, handoffNames []string, accessLevel ToolAccessLevel, phase string) {
+func (l *AgentLogger) Tools(toolNames []string, handoffNames []string, accessLevel ToolAccessLevel) {
 	log.Printf("[turn] tools=%d %v", len(toolNames), toolNames)
 	log.Printf("[turn] handoffs=%d %v", len(handoffNames), handoffNames)
-	log.Printf("[turn] tool_access=%q phase=%q", accessLevel, phase)
+	log.Printf("[turn] tool_access=%q", accessLevel)
 }
 
 // Instructions logs system instructions. Full dump in debug, length-only in normal.
@@ -181,11 +181,6 @@ func (l *AgentLogger) Debugf(format string, args ...any) {
 // Infof always logs.
 func (l *AgentLogger) Infof(format string, args ...any) {
 	log.Printf(format, args...)
-}
-
-// Phase logs a phase transition.
-func (l *AgentLogger) Phase(name, kind, role string) {
-	log.Printf("[phase] → %s (kind=%s role=%s)", name, kind, role)
 }
 
 // ModelResponse logs a model response summary.

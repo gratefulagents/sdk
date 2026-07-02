@@ -68,17 +68,6 @@ func TestBuildDelegationGuideIncludesCompactTaskPacketGuidance(t *testing.T) {
 	}
 }
 
-func TestFilterRoleCatalogForMode(t *testing.T) {
-	catalog := RoleCatalog{
-		{Name: "researcher"},
-		{Name: "executor"},
-	}
-	filtered := FilterRoleCatalogForMode(catalog, &sdkmode.TemplateSpec{Capabilities: []string{"researcher"}})
-	if len(filtered) != 1 || filtered[0].Name != "researcher" {
-		t.Fatalf("filtered = %#v, want researcher only", filtered)
-	}
-}
-
 func TestBuildSpecialistToolsFromCatalogAppliesAccessAndRouting(t *testing.T) {
 	runner := NewRunnerWithProvider(stubModelProvider{})
 	writeTool := &FunctionTool{ToolName: "Write", ReadOnly: false}

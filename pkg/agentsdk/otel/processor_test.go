@@ -15,7 +15,6 @@ func TestMapSpanData_Generation(t *testing.T) {
 		AttemptNumber:     2,
 		Scope:             "subagent",
 		TaskID:            "task-1",
-		Phase:             "planning",
 		UsageAvailable:    true,
 		PromptTokens:      100,
 		CompletionTokens:  50,
@@ -34,8 +33,8 @@ func TestMapSpanData_Generation(t *testing.T) {
 	if name != "llm.generation" {
 		t.Errorf("expected llm.generation, got %s", name)
 	}
-	if len(attrs) != 34 {
-		t.Errorf("expected 34 attrs, got %d", len(attrs))
+	if len(attrs) != 33 {
+		t.Errorf("expected 33 attrs, got %d", len(attrs))
 	}
 }
 

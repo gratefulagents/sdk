@@ -243,7 +243,7 @@ func (r *Registry) Register(tool agentsdk.Tool) {
 
 func isRegistryControlFlowTool(name string) bool {
 	switch name {
-	case "finish", "set_phase", "save_plan", "get_plan", "RequestMCPBreakGlass":
+	case "finish", "save_plan", "get_plan", "RequestMCPBreakGlass":
 		return true
 	}
 	return false

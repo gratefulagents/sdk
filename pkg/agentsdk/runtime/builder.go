@@ -60,9 +60,7 @@ type Config struct {
 	WorkDir      string
 	AgentName    string
 	Instructions string
-	SessionMode  agentsdk.SessionMode
 	ActiveMode   string
-	ActivePhase  string
 	ModeSnapshot *sdkmode.TemplateSpec
 	RoleCatalog  agentsdk.RoleCatalog
 
@@ -264,7 +262,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 	}
 
 	tracker := agentsdk.NewProgressTracker(agentsdk.WithTracingProcessor(tracingProcessor(cfg, features)))
-	tracker.SetSession(sessionNumber(cfg), runtimePhase(cfg))
+	tracker.SetSession(sessionNumber(cfg), modeLabel(cfg))
 
 	var toolBundle ToolBundle
 	if shouldBuildToolBundle(features) {
@@ -282,7 +280,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 	if cfg.EventWriter != nil && features.value.Runtime.EventStream {
 		eventStream = agentsdk.NewSessionEventStream(cfg.EventWriter, agentsdk.SessionEventStreamOptions{
 			Session: sessionNumber(cfg),
-			Phase:   runtimePhase(cfg),
+			Phase:   modeLabel(cfg),
 		})
 		hooks = agentsdk.NewPlatformHooks(tracker, eventStream)
 	}
@@ -728,7 +726,6 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 		AdditionalInstructions: additionalInstructions(cfg),
 		WorkingStateContext:    firstNonEmpty(cfg.WorkingStateText, "Runtime state is maintained by the host adapter."),
 		ToolAccessLevel:        cfg.ToolAccess,
-		Phase:                  runtimePhase(cfg),
 		ToolPolicy:             toolPolicy(cfg),
 		MaxConcurrentSubAgents: cfg.MaxConcurrentSubAgents,
 		ForceFinalSummaryTurn:  features.value.Runtime.ForceFinalSummary,
@@ -787,9 +784,6 @@ func (cfg Config) normalized() Config {
 	if strings.TrimSpace(cfg.AgentName) == "" {
 		cfg.AgentName = "agent"
 	}
-	if cfg.SessionMode == "" {
-		cfg.SessionMode = agentsdk.SessionModeChat
-	}
 	if strings.TrimSpace(cfg.Reasoning) == "" {
 		cfg.Reasoning = string(agentsdk.ReasoningMedium)
 	}
@@ -798,6 +792,14 @@ func (cfg Config) normalized() Config {
 	}
 	if cfg.ToolAccess == "" {
 		cfg.ToolAccess = agentsdk.ToolAccessLevelFull
+	}
+	// A mode template's tool access is a constraint, not a suggestion: a
+	// read-only mode (e.g. the built-in plan mode) must narrow the run's tool
+	// surface regardless of feature selection.
+	if cfg.ModeSnapshot != nil {
+		if agentsdk.NormalizeToolAccessLevel(agentsdk.ToolAccessLevel(cfg.ModeSnapshot.ToolAccess)) == agentsdk.ToolAccessLevelReadOnly {
+			cfg.ToolAccess = agentsdk.ToolAccessLevelReadOnly
+		}
 	}
 	cfg.ToolAccess = agentsdk.NormalizeToolAccessLevel(cfg.ToolAccess)
 	if cfg.PermissionMode == "" {
@@ -832,30 +834,7 @@ func signalTools(cfg Config, features SignalFeatures) []agentsdk.Tool {
 	if features.Finish {
 		tools = append(tools, &sdksignal.FinishTool{})
 	}
-	if features.SetPhase {
-		tools = append(tools, &sdksignal.SetPhaseTool{
-			Phases:        signalPhaseOptions(cfg),
-			CurrentPhase:  cfg.ActivePhase,
-			PauseOnChange: true,
-		})
-	}
 	return tools
-}
-
-func signalPhaseOptions(cfg Config) []sdksignal.PhaseOption {
-	if cfg.ModeSnapshot == nil || len(cfg.ModeSnapshot.Phases) == 0 {
-		return nil
-	}
-	out := make([]sdksignal.PhaseOption, 0, len(cfg.ModeSnapshot.Phases))
-	for _, phase := range cfg.ModeSnapshot.Phases {
-		out = append(out, sdksignal.PhaseOption{
-			ID:               phase.ID,
-			ReadOnly:         phase.ReadOnly,
-			RequiresApproval: phase.RequiresApproval,
-			Description:      phase.Description,
-		})
-	}
-	return out
 }
 
 func parentToolSurfaceEnabled(features resolvedFeatures) bool {
@@ -1046,21 +1025,10 @@ Available tools include: %s.
 }
 
 func modeInstructionBlocks(cfg Config, features resolvedFeatures) []string {
-	if !features.value.Modes.Instructions && !features.value.Modes.PhaseTracking {
+	if !features.value.Modes.Instructions {
 		return nil
 	}
-	var blocks []string
-	if features.value.Modes.Instructions {
-		blocks = append(blocks,
-			"Session mode: "+string(cfg.SessionMode),
-			"Active mode: "+modeLabel(cfg),
-			"Active phase: "+runtimePhase(cfg),
-		)
-	}
-	if features.value.Modes.PhaseTracking {
-		blocks = append(blocks, agentsdk.BuildPhaseTrackingDirective(cfg.ModeSnapshot))
-	}
-	return blocks
+	return []string{"Active mode: " + modeLabel(cfg)}
 }
 
 func tracingProcessor(cfg Config, features resolvedFeatures) agentsdk.TracingProcessor {
@@ -1180,7 +1148,7 @@ func runCompactionCarryForward(cfg Config) func(context.Context) string {
 		return cfg.CompactionCarryForward
 	}
 	return func(context.Context) string {
-		return "Runtime state: provider=" + cfg.Provider + ", mode=" + modeLabel(cfg) + ", phase=" + runtimePhase(cfg)
+		return "Runtime state: provider=" + cfg.Provider + ", mode=" + modeLabel(cfg)
 	}
 }
 
@@ -1258,16 +1226,6 @@ func permissionModeFromAccess(access agentsdk.ToolAccessLevel) policy.Permission
 	return policy.PermissionModeWorkspaceWrite
 }
 
-func runtimePhase(cfg Config) string {
-	if strings.TrimSpace(cfg.ActivePhase) != "" {
-		return strings.TrimSpace(cfg.ActivePhase)
-	}
-	if strings.TrimSpace(cfg.ActiveMode) != "" {
-		return strings.TrimSpace(cfg.ActiveMode)
-	}
-	return string(cfg.SessionMode)
-}
-
 func modeLabel(cfg Config) string {
 	if cfg.ModeSnapshot != nil {
 		if cfg.ModeSnapshot.DisplayName != "" {
@@ -1280,7 +1238,7 @@ func modeLabel(cfg Config) string {
 	if strings.TrimSpace(cfg.ActiveMode) != "" {
 		return cfg.ActiveMode
 	}
-	return string(cfg.SessionMode)
+	return "chat"
 }
 
 func sessionNumber(cfg Config) int32 {

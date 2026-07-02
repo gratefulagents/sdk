@@ -347,7 +347,6 @@ func generationAttributes(d agent.GenerationSpanData) []attribute.KeyValue {
 		attribute.Int("gen.turn", int(d.Turn)),
 		attribute.String("gen.scope", d.Scope),
 		attribute.String("gen.task_id", d.TaskID),
-		attribute.String("gen.phase", d.Phase),
 		attribute.String("gen.status", d.Status),
 		attribute.Bool("gen.usage_available", d.UsageAvailable),
 		attribute.Int64("gen.input_tokens", d.PromptTokens),

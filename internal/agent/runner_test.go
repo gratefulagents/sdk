@@ -1176,7 +1176,7 @@ func TestRunnerEmitsLLMAttemptEvents_SuccessFailureRetry(t *testing.T) {
 	}
 	runner := NewRunnerWithModel(model)
 	agent := &Agent{Name: "test", Model: "openai/gpt-5.4"}
-	res, err := runner.Run(context.Background(), agent, nil, RunConfig{Hooks: hooks, Phase: "implementing"})
+	res, err := runner.Run(context.Background(), agent, nil, RunConfig{Hooks: hooks})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1232,7 +1232,7 @@ func TestRunnerEmitsLLMAttemptFailureEvent(t *testing.T) {
 	}
 	runner := NewRunnerWithModel(model)
 	agent := &Agent{Name: "test", Model: "openai/gpt-5.4"}
-	if _, err := runner.Run(context.Background(), agent, nil, RunConfig{Hooks: hooks, Phase: "verifying"}); err == nil {
+	if _, err := runner.Run(context.Background(), agent, nil, RunConfig{Hooks: hooks}); err == nil {
 		t.Fatal("expected run error")
 	}
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
@@ -1715,18 +1715,17 @@ func TestApplyCompactionCarryForwardAppendsCurrentState(t *testing.T) {
 	}
 
 	got, carryForward := applyCompactionCarryForward(context.Background(), compacted, nil, RunConfig{
-		Phase:               "checking",
 		WorkingStateContext: "## Durable Working State\nLatest assistant summary: implementation already landed",
 		CompactionCarryForward: func(context.Context) string {
-			return "Live AgentRun state: mode=deep phase=checking step=reviewing\n\n## Durable Working State\nLatest assistant summary: implementation already landed"
+			return "Live AgentRun state: mode=deep step=reviewing\n\n## Durable Working State\nLatest assistant summary: implementation already landed"
 		},
 	})
 
 	if carryForward == "" {
 		t.Fatal("expected carry-forward text")
 	}
-	if !strings.Contains(carryForward, "phase=checking") || !strings.Contains(carryForward, "implementation already landed") {
-		t.Fatalf("carryForward = %q, want live phase and durable work state", carryForward)
+	if !strings.Contains(carryForward, "mode=deep") || !strings.Contains(carryForward, "implementation already landed") {
+		t.Fatalf("carryForward = %q, want live mode and durable work state", carryForward)
 	}
 	gotText := Items.ExtractText(got)
 	if strings.Contains(gotText, "stale state") {

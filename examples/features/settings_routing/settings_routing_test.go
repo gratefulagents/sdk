@@ -33,11 +33,4 @@ func TestSettingsAndModeRoutingExample(t *testing.T) {
 		writer.ModelSettings.TextVerbosity != "high" {
 		t.Fatalf("writer routing = %+v", writer)
 	}
-
-	if agentsdk.NormalizeSessionMode("plan") != agentsdk.SessionModePlan {
-		t.Fatal("plan mode did not normalize")
-	}
-	if !agentsdk.ValidSessionModeTransition(agentsdk.SessionModePlan, agentsdk.SessionModeChat) {
-		t.Fatal("plan -> chat should be a valid SDK transition")
-	}
 }

@@ -229,7 +229,6 @@ type RunConfig struct {
 
 	WorkingStateContext    string          // durable working-state summary appended to compaction carry-forward
 	ToolAccessLevel        ToolAccessLevel // controls tool access tier (full/read-only)
-	Phase                  string          // optional host workflow phase label for hooks/observability
 	ToolPolicy             *ToolPolicy     // optional approval and timeout policy applied to tools
 	MaxConcurrentSubAgents int             // 0 = unlimited
 	ForceFinalSummaryTurn  bool            // reserve the final turn for a no-tool summary instead of hard-failing

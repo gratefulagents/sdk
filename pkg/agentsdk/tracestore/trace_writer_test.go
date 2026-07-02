@@ -24,7 +24,6 @@ func TestAddSpanDataGenerationUsesCurrentFields(t *testing.T) {
 		Turn:               3,
 		Scope:              "top_level",
 		TaskID:             "task-123",
-		Phase:              "analysis",
 		Status:             "completed",
 		UsageAvailable:     true,
 		PromptTokens:       101,
@@ -73,9 +72,6 @@ func TestAddSpanDataGenerationUsesCurrentFields(t *testing.T) {
 	}
 	if got := entry["resolved_model"]; got != "gpt-5.4" {
 		t.Fatalf("resolved_model = %v, want gpt-5.4", got)
-	}
-	if got := entry["phase"]; got != "analysis" {
-		t.Fatalf("phase = %v, want analysis", got)
 	}
 	if got := entry["request"]; got == nil {
 		t.Fatal("request snapshot missing")

@@ -98,7 +98,6 @@ type RunResult = agent.RunResult
 type RunState = agent.RunState
 type Runner = agent.Runner
 type SessionSpanData = agent.SessionSpanData
-type SessionMode = agent.SessionMode
 type Span = agent.Span
 type SpanData = agent.SpanData
 type StopAtTools = agent.StopAtTools
@@ -170,9 +169,6 @@ const (
 
 	RunLLMAgain     = agent.RunLLMAgain
 	StopOnFirstTool = agent.StopOnFirstTool
-
-	SessionModeChat = agent.SessionModeChat
-	SessionModePlan = agent.SessionModePlan
 
 	ToolAccessLevelFull     = agent.ToolAccessLevelFull
 	ToolAccessLevelReadOnly = agent.ToolAccessLevelReadOnly
@@ -248,7 +244,6 @@ var (
 	NormalizeToolAccessLevel            = agent.NormalizeToolAccessLevel
 	NormalizeSubAgentDependencyPolicy   = agent.NormalizeSubAgentDependencyPolicy
 	NormalizeModelIdentity              = agent.NormalizeModelIdentity
-	NormalizeSessionMode                = agent.NormalizeSessionMode
 	ParentCallIDFromContext             = agent.ParentCallIDFromContext
 	SubAgentStreamEventFromContentEvent = agent.SubAgentStreamEventFromContentEvent
 	ModeReasoningSettings               = agent.ModeReasoningSettings
@@ -271,7 +266,6 @@ var (
 	Truncate                            = agent.Truncate
 	TruncateBytes                       = agent.TruncateBytes
 	TruncateMiddle                      = agent.TruncateMiddle
-	ValidSessionModeTransition          = agent.ValidSessionModeTransition
 	WrapWithPolicy                      = agent.WrapWithPolicy
 	WithDescription                     = agent.WithDescription
 	WithHandoffs                        = agent.WithHandoffs

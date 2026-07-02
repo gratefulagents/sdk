@@ -74,14 +74,6 @@ func (h *PlatformHooks) OnToolEnd(runCtx *RunContext, agent *Agent, tool Tool, c
 	inputSummary := extractToolInputSummary(tool.Name(), call.Input)
 	h.Tracker.RecordToolResult(toolCallID, tool.Name(), result.Content, result.IsError, durationMS, agent.Name, parentCallID)
 	if h.EventStream != nil {
-		if tool.Name() == "set_phase" {
-			var payload struct {
-				Phase string `json:"phase"`
-			}
-			if json.Unmarshal(call.Input, &payload) == nil {
-				h.EventStream.SetPhase(payload.Phase)
-			}
-		}
 		h.EventStream.SetStep(h.Tracker.CurrentStep())
 		h.EventStream.EmitToolEnd(tool.Name(), toolCallID, parentCallID, result.IsError, agent.Name, result.Content, durationMS)
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	sdkmcp "github.com/gratefulagents/sdk/pkg/agentsdk/mcp"
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
@@ -69,7 +70,7 @@ func TestBuildToolBundleIncludesSDKAndSignalTools(t *testing.T) {
 	for _, tool := range bundle.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"Bash", "Write", "Edit", "LSP", "WebFetch", "AskUserQuestion", "present_plan", "finish", "set_phase", "list_files", "read_file", "glob", "grep"} {
+	for _, want := range []string{"Bash", "Write", "Edit", "LSP", "WebFetch", "AskUserQuestion", "present_plan", "finish", "list_files", "read_file", "glob", "grep"} {
 		if !names[want] {
 			t.Fatalf("missing tool %q; names=%v", want, names)
 		}
@@ -333,10 +334,10 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 		SubAgentMaxTurns:       2,
 		ToolAccess:             agentsdk.ToolAccessLevelReadOnly,
 		MaxConcurrentSubAgents: 1,
-		ModeSnapshot: &sdkmode.TemplateSpec{Phases: []sdkmode.Phase{
-			{ID: "plan"},
-			{ID: "ship"},
-		}},
+		ModeSnapshot: &sdkmode.TemplateSpec{
+			Name:        "review",
+			DisplayName: "Review",
+		},
 	}
 	bundle, err := NewBuilder(cfg).Build(context.Background())
 	if err != nil {
@@ -379,8 +380,8 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 		t.Fatal("expected session state with async sub-agent scheduler")
 	}
 	instructions := bundle.Agent.InstructionsFn(&agentsdk.RunContext{Config: bundle.Config}, bundle.Agent)
-	if !strings.Contains(instructions, "This mode defines phases: plan -> ship") {
-		t.Fatalf("instructions missing phase tracking directive:\n%s", instructions)
+	if !strings.Contains(instructions, "Active mode: Review") {
+		t.Fatalf("instructions missing active mode label:\n%s", instructions)
 	}
 	if !strings.Contains(instructions, "Turn budget: 3 LLM turns for this top-level run") {
 		t.Fatalf("instructions missing top-level run budget:\n%s", instructions)
@@ -461,45 +462,56 @@ func TestBuilderReusesSessionStateSubAgentSchedulerAcrossBuilds(t *testing.T) {
 	}
 }
 
+func TestModeSnapshotToolAccessConstrainsRun(t *testing.T) {
+	cfg := Config{
+		WorkDir: t.TempDir(),
+		ModeSnapshot: &sdkmode.TemplateSpec{
+			Name:       "plan",
+			ToolAccess: "read-only",
+		},
+	}.normalized()
+	if cfg.ToolAccess != agentsdk.ToolAccessLevelReadOnly {
+		t.Fatalf("ToolAccess = %q, want read-only from mode snapshot", cfg.ToolAccess)
+	}
+	if cfg.PermissionMode != policy.PermissionModeReadOnly {
+		t.Fatalf("PermissionMode = %q, want read-only", cfg.PermissionMode)
+	}
+}
+
 func TestBuildAgentStrictModesDisabledByDefault(t *testing.T) {
 	cfg := Config{
-		WorkDir:     t.TempDir(),
-		ActiveMode:  "feature-mode",
-		ActivePhase: "plan",
-		ModeSnapshot: &sdkmode.TemplateSpec{Phases: []sdkmode.Phase{
-			{ID: "plan"},
-			{ID: "ship"},
-		}},
+		WorkDir:    t.TempDir(),
+		ActiveMode: "feature-mode",
+		ModeSnapshot: &sdkmode.TemplateSpec{
+			Name: "feature-mode",
+		},
 		Features: &Features{},
 	}
 	agent, _ := BuildAgent(cfg, nil, ToolBundle{})
 	instructions := agent.InstructionsFn(&agentsdk.RunContext{}, agent)
-	for _, notWant := range []string{"Session mode:", "Active mode:", "Active phase:", "This mode defines phases"} {
+	for _, notWant := range []string{"Active mode:"} {
 		if strings.Contains(instructions, notWant) {
 			t.Fatalf("strict instructions unexpectedly contained %q:\n%s", notWant, instructions)
 		}
 	}
 }
 
-func TestBuildAgentStrictModesCanEnableInstructionsAndPhaseTracking(t *testing.T) {
+func TestBuildAgentStrictModesCanEnableInstructions(t *testing.T) {
 	cfg := Config{
-		WorkDir:     t.TempDir(),
-		ActiveMode:  "feature-mode",
-		ActivePhase: "plan",
-		ModeSnapshot: &sdkmode.TemplateSpec{Phases: []sdkmode.Phase{
-			{ID: "plan"},
-			{ID: "ship"},
-		}},
+		WorkDir:    t.TempDir(),
+		ActiveMode: "feature-mode",
+		ModeSnapshot: &sdkmode.TemplateSpec{
+			Name: "feature-mode",
+		},
 		Features: &Features{
 			Modes: ModeFeatures{
-				Instructions:  true,
-				PhaseTracking: true,
+				Instructions: true,
 			},
 		},
 	}
 	agent, _ := BuildAgent(cfg, nil, ToolBundle{})
 	instructions := agent.InstructionsFn(&agentsdk.RunContext{}, agent)
-	for _, want := range []string{"Session mode:", "Active mode: feature-mode", "Active phase: plan", "This mode defines phases: plan -> ship"} {
+	for _, want := range []string{"Active mode: feature-mode"} {
 		if !strings.Contains(instructions, want) {
 			t.Fatalf("strict instructions missing %q:\n%s", want, instructions)
 		}
@@ -604,7 +616,6 @@ func TestBuildRunConfigHonorsHostOverrides(t *testing.T) {
 		Model:                     "gpt-test",
 		WorkDir:                   "/repo",
 		ActiveMode:                "ultrawork",
-		ActivePhase:               "shipping",
 		ModelSettings:             &settings,
 		MaxTurns:                  7,
 		SubAgentMaxTurns:          3,

@@ -284,7 +284,7 @@ func (es *EventStream) SetSession(num int32) {
 	es.sessionNumber = num
 }
 
-// SetPhase updates the current workflow phase.
+// SetPhase updates the host-defined phase label stamped onto emitted events.
 func (es *EventStream) SetPhase(name string) {
 	es.mu.Lock()
 	defer es.mu.Unlock()

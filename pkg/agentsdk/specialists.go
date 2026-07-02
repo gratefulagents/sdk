@@ -71,7 +71,6 @@ func FilterToolsByAccess(allTools []Tool, accessLevel string) []Tool {
 func DefaultSignalToolNames() map[string]bool {
 	return map[string]bool{
 		"finish":          true,
-		"set_phase":       true,
 		"present_plan":    true,
 		"AskUserQuestion": true,
 	}
@@ -98,34 +97,6 @@ func ToolAccessLevelFromRole(value string) ToolAccessLevel {
 		return ToolAccessLevelFull
 	}
 	return NormalizeToolAccessLevel(ToolAccessLevel(value))
-}
-
-// FilterRoleCatalogForMode narrows a catalog to the capabilities declared by a
-// mode template. If a mode names capabilities but none match local roles, the
-// original catalog is returned so hosts do not silently lose all specialists.
-func FilterRoleCatalogForMode(catalog RoleCatalog, spec *sdkmode.TemplateSpec) RoleCatalog {
-	if spec == nil || len(spec.Capabilities) == 0 {
-		return catalog
-	}
-	allowed := map[string]bool{}
-	for _, name := range spec.Capabilities {
-		if trimmed := strings.TrimSpace(name); trimmed != "" {
-			allowed[trimmed] = true
-		}
-	}
-	if len(allowed) == 0 {
-		return catalog
-	}
-	filtered := make(RoleCatalog, 0, len(catalog))
-	for _, role := range catalog {
-		if allowed[role.Name] {
-			filtered = append(filtered, role)
-		}
-	}
-	if len(filtered) == 0 {
-		return catalog
-	}
-	return filtered
 }
 
 // ModeRoutingFromTemplateSpec converts SDK mode routing config into runner
@@ -242,7 +213,7 @@ Keep steering messages short and specific.`)
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("Signal tools: finish, set_phase\n")
+	b.WriteString("Signal tools: finish\n")
 	return b.String()
 }
 

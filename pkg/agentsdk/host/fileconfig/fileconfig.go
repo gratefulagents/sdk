@@ -1,8 +1,8 @@
 // Package fileconfig provides file-backed SDK host configuration.
 //
-// The loader intentionally accepts the same CRD-shaped YAML used by the
-// operator ModeTemplate and RoleInstruction fixtures, while exposing only
-// SDK-native types to clients.
+// The loader accepts CRD-shaped ModeTemplate YAML and plain mode specs, while
+// exposing only SDK-native types to clients. Built-in "chat" and "plan" modes
+// are always available and can be overridden by files of the same name.
 package fileconfig
 
 import (
@@ -30,17 +30,12 @@ type Source struct {
 	rootDir        string
 	workDir        string
 	activeModeName string
-	activePhase    string
 }
 
 type Option func(*Source)
 
 func WithActiveMode(name string) Option {
 	return func(s *Source) { s.activeModeName = strings.TrimSpace(name) }
-}
-
-func WithActivePhase(phase string) Option {
-	return func(s *Source) { s.activePhase = strings.TrimSpace(phase) }
 }
 
 func New(rootDir, workDir string, opts ...Option) *Source {
@@ -82,18 +77,48 @@ func (s *Source) AgentDir() string {
 	return filepath.Join(s.RootDir(), "agents")
 }
 
+// BuiltinModes returns the built-in mode templates shipped with the SDK.
+// "chat" is the interactive default; "plan" is a read-only planning preset.
+// Files in the modes directory override built-ins of the same name.
+func BuiltinModes() []sdkmode.TemplateSpec {
+	return []sdkmode.TemplateSpec{
+		{
+			Name:        "chat",
+			Version:     "v1",
+			DisplayName: "Chat",
+			Description: "Interactive chat and coding. Default mode.",
+			Category:    "direct",
+		},
+		{
+			Name:        "plan",
+			Version:     "v1",
+			DisplayName: "Plan",
+			Description: "Read-only planning session.",
+			Category:    "direct",
+			ToolAccess:  "read-only",
+			Instructions: strings.Join([]string{
+				"PLAN MODE — Read-Only Planning",
+				"",
+				"Focus on understanding the problem, exploring the code, weighing tradeoffs,",
+				"and producing a concrete plan. Use read-only inspection tools freely, but do",
+				"not modify files, run mutating commands, or take externally visible actions.",
+				"When the plan is ready, present it and wait for the user to switch modes",
+				"before implementing.",
+			}, "\n"),
+		},
+	}
+}
+
 func (s *Source) ListModes(ctx context.Context) ([]sdkmode.TemplateSpec, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(s.ModeDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read modes dir %s: %w", s.ModeDir(), err)
 	}
 	var modes []sdkmode.TemplateSpec
+	seen := map[string]bool{}
 	for _, entry := range entries {
 		if entry.IsDir() || !isYAMLFile(entry.Name()) {
 			continue
@@ -103,6 +128,12 @@ func (s *Source) ListModes(ctx context.Context) ([]sdkmode.TemplateSpec, error) 
 			return nil, err
 		}
 		modes = append(modes, spec)
+		seen[strings.ToLower(spec.Name)] = true
+	}
+	for _, builtin := range BuiltinModes() {
+		if !seen[strings.ToLower(builtin.Name)] {
+			modes = append(modes, builtin)
+		}
 	}
 	sort.Slice(modes, func(i, j int) bool { return modes[i].Name < modes[j].Name })
 	return modes, nil
@@ -147,8 +178,7 @@ func (s *Source) PermissionMode(ctx context.Context) (agentsdk.PermissionMode, e
 	if err != nil {
 		return "", err
 	}
-	phase := SelectPhase(spec, s.activePhase)
-	if phase != nil && phase.ReadOnly {
+	if spec != nil && normalizeToolAccess(spec.ToolAccess) == "read-only" {
 		return agentsdk.PermissionModeReadOnly, nil
 	}
 	return agentsdk.PermissionModeWorkspaceWrite, nil
@@ -176,7 +206,7 @@ func (s *Source) MCPServers(context.Context) (map[string]agentsdk.MCPServerConfi
 	return nil, nil
 }
 
-func (s *Source) PhaseDirective(ctx context.Context) (string, error) {
+func (s *Source) ModeDirective(ctx context.Context) (string, error) {
 	spec, err := s.ModeSnapshot(ctx)
 	if err != nil {
 		return "", err
@@ -184,7 +214,7 @@ func (s *Source) PhaseDirective(ctx context.Context) (string, error) {
 	if spec == nil {
 		return "", nil
 	}
-	return BuildModeDirective(spec, s.activePhase), nil
+	return BuildModeDirective(spec), nil
 }
 
 func (s *Source) HandoffHistory(context.Context) ([]agentsdk.RunItem, error) {
@@ -220,22 +250,7 @@ func LoadRoleCatalog(dir string) (agentsdk.RoleCatalog, error) {
 	return catalog, nil
 }
 
-func SelectPhase(spec *sdkmode.TemplateSpec, preferred string) *sdkmode.Phase {
-	if spec == nil || len(spec.Phases) == 0 {
-		return nil
-	}
-	preferred = strings.TrimSpace(preferred)
-	if preferred != "" {
-		for i := range spec.Phases {
-			if spec.Phases[i].ID == preferred {
-				return &spec.Phases[i]
-			}
-		}
-	}
-	return &spec.Phases[0]
-}
-
-func BuildModeDirective(spec *sdkmode.TemplateSpec, activePhase string) string {
+func BuildModeDirective(spec *sdkmode.TemplateSpec) string {
 	if spec == nil {
 		return ""
 	}
@@ -247,42 +262,8 @@ func BuildModeDirective(spec *sdkmode.TemplateSpec, activePhase string) string {
 	if strings.TrimSpace(spec.Description) != "" {
 		parts = append(parts, "Mode description: "+strings.TrimSpace(spec.Description))
 	}
-	if phase := SelectPhase(spec, activePhase); phase != nil {
-		line := "Active phase: " + phase.ID
-		if phase.Name != "" && phase.Name != phase.ID {
-			line += " (" + phase.Name + ")"
-		}
-		var flags []string
-		if phase.ReadOnly {
-			flags = append(flags, "read-only")
-		}
-		if phase.RequiresApproval {
-			flags = append(flags, "requires approval")
-		}
-		if len(flags) > 0 {
-			line += " [" + strings.Join(flags, ", ") + "]"
-		}
-		parts = append(parts, line)
-		if strings.TrimSpace(phase.Description) != "" {
-			parts = append(parts, "Phase description: "+strings.TrimSpace(phase.Description))
-		}
-		if len(phase.EntryGates) > 0 {
-			var gates []string
-			for _, gate := range phase.EntryGates {
-				if gate.Require == "" {
-					continue
-				}
-				msg := strings.TrimSpace(gate.Message)
-				if msg != "" {
-					gates = append(gates, "- "+gate.Require+": "+msg)
-				} else {
-					gates = append(gates, "- "+gate.Require)
-				}
-			}
-			if len(gates) > 0 {
-				parts = append(parts, "Phase entry gates:\n"+strings.Join(gates, "\n"))
-			}
-		}
+	if normalizeToolAccess(spec.ToolAccess) == "read-only" {
+		parts = append(parts, "Tool access: read-only. Do not modify files or run mutating commands.")
 	}
 	if strings.TrimSpace(spec.Instructions) != "" {
 		parts = append(parts, strings.TrimSpace(spec.Instructions))
@@ -362,20 +343,16 @@ type metadata struct {
 }
 
 type modeSpec struct {
-	Name             string            `yaml:"name"`
-	Version          string            `yaml:"version"`
-	DisplayName      string            `yaml:"displayName"`
-	Description      string            `yaml:"description"`
-	Category         string            `yaml:"category"`
-	Autonomous       bool              `yaml:"autonomous"`
-	Instructions     string            `yaml:"instructions"`
-	Phases           []phaseSpec       `yaml:"phases"`
-	Transitions      []transitionSpec  `yaml:"transitions"`
-	Capabilities     []string          `yaml:"capabilities"`
-	ModelRouting     *modelRoutingSpec `yaml:"modelRouting"`
-	RoleInstructions map[string]string `yaml:"roleInstructions"`
-	Constraints      *constraintsSpec  `yaml:"constraints"`
-	ResetTo          *resetToSpec      `yaml:"resetTo"`
+	Name         string            `yaml:"name"`
+	Version      string            `yaml:"version"`
+	DisplayName  string            `yaml:"displayName"`
+	Description  string            `yaml:"description"`
+	Category     string            `yaml:"category"`
+	Autonomous   bool              `yaml:"autonomous"`
+	ToolAccess   string            `yaml:"toolAccess"`
+	Instructions string            `yaml:"instructions"`
+	ModelRouting *modelRoutingSpec `yaml:"modelRouting"`
+	Constraints  *constraintsSpec  `yaml:"constraints"`
 }
 
 func (s modeSpec) isZero() bool {
@@ -385,30 +362,22 @@ func (s modeSpec) isZero() bool {
 		s.Description == "" &&
 		s.Category == "" &&
 		!s.Autonomous &&
+		s.ToolAccess == "" &&
 		s.Instructions == "" &&
-		len(s.Phases) == 0 &&
 		s.ModelRouting == nil &&
-		s.Constraints == nil &&
-		s.ResetTo == nil
+		s.Constraints == nil
 }
 
 func (s modeSpec) toSDK() sdkmode.TemplateSpec {
 	out := sdkmode.TemplateSpec{
-		Name:             strings.TrimSpace(s.Name),
-		Version:          strings.TrimSpace(s.Version),
-		DisplayName:      strings.TrimSpace(s.DisplayName),
-		Description:      strings.TrimSpace(s.Description),
-		Category:         strings.TrimSpace(s.Category),
-		Autonomous:       s.Autonomous,
-		Instructions:     strings.TrimSpace(s.Instructions),
-		Capabilities:     append([]string(nil), s.Capabilities...),
-		RoleInstructions: cloneStringMap(s.RoleInstructions),
-	}
-	for _, p := range s.Phases {
-		out.Phases = append(out.Phases, p.toSDK())
-	}
-	for _, tr := range s.Transitions {
-		out.Transitions = append(out.Transitions, tr.toSDK())
+		Name:         strings.TrimSpace(s.Name),
+		Version:      strings.TrimSpace(s.Version),
+		DisplayName:  strings.TrimSpace(s.DisplayName),
+		Description:  strings.TrimSpace(s.Description),
+		Category:     strings.TrimSpace(s.Category),
+		Autonomous:   s.Autonomous,
+		ToolAccess:   normalizeModeToolAccess(s.ToolAccess),
+		Instructions: strings.TrimSpace(s.Instructions),
 	}
 	if s.ModelRouting != nil {
 		out.ModelRouting = s.ModelRouting.toSDK()
@@ -416,63 +385,16 @@ func (s modeSpec) toSDK() sdkmode.TemplateSpec {
 	if s.Constraints != nil {
 		out.Constraints = s.Constraints.toSDK()
 	}
-	if s.ResetTo != nil {
-		out.ResetTo = s.ResetTo.toSDK()
-	}
 	return out
 }
 
-type phaseSpec struct {
-	ID               string     `yaml:"id"`
-	Name             string     `yaml:"name"`
-	Description      string     `yaml:"description"`
-	ReadOnly         bool       `yaml:"readOnly"`
-	RequiresApproval bool       `yaml:"requiresApproval"`
-	PresentArtifact  string     `yaml:"presentArtifact"`
-	EntryGates       []gateSpec `yaml:"entryGates"`
-}
-
-func (p phaseSpec) toSDK() sdkmode.Phase {
-	out := sdkmode.Phase{
-		ID:               strings.TrimSpace(p.ID),
-		Name:             strings.TrimSpace(p.Name),
-		Description:      strings.TrimSpace(p.Description),
-		ReadOnly:         p.ReadOnly,
-		RequiresApproval: p.RequiresApproval,
-		PresentArtifact:  strings.TrimSpace(p.PresentArtifact),
+// normalizeModeToolAccess maps mode toolAccess values onto the recognized set,
+// leaving empty (inherit) untouched.
+func normalizeModeToolAccess(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
 	}
-	for _, gate := range p.EntryGates {
-		out.EntryGates = append(out.EntryGates, gate.toSDK())
-	}
-	return out
-}
-
-type gateSpec struct {
-	Require string `yaml:"require"`
-	Message string `yaml:"message"`
-}
-
-func (g gateSpec) toSDK() sdkmode.PhaseGate {
-	return sdkmode.PhaseGate{
-		Require: strings.TrimSpace(g.Require),
-		Message: strings.TrimSpace(g.Message),
-	}
-}
-
-type transitionSpec struct {
-	From  string   `yaml:"from"`
-	To    string   `yaml:"to"`
-	Gates []string `yaml:"gates"`
-	When  []string `yaml:"when"`
-}
-
-func (t transitionSpec) toSDK() sdkmode.Transition {
-	return sdkmode.Transition{
-		From:  strings.TrimSpace(t.From),
-		To:    strings.TrimSpace(t.To),
-		Gates: append([]string(nil), t.Gates...),
-		When:  append([]string(nil), t.When...),
-	}
+	return normalizeToolAccess(value)
 }
 
 type modelRoutingSpec struct {
@@ -542,25 +464,6 @@ func (c constraintsSpec) toSDK() *sdkmode.Constraints {
 		MaxConcurrentSubAgents: c.MaxConcurrentSubAgents,
 		MaxRetries:             c.MaxRetries,
 		MaxRuntimeMinutes:      c.MaxRuntimeMinutes,
-	}
-}
-
-type resetToSpec struct {
-	Mode             string `yaml:"mode"`
-	Name             string `yaml:"name"`
-	Version          string `yaml:"version"`
-	Prompt           string `yaml:"prompt"`
-	RequiresApproval bool   `yaml:"requiresApproval"`
-	ClearHistory     bool   `yaml:"clearHistory"`
-}
-
-func (r resetToSpec) toSDK() *sdkmode.ResetTo {
-	return &sdkmode.ResetTo{
-		Name:             firstNonEmpty(r.Name, r.Mode),
-		Version:          strings.TrimSpace(r.Version),
-		Prompt:           strings.TrimSpace(r.Prompt),
-		RequiresApproval: r.RequiresApproval,
-		ClearHistory:     r.ClearHistory,
 	}
 }
 

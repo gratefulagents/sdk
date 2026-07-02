@@ -95,7 +95,6 @@ type GenerationSpanData struct {
 	Turn                         int32
 	Scope                        string
 	TaskID                       string
-	Phase                        string
 	Status                       string
 	UsageAvailable               bool
 	PromptTokens                 int64

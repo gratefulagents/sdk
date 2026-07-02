@@ -64,53 +64,6 @@ func (g approvingGate) ApproveTool(context.Context, ToolApprovalRequest) (bool, 
 	return false, "denied", nil
 }
 
-type phasePauseTool struct{}
-
-func (phasePauseTool) Name() string                 { return "set_phase" }
-func (phasePauseTool) Description() string          { return "set phase" }
-func (phasePauseTool) InputSchema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
-func (phasePauseTool) IsReadOnly() bool             { return false }
-func (phasePauseTool) IsEnabled(*RunContext) bool   { return true }
-func (phasePauseTool) NeedsApproval() bool          { return false }
-func (phasePauseTool) TimeoutSeconds() int          { return 0 }
-func (phasePauseTool) Execute(context.Context, json.RawMessage, string) (ToolResult, error) {
-	return ToolResult{Content: `{"phase":"build","status":"changed"}`, ShouldPause: true}, nil
-}
-
-func TestChatLoopResumesAfterSetPhasePause(t *testing.T) {
-	model := &scriptedChatModel{responses: []*ModelResponse{
-		{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{
-			ID:    "phase_call",
-			Name:  "set_phase",
-			Input: json.RawMessage(`{"phase":"build"}`),
-		}}}},
-		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done in build"}}}},
-	}}
-	runner := NewRunnerWithModel(model)
-
-	result, err := NewChatLoop(ChatLoopOptions{
-		Runner: runner,
-		Agent: &Agent{
-			Name:  "loop",
-			Model: "demo",
-			Tools: []Tool{phasePauseTool{}},
-		},
-		RunConfig: RunConfig{MaxTurns: 3, Phase: "plan"},
-	}).Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.FinalText() != "done in build" {
-		t.Fatalf("FinalText() = %q", result.FinalText())
-	}
-	if len(model.requests) != 2 {
-		t.Fatalf("model requests = %d, want 2", len(model.requests))
-	}
-	if len(result.NewItems) < 3 {
-		t.Fatalf("NewItems = %d, want phase call/output plus final", len(result.NewItems))
-	}
-}
-
 func TestChatLoopResolvesToolApprovalAndResumes(t *testing.T) {
 	model := &scriptedChatModel{responses: []*ModelResponse{
 		{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{
@@ -468,7 +421,7 @@ func (staticConfigSource) MCPServers(context.Context) (map[string]MCPServerConfi
 	return nil, nil
 }
 
-func (staticConfigSource) PhaseDirective(context.Context) (string, error) {
+func (staticConfigSource) ModeDirective(context.Context) (string, error) {
 	return "", nil
 }
 

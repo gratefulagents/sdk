@@ -381,7 +381,6 @@ func addGenerationSpanData(entry map[string]any, d agent.GenerationSpanData) {
 	entry["generation_turn"] = d.Turn
 	entry["scope"] = d.Scope
 	entry["task_id"] = d.TaskID
-	entry["phase"] = d.Phase
 	entry["status"] = d.Status
 	entry["usage_available"] = d.UsageAvailable
 	entry["input_tokens"] = d.PromptTokens

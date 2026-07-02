@@ -37,7 +37,6 @@ type SignalFeatures struct {
 	AskUserQuestion bool
 	PresentPlan     bool
 	Finish          bool
-	SetPhase        bool
 }
 
 type MCPFeatures struct {
@@ -73,9 +72,8 @@ type GuardrailFeatures struct {
 }
 
 type ModeFeatures struct {
-	Instructions  bool
-	PhaseTracking bool
-	ModelRouting  bool
+	Instructions bool
+	ModelRouting bool
 }
 
 type ProjectStateFeatures struct {
@@ -131,7 +129,6 @@ func legacyFeatures(cfg Config) Features {
 				AskUserQuestion: signalTools,
 				PresentPlan:     signalTools,
 				Finish:          signalTools,
-				SetPhase:        signalTools,
 			},
 		},
 		MCP: MCPFeatures{
@@ -156,9 +153,8 @@ func legacyFeatures(cfg Config) Features {
 			Builtin: cfg.EnableGuardrails,
 		},
 		Modes: ModeFeatures{
-			Instructions:  true,
-			PhaseTracking: true,
-			ModelRouting:  true,
+			Instructions: true,
+			ModelRouting: true,
 		},
 		ProjectState: ProjectStateFeatures{
 			PrimeContext: cfg.EnableProjectState,
@@ -186,7 +182,7 @@ func (f ToolFeatures) hasRegistryTools() bool {
 }
 
 func (f ToolFeatures) hasSignals() bool {
-	return f.Signals.AskUserQuestion || f.Signals.PresentPlan || f.Signals.Finish || f.Signals.SetPhase
+	return f.Signals.AskUserQuestion || f.Signals.PresentPlan || f.Signals.Finish
 }
 
 func (f MCPFeatures) hasServerSelection() bool {

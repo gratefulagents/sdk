@@ -416,10 +416,7 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 	modeSpec := &sdkmode.TemplateSpec{
 		Name:        "ship-mode",
 		DisplayName: "Ship Mode",
-		Phases: []sdkmode.Phase{
-			{ID: "plan", ReadOnly: true},
-			{ID: "build", RequiresApproval: true},
-		},
+		ToolAccess:  "read-only",
 		ModelRouting: &sdkmode.ModelRouting{
 			DefaultModel:   "openai/" + liveOpenAIModel,
 			ReasoningLevel: string(agentsdk.ReasoningHigh),
@@ -429,31 +426,9 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 			},
 		},
 		Constraints: &sdkmode.Constraints{MaxTurns: 4, SubAgentMaxTurns: 2, MaxConcurrentSubAgents: 1},
-		ResetTo:     &sdkmode.ResetTo{Name: "chat", Prompt: "Continue in chat.", RequiresApproval: true},
-	}
-	if access, overridden := agentsdk.ResolvePhaseToolAccess(agentsdk.ToolAccessLevelFull, modeSpec, "plan"); !overridden || access != agentsdk.ToolAccessLevelReadOnly {
-		t.Fatalf("phase access = %q overridden=%v", access, overridden)
-	}
-	if decision := agentsdk.EvaluatePhaseTurnLimit("build", 2, 2); !decision.Exceeded || len(decision.Actions) == 0 {
-		t.Fatalf("phase turn decision = %+v", decision)
-	}
-	if completion := agentsdk.EvaluateModeCompletion("ship-mode", true, modeSpec.ResetTo); !completion.Completed || !completion.RequiresApproval || completion.TargetMode != "chat" {
-		t.Fatalf("mode completion = %+v", completion)
 	}
 	if routing := agentsdk.ResolveRoleModeRouting("", "openai", "writer", agentsdk.ModeRoutingFromTemplateSpec(modeSpec)); routing.Model == "" || routing.ModelSettings.ReasoningEffort != "low" {
 		t.Fatalf("role routing = %+v", routing)
-	}
-	denied := sdkmode.Evaluate(modeSpec, &sdkmode.TemplateSpec{Name: "admin-only", Category: "orchestrated"}, sdkmode.EvaluateOpts{ActorRole: sdkmode.RoleUser})
-	if denied.Result != sdkmode.ResultDenied || denied.DenyCode != sdkmode.DenyRBACDenied {
-		t.Fatalf("mode RBAC denial = %+v", denied)
-	}
-	if gate := sdkmode.EvaluatePhaseEntryGates([]sdkmode.PhaseGate{{Require: "plan_exists"}}, sdkmode.EvidenceContext{WorkDir: workDir}); gate == nil || gate.Passed {
-		t.Fatalf("missing plan gate = %+v", gate)
-	}
-	if gate := sdkmode.EvaluatePhaseEntryGatesWithGitRunner([]sdkmode.PhaseGate{{Require: "git_clean"}}, sdkmode.EvidenceContext{WorkDir: workDir}, func(string, ...string) ([]byte, error) {
-		return []byte(" M file.go\n"), nil
-	}); gate == nil || gate.Passed || !strings.Contains(gate.Message, "uncommitted") {
-		t.Fatalf("dirty git gate = %+v", gate)
 	}
 	specialists := agentsdk.BuildSpecialistsFromCatalog(agentsdk.RoleCatalog{{
 		Name:         "writer",
@@ -998,25 +973,15 @@ func TestSDKSecurityRegressionCoverage(t *testing.T) {
 		}
 	})
 
-	t.Run("mode gates and transitions fail closed", func(t *testing.T) {
-		for _, gateName := range []string{sdkmode.GatePrerequisiteArtifact, sdkmode.GateSafety, "unknown_gate"} {
-			gate := sdkmode.EvaluateGates([]string{gateName}, sdkmode.GateContext{})
-			if gate == nil || gate.Passed || gate.DenyCode != sdkmode.DenyGateFailed {
-				t.Fatalf("gate %q = %+v, want fail-closed denial", gateName, gate)
-			}
+	t.Run("mode tool access constrains permission mode", func(t *testing.T) {
+		root := t.TempDir()
+		src := fileconfig.New(root, root, fileconfig.WithActiveMode("plan"))
+		mode, err := src.PermissionMode(ctx)
+		if err != nil {
+			t.Fatalf("PermissionMode: %v", err)
 		}
-		current := &sdkmode.TemplateSpec{
-			Name:        "plan",
-			Transitions: []sdkmode.Transition{{From: "plan", To: "review"}},
-		}
-		if result := sdkmode.Evaluate(current, &sdkmode.TemplateSpec{Name: "ship"}, sdkmode.EvaluateOpts{ActorRole: sdkmode.RoleSystem}); result.Result != sdkmode.ResultDenied || result.DenyCode != sdkmode.DenyEdgeNotFound {
-			t.Fatalf("missing transition result = %+v", result)
-		}
-		if result := sdkmode.Evaluate(&sdkmode.TemplateSpec{
-			Name:        "plan",
-			Transitions: []sdkmode.Transition{{From: "plan", To: "ship", Gates: []string{sdkmode.GateSafety}}},
-		}, &sdkmode.TemplateSpec{Name: "ship"}, sdkmode.EvaluateOpts{ActorRole: sdkmode.RoleSystem}); result.Result != sdkmode.ResultDenied || result.DenyCode != sdkmode.DenyGateFailed {
-			t.Fatalf("safety transition result = %+v", result)
+		if mode != agentsdk.PermissionModeReadOnly {
+			t.Fatalf("builtin plan permission mode = %q, want read-only", mode)
 		}
 	})
 }
@@ -1051,10 +1016,7 @@ metadata:
 spec:
   name: integration
   displayName: Integration
-  phases:
-    - id: discover
-      readOnly: true
-    - id: ship
+  toolAccess: read-only
   instructions: |
     Work through the integration test.
 `), 0o644))
@@ -1065,7 +1027,7 @@ tool_access: read-only
 ---
 Find facts carefully.
 `), 0o644))
-	source := fileconfig.New(root, t.TempDir(), fileconfig.WithActiveMode("integration"), fileconfig.WithActivePhase("discover"))
+	source := fileconfig.New(root, t.TempDir(), fileconfig.WithActiveMode("integration"))
 	snapshot, err := source.ModeSnapshot(ctx)
 	if err != nil || snapshot == nil || snapshot.DisplayName != "Integration" {
 		t.Fatalf("snapshot = %+v err=%v", snapshot, err)
@@ -1081,7 +1043,6 @@ Find facts carefully.
 	workingState := agentsdk.WorkingState{
 		Goal:                 "Verify OAuth integration coverage",
 		CurrentMode:          "integration",
-		CurrentPhase:         "discover",
 		CurrentStep:          "security checks",
 		LastUserMessage:      "make it exhaustive",
 		LastAssistantSummary: "moved suite under test/integration",
@@ -1110,9 +1071,6 @@ Find facts carefully.
 	immediateItems, lastCursor := agentsdk.CollectImmediateRunItems([]agentsdk.UserMessage{{ID: 20, Content: "now", Mode: agentsdk.UserMessageModeImmediate}}, map[int64]struct{}{})
 	if len(immediateItems) != 1 || lastCursor != 20 || immediateItems[0].Message.Text != "now" {
 		t.Fatalf("immediate items=%+v cursor=%d", immediateItems, lastCursor)
-	}
-	if !agentsdk.IsSessionModeSlashCommand("/mode integration") || !agentsdk.ValidSessionModeTransition(agentsdk.SessionModePlan, agentsdk.SessionModeChat) {
-		t.Fatal("session mode command/transition helpers failed")
 	}
 	if goal := agentsdk.DeriveWorkingStateGoal("approve", "ship the integration suite"); goal != "ship the integration suite" {
 		t.Fatalf("derived goal = %q", goal)
@@ -1183,15 +1141,6 @@ Find facts carefully.
 	finishResult, err := (&sdksignal.FinishTool{Sink: finishSink}).Execute(ctx, json.RawMessage(`{"summary":"done"}`), root)
 	if err != nil || finishResult.IsError || !finishResult.ShouldPause || finishSink.summary != "done" {
 		t.Fatalf("finish result=%+v sink=%+v err=%v", finishResult, finishSink, err)
-	}
-	phaseSink := &integrationPhaseSink{}
-	setPhaseResult, err := (&sdksignal.SetPhaseTool{
-		Phases:       []sdksignal.PhaseOption{{ID: "discover", ReadOnly: true}, {ID: "ship", RequiresApproval: true}},
-		CurrentPhase: "discover",
-		Sink:         phaseSink,
-	}).Execute(ctx, json.RawMessage(`{"phase":"ship"}`), root)
-	if err != nil || setPhaseResult.IsError || phaseSink.phase != "ship" || !strings.Contains(setPhaseResult.Content, "requires_approval") {
-		t.Fatalf("set_phase result=%+v sink=%+v err=%v", setPhaseResult, phaseSink, err)
 	}
 
 	manager := &integrationMCPManager{}
@@ -1427,7 +1376,7 @@ func (integrationConfigSource) MCPServers(context.Context) (map[string]agentsdk.
 	return nil, nil
 }
 
-func (integrationConfigSource) PhaseDirective(context.Context) (string, error) {
+func (integrationConfigSource) ModeDirective(context.Context) (string, error) {
 	return "", nil
 }
 
@@ -1632,15 +1581,6 @@ type integrationFinishSink struct {
 
 func (s *integrationFinishSink) Finish(_ context.Context, summary string) error {
 	s.summary = summary
-	return nil
-}
-
-type integrationPhaseSink struct {
-	phase string
-}
-
-func (s *integrationPhaseSink) SetPhase(_ context.Context, phase string) error {
-	s.phase = phase
 	return nil
 }
 

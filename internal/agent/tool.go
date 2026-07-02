@@ -80,7 +80,7 @@ type policyToolWrapper struct {
 // Approval semantics: when approval=true, NeedsApproval() returns true even
 // for tools whose own implementation hardcodes NeedsApproval()=false (notably
 // the signal tools in pkg/agentsdk/tools/signal/*: finish, plan, present_plan,
-// question, set_phase). The wrapper's approval flag is therefore an *override*
+// question). The wrapper's approval flag is therefore an *override*
 // — hosts that opt these tools into approval gating via tool policy will see
 // approval prompts despite the inner tool's default. The reverse is not true:
 // approval=false leaves the inner tool's NeedsApproval() decision intact.

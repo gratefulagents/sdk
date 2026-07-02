@@ -32,7 +32,6 @@ type UserMessage struct {
 type WorkingState struct {
 	Goal                  string
 	CurrentMode           string
-	CurrentPhase          string
 	CurrentStep           string
 	LastUserMessage       string
 	LastAssistantSummary  string
@@ -87,7 +86,7 @@ type ConfigSource interface {
 	GuardrailRules(ctx context.Context) ([]GuardrailRule, error)
 	RoleCatalog(ctx context.Context) (RoleCatalog, error)
 	MCPServers(ctx context.Context) (map[string]MCPServerConfig, error)
-	PhaseDirective(ctx context.Context) (string, error)
+	ModeDirective(ctx context.Context) (string, error)
 	HandoffHistory(ctx context.Context) ([]RunItem, error)
 }
 
@@ -136,9 +135,9 @@ func NewChatLoop(opts ChatLoopOptions) *ChatLoop {
 
 // Run executes a host-backed chat loop.
 //
-// The loop can resume after SDK tool approvals and phase-changing pause tools.
-// Hosts still own their platform side effects through SessionStore, ConfigSource,
-// ApprovalGate, RunStatusSink, TraceStore, and PlatformToolFactory.
+// The loop can resume after SDK tool approvals. Hosts still own their platform
+// side effects through SessionStore, ConfigSource, ApprovalGate, RunStatusSink,
+// TraceStore, and PlatformToolFactory.
 func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 	if l == nil {
 		return nil, fmt.Errorf("chat loop is nil")
@@ -222,15 +221,6 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			continue
 		}
 
-		if phase, ok := latestSuccessfulSetPhase(result.NewItems); ok && phase != "" && phase != runCfg.Phase {
-			if resumes >= maxResumes {
-				return combined, fmt.Errorf("too many automatic phase transitions; last phase %q", phase)
-			}
-			runCfg.Phase = phase
-			runCfg.AdditionalInstructions = strings.TrimSpace(runCfg.AdditionalInstructions + "\n\n" + "Active phase changed to " + phase + ". Continue in this phase.")
-			continue
-		}
-
 		return l.finalize(ctx, combined)
 	}
 }
@@ -250,8 +240,8 @@ func (l *ChatLoop) prepareRun(ctx context.Context) (Agent, RunConfig, error) {
 		if runCfg.ToolAccessLevel == "" {
 			runCfg.ToolAccessLevel = toolAccessLevelFromPermissionMode(mode)
 		}
-		if directive, err := l.opts.ConfigSource.PhaseDirective(ctx); err != nil {
-			return Agent{}, RunConfig{}, fmt.Errorf("load phase directive: %w", err)
+		if directive, err := l.opts.ConfigSource.ModeDirective(ctx); err != nil {
+			return Agent{}, RunConfig{}, fmt.Errorf("load mode directive: %w", err)
 		} else if strings.TrimSpace(directive) != "" {
 			runCfg.AdditionalInstructions = strings.TrimSpace(runCfg.AdditionalInstructions + "\n\n" + directive)
 		}
@@ -494,33 +484,6 @@ func combineLoopResult(result *RunResult, newItems []RunItem, responses []ModelR
 	combined.RawResponses = append([]ModelResponse(nil), responses...)
 	combined.Usage = usage
 	return &combined
-}
-
-func latestSuccessfulSetPhase(items []RunItem) (string, bool) {
-	phaseByCall := map[string]string{}
-	var latest string
-	for _, item := range items {
-		switch item.Type {
-		case RunItemToolCall:
-			if item.ToolCall == nil || item.ToolCall.Name != "set_phase" {
-				continue
-			}
-			var payload struct {
-				Phase string `json:"phase"`
-			}
-			if err := json.Unmarshal(item.ToolCall.Input, &payload); err == nil && strings.TrimSpace(payload.Phase) != "" {
-				phaseByCall[item.ToolCall.ID] = strings.TrimSpace(payload.Phase)
-			}
-		case RunItemToolOutput:
-			if item.ToolOutput == nil || item.ToolOutput.IsError {
-				continue
-			}
-			if phase := phaseByCall[item.ToolOutput.CallID]; phase != "" {
-				latest = phase
-			}
-		}
-	}
-	return latest, latest != ""
 }
 
 func cloneRawMessage(raw json.RawMessage) json.RawMessage {

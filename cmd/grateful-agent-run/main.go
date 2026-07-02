@@ -315,7 +315,6 @@ func buildBundle(ctx context.Context, cfg cliConfig, workDir string, eventFile i
 		WorkingStateText:         "Runtime state is maintained by the headless evaluation harness.",
 		ModeDirectiveText:        runtimeDirectiveText(cfg),
 		ActiveMode:               firstNonEmpty(cfg.Mode, "eval"),
-		ActivePhase:              firstNonEmpty(cfg.Mode, "eval"),
 		DisableSignalTools:       true,
 	}).Build(ctx)
 	if err != nil {

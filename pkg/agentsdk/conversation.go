@@ -75,13 +75,7 @@ func BuildWorkingStateContext(state WorkingState) string {
 		lines = append(lines, "Current objective: "+TruncateContextText(state.Goal, DefaultContextSummaryCharLimit))
 	}
 	if state.CurrentMode != "" {
-		modeLine := "Mode: " + state.CurrentMode
-		if state.CurrentPhase != "" {
-			modeLine += fmt.Sprintf(" (phase: %s)", state.CurrentPhase)
-		}
-		lines = append(lines, modeLine)
-	} else if state.CurrentPhase != "" {
-		lines = append(lines, "Phase: "+state.CurrentPhase)
+		lines = append(lines, "Mode: "+state.CurrentMode)
 	}
 	if state.CurrentStep != "" {
 		lines = append(lines, "Current step: "+TruncateContextText(state.CurrentStep, DefaultContextSummaryCharLimit))

@@ -37,7 +37,6 @@ func TestBuildWorkingStateContextUsesMostRecentProgress(t *testing.T) {
 	state := WorkingState{
 		Goal:                 "finish github auth end to end",
 		CurrentMode:          "deep",
-		CurrentPhase:         "shipping",
 		LastUserMessage:      "also wire github app callbacks",
 		LastAssistantSummary: "implemented oauth callback plumbing",
 		RecentTurnSummaries:  []string{"summary-1", "summary-2", "summary-3", "summary-4", "summary-5"},
@@ -47,8 +46,8 @@ func TestBuildWorkingStateContextUsesMostRecentProgress(t *testing.T) {
 	if !strings.Contains(context, "Current objective: finish github auth end to end") {
 		t.Fatalf("context = %q, want objective", context)
 	}
-	if !strings.Contains(context, "Mode: deep (phase: shipping)") {
-		t.Fatalf("context = %q, want mode/phase", context)
+	if !strings.Contains(context, "Mode: deep") {
+		t.Fatalf("context = %q, want mode", context)
 	}
 	if strings.Contains(context, "summary-1") {
 		t.Fatalf("context = %q, want only last four summaries", context)
