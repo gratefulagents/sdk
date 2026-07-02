@@ -359,7 +359,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if len(joinItems) > 0 {
 					currentInput = append(currentInput, joinItems...)
 					allItems = append(allItems, joinItems...)
-					emitRunItems(streamEvents, joinItems)
+					emitRunItems(ctx, streamEvents, joinItems)
 					maxTurns = turn + 2
 					continue
 				}
@@ -396,7 +396,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		if pollItems := pollSubAgentResultItems(tools); len(pollItems) > 0 {
 			currentInput = append(currentInput, pollItems...)
 			allItems = append(allItems, pollItems...)
-			emitRunItems(streamEvents, pollItems)
+			emitRunItems(ctx, streamEvents, pollItems)
 		}
 		pendingSubAgentJoin := hasPendingSubAgentFinalJoin(tools)
 		if cfg.ForceFinalSummaryTurn && turn == maxTurns-1 && !pendingSubAgentJoin {
@@ -822,7 +822,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			newItems[i].Agent = currentAgent
 		}
 		allItems = append(allItems, newItems...)
-		emitRunItems(streamEvents, newItems)
+		emitRunItems(ctx, streamEvents, newItems)
 		responseCompactionSummary, responseHasCompaction := providerCompactionSummaryFromItems(newItems)
 		responseCompactionRecorded := false
 		recordAndPruneResponseCompaction := func(items []RunItem) []RunItem {
@@ -857,7 +857,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				currentInput = append(currentInput, newItems...)
 				currentInput = append(currentInput, joinItems...)
 				allItems = append(allItems, joinItems...)
-				emitRunItems(streamEvents, joinItems)
+				emitRunItems(ctx, streamEvents, joinItems)
 				if turn >= maxTurns-1 {
 					maxTurns++
 				}
@@ -877,7 +877,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				currentInput = append(currentInput, newItems...)
 				currentInput = append(currentInput, confirmItem)
 				allItems = append(allItems, confirmItem)
-				emitRunItems(streamEvents, []RunItem{confirmItem})
+				emitRunItems(ctx, streamEvents, []RunItem{confirmItem})
 				if turn >= maxTurns-1 {
 					maxTurns++
 				}
@@ -899,7 +899,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					currentInput = append(currentInput, newItems...)
 					currentInput = append(currentInput, gateItem)
 					allItems = append(allItems, gateItem)
-					emitRunItems(streamEvents, []RunItem{gateItem})
+					emitRunItems(ctx, streamEvents, []RunItem{gateItem})
 					if turn >= maxTurns-1 {
 						maxTurns++
 					}
@@ -923,7 +923,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					currentInput = append(currentInput, newItems...)
 					currentInput = append(currentInput, verifyItem)
 					allItems = append(allItems, verifyItem)
-					emitRunItems(streamEvents, []RunItem{verifyItem})
+					emitRunItems(ctx, streamEvents, []RunItem{verifyItem})
 					pendingCompletion = false
 					if turn >= maxTurns-1 {
 						maxTurns++
@@ -982,15 +982,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			handoffOutputs := handoffToolOutputs(newItems, s.handoff, currentAgent, s.target)
 			if len(handoffOutputs) > 0 {
 				allItems = append(allItems, handoffOutputs...)
-				emitRunItems(streamEvents, handoffOutputs)
+				emitRunItems(ctx, streamEvents, handoffOutputs)
 			}
 
 			nextInput := append([]RunItem(nil), currentInput...)
+			// Both branches must see the current turn's items: the assistant
+			// message + handoff tool call and the synthesized handoff outputs
+			// are part of the history handed to the target agent, whether or
+			// not a filter is applied.
+			nextInput = append(nextInput, newItems...)
+			nextInput = append(nextInput, handoffOutputs...)
 			if s.handoff.InputFilter != nil {
 				nextInput = s.handoff.InputFilter(nextInput, allItems)
-			} else {
-				nextInput = append(nextInput, newItems...)
-				nextInput = append(nextInput, handoffOutputs...)
 			}
 			nextInput = recordAndPruneResponseCompaction(nextInput)
 			if compacted, before, after, ok, reason := MaybeCompactHandoffInput(nextInput, cfg.HandoffHistory); ok {
@@ -1021,7 +1024,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			allToolInputResults = append(allToolInputResults, toolInResults...)
 			allToolOutputResults = append(allToolOutputResults, toolOutResults...)
 			allItems = append(allItems, toolResults...)
-			emitRunItems(streamEvents, toolResults)
+			emitRunItems(ctx, streamEvents, toolResults)
 			currentInput = append(currentInput, newItems...)
 			// H3: wrap tool outputs as untrusted before they become next-turn
 			// model input. Original toolResults retained in allItems untouched
@@ -1063,28 +1066,36 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						}
 						currentInput = append(currentInput, escalation)
 						allItems = append(allItems, escalation)
-						emitRunItems(streamEvents, []RunItem{escalation})
+						emitRunItems(ctx, streamEvents, []RunItem{escalation})
 					}
 				}
 			}
 
-			// Check for tool approval interruptions.
+			// Check for tool approval interruptions. Parallel tool calls can
+			// require several approvals in one turn; surface all of them so
+			// the host can resolve each pending call — leaving any unresolved
+			// produces an unpaired tool_use the provider rejects next turn.
+			var interruptions []*Interruption
 			for _, tr := range toolResults {
 				if tr.Type == RunItemToolApproval {
-					return &RunResult{
-						LastAgent:                  currentAgent,
-						NewItems:                   allItems,
-						RawResponses:               allResponses,
-						ToolInputGuardrailResults:  allToolInputResults,
-						ToolOutputGuardrailResults: allToolOutputResults,
-						Usage:                      runCtx.Usage,
-						Interruption: &Interruption{
-							ToolName:   tr.ToolApproval.ToolName,
-							ToolInput:  tr.ToolApproval.Input,
-							ToolCallID: tr.ToolApproval.CallID,
-						},
-					}, nil
+					interruptions = append(interruptions, &Interruption{
+						ToolName:   tr.ToolApproval.ToolName,
+						ToolInput:  tr.ToolApproval.Input,
+						ToolCallID: tr.ToolApproval.CallID,
+					})
 				}
+			}
+			if len(interruptions) > 0 {
+				return &RunResult{
+					LastAgent:                  currentAgent,
+					NewItems:                   allItems,
+					RawResponses:               allResponses,
+					ToolInputGuardrailResults:  allToolInputResults,
+					ToolOutputGuardrailResults: allToolOutputResults,
+					Usage:                      runCtx.Usage,
+					Interruption:               interruptions[0],
+					Interruptions:              interruptions,
+				}, nil
 			}
 
 			if currentAgent.ToolUseBehavior == StopOnFirstTool || shouldStopAtTools(currentAgent, s.toolCalls) {
@@ -1286,15 +1297,20 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 	return streamedResp, nil
 }
 
-func emitRunItems(events chan<- StreamEvent, items []RunItem) {
+// emitRunItems forwards run items to the stream without ever blocking past
+// context cancellation. StreamedRunResult consumers may stop draining Events
+// (e.g. callers that only wait on FinalResult); an unguarded send would then
+// block this run goroutine forever once the channel buffer fills.
+func emitRunItems(ctx context.Context, events chan<- StreamEvent, items []RunItem) {
 	if events == nil {
 		return
 	}
 	for i := range items {
 		item := items[i]
-		events <- StreamEvent{
-			Type: StreamEventRunItem,
-			Item: &item,
+		select {
+		case events <- StreamEvent{Type: StreamEventRunItem, Item: &item}:
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -1434,21 +1450,37 @@ func handoffCallInput(items []RunItem, toolName string) json.RawMessage {
 	return nil
 }
 
+// handoffToolOutputs synthesizes tool outputs for every tool call in the
+// response that triggered a handoff. The triggered handoff call gets a
+// transfer acknowledgement; any sibling calls (parallel tool calls or a
+// second handoff in the same turn) are never executed, so they get an
+// explanatory output instead — an unpaired tool_use in the next request is
+// rejected by provider APIs.
 func handoffToolOutputs(items []RunItem, handoff *Handoff, fromAgent, toAgent *Agent) []RunItem {
 	if handoff == nil || toAgent == nil {
 		return nil
 	}
 	var outputs []RunItem
+	handled := false
 	for _, item := range items {
-		if item.Type != RunItemToolCall || item.ToolCall == nil || item.ToolCall.Name != handoff.ToolName {
+		if item.Type != RunItemToolCall || item.ToolCall == nil {
 			continue
+		}
+		content := fmt.Sprintf("Handing off to %s", toAgent.Name)
+		isError := false
+		if item.ToolCall.Name != handoff.ToolName || handled {
+			content = fmt.Sprintf("not executed: the conversation was handed off to %s in this turn", toAgent.Name)
+			isError = true
+		} else {
+			handled = true
 		}
 		outputs = append(outputs, RunItem{
 			Type:  RunItemToolOutput,
 			Agent: fromAgent,
 			ToolOutput: &ToolOutputData{
 				CallID:  item.ToolCall.ID,
-				Content: fmt.Sprintf("Handing off to %s", toAgent.Name),
+				Content: content,
+				IsError: isError,
 			},
 		})
 	}

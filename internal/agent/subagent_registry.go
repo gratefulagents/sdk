@@ -798,6 +798,22 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 // All registry-level configuration is read from the spawn-time snapshot so the
 // task never races with concurrent registry reconfiguration.
 func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, toolAccessOverride ToolAccessLevel, snap taskRunSnapshot, trace *Trace, processor TracingProcessor, parentSpanID string) {
+	// A panic anywhere in the sub-agent run must fail this task, not crash the
+	// host process: runTask executes as a bare goroutine, so an unrecovered
+	// panic here is fatal to the whole program (mirrors RunStreamed's guard).
+	defer func() {
+		if rec := recover(); rec != nil {
+			duration := r.taskDuration(taskID)
+			errMsg := fmt.Sprintf("agent %q panicked: %v", ag.Name, rec)
+			r.setTerminal(taskID, SubAgentTaskFailed, "", errMsg, duration, 0, 0)
+			if snap.tracker != nil {
+				snap.tracker.RecordSubagentCompleted(taskID, "failed", errMsg, 0, 0, Usage{}, "", nil, nil)
+			}
+			if snap.eventStream != nil {
+				snap.eventStream.EmitSubagentCompleted(taskID, "failed", errMsg, 0, 0, duration.Milliseconds(), 0, false, 0, "failed", "")
+			}
+		}
+	}()
 	dependencyContext, waitErr := r.waitForDependencies(ctx, taskID)
 	if waitErr != nil {
 		duration := r.taskDuration(taskID)

@@ -82,6 +82,7 @@ type LLMReasoning struct {
 
 type LLMCompaction struct {
 	ID               string `json:"id,omitempty"`
+	Content          string `json:"content,omitempty"`
 	EncryptedContent string `json:"encrypted_content,omitempty"`
 	CreatedBy        string `json:"created_by,omitempty"`
 }

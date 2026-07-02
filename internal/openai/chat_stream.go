@@ -43,6 +43,7 @@ type chatChunkChoice struct {
 type chatChunkDelta struct {
 	Role      string              `json:"role"`
 	Content   string              `json:"content"`
+	Refusal   string              `json:"refusal"`
 	ToolCalls []chatChunkToolCall `json:"tool_calls"`
 	// Copilot-specific reasoning fields.
 	ReasoningText   string `json:"reasoning_text"`
@@ -298,6 +299,24 @@ func (r *chatStreamReader) translateChunk(chunk chatCompletionChunk) {
 			Type:  anthropic.EventContentBlockDelta,
 			Index: r.openIndex,
 			Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: delta.Content},
+		})
+	}
+
+	// Surface refusal deltas as text so the reason reaches the caller instead
+	// of producing an empty (and wrongly retried) response.
+	if delta.Refusal != "" {
+		if r.openKind != chatBlockText {
+			r.startBlock(chatBlockText, anthropic.ContentBlock{Type: "text"})
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: r.openIndex,
+				Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: "The model refused to respond: "},
+			})
+		}
+		r.emit(anthropic.StreamEvent{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: r.openIndex,
+			Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: delta.Refusal},
 		})
 	}
 

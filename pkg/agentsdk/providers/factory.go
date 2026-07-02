@@ -121,7 +121,7 @@ func NewRunnerFromConfig(spec ProviderSpec) (*agentsdk.Runner, error) {
 
 func newOpenAIProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	baseURL := baseURLForProvider(spec, DefaultProviderOpenAI)
-	authMode := sdkopenai.NormalizeAuthMode(spec.AuthMode)
+	authMode := authModeForOpenAIProvider(spec)
 	apiKey := apiKeyForProvider(spec, DefaultProviderOpenAI)
 	session := spec.OpenAIAuthSession
 
@@ -151,7 +151,7 @@ func newOpenAIProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error
 		BaseURL:     baseURL,
 		APIKey:      apiKey,
 		AuthMode:    authMode,
-		APIMode:     apiModeForProvider(spec, DefaultProviderOpenAI, spec.APIMode),
+		APIMode:     apiModeForProvider(spec, DefaultProviderOpenAI, ""),
 		AuthSession: session,
 	}), nil
 }
@@ -406,6 +406,22 @@ func authModeForAnthropicProvider(spec ProviderSpec) string {
 		return authMode
 	}
 	return ""
+}
+
+// authModeForOpenAIProvider scopes a top-level AuthMode=oauth to the OpenAI
+// provider, mirroring authModeForAnthropicProvider. Without this, a multi spec
+// whose OAuth setting targets another default provider would push the
+// always-registered OpenAI leg onto the Codex OAuth backend.
+func authModeForOpenAIProvider(spec ProviderSpec) sdkopenai.AuthMode {
+	authMode := sdkopenai.NormalizeAuthMode(spec.AuthMode)
+	if authMode != sdkopenai.AuthModeOAuth {
+		return authMode
+	}
+	provider := normalizeProviderName(spec.Provider)
+	if provider == DefaultProviderOpenAI || defaultProviderForSpec(spec) == DefaultProviderOpenAI {
+		return authMode
+	}
+	return sdkopenai.NormalizeAuthMode("")
 }
 
 func defaultProviderForSpec(spec ProviderSpec) string {

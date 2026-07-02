@@ -812,7 +812,11 @@ func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recent
 		result = buildCompactedRunItems(items, protected, summary)
 		after = estimateRunItemsTokens(result)
 	}
-	if after >= before && len(result) >= len(items) {
+	// A summary that does not actually shrink the token count is worse than
+	// useless: callers treat ok=true as "input reduced" and retry the model
+	// call (including the forced post-overflow path). Reject it regardless of
+	// how many items were collapsed.
+	if after >= before {
 		return nil, 0, false, "ineffective-summary"
 	}
 	return result, after, true, ""

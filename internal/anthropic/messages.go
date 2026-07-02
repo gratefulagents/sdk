@@ -6,6 +6,7 @@ import (
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
 )
 
 // CreateMessageRequest for POST /v1/messages.
@@ -164,6 +165,14 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 		}
 	}
 
+	// Convert structured-output schema to the native output_format field so the
+	// API enforces schema-constrained JSON.
+	if r.OutputSchema != nil && len(r.OutputSchema.Schema) > 0 {
+		params.OutputFormat = sdk.BetaJSONOutputFormatParam{
+			Schema: json.RawMessage(r.OutputSchema.Schema),
+		}
+	}
+
 	// Convert betas to SDK AnthropicBeta values.
 	for _, b := range r.Betas {
 		params.Betas = append(params.Betas, sdk.AnthropicBeta(b))
@@ -235,6 +244,18 @@ func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 				},
 			},
 		}
+	case "compaction":
+		// Round-trip server compaction blocks verbatim. Content carries the
+		// summary; the API requires null (not "") when no summary is present.
+		compaction := &sdk.BetaCompactionBlockParam{
+			EncryptedContent: sdk.String(block.EncryptedContent),
+		}
+		if block.Content != "" {
+			compaction.Content = sdk.String(block.Content)
+		} else {
+			compaction.Content = param.Null[string]()
+		}
+		return sdk.BetaContentBlockParamUnion{OfCompaction: compaction}
 	default:
 		return sdk.BetaContentBlockParamUnion{
 			OfText: &sdk.BetaTextBlockParam{Text: block.Text},
@@ -295,6 +316,7 @@ type DeltaBlock struct {
 	Thinking         string `json:"thinking,omitempty"`
 	Signature        string `json:"signature,omitempty"`
 	PartialJSON      string `json:"partial_json,omitempty"`
+	Content          string `json:"content,omitempty"` // compaction_delta summary content
 	EncryptedContent string `json:"encrypted_content,omitempty"`
 	StopReason       string `json:"stop_reason,omitempty"`
 	Usage            *Usage `json:"usage,omitempty"`

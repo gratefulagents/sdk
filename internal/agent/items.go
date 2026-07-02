@@ -83,6 +83,7 @@ type ReasoningData struct {
 // CompactionData holds an opaque provider compaction item.
 type CompactionData struct {
 	ID               string `json:"id,omitempty"`
+	Content          string `json:"content,omitempty"` // provider summary of compacted context
 	EncryptedContent string `json:"encrypted_content,omitempty"`
 	CreatedBy        string `json:"created_by,omitempty"`
 }

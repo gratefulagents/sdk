@@ -185,14 +185,26 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		}
 
 		combined := combineLoopResult(result, allNewItems, allResponses, totalUsage)
-		if result.Interruption != nil {
+		if result.IsInterrupted() {
 			if l.opts.ApprovalGate == nil {
 				return l.finalize(ctx, combined)
 			}
 			if resumes >= maxResumes {
 				return combined, fmt.Errorf("too many chat loop resumes after approval interruption")
 			}
-			items, err := l.resolveToolApproval(ctx, &agent, runCfg, result.Interruption)
+			// Resolve every pending approval from the turn: parallel tool
+			// calls can trigger several, and each pending tool_use needs a
+			// paired output before the next model call.
+			var items []RunItem
+			var resolveErr error
+			for _, pending := range result.AllInterruptions() {
+				resolved, err := l.resolveToolApproval(ctx, &agent, runCfg, pending)
+				items = append(items, resolved...)
+				if err != nil {
+					resolveErr = err
+					break
+				}
+			}
 			if len(items) > 0 {
 				allNewItems = append(allNewItems, items...)
 				history = append(history, items...)
@@ -203,9 +215,9 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 					return combined, fmt.Errorf("append approval items: %w", err)
 				}
 			}
-			if err != nil {
+			if resolveErr != nil {
 				combined = combineLoopResult(result, allNewItems, allResponses, totalUsage)
-				return combined, err
+				return combined, resolveErr
 			}
 			continue
 		}

@@ -39,7 +39,7 @@ type ContentBlock struct {
 
 	// ToolResultBlock fields (type="tool_result").
 	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"` // for tool_result text
+	Content   string `json:"content,omitempty"` // tool_result text / compaction summary
 	IsError   bool   `json:"is_error,omitempty"`
 
 	// ImageBlock fields (type="image").

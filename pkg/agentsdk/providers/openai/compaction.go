@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 
@@ -111,8 +112,10 @@ func CompactionDefaultsFromModelMetadata(meta ModelMetadata) (triggerTokens, tar
 
 // CompactionConfigFromMetadata builds a compaction config using provider model
 // metadata. It returns ok=false when metadata is unavailable or incomplete.
+// Authentication uses OPENAI_API_KEY when set; prefer
+// CompactionConfigFromMetadataWithAuthSession to supply explicit credentials.
 func CompactionConfigFromMetadata(ctx context.Context, baseURL, model string) (agentsdk.CompactionConfig, bool) {
-	resolver := NewCompactionMetadataResolver(baseURL)
+	resolver := NewCompactionMetadataResolver(baseURL, NewAPIKeyAuthSession(os.Getenv("OPENAI_API_KEY")))
 	return compactionConfigFromResolver(ctx, resolver, model)
 }
 

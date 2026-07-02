@@ -182,6 +182,7 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 		// 10-minute non-streaming limit. Streaming has no such cap, and the
 		// SDK's own accumulator reassembles the identical final message.
 		stream := c.sdk.Beta.Messages.NewStreaming(ctx, params, betas...)
+		defer stream.Close()
 		var acc sdk.BetaMessage
 		for stream.Next() {
 			if err := acc.Accumulate(stream.Current()); err != nil {
@@ -206,10 +207,13 @@ func (c *Client) createMessageStreamSDK(ctx context.Context, req CreateMessageRe
 	var reader *StreamReader
 	err := c.doWithRetry(ctx, func(ctx context.Context) error {
 		stream := c.sdk.Beta.Messages.NewStreaming(ctx, params, betas...)
-		reader = &StreamReader{sdkStream: stream}
-		if stream.Err() != nil {
-			return stream.Err()
+		if err := stream.Err(); err != nil {
+			// Close the failed stream so its response body is not leaked
+			// across retries.
+			_ = stream.Close()
+			return err
 		}
+		reader = &StreamReader{sdkStream: stream}
 		return nil
 	})
 	if err != nil {
@@ -479,7 +483,10 @@ func fromSDKStreamEvent(u sdk.BetaRawMessageStreamEventUnion) *StreamEvent {
 				StopReason: string(e.Delta.StopReason),
 			},
 			Usage: &Usage{
-				OutputTokens: int64(e.Usage.OutputTokens),
+				InputTokens:              e.Usage.InputTokens,
+				OutputTokens:             e.Usage.OutputTokens,
+				CacheReadInputTokens:     e.Usage.CacheReadInputTokens,
+				CacheCreationInputTokens: e.Usage.CacheCreationInputTokens,
 			},
 		}
 	case "message_stop":
@@ -526,6 +533,11 @@ func fromSDKBetaMessage(msg *sdk.BetaMessage) *CreateMessageResponse {
 			b := block.AsToolUse()
 			input, _ := json.Marshal(b.Input)
 			resp.Content = append(resp.Content, NewToolUseBlock(b.ID, b.Name, input))
+		case "compaction":
+			b := block.AsCompaction()
+			compaction := NewCompactionBlock("", b.EncryptedContent, "")
+			compaction.Content = b.Content
+			resp.Content = append(resp.Content, compaction)
 		}
 	}
 
@@ -547,6 +559,9 @@ func fromSDKContentBlockStart(e sdk.BetaRawContentBlockStartEvent) *ContentBlock
 	case "tool_use":
 		b := e.ContentBlock.AsToolUse()
 		return &ContentBlock{Type: "tool_use", ID: b.ID, Name: b.Name}
+	case "compaction":
+		b := e.ContentBlock.AsCompaction()
+		return &ContentBlock{Type: "compaction", Content: b.Content, EncryptedContent: b.EncryptedContent}
 	default:
 		return &ContentBlock{Type: string(e.ContentBlock.Type)}
 	}
@@ -567,6 +582,9 @@ func fromSDKDelta(e sdk.BetaRawContentBlockDeltaEvent) *DeltaBlock {
 	case "input_json_delta":
 		d := e.Delta.AsInputJSONDelta()
 		return &DeltaBlock{Type: "input_json_delta", PartialJSON: d.PartialJSON}
+	case "compaction_delta":
+		d := e.Delta.AsCompactionDelta()
+		return &DeltaBlock{Type: "compaction_delta", Content: d.Content, EncryptedContent: d.EncryptedContent}
 	default:
 		return &DeltaBlock{Type: string(e.Delta.Type)}
 	}

@@ -13,8 +13,9 @@ type RunResult struct {
 	ToolInputGuardrailResults  []ToolGuardrailResult
 	ToolOutputGuardrailResults []ToolGuardrailResult
 	Usage                      Usage
-	Interruption               *Interruption // non-nil if run was interrupted (e.g. approval gate)
-	LastResponseID             string        // last model response ID for continuation
+	Interruption               *Interruption   // non-nil if run was interrupted (e.g. approval gate); first of Interruptions
+	Interruptions              []*Interruption // all pending interruptions from the turn (parallel tool calls can trigger several)
+	LastResponseID             string          // last model response ID for continuation
 }
 
 // ToInputList converts the result's items into a format suitable for resuming a run.
@@ -35,12 +36,26 @@ func (r *RunResult) IsInterrupted() bool {
 	return r.Interruption != nil
 }
 
+// AllInterruptions returns every pending interruption from the run. It falls
+// back to the singular Interruption field for results built before the
+// Interruptions slice existed.
+func (r *RunResult) AllInterruptions() []*Interruption {
+	if len(r.Interruptions) > 0 {
+		return r.Interruptions
+	}
+	if r.Interruption != nil {
+		return []*Interruption{r.Interruption}
+	}
+	return nil
+}
+
 // ToState converts the result into a RunState for resuming an interrupted run.
 func (r *RunResult) ToState() *RunState {
 	return &RunState{
 		Items:          r.NewItems,
 		LastAgent:      r.LastAgent,
 		Interruption:   r.Interruption,
+		Interruptions:  r.Interruptions,
 		LastResponseID: r.LastResponseID,
 	}
 }
@@ -50,6 +65,7 @@ type RunState struct {
 	Items          []RunItem
 	LastAgent      *Agent
 	Interruption   *Interruption
+	Interruptions  []*Interruption
 	LastResponseID string
 }
 

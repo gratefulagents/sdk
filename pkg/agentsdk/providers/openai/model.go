@@ -403,11 +403,11 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 			}
 		case agentsdk.RunItemCompaction:
 			if item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+				compaction := internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy)
+				compaction.Content = item.Compaction.Content
 				msgs = append(msgs, internalanthropic.Message{
-					Role: internalanthropic.RoleAssistant,
-					Content: []internalanthropic.ContentBlock{
-						internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy),
-					},
+					Role:    internalanthropic.RoleAssistant,
+					Content: []internalanthropic.ContentBlock{compaction},
 				})
 			}
 		}
@@ -457,6 +457,7 @@ func convertAnthropicResponse(resp *internalanthropic.CreateMessageResponse) *ag
 				Type: agentsdk.RunItemCompaction,
 				Compaction: &agentsdk.CompactionData{
 					ID:               block.ID,
+					Content:          block.Content,
 					EncryptedContent: block.EncryptedContent,
 					CreatedBy:        block.CreatedBy,
 				},
@@ -548,6 +549,7 @@ func anthropicMessagesToRunItems(messages []internalanthropic.Message) []agentsd
 					Agent: assistantAgent,
 					Compaction: &agentsdk.CompactionData{
 						ID:               block.ID,
+						Content:          block.Content,
 						EncryptedContent: block.EncryptedContent,
 						CreatedBy:        block.CreatedBy,
 					},

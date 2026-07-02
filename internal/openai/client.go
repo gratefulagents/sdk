@@ -488,6 +488,51 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 				},
 			})
 		}
+		// Refusal parts surface as text so the reason reaches the caller
+		// instead of producing an empty (and wrongly retried) response.
+		if evt.Part.Type == "refusal" {
+			r.blockIndex = int(evt.OutputIndex)
+			phase := r.outputPhases[r.blockIndex]
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockStart,
+				Index: r.blockIndex,
+				ContentBlock: &anthropic.ContentBlock{
+					Type:  "text",
+					Phase: phase,
+				},
+			})
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: r.blockIndex,
+				Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: "The model refused to respond: "},
+			})
+		}
+
+	case "response.refusal.delta":
+		r.markDelta(int(evt.OutputIndex))
+		r.emit(anthropic.StreamEvent{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: int(evt.OutputIndex),
+			Delta: &anthropic.DeltaBlock{
+				Type: "text_delta",
+				Text: evt.Delta,
+			},
+		})
+
+	case "response.refusal.done":
+		idx := int(evt.OutputIndex)
+		if !r.deltaEmitted[idx] && evt.Refusal != "" {
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: idx,
+				Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: evt.Refusal},
+			})
+		}
+		r.emit(anthropic.StreamEvent{
+			Type:  anthropic.EventContentBlockStop,
+			Index: idx,
+		})
+		r.markStopped(idx)
 
 	case "response.output_text.delta":
 		r.markDelta(int(evt.OutputIndex))
@@ -1414,6 +1459,13 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 					block.Phase = phase
 					out.Content = append(out.Content, block)
 				}
+				// Surface refusals as text so the caller sees the reason
+				// instead of an empty (and wrongly retried) response.
+				if c.Type == "refusal" && strings.TrimSpace(c.Refusal) != "" {
+					block := anthropic.NewTextBlock("The model refused to respond: " + c.Refusal)
+					block.Phase = phase
+					out.Content = append(out.Content, block)
+				}
 			}
 		case "reasoning":
 			var thinkingText string
@@ -1463,10 +1515,14 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 		}
 	}
 
-	if hasToolCalls {
-		out.StopReason = anthropic.StopReasonToolUse
-	} else if strings.EqualFold(resp.IncompleteDetails.Reason, "max_output_tokens") {
+	// Truncation takes precedence: a turn cut off by max_output_tokens is not a
+	// complete tool-use turn even if partial tool calls were parsed (their
+	// arguments may be truncated). The streaming path (translateEvent
+	// response.completed) applies the same precedence.
+	if strings.EqualFold(resp.IncompleteDetails.Reason, "max_output_tokens") {
 		out.StopReason = anthropic.StopReasonMaxTokens
+	} else if hasToolCalls {
+		out.StopReason = anthropic.StopReasonToolUse
 	} else {
 		out.StopReason = anthropic.StopReasonEndTurn
 	}
@@ -2014,6 +2070,8 @@ type chatMessage struct {
 	Content    any            `json:"content,omitempty"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	// Refusal is set by the API on refused responses; never sent in requests.
+	Refusal string `json:"refusal,omitempty"`
 	// Copilot-specific reasoning round-trip fields. ReasoningText is only sent
 	// back when ReasoningOpaque (the encrypted multi-turn signature) is present,
 	// mirroring opencode's github-copilot chat adapter.
@@ -2158,20 +2216,51 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 		switch m.Role {
 		case anthropic.RoleUser:
 			var textParts []string
+			var imageParts []map[string]any
+			// flushUser emits pending text/images as one user message: a plain
+			// string when text-only, or multipart content when images exist.
+			flushUser := func() {
+				if len(textParts) == 0 && len(imageParts) == 0 {
+					return
+				}
+				if len(imageParts) == 0 {
+					msgs = append(msgs, chatMessage{
+						Role:    "user",
+						Content: strings.Join(textParts, "\n"),
+					})
+				} else {
+					parts := make([]map[string]any, 0, len(imageParts)+1)
+					if len(textParts) > 0 {
+						parts = append(parts, map[string]any{"type": "text", "text": strings.Join(textParts, "\n")})
+					}
+					parts = append(parts, imageParts...)
+					msgs = append(msgs, chatMessage{Role: "user", Content: parts})
+				}
+				textParts = nil
+				imageParts = nil
+			}
 			for _, block := range m.Content {
 				switch block.Type {
 				case "text":
 					if strings.TrimSpace(block.Text) != "" {
 						textParts = append(textParts, block.Text)
 					}
-				case "tool_result":
-					if len(textParts) > 0 {
-						msgs = append(msgs, chatMessage{
-							Role:    "user",
-							Content: strings.Join(textParts, "\n"),
-						})
-						textParts = nil
+				case "image":
+					if block.Source == nil || strings.TrimSpace(block.Source.Data) == "" {
+						continue
 					}
+					mediaType := strings.TrimSpace(block.Source.MediaType)
+					if mediaType == "" {
+						mediaType = "image/png"
+					}
+					imageParts = append(imageParts, map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url": fmt.Sprintf("data:%s;base64,%s", mediaType, block.Source.Data),
+						},
+					})
+				case "tool_result":
+					flushUser()
 
 					content := block.Content
 					if content == "" {
@@ -2184,12 +2273,7 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 					})
 				}
 			}
-			if len(textParts) > 0 {
-				msgs = append(msgs, chatMessage{
-					Role:    "user",
-					Content: strings.Join(textParts, "\n"),
-				})
-			}
+			flushUser()
 
 		case anthropic.RoleAssistant:
 			var textParts []string
@@ -2280,6 +2364,11 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 	if strings.TrimSpace(text) != "" {
 		out.Content = append(out.Content, anthropic.NewTextBlock(text))
 	}
+	// Surface refusals as text so the caller sees the reason instead of an
+	// empty (and wrongly retried) response.
+	if refusal := strings.TrimSpace(choice.Message.Refusal); refusal != "" {
+		out.Content = append(out.Content, anthropic.NewTextBlock("The model refused to respond: "+refusal))
+	}
 	for idx, tc := range choice.Message.ToolCalls {
 		id := tc.ID
 		if id == "" {
@@ -2325,16 +2414,18 @@ func extractTextContent(content any) string {
 // tool outputs that never arrive). When no tool calls are present, such turns
 // are treated as end_turn. This is what previously forced Claude-on-Copilot onto
 // the /v1/messages shim.
+//
+// finish_reason="length" wins over tool calls: a truncated turn is not a
+// complete tool-use turn (its arguments may be cut mid-JSON), and reporting
+// tool_use would mask the truncation entirely.
 func chatStopReason(reason string, hasToolCalls bool) anthropic.StopReason {
+	if reason == "length" {
+		return anthropic.StopReasonMaxTokens
+	}
 	if hasToolCalls {
 		return anthropic.StopReasonToolUse
 	}
-	switch reason {
-	case "length":
-		return anthropic.StopReasonMaxTokens
-	default:
-		return anthropic.StopReasonEndTurn
-	}
+	return anthropic.StopReasonEndTurn
 }
 
 func responseToEvents(resp *anthropic.CreateMessageResponse) []anthropic.StreamEvent {

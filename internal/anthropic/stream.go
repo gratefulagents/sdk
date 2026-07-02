@@ -61,6 +61,8 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 				phase:            event.ContentBlock.Phase,
 				signature:        event.ContentBlock.Signature,
 				data:             event.ContentBlock.Data,
+				content:          event.ContentBlock.Content,
+				createdBy:        event.ContentBlock.CreatedBy,
 				encryptedContent: event.ContentBlock.EncryptedContent,
 			})
 		}
@@ -79,6 +81,13 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 				b.encryptedContent = event.Delta.EncryptedContent
 			case "input_json_delta":
 				b.inputJSON += event.Delta.PartialJSON
+			case "compaction_delta":
+				b.content += event.Delta.Content
+				if event.Delta.EncryptedContent != "" {
+					b.encryptedContent = event.Delta.EncryptedContent
+				}
+			case "compaction_encrypted_content":
+				b.encryptedContent = event.Delta.EncryptedContent
 			}
 		}
 
@@ -92,11 +101,22 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 		if event.Delta != nil && event.Delta.StopReason != "" {
 			a.resp.StopReason = StopReason(event.Delta.StopReason)
 		}
+		// message_delta usage is authoritative when present, but some backends
+		// (and shims) only populate output_tokens there. Never let a zero field
+		// clobber a non-zero value captured from message_start.
 		if event.Usage != nil {
-			a.resp.Usage.InputTokens = event.Usage.InputTokens
-			a.resp.Usage.OutputTokens = event.Usage.OutputTokens
-			a.resp.Usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
-			a.resp.Usage.CacheCreationInputTokens = event.Usage.CacheCreationInputTokens
+			if event.Usage.InputTokens != 0 {
+				a.resp.Usage.InputTokens = event.Usage.InputTokens
+			}
+			if event.Usage.OutputTokens != 0 {
+				a.resp.Usage.OutputTokens = event.Usage.OutputTokens
+			}
+			if event.Usage.CacheReadInputTokens != 0 {
+				a.resp.Usage.CacheReadInputTokens = event.Usage.CacheReadInputTokens
+			}
+			if event.Usage.CacheCreationInputTokens != 0 {
+				a.resp.Usage.CacheCreationInputTokens = event.Usage.CacheCreationInputTokens
+			}
 		}
 
 	case EventMessageStop:
@@ -123,6 +143,8 @@ type blockAssembler struct {
 	thinking         string
 	signature        string
 	data             string
+	content          string
+	createdBy        string
 	encryptedContent string
 	inputJSON        string
 }
@@ -145,7 +167,9 @@ func (b *blockAssembler) build() ContentBlock {
 		block.EncryptedContent = b.encryptedContent
 		return block
 	case "compaction":
-		return NewCompactionBlock(b.id, b.encryptedContent, "")
+		block := NewCompactionBlock(b.id, b.encryptedContent, b.createdBy)
+		block.Content = b.content
+		return block
 	case "tool_use":
 		var input json.RawMessage
 		if b.inputJSON != "" {

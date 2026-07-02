@@ -177,6 +177,7 @@ func (t *ProgressTracker) RecordSubagentStarted(taskID, toolUseID, description, 
 		Description:  description,
 		Model:        model,
 		Isolation:    isolation,
+		Prompt:       prompt,
 	}
 	t.addEventLocked(ProgressEvent{
 		Timestamp: time.Now(),
