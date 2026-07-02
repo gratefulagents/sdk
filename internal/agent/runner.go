@@ -324,10 +324,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// returned an error; escalation fires at the configured limit.
 	consecutiveToolErrorTurns := 0
 	toolErrorEscalated := false
-	// consecutiveReadOnlyTurns counts tool turns where every executed tool is
-	// read-only; a converge nudge fires at the configured limit.
-	consecutiveReadOnlyTurns := 0
-	readOnlyStallNudges := 0
 	// estimateCalibration corrects the token estimator against the actual
 	// input tokens reported by provider usage. The estimator historically
 	// undercounts (~25% on Claude histories), which delays compaction past
@@ -1099,44 +1095,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						currentInput = append(currentInput, escalation)
 						allItems = append(allItems, escalation)
 						emitRunItems(ctx, streamEvents, []RunItem{escalation})
-					}
-				}
-			}
-
-			// Converge nudge: reasoning models can spiral into open-ended
-			// exploration — dozens of read-only turns re-deriving a plan
-			// without ever editing or answering. After a generous run of
-			// consecutive read-only tool turns, inject a nudge to commit.
-			if limit := cfg.EffectiveReadOnlyStallTurnLimit(); limit > 0 {
-				readOnlyByName := make(map[string]bool, len(tools))
-				for _, t := range tools {
-					readOnlyByName[t.Name()] = t.IsReadOnly()
-				}
-				executed, readOnly := 0, 0
-				for _, call := range s.toolCalls {
-					executed++
-					if readOnlyByName[call.Name] {
-						readOnly++
-					}
-				}
-				if executed > 0 {
-					if readOnly == executed {
-						consecutiveReadOnlyTurns++
-					} else {
-						consecutiveReadOnlyTurns = 0
-					}
-					if consecutiveReadOnlyTurns >= limit && readOnlyStallNudges < maxReadOnlyStallNudgesPerRun {
-						readOnlyStallNudges++
-						consecutiveReadOnlyTurns = 0
-						nudge := RunItem{
-							Type: RunItemMessage,
-							Message: &MessageOutput{Text: fmt.Sprintf(
-								"[SYSTEM] Your last %d tool turns were read-only exploration with no state-changing action and no final answer. Converge now: if you have enough context, act — make the edit, run the command, or deliver your answer/plan. Do not re-read files you have already seen. If key questions genuinely remain, name them explicitly and answer them with the minimum further reads.",
-								limit)},
-						}
-						currentInput = append(currentInput, nudge)
-						allItems = append(allItems, nudge)
-						emitRunItems(ctx, streamEvents, []RunItem{nudge})
 					}
 				}
 			}

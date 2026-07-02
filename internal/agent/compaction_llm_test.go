@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -103,83 +102,5 @@ func TestFlattenRunItemsForSummaryTruncatesMiddleOut(t *testing.T) {
 	}
 	if !strings.Contains(out, "[... transcript truncated ...]") {
 		t.Fatal("expected truncation marker")
-	}
-}
-
-func TestRunnerReadOnlyStallNudge(t *testing.T) {
-	readTool := &FunctionTool{
-		ToolName:        "read_file",
-		ToolDescription: "read",
-		ReadOnly:        true,
-		Fn: func(ctx context.Context, input json.RawMessage) (string, error) {
-			return "content", nil
-		},
-	}
-	var responses []*ModelResponse
-	for i := 0; i < DefaultReadOnlyStallTurnLimit; i++ {
-		responses = append(responses, &ModelResponse{Items: []RunItem{
-			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: callID(i), Name: "read_file", Input: []byte(`{}`)}},
-		}})
-	}
-	responses = append(responses, &ModelResponse{Items: []RunItem{
-		{Type: RunItemMessage, Message: &MessageOutput{Text: "done exploring"}},
-	}})
-	model := &mockModel{responses: responses}
-	runner := NewRunnerWithModel(model)
-	agent := &Agent{Name: "explorer", Instructions: "explore", Tools: []Tool{readTool}}
-
-	result, err := runner.Run(context.Background(), agent, []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "look around"}}}, RunConfig{MaxTurns: DefaultReadOnlyStallTurnLimit + 5})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var nudges int
-	for _, item := range result.NewItems {
-		if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "read-only exploration") {
-			nudges++
-		}
-	}
-	if nudges != 1 {
-		t.Fatalf("expected exactly 1 converge nudge, got %d", nudges)
-	}
-}
-
-func TestRunnerReadOnlyStallNudgeResetOnMutatingTool(t *testing.T) {
-	readTool := &FunctionTool{
-		ToolName: "read_file", ToolDescription: "read", ReadOnly: true,
-		Fn: func(ctx context.Context, input json.RawMessage) (string, error) { return "content", nil },
-	}
-	writeTool := &FunctionTool{
-		ToolName: "write_file", ToolDescription: "write", ReadOnly: false,
-		Fn: func(ctx context.Context, input json.RawMessage) (string, error) { return "written", nil },
-	}
-	var responses []*ModelResponse
-	// One shy of the limit, then a mutating turn, then a few more reads: no nudge.
-	for i := 0; i < DefaultReadOnlyStallTurnLimit-1; i++ {
-		responses = append(responses, &ModelResponse{Items: []RunItem{
-			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: callID(i), Name: "read_file", Input: []byte(`{}`)}},
-		}})
-	}
-	responses = append(responses, &ModelResponse{Items: []RunItem{
-		{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call-write", Name: "write_file", Input: []byte(`{}`)}},
-	}})
-	for i := 0; i < 3; i++ {
-		responses = append(responses, &ModelResponse{Items: []RunItem{
-			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: callID(i + 40), Name: "read_file", Input: []byte(`{}`)}},
-		}})
-	}
-	responses = append(responses, &ModelResponse{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}})
-
-	model := &mockModel{responses: responses}
-	runner := NewRunnerWithModel(model)
-	agent := &Agent{Name: "worker", Instructions: "work", Tools: []Tool{readTool, writeTool}}
-
-	result, err := runner.Run(context.Background(), agent, []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "task"}}}, RunConfig{MaxTurns: DefaultReadOnlyStallTurnLimit + 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, item := range result.NewItems {
-		if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "read-only exploration") {
-			t.Fatal("nudge fired despite mutating tool resetting the streak")
-		}
 	}
 }

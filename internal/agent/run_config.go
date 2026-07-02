@@ -267,14 +267,6 @@ type RunConfig struct {
 	// disables escalation.
 	ConsecutiveToolErrorLimit int
 
-	// ReadOnlyStallTurnLimit nudges when this many consecutive tool turns use
-	// only read-only tools (exploration without any state-changing action or
-	// final answer). Deep-reasoning models legitimately explore for several
-	// turns, so the limit is generous; the nudge asks the model to converge —
-	// act on what it knows or deliver its answer — instead of re-reading.
-	// 0 uses DefaultReadOnlyStallTurnLimit; negative disables the nudge.
-	ReadOnlyStallTurnLimit int
-
 	// StopGate is a deterministic finalization gate. When set, it runs on
 	// every candidate final answer; returning ok=false blocks finalization
 	// and feeds the feedback back to the model. After StopGateMaxBlocks
@@ -359,15 +351,6 @@ const DefaultMaxToolOutputBytes = 64 * 1024
 // threshold that triggers a corrective escalation note.
 const DefaultConsecutiveToolErrorLimit = 3
 
-// DefaultReadOnlyStallTurnLimit is the consecutive read-only tool-turn
-// threshold that triggers a converge nudge. Ten turns gives reasoning-heavy
-// models room for legitimate exploration before being asked to commit.
-const DefaultReadOnlyStallTurnLimit = 10
-
-// maxReadOnlyStallNudgesPerRun caps converge nudges per run so a genuinely
-// research-only task is not nagged forever.
-const maxReadOnlyStallNudgesPerRun = 3
-
 // DefaultStopGateMaxBlocks caps consecutive StopGate blocks before the gate
 // is bypassed.
 const DefaultStopGateMaxBlocks = 8
@@ -382,18 +365,6 @@ func (c *RunConfig) EffectiveConsecutiveToolErrorLimit() int {
 		return DefaultConsecutiveToolErrorLimit
 	}
 	return c.ConsecutiveToolErrorLimit
-}
-
-// EffectiveReadOnlyStallTurnLimit returns the converge-nudge threshold, or 0
-// when the nudge is disabled.
-func (c *RunConfig) EffectiveReadOnlyStallTurnLimit() int {
-	if c.ReadOnlyStallTurnLimit < 0 {
-		return 0
-	}
-	if c.ReadOnlyStallTurnLimit == 0 {
-		return DefaultReadOnlyStallTurnLimit
-	}
-	return c.ReadOnlyStallTurnLimit
 }
 
 // EffectiveStopGateMaxBlocks returns the consecutive-block cap for StopGate.
