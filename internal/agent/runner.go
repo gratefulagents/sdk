@@ -1985,11 +1985,28 @@ func fireRunHook(hooks RunHooks, fn func(RunHooks)) {
 }
 
 func emitLLMAttemptEvent(hooks RunHooks, event ContentEvent) {
-	platformHooks, ok := hooks.(*PlatformHooks)
-	if !ok || platformHooks == nil || platformHooks.EventStream == nil {
+	platformHooks := findPlatformHooks(hooks)
+	if platformHooks == nil || platformHooks.EventStream == nil {
 		return
 	}
 	platformHooks.EventStream.EmitLLMAttempt(event)
+}
+
+// findPlatformHooks locates a *PlatformHooks inside hooks, unwrapping
+// composite hooks (hosts commonly wrap PlatformHooks with extra observers,
+// e.g. trace writers) so llm_attempt events still reach the event stream.
+func findPlatformHooks(hooks RunHooks) *PlatformHooks {
+	switch h := hooks.(type) {
+	case *PlatformHooks:
+		return h
+	case interface{ Unwrap() []RunHooks }:
+		for _, inner := range h.Unwrap() {
+			if found := findPlatformHooks(inner); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
 }
 
 func attemptFailureEvent(event ContentEvent, data *GenerationSpanData) ContentEvent {

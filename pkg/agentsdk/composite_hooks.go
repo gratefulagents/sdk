@@ -17,6 +17,13 @@ func NewCompositeHooks(hooks ...RunHooks) *CompositeHooks {
 	return &CompositeHooks{hooks: filtered}
 }
 
+// Unwrap exposes the wrapped hooks so runner internals that look for a
+// specific hook implementation (e.g. PlatformHooks for llm_attempt event
+// emission) can find it inside a composite.
+func (c *CompositeHooks) Unwrap() []RunHooks {
+	return c.hooks
+}
+
 func (c *CompositeHooks) OnAgentStart(ctx *RunContext, a *Agent) {
 	for _, h := range c.hooks {
 		h.OnAgentStart(ctx, a)
