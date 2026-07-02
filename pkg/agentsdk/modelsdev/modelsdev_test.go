@@ -56,9 +56,14 @@ func TestLookupProviderAliasesAndPrefixes(t *testing.T) {
 		t.Fatalf("copilot fable = %+v ok=%v, want 1M", limits, ok)
 	}
 	// Same model, different provider, different window.
-	limits, ok = r.Lookup(ctx, "openai-oauth", "gpt-5.3-codex-spark")
+	limits, ok = r.Lookup(ctx, "openai", "gpt-5.3-codex-spark")
 	if !ok || limits.ContextTokens != 128000 {
 		t.Fatalf("openai spark = %+v ok=%v, want 128K", limits, ok)
+	}
+	// The ChatGPT codex backend is not cataloged by models.dev; the lookup
+	// must miss so resolvers fall through to the backend's own /models.
+	if _, ok := r.Lookup(ctx, "openai-oauth", "gpt-5.3-codex-spark"); ok {
+		t.Fatal("openai-oauth must not resolve via models.dev")
 	}
 	// Dated snapshot resolves via suffix tolerance.
 	limits, ok = r.Lookup(ctx, "anthropic-oauth", "claude-fable-5-20270101")
@@ -87,10 +92,15 @@ func TestCompactionResolverFuncUsesModelPrefixAsProvider(t *testing.T) {
 	if !ok || trigger != 360000 {
 		t.Fatalf("default provider codex trigger = %d ok=%v, want 360000", trigger, ok)
 	}
-	// Prefix overrides default provider: openai gpt-5.4 is 1.05M.
-	trigger, _, ok = resolve(context.Background(), "openai-oauth/gpt-5.4")
+	// Prefix overrides default provider; the openai-oauth codex backend is
+	// uncataloged so the resolver reports no result for it.
+	if _, _, ok := resolve(context.Background(), "openai-oauth/gpt-5.4"); ok {
+		t.Fatal("openai-oauth prefix must not resolve via models.dev")
+	}
+	// A plain API-provider prefix resolves normally: openai gpt-5.4 is 1.05M.
+	trigger, _, ok = resolve(context.Background(), "openai/gpt-5.4")
 	if !ok || trigger != 945000 {
-		t.Fatalf("openai-oauth gpt-5.4 trigger = %d ok=%v, want 945000", trigger, ok)
+		t.Fatalf("openai gpt-5.4 trigger = %d ok=%v, want 945000", trigger, ok)
 	}
 }
 

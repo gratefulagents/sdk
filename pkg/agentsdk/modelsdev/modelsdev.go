@@ -41,12 +41,15 @@ type ModelLimits struct {
 type Catalog map[string]map[string]ModelLimits
 
 // providerAliases maps runtime provider/prefix names to models.dev provider
-// IDs. Both sides are matched lower-case.
+// IDs. Both sides are matched lower-case. Note: "openai-oauth" (the ChatGPT
+// codex backend at chatgpt.com/backend-api/codex) is deliberately absent —
+// models.dev has no provider for that deployment and its windows differ from
+// the OpenAI API (e.g. 272K vs 400K/1M), so lookups must miss and fall
+// through to the codex backend's own /models metadata.
 var providerAliases = map[string]string{
 	"copilot":         "github-copilot",
 	"github-copilot":  "github-copilot",
 	"openai":          "openai",
-	"openai-oauth":    "openai",
 	"anthropic":       "anthropic",
 	"anthropic-oauth": "anthropic",
 }
