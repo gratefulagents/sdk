@@ -55,21 +55,17 @@ type HandoffFeatures struct {
 }
 
 type SubAgentFeatures struct {
-	SyncTools       bool
 	GenericFallback bool
 	Async           AsyncSubAgentFeatures
 }
 
+// AsyncSubAgentFeatures gates the managed sub-agent tool surface:
+// subagent (spawn sync/background, single or DAG), subagent_status
+// (summary/activity/graph introspection), subagent_control (steer/cancel).
 type AsyncSubAgentFeatures struct {
-	Spawn     bool
-	Run       bool
-	Graph     bool
-	List      bool
-	Status    bool
-	Activity  bool
-	TaskGraph bool
-	Message   bool
-	Cancel    bool
+	Task    bool
+	Status  bool
+	Control bool
 }
 
 type GuardrailFeatures struct {
@@ -149,18 +145,11 @@ func legacyFeatures(cfg Config) Features {
 			GenericFallback: cfg.EnableHandoffs,
 		},
 		SubAgents: SubAgentFeatures{
-			SyncTools:       cfg.EnableSubAgents,
 			GenericFallback: cfg.EnableSubAgents,
 			Async: AsyncSubAgentFeatures{
-				Spawn:     cfg.EnableSubAgents,
-				Run:       cfg.EnableSubAgents,
-				Graph:     cfg.EnableSubAgents,
-				List:      cfg.EnableSubAgents,
-				Status:    cfg.EnableSubAgents,
-				Activity:  cfg.EnableSubAgents,
-				TaskGraph: cfg.EnableSubAgents,
-				Message:   cfg.EnableSubAgents,
-				Cancel:    cfg.EnableSubAgents,
+				Task:    cfg.EnableSubAgents,
+				Status:  cfg.EnableSubAgents,
+				Control: cfg.EnableSubAgents,
 			},
 		},
 		Guardrails: GuardrailFeatures{
@@ -213,7 +202,7 @@ func (f ProjectStateFeatures) needsStore() bool {
 }
 
 func (f SubAgentFeatures) enabled() bool {
-	return f.SyncTools || f.asyncEnabled()
+	return f.asyncEnabled()
 }
 
 func (f SubAgentFeatures) asyncEnabled() bool {
@@ -221,7 +210,7 @@ func (f SubAgentFeatures) asyncEnabled() bool {
 }
 
 func (f AsyncSubAgentFeatures) any() bool {
-	return f.Spawn || f.Run || f.Graph || f.List || f.Status || f.Activity || f.TaskGraph || f.Message || f.Cancel
+	return f.Task || f.Status || f.Control
 }
 
 func shouldBuildToolBundle(features resolvedFeatures) bool {

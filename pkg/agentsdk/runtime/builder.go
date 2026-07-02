@@ -150,7 +150,6 @@ type Bundle struct {
 	Config           agentsdk.RunConfig
 	Tracker          *agentsdk.ProgressTracker
 	Tools            []agentsdk.Tool
-	SpecialistTools  []agentsdk.Tool
 	SpecialistAgents map[string]*agentsdk.Agent
 	SessionState     *SessionState
 	Closers          []io.Closer
@@ -276,7 +275,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 		}
 	}
 
-	agent, agentTools, specialistTools, specialistAgents := BuildAgentWithSpecialists(cfg, runner, toolBundle)
+	agent, agentTools, specialistAgents := BuildAgentWithSpecialists(cfg, runner, toolBundle)
 
 	hooks := agentsdk.NewPlatformHooks(tracker, nil)
 	var eventStream *agentsdk.EventStream
@@ -309,7 +308,6 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 		Config:           runCfg,
 		Tracker:          tracker,
 		Tools:            agentTools,
-		SpecialistTools:  specialistTools,
 		SpecialistAgents: specialistAgents,
 		SessionState:     state,
 		Closers:          toolBundle.Closers,
@@ -521,15 +519,14 @@ func openAIVisionAnalyzeFn(cfg Config) sdkvision.AnalyzeWithDetailFn {
 }
 
 func BuildAgent(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*agentsdk.Agent, []agentsdk.Tool) {
-	agent, tools, _, _ := BuildAgentWithSpecialists(cfg, runner, hostBundle)
+	agent, tools, _ := BuildAgentWithSpecialists(cfg, runner, hostBundle)
 	return agent, tools
 }
 
-func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*agentsdk.Agent, []agentsdk.Tool, []agentsdk.Tool, map[string]*agentsdk.Agent) {
+func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*agentsdk.Agent, []agentsdk.Tool, map[string]*agentsdk.Agent) {
 	cfg = cfg.normalized()
 	features := resolveFeatures(cfg)
 	var tools []agentsdk.Tool
-	var specialistTools []agentsdk.Tool
 	var specialistAgents map[string]*agentsdk.Agent
 	if parentToolSurfaceEnabled(features) {
 		tools = append(tools, cloneTools(hostBundle.Tools)...)
@@ -558,10 +555,6 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 			OutputExtractor:   cfg.SpecialistOutputExtractor,
 		})
 		specialistAgents = specialists.Agents
-		if features.value.SubAgents.SyncTools {
-			specialistTools = cloneTools(specialists.Tools)
-			tools = append(tools, specialistTools...)
-		}
 	}
 
 	agent := &agentsdk.Agent{
@@ -574,7 +567,7 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 		InstructionsFn: func(_ *agentsdk.RunContext, a *agentsdk.Agent) string {
 			blocks := []string{
 				cfg.Instructions,
-				agentsdk.BuildDelegationGuide(a),
+				agentsdk.BuildDelegationGuide(a, specialistAgents),
 			}
 			blocks = append(blocks, modeInstructionBlocks(cfg, features)...)
 			blocks = append(blocks,
@@ -590,7 +583,7 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 	if features.value.Handoffs.Enabled {
 		agent.Handoffs = buildCatalogHandoffs(cfg, specialistAgents, features.value.Handoffs)
 	}
-	return agent, tools, specialistTools, specialistAgents
+	return agent, tools, specialistAgents
 }
 
 // buildCatalogHandoffs creates one handoff per catalog specialist so the parent
@@ -941,15 +934,9 @@ func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {
 			names[name] = true
 		}
 	}
-	add(features.Spawn, "spawn_subagent_task")
-	add(features.Run, "run_subagent_task")
-	add(features.Graph, "spawn_subagent_graph")
-	add(features.List, "list_subagent_tasks")
-	add(features.Status, "get_subagent_task_status")
-	add(features.Activity, "get_subagent_activity")
-	add(features.TaskGraph, "get_subagent_task_graph")
-	add(features.Message, "send_message_to_subagent_task")
-	add(features.Cancel, "cancel_subagent_task")
+	add(features.Task, "subagent")
+	add(features.Status, "subagent_status")
+	add(features.Control, "subagent_control")
 	return names
 }
 

@@ -361,10 +361,13 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 	for _, tool := range bundle.Agent.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"agent_agent", "spawn_subagent_task", "spawn_subagent_graph"} {
+	for _, want := range []string{"subagent", "subagent_status", "subagent_control"} {
 		if !names[want] {
 			t.Fatalf("missing sub-agent tool %q; names=%v", want, toolNames(bundle.Agent.Tools))
 		}
+	}
+	if names["agent_agent"] || names["spawn_subagent_task"] || names["run_subagent_task"] || names["spawn_subagent_graph"] {
+		t.Fatalf("legacy sub-agent tools should no longer be registered; names=%v", toolNames(bundle.Agent.Tools))
 	}
 	if names["collect_subagent_result"] {
 		t.Fatalf("collect_subagent_result was removed but is still registered; names=%v", toolNames(bundle.Agent.Tools))

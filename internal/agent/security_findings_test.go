@@ -143,14 +143,20 @@ func TestRunner_M1_RetryAfterIsCappedAtFiveMinutes(t *testing.T) {
 // --- M3: control-flow tools matched by prefix ---
 
 func TestRunner_M3_ControlFlowAllowlistIsExplicit(t *testing.T) {
-	// "spawn_subagent_evil_extra" matches the old prefix HasPrefix("spawn_subagent_") but
-	// is not the canonical tool name — it must NOT be allowed through as control-flow.
-	if isControlFlowTool("spawn_subagent_evil_extra") {
-		t.Fatalf("prefix-style false positive: arbitrary spawn_subagent_* should not be control-flow")
+	// "subagent_evil_extra" matches a naive HasPrefix("subagent") check but is
+	// not a canonical tool name — it must NOT be allowed through as control-flow.
+	if isControlFlowTool("subagent_evil_extra") {
+		t.Fatalf("prefix-style false positive: arbitrary subagent_* should not be control-flow")
 	}
-	// The real tool name must still be allowed.
-	if !isControlFlowTool("spawn_subagent_task") {
-		t.Fatalf("canonical spawn_subagent_task must be control-flow")
+	// The real tool names must still be allowed.
+	for _, name := range []string{"subagent", "subagent_status", "subagent_control"} {
+		if !isControlFlowTool(name) {
+			t.Fatalf("canonical %s must be control-flow", name)
+		}
+	}
+	// Legacy tool names were removed and must no longer be control-flow.
+	if isControlFlowTool("spawn_subagent_task") || isControlFlowTool("run_subagent_task") {
+		t.Fatalf("legacy sub-agent tool names must not remain control-flow")
 	}
 	if !isControlFlowTool("finish") {
 		t.Fatalf("finish must be control-flow")

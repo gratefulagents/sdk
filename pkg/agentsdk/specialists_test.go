@@ -43,16 +43,28 @@ func TestFilterToolsByAccessUsesAdapterForReadOnly(t *testing.T) {
 }
 
 func TestBuildDelegationGuideIncludesCompactTaskPacketGuidance(t *testing.T) {
-	a := &Agent{Tools: []Tool{&FunctionTool{ToolName: "agent_executor", ToolDescription: "Implement a bounded change"}}}
-	guide := BuildDelegationGuide(a)
+	a := &Agent{}
+	specialists := map[string]*Agent{
+		"executor": {Name: "executor", HandoffDescription: "Implement a bounded change"},
+	}
+	guide := BuildDelegationGuide(a, specialists)
 	for _, want := range []string{
+		"- executor: Implement a bounded change",
 		"compact, self-contained task packet",
 		"Do NOT send the same large background block to every task if only one sub-agent needs it.",
 		"Files you own",
+		"subagent tool",
+		"mode=\"background\"",
+		"tasks=[{key, message, depends_on:[keys]}",
+		"subagent_status",
+		"subagent_control",
 	} {
 		if !strings.Contains(guide, want) {
 			t.Fatalf("BuildDelegationGuide() missing %q\n%s", want, guide)
 		}
+	}
+	if got := BuildDelegationGuide(&Agent{}, nil); got != "" {
+		t.Fatalf("BuildDelegationGuide with no specialists/handoffs = %q, want empty", got)
 	}
 }
 

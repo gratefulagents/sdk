@@ -278,7 +278,7 @@ func TestLiveOpenAIOAuthRuntimeBuilderChatLoopHandoffsSyncAndAsyncSubagents(t *t
 		MaxTurns:        1,
 	})
 	asyncTools := agentsdk.BuildSubAgentTaskTools(scheduler, "async_worker")
-	spawnResult, err := toolByName(t, asyncTools, "spawn_subagent_task").Execute(ctx, json.RawMessage(`{"agent_name":"async_worker","message":"Say the exact async test phrase.","tool_access":"read-only"}`), "")
+	spawnResult, err := toolByName(t, asyncTools, "subagent").Execute(ctx, json.RawMessage(`{"agent_name":"async_worker","message":"Say the exact async test phrase.","tool_access":"read-only","mode":"background"}`), "")
 	if err != nil || spawnResult.IsError {
 		t.Fatalf("spawn async sub-agent result=%+v err=%v", spawnResult, err)
 	}
@@ -291,7 +291,7 @@ func TestLiveOpenAIOAuthRuntimeBuilderChatLoopHandoffsSyncAndAsyncSubagents(t *t
 	if _, err := scheduler.WaitForTask(ctx, spawned.TaskID, 60000); err != nil {
 		t.Fatalf("wait async sub-agent task: %v", err)
 	}
-	activityResult, err := toolByName(t, asyncTools, "get_subagent_activity").Execute(ctx, json.RawMessage(fmt.Sprintf(`{"task_id":%q}`, spawned.TaskID)), "")
+	activityResult, err := toolByName(t, asyncTools, "subagent_status").Execute(ctx, json.RawMessage(fmt.Sprintf(`{"detail":"activity","task_ids":[%q]}`, spawned.TaskID)), "")
 	if err != nil || activityResult.IsError || !strings.Contains(activityResult.Content, `"agent": "async_worker"`) {
 		t.Fatalf("activity result=%+v err=%v", activityResult, err)
 	}

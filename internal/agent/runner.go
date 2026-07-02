@@ -107,17 +107,9 @@ var controlFlowToolNames = map[string]struct{}{
 	"save_plan":                     {},
 	"get_plan":                      {},
 	"RequestMCPBreakGlass":          {},
-	"spawn_subagent_task":           {},
-	"run_subagent_task":             {},
-	"spawn_subagent_graph":          {},
-	"list_subagent_tasks":           {},
-	"get_subagent_task_status":      {},
-	"get_subagent_activity":         {},
-	"get_subagent_task_graph":       {},
-	"wait_for_subagent_progress":    {},
-	"wait_for_subagent_change":      {},
-	"send_message_to_subagent_task": {},
-	"cancel_subagent_task":          {},
+	"subagent":                      {},
+	"subagent_status":               {},
+	"subagent_control":              {},
 }
 
 type subAgentFinalJoinProvider interface {

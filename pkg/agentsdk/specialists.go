@@ -2,6 +2,7 @@ package agentsdk
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
@@ -154,18 +155,23 @@ func ModeRoutingFromTemplateSpec(spec *sdkmode.TemplateSpec) *ModeModelRouting {
 }
 
 // BuildDelegationGuide generates structured delegation instructions describing
-// specialist sub-agents and lateral handoffs available to an agent.
-func BuildDelegationGuide(a *Agent) string {
+// the specialist sub-agents reachable through the subagent tool and lateral
+// handoffs available to an agent.
+func BuildDelegationGuide(a *Agent, specialists map[string]*Agent) string {
 	var subAgents, handoffs []string
-	for _, t := range a.Tools {
-		name := t.Name()
-		if len(name) > 6 && name[:6] == "agent_" {
-			desc := t.Description()
-			if desc == "" {
-				desc = "Specialist sub-agent"
-			}
-			subAgents = append(subAgents, fmt.Sprintf("- %s: %s", name, desc))
+	names := make([]string, 0, len(specialists))
+	for name := range specialists {
+		if strings.TrimSpace(name) != "" {
+			names = append(names, name)
 		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		desc := specialists[name].HandoffDescription
+		if desc == "" {
+			desc = "Specialist sub-agent"
+		}
+		subAgents = append(subAgents, fmt.Sprintf("- %s: %s", name, desc))
 	}
 	for _, h := range a.Handoffs {
 		desc := h.Description
@@ -181,10 +187,10 @@ func BuildDelegationGuide(a *Agent) string {
 
 	var b strings.Builder
 	if len(subAgents) > 0 {
-		b.WriteString("Available sub-agents (call as tools for bounded tasks):\n")
+		b.WriteString("Available specialist sub-agents (delegate via the subagent tool, agent_name=<name>):\n")
 		b.WriteString(strings.Join(subAgents, "\n"))
 		b.WriteString("\n\n")
-		b.WriteString(`CRITICAL: When delegating to a sub-agent, your "message" is the ONLY context it receives.
+		b.WriteString(`CRITICAL: When delegating, the "message" is the ONLY context the sub-agent receives.
 Give each sub-agent a compact, self-contained task packet: enough context to execute without guessing, but no extra history.
 Include only the pieces that materially affect this task:
 - the exact task or deliverable for this sub-agent
@@ -199,14 +205,17 @@ Do NOT send the same large background block to every task if only one sub-agent 
 Planning/review/design tasks usually need the broader objective plus the current findings or draft they are building on.
 Execution/test/fix tasks usually need the concrete slice they own plus adjacent contracts they must preserve.
 
-FILE ISOLATION: When spawning parallel sub-agents, assign each a disjoint set of files.
+SYNC VS BACKGROUND: mode="sync" (default) returns the result in the same subagent call — use it when you need the result before continuing.
+mode="background" returns task ids immediately so you can keep working; each result is delivered to you automatically as soon as its task finishes.
+Only use background mode when you have genuinely independent work to do meanwhile — do not spawn and then idle-poll.
+
+FILE ISOLATION: When running parallel sub-agents, assign each a disjoint set of files.
 Never let two concurrent sub-agents edit the same file. If tasks must touch the same file, run them sequentially.
 Include "Files you own: [...]" in each message so the sub-agent stays in its lane.
 
-DAG WORKFLOWS: If a sub-agent needs another sub-agent's result before starting, use dependencies instead of manual polling.
-Use run_subagent_task for normal delegate-and-return work.
-Use spawn_subagent_graph with return_when="all_complete" for multi-step DAG joins, or depends_on in spawn_subagent_task for managed downstream work.
-By default, dependency outputs are passed to downstream tasks as context once all dependencies complete.
+DAG WORKFLOWS: If tasks depend on each other, describe the whole graph in one subagent call using tasks=[{key, message, depends_on:[keys]}, ...] instead of manual sequencing.
+depends_on entries reference other task keys in the same call (or existing task ids); dependency outputs are passed to downstream tasks as context by default.
+mode="sync" on a tasks array waits for the whole graph and returns all results; mode="background" returns the task ids immediately.
 
 EFFORT SCALING: Match delegation to task complexity instead of defaulting to maximum fan-out.
 - Simple lookups or single-file questions: answer directly with your own tools, or at most 1 read-only sub-agent.
@@ -217,12 +226,12 @@ State an explicit effort budget in each task packet (e.g. "aim for under 10 tool
 ARTIFACTS: For large deliverables (reports, generated code listings, long logs), instruct the sub-agent to write the full output to a file under the working directory and return a concise summary plus the file path.
 Read the file yourself only when needed. Passing lightweight references instead of full content avoids losing information when many results flow through you.
 
-STATUS REPORTING: Managed sub-agent progress streams through the runtime while the SDK keeps the parent run open. You do not need to call a polling/wait tool just to check whether tasks are still running.
+STATUS AND RESULTS: Background task progress streams through the runtime; you do not need to poll to check whether tasks are still running.
 Completed task results are delivered to you automatically as soon as each task finishes; act on early results while slower tasks keep running.
-Use get_subagent_activity for deeper detail on a specific task when you need evidence before steering.
-The SDK will not let the parent final-answer while managed sub-agent tasks are still active; keep supervising until results arrive.
+Use subagent_status (detail="activity") for evidence on a specific task before steering; detail="graph" shows the dependency DAG.
+The SDK will not let you final-answer while background tasks are still active; keep supervising until results arrive.
 
-STEERING: If a running sub-agent needs an update, correction, or narrower constraint, send_message_to_subagent_task can queue a parent message for its next model turn.
+STEERING: If a running task needs an update, correction, or narrower constraint, subagent_control action="message" queues a parent message for its next model turn; action="cancel" stops it.
 Keep steering messages short and specific.`)
 		b.WriteString("\n\n")
 	}

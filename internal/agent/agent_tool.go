@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -128,62 +127,13 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		return ToolResult{Content: "message is required", IsError: true}, nil
 	}
 
-	// Clone the agent; workspace context is injected after the child tool
-	// access level is resolved below (the nested run config may clamp it).
-	childAgent := t.agent.Clone()
-
-	// Run the nested agent, inheriting the runner's default hooks so sub-agent
-	// tool events appear in the parent's activity log.
-	items := []RunItem{{
-		Type:    RunItemMessage,
-		Message: &MessageOutput{Text: params.Message},
-	}}
-	runHooks := t.runner.DefaultHooks
-	var (
-		parentTracker *ProgressTracker
-		parentES      *EventStream
-		taskID        string
-		trace         = TraceFromContext(ctx)
-		processor     = TracingProcessorFromContext(ctx)
-		parentSpanID  = SpanParentIDFromContext(ctx)
-	)
-	if platformHooks, ok := t.runner.DefaultHooks.(*PlatformHooks); ok && platformHooks != nil && platformHooks.Tracker != nil {
-		parentTracker = platformHooks.Tracker
-		parentES = platformHooks.EventStream
-		taskID = "task_" + uuid.NewString()
-		toolUseID := ParentCallIDFromContext(ctx)
-		description := Truncate(params.Message, 160)
-		parentTracker.RecordSubagentStarted(taskID, toolUseID, description, t.agent.Name, t.agent.Model, "", params.Message)
-
-		// Emit subagent start to EventStream for host activity views.
-		if parentES != nil {
-			parentES.EmitSubagentStarted(taskID, toolUseID, description, t.agent.Name, t.agent.Model, params.Message)
-		}
-
-		childTracker := NewChildTracker(parentTracker, taskID)
-		if parentSpanID != "" {
-			childTracker.SetRootSpanID(parentSpanID)
-		}
-		var childES *EventStream
-		if parentES != nil {
-			childES = NewChildEventStream(parentES, taskID)
-		}
-		childHooks := NewPlatformHooks(childTracker, childES)
-		childHooks.Turn = platformHooks.Turn
-		runHooks = childHooks
-	}
-
-	startedAt := time.Now()
-	childCtx := WithTaskID(ctx, taskID)
 	runConfig := RunConfig{
-		MaxTurns:              DefaultSubAgentMaxTurns,
-		SubAgentMaxTurns:      DefaultSubAgentMaxTurns,
-		Hooks:                 runHooks,
-		WorkDir:               workDir,
-		Trace:                 trace,
-		ParentSpanID:          parentSpanID,
-		TracingProcessor:      processor,
-		ForceFinalSummaryTurn: true,
+		MaxTurns:         DefaultSubAgentMaxTurns,
+		SubAgentMaxTurns: DefaultSubAgentMaxTurns,
+		WorkDir:          workDir,
+		Trace:            TraceFromContext(ctx),
+		ParentSpanID:     SpanParentIDFromContext(ctx),
+		TracingProcessor: TracingProcessorFromContext(ctx),
 	}
 	// Child tool access defaults to the wrapper's effective access; the parent
 	// run's level (inherited below) can only clamp it further, never widen it.
@@ -212,64 +162,32 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		}
 	}
 	runConfig.ToolAccessLevel = childToolAccess
-	if workDir != "" {
-		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(workDir, childToolAccess)
-	}
-	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(runConfig.MaxTurns)
-	result, err := t.runner.Run(childCtx, childAgent, items, runConfig)
-	if err != nil {
-		if parentTracker != nil {
-			parentTracker.RecordSubagentCompleted(taskID, "failed", fmt.Sprintf("agent %q failed: %v", t.agent.Name, err), 0, 0, Usage{}, "", nil, nil)
-		}
-		if parentES != nil {
-			parentES.EmitSubagentCompleted(taskID, "failed", fmt.Sprintf("agent %q failed: %v", t.agent.Name, err), 0, 0, 0, 0, false, 0, "error", "")
-		}
-		return ToolResult{Content: fmt.Sprintf("agent %q failed: %v", t.agent.Name, err), IsError: true}, nil
-	}
 
-	if parentTracker != nil {
-		usage := Usage{
-			InputTokens:       result.Usage.InputTokens,
-			OutputTokens:      result.Usage.OutputTokens,
-			CacheReadTokens:   result.Usage.CacheReadTokens,
-			CacheCreateTokens: result.Usage.CacheCreateTokens,
-		}
-		toolCount := int32(0)
-		for _, item := range result.NewItems {
-			if item.Type == RunItemToolCall && item.ToolCall != nil {
-				toolCount++
-			}
-		}
-		parentTracker.RecordSubagentProgress(taskID, toolCount, usage.InputTokens+usage.OutputTokens, time.Since(startedAt).Milliseconds(), "")
-
-		status := "completed"
-		if result.Interruption != nil {
-			status = "stopped"
-		}
-		summary := result.FinalText()
-		if summary == "" {
-			summary = "(no output)"
-		}
-		costUsd, costKnown := estimateRunResultCost(result, t.runner.model)
-		numTurns := len(result.RawResponses)
-		parentTracker.RecordSubagentCompleted(
-			taskID,
-			status,
-			summary,
-			costUsd,
-			numTurns,
-			usage,
-			"",
-			nil, nil,
-		)
-		if parentES != nil {
-			parentES.EmitSubagentCompleted(taskID, status, summary, toolCount, usage.InputTokens+usage.OutputTokens, time.Since(startedAt).Milliseconds(), costUsd, costKnown, int32(numTurns), "", summary)
-		}
+	// Run through the shared sub-agent engine, inheriting the runner's default
+	// hooks so sub-agent tool events appear in the parent's activity log.
+	spec := subAgentRunSpec{
+		Runner:        t.runner,
+		Agent:         t.agent,
+		Message:       params.Message,
+		ParentCallID:  ParentCallIDFromContext(ctx),
+		FallbackHooks: t.runner.DefaultHooks,
+		RunConfig:     runConfig,
+	}
+	if platformHooks, ok := t.runner.DefaultHooks.(*PlatformHooks); ok && platformHooks != nil && platformHooks.Tracker != nil {
+		spec.TaskID = "task_" + uuid.NewString()
+		spec.Tracker = platformHooks.Tracker
+		spec.EventStream = platformHooks.EventStream
+		spec.Turn = platformHooks.Turn
 	}
 
-	text := result.FinalText()
+	outcome := runSubAgentOnce(ctx, spec)
+	if outcome.Err != nil {
+		return ToolResult{Content: outcome.ErrMsg, IsError: true}, nil
+	}
+
+	text := outcome.FinalText
 	if t.outputExtractor != nil {
-		if extracted := t.outputExtractor(result); extracted != "" {
+		if extracted := t.outputExtractor(outcome.Result); extracted != "" {
 			text = extracted
 		}
 	}

@@ -71,6 +71,35 @@ The runner keeps each model request prompt-cache friendly:
 Hosts using `Agent.InstructionsFn` should return a stable string for the duration
 of a run, or accept the cache cost of changing it.
 
+## Sub-Agents
+
+One execution engine, one model-facing spawn tool.
+
+- **Engine.** `internal/agent/subagent_run.go` (`runSubAgentOnce`) is the single
+  nested-run engine: agent clone, workspace/budget context injection, child
+  hooks/tracker/event-stream wiring, run-config inheritance (tool policy,
+  guardrails, compaction), and outcome accounting (status, usage, cost, files).
+  Both delegation surfaces ride it, so behavior cannot drift:
+  - `SubAgentRegistry.runTask` — managed async tasks with dependency waits,
+    a spawn-time config snapshot, and a shared concurrency semaphore.
+  - `Agent.AsTool` — the embeddable agent-as-tool primitive for direct SDK use.
+- **Model-facing tools** (`pkg/agentsdk/subagent_tools.go`, attached by the
+  runtime builder):
+  - `subagent` — spawn one task (`message`) or a keyed DAG (`tasks` with
+    `depends_on`); `mode:"sync"` (default) returns results in the same call,
+    `mode:"background"` returns task ids immediately.
+  - `subagent_status` — `detail:"summary" | "activity" | "graph"` introspection.
+  - `subagent_control` — `action:"message"` (steering) or `action:"cancel"`.
+- **Lifecycle.** Background tasks are managed: the runner injects each terminal
+  result at the next turn boundary (incremental delivery), blocks parent final
+  answers while tasks are active (final-join), and lets the parent steer running
+  tasks via queued messages. Dependency outputs are forwarded to downstream
+  tasks as context by default.
+- **Isolation.** Children get a fresh conversation seeded only by the task
+  message, inherit the parent's tool policy/guardrails, and can never escalate
+  above the parent's tool access level. Sub-agent tools are stripped from
+  children, so delegation depth is bounded to one level by construction.
+
 ## Host Integration
 
 The reusable runtime depends on narrow interfaces instead of prescribing an

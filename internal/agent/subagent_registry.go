@@ -83,7 +83,6 @@ type subAgentTaskEntry struct {
 	includeDependencyResults bool
 	queuedMessages           []RunItem
 	resultDelivered          bool
-	autoJoin                 bool // Deprecated: all async tasks are managed for final-join.
 }
 
 // SubAgentSpawnOptions configures an async sub-agent spawn.
@@ -92,7 +91,6 @@ type SubAgentSpawnOptions struct {
 	DependsOn                []string
 	DependencyPolicy         SubAgentDependencyPolicy
 	IncludeDependencyResults *bool
-	AutoJoin                 bool // Deprecated: async tasks are always managed until final delivery.
 }
 
 // SubAgentActivityEntry records a single tool invocation by a sub-agent.
@@ -109,7 +107,7 @@ const managedSubAgentStatusHeartbeat = 15 * time.Second
 
 // SubAgentActivity is a thread-safe ledger tracking file operations and tool
 // activity for a sub-agent task. It is populated by PlatformHooks and read by
-// the parent via get_subagent_activity.
+// the parent via subagent_status (detail="activity").
 type SubAgentActivity struct {
 	mu              sync.Mutex
 	filesRead       []string
@@ -612,7 +610,7 @@ func BuildSubAgentMonitorContext(tasks []SubAgentTask) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("[SYSTEM] Managed sub-agent tasks are still active, so this is not a final-answer turn. The SDK is waiting in the runtime and streaming live status. Inspect activity when you need evidence, and use send_message_to_subagent_task if a child needs steering. Do not produce the final answer until every managed task is terminal and its results have been incorporated.\n")
+	b.WriteString("[SYSTEM] Managed sub-agent tasks are still active, so this is not a final-answer turn. The SDK is waiting in the runtime and streaming live status. Inspect activity when you need evidence, and use subagent_control (action=\"message\") if a child needs steering. Do not produce the final answer until every managed task is terminal and its results have been incorporated.\n")
 	b.WriteString("<active_sub_agent_tasks>\n")
 	for _, task := range tasks {
 		b.WriteString("\nTask: ")
@@ -703,7 +701,7 @@ func (r *SubAgentRegistry) newSubAgentTaskID() string {
 
 // SpawnAsyncWithOptions launches a sub-agent with dependency and context
 // forwarding controls. Dependencies must be existing task IDs; use the
-// spawn_subagent_graph tool when callers want to describe a whole DAG by
+// subagent tool's tasks array when callers want to describe a whole DAG by
 // logical keys in one call.
 func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName, message string, opts SubAgentSpawnOptions) (string, error) {
 	// Capture the parent call ID from the current tool execution context so
@@ -753,7 +751,6 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		},
 		activity:                 NewSubAgentActivity(),
 		includeDependencyResults: includeDependencyResults,
-		autoJoin:                 true,
 		cancel:                   cancel,
 	}
 	snap := taskRunSnapshot{
@@ -852,43 +849,14 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 
 	r.setStatus(taskID, SubAgentTaskRunning, "", "")
 
-	// Record sub-agent start in the parent progress tracker and/or event stream.
-	var childHooks RunHooks
-	if snap.tracker != nil || snap.eventStream != nil {
-		description := Truncate(message, 160)
-
-		var childTracker *ProgressTracker
-		if snap.tracker != nil {
-			snap.tracker.RecordSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, "async", message)
-			childTracker = NewChildTracker(snap.tracker, taskID)
-			if parentSpanID != "" {
-				childTracker.SetRootSpanID(parentSpanID)
-			}
-		}
-
-		var childES *EventStream
-		if snap.eventStream != nil {
-			// Emit subagent start to EventStream for host activity views.
-			snap.eventStream.EmitSubagentStarted(taskID, parentCallID, description, ag.Name, ag.Model, message)
-			childES = NewChildEventStream(snap.eventStream, taskID)
-		}
-
-		childHooks = NewPlatformHooks(childTracker, childES)
-		// Wire the activity ledger so tool start/end events are tracked.
-		r.mu.Lock()
-		if entry, ok := r.tasks[taskID]; ok {
-			childHooks.(*PlatformHooks).Activity = entry.activity
-		}
-		r.mu.Unlock()
+	// Fetch the activity ledger so tool start/end events are tracked while the
+	// task runs and file activity flows into completion records.
+	var activity *SubAgentActivity
+	r.mu.Lock()
+	if entry, ok := r.tasks[taskID]; ok {
+		activity = entry.activity
 	}
-	if childHooks == nil {
-		childHooks = snap.runner.DefaultHooks
-	}
-
-	items := []RunItem{{
-		Type:    RunItemMessage,
-		Message: &MessageOutput{Text: message},
-	}}
+	r.mu.Unlock()
 
 	// Sub-agents inherit the parent's tool access level by default.
 	// A per-spawn override (e.g., "read-only" for explore agents) takes priority.
@@ -905,104 +873,49 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 		}
 	}
 
-	// Clone the agent and inject workspace context into instructions so the
-	// sub-agent knows its working directory and available tool capabilities.
-	// Without this, models guess wrong absolute paths (e.g., /workspace/foo
-	// instead of /workspace/repo/foo), get "outside workspace" errors on
-	// reads, and incorrectly conclude they lack write tools.
-	childAgent := ag.Clone()
-	if snap.workDir != "" {
-		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(snap.workDir, childToolAccess)
-	}
-	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(snap.maxTurns)
-
-	startedAt := time.Now()
-	childCtx := WithTaskID(ctx, taskID)
-	result, err := snap.runner.Run(childCtx, childAgent, items, RunConfig{
-		Hooks:                   childHooks,
-		MaxTurns:                snap.maxTurns,
-		SubAgentMaxTurns:        snap.maxTurns,
-		WorkDir:                 snap.workDir,
-		ToolAccessLevel:         childToolAccess,
-		ToolPolicy:              snap.toolPolicy,
-		ToolInputGuardrails:     snap.toolInputGuardrails,
-		ToolOutputGuardrails:    snap.toolOutputGuardrails,
-		CompactionConfig:        snap.compactionConfig,
-		CompactionModelResolver: snap.compactionModelResolver,
-		Trace:                   trace,
-		ParentSpanID:            parentSpanID,
-		TracingProcessor:        processor,
-		ForceFinalSummaryTurn:   true,
-		ImmediateInputPoller: func(context.Context) ([]RunItem, error) {
-			return r.drainQueuedMessages(taskID), nil
+	runSubAgentOnce(ctx, subAgentRunSpec{
+		Runner:        snap.runner,
+		Agent:         ag,
+		Message:       message,
+		TaskID:        taskID,
+		ParentCallID:  parentCallID,
+		Isolation:     "async",
+		Tracker:       snap.tracker,
+		EventStream:   snap.eventStream,
+		Activity:      activity,
+		FallbackHooks: snap.runner.DefaultHooks,
+		OnTerminal: func(outcome subAgentOutcome) {
+			switch {
+			case outcome.Err != nil:
+				finalStatus := SubAgentTaskFailed
+				if outcome.Status == subAgentStatusCancelled {
+					finalStatus = SubAgentTaskCancelled
+				}
+				r.setTerminal(taskID, finalStatus, "", outcome.ErrMsg, outcome.Duration, 0, 0)
+			case outcome.Status == subAgentStatusStopped:
+				r.setTerminal(taskID, SubAgentTaskCancelled, outcome.FinalText, "", outcome.Duration, outcome.ToolCount, outcome.Tokens)
+			default:
+				r.setTerminal(taskID, SubAgentTaskCompleted, outcome.FinalText, "", outcome.Duration, outcome.ToolCount, outcome.Tokens)
+			}
+		},
+		RunConfig: RunConfig{
+			MaxTurns:                snap.maxTurns,
+			SubAgentMaxTurns:        snap.maxTurns,
+			WorkDir:                 snap.workDir,
+			ToolAccessLevel:         childToolAccess,
+			ToolPolicy:              snap.toolPolicy,
+			ToolInputGuardrails:     snap.toolInputGuardrails,
+			ToolOutputGuardrails:    snap.toolOutputGuardrails,
+			CompactionConfig:        snap.compactionConfig,
+			CompactionModelResolver: snap.compactionModelResolver,
+			Trace:                   trace,
+			ParentSpanID:            parentSpanID,
+			TracingProcessor:        processor,
+			ImmediateInputPoller: func(context.Context) ([]RunItem, error) {
+				return r.drainQueuedMessages(taskID), nil
+			},
 		},
 	})
-
-	duration := time.Since(startedAt)
-
-	if err != nil {
-		// Distinguish context cancellation (user-initiated cancel) from real failures.
-		finalStatus := SubAgentTaskFailed
-		statusLabel := "failed"
-		if ctx.Err() != nil {
-			finalStatus = SubAgentTaskCancelled
-			statusLabel = "cancelled"
-		}
-		errMsg := fmt.Sprintf("agent %q %s: %v", ag.Name, statusLabel, err)
-		filesRead, filesWritten := r.getTaskFileActivity(taskID)
-		r.setTerminal(taskID, finalStatus, "", errMsg, duration, 0, 0)
-		if snap.tracker != nil {
-			snap.tracker.RecordSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, Usage{}, "", filesRead, filesWritten)
-		}
-		if snap.eventStream != nil {
-			snap.eventStream.EmitSubagentCompleted(taskID, statusLabel, errMsg, 0, 0, 0, 0, false, 0, statusLabel, "")
-		}
-		return
-	}
-
-	text := result.FinalText()
-	if text == "" {
-		text = "(no output)"
-	}
-
-	var toolCount int32
-	var totalTokens int64
-	for _, item := range result.NewItems {
-		if item.Type == RunItemToolCall && item.ToolCall != nil {
-			toolCount++
-		}
-	}
-	totalTokens = result.Usage.InputTokens + result.Usage.OutputTokens
-
-	filesRead, filesWritten := r.getTaskFileActivity(taskID)
-	status := "completed"
-	finalStatus := SubAgentTaskCompleted
-	if result.Interruption != nil {
-		status = "stopped"
-		finalStatus = SubAgentTaskCancelled
-	}
-	usage := Usage{
-		InputTokens:       result.Usage.InputTokens,
-		OutputTokens:      result.Usage.OutputTokens,
-		CacheReadTokens:   result.Usage.CacheReadTokens,
-		CacheCreateTokens: result.Usage.CacheCreateTokens,
-	}
-	costUsd, costKnown := estimateRunResultCost(result, snap.runner.model)
-	numTurns := len(result.RawResponses)
-	r.setTerminal(taskID, finalStatus, text, "", duration, toolCount, totalTokens)
-	if snap.tracker != nil {
-		snap.tracker.RecordSubagentProgress(taskID, toolCount, totalTokens, duration.Milliseconds(), "")
-		snap.tracker.RecordSubagentCompleted(
-			taskID, status, text,
-			costUsd,
-			numTurns,
-			usage, "",
-			filesRead, filesWritten,
-		)
-	}
-	if snap.eventStream != nil {
-		snap.eventStream.EmitSubagentCompleted(taskID, status, text, toolCount, totalTokens, duration.Milliseconds(), costUsd, costKnown, int32(numTurns), "", text)
-	}
 }
 
 func (r *SubAgentRegistry) setStatus(taskID string, status SubAgentTaskStatus, result, errMsg string) {
@@ -1064,18 +977,6 @@ func (r *SubAgentRegistry) setTerminal(taskID string, status SubAgentTaskStatus,
 	}
 	r.mu.Unlock()
 	r.signalChange()
-}
-
-// getTaskFileActivity returns the files read/written by a subagent task.
-func (r *SubAgentRegistry) getTaskFileActivity(taskID string) (filesRead, filesWritten []string) {
-	r.mu.Lock()
-	entry, ok := r.tasks[taskID]
-	r.mu.Unlock()
-	if !ok || entry.activity == nil {
-		return nil, nil
-	}
-	snap := entry.activity.Snapshot(false)
-	return snap.FilesRead, snap.FilesWritten
 }
 
 func subAgentTaskSnapshot(entry *subAgentTaskEntry) SubAgentTask {

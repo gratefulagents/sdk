@@ -1376,7 +1376,7 @@ type finalJoinTool struct {
 	pending bool
 }
 
-func (t *finalJoinTool) Name() string                 { return "spawn_subagent_task" }
+func (t *finalJoinTool) Name() string                 { return "subagent" }
 func (t *finalJoinTool) Description() string          { return "test final join provider" }
 func (t *finalJoinTool) InputSchema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 func (t *finalJoinTool) Execute(context.Context, json.RawMessage, string) (ToolResult, error) {

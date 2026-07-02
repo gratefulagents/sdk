@@ -81,7 +81,7 @@ func (m *blockingSubagentToolModel) GetRetryAdvice(error) *ModelRetryAdvice { re
 func (m *blockingSubagentToolModel) CalculateCost(Usage) float64            { return 0 }
 func (m *blockingSubagentToolModel) Provider() string                       { return "mock" }
 
-func TestRunSubagentTaskToolWaitsAndReturnsResult(t *testing.T) {
+func TestSubagentToolSyncModeWaitsAndReturnsResult(t *testing.T) {
 	model := &subagentToolMockModel{
 		responses: []*ModelResponse{
 			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "child done"}}}},
@@ -93,7 +93,7 @@ func TestRunSubagentTaskToolWaitsAndReturnsResult(t *testing.T) {
 			"worker": {Name: "worker"},
 		},
 	})
-	tool := &runSubagentTaskTool{registry: registry, defaultAgent: "worker"}
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
 
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it"}`), "")
 	if err != nil {
@@ -107,7 +107,36 @@ func TestRunSubagentTaskToolWaitsAndReturnsResult(t *testing.T) {
 	}
 }
 
-func TestSpawnSubagentTaskManagedJoinProviderReturnsResultOnce(t *testing.T) {
+func TestSubagentToolRequiresExactlyOneOfMessageOrTasks(t *testing.T) {
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(&subagentToolMockModel{}),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	for name, input := range map[string]string{
+		"neither": `{}`,
+		"both":    `{"message":"x","tasks":[{"key":"a","message":"y"}]}`,
+	} {
+		result, err := tool.Execute(context.Background(), json.RawMessage(input), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.IsError || !strings.Contains(result.Content, "exactly one of") {
+			t.Fatalf("%s: result = %+v, want mutual-exclusion error", name, result)
+		}
+	}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"x","mode":"nope"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "invalid mode") {
+		t.Fatalf("invalid mode result = %+v", result)
+	}
+}
+
+func TestSubagentToolBackgroundModeManagedJoinProviderReturnsResultOnce(t *testing.T) {
 	model := &subagentToolMockModel{
 		responses: []*ModelResponse{
 			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "managed child"}}}},
@@ -119,9 +148,9 @@ func TestSpawnSubagentTaskManagedJoinProviderReturnsResultOnce(t *testing.T) {
 			"worker": {Name: "worker"},
 		},
 	})
-	tool := &spawnSubagentTaskTool{registry: registry, defaultAgent: "worker"}
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
 
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it"}`), "")
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it","mode":"background"}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +182,7 @@ func TestSpawnSubagentTaskManagedJoinProviderReturnsResultOnce(t *testing.T) {
 	}
 }
 
-func TestSpawnSubagentTaskManagedJoinProviderWaitsInSDKUntilResult(t *testing.T) {
+func TestSubagentToolBackgroundModeManagedJoinProviderWaitsInSDKUntilResult(t *testing.T) {
 	model := &blockingSubagentToolModel{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
@@ -164,9 +193,9 @@ func TestSpawnSubagentTaskManagedJoinProviderWaitsInSDKUntilResult(t *testing.T)
 			"worker": {Name: "worker"},
 		},
 	})
-	tool := &spawnSubagentTaskTool{registry: registry, defaultAgent: "worker"}
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
 
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it"}`), "")
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it","mode":"background"}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +249,77 @@ func TestSpawnSubagentTaskManagedJoinProviderWaitsInSDKUntilResult(t *testing.T)
 	}
 }
 
-func TestWaitForSubagentProgressReturnsReportableSnapshot(t *testing.T) {
+func TestSubagentToolBatchSyncWaitsForWholeGraph(t *testing.T) {
+	model := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "first result"}}}},
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "second result"}}}},
+		},
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"tasks": [
+			{"key": "a", "message": "first"},
+			{"key": "b", "message": "second", "depends_on": ["a"]}
+		]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("batch sync failed: %s", result.Content)
+	}
+	for _, want := range []string{`"wait_complete": true`, `"task_ids_by_key"`, `"results"`} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("content missing %s: %s", want, result.Content)
+		}
+	}
+	if strings.Count(result.Content, `"status": "completed"`) != 2 {
+		t.Fatalf("expected two completed results: %s", result.Content)
+	}
+	// Sync batch results are marked delivered — no duplicate final-join delivery.
+	if tool.HasPendingSubAgentFinalJoin() {
+		t.Fatal("no pending final join expected after sync batch")
+	}
+}
+
+func TestSubagentToolBatchRejectsCyclesAndUnknownDeps(t *testing.T) {
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(&subagentToolMockModel{}),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"tasks": [
+			{"key": "a", "message": "x", "depends_on": ["b"]},
+			{"key": "b", "message": "y", "depends_on": ["a"]}
+		]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "cycle") {
+		t.Fatalf("cycle result = %+v", result)
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{
+		"tasks": [{"key": "a", "message": "x", "depends_on": ["ghost"]}]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "neither a key in this batch nor an existing task id") {
+		t.Fatalf("unknown dep result = %+v", result)
+	}
+}
+
+func TestSubagentStatusSummaryReturnsReportableSnapshot(t *testing.T) {
 	model := &subagentToolMockModel{
 		responses: []*ModelResponse{
 			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "finished child"}}}},
@@ -240,8 +339,8 @@ func TestWaitForSubagentProgressReturnsReportableSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tool := &waitForSubagentProgressTool{registry: registry}
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"timeout_ms":1}`), "")
+	tool := &subagentStatusTool{registry: registry}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +357,7 @@ func TestWaitForSubagentProgressReturnsReportableSnapshot(t *testing.T) {
 	}
 }
 
-func TestGetSubagentTaskStatusTruncatesMessageEcho(t *testing.T) {
+func TestSubagentStatusDetailsActivityAndGraph(t *testing.T) {
 	model := &subagentToolMockModel{
 		responses: []*ModelResponse{
 			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
@@ -278,25 +377,101 @@ func TestGetSubagentTaskStatusTruncatesMessageEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tool := &getSubagentTaskStatusTool{registry: registry}
-	result, err := tool.Execute(context.Background(), json.RawMessage(`{"task_id":"`+taskID+`"}`), "")
+	tool := &subagentStatusTool{registry: registry}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"detail":"activity","task_ids":["`+taskID+`"]}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.IsError {
-		t.Fatalf("unexpected error: %s", result.Content)
+		t.Fatalf("activity error: %s", result.Content)
 	}
-	var view struct {
-		Message string `json:"message"`
+	if !strings.Contains(result.Content, `"activity"`) || !strings.Contains(result.Content, taskID) {
+		t.Fatalf("activity content = %s", result.Content)
 	}
-	if err := json.Unmarshal([]byte(result.Content), &view); err != nil {
+	// Status views must not echo the full task packet back into the parent context.
+	if strings.Contains(result.Content, longMessage) {
+		t.Fatal("activity view leaked full task message")
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{"detail":"graph"}`), "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(view.Message) > 260 {
-		t.Fatalf("status echo should truncate message to ~240 chars, got %d", len(view.Message))
+	if result.IsError {
+		t.Fatalf("graph error: %s", result.Content)
 	}
-	if !strings.HasSuffix(view.Message, "...") {
-		t.Fatalf("truncated message should end with ellipsis: %q", view.Message)
+	if !strings.Contains(result.Content, `"nodes"`) || !strings.Contains(result.Content, `"edges"`) {
+		t.Fatalf("graph content = %s", result.Content)
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{"detail":"bogus"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "invalid detail") {
+		t.Fatalf("invalid detail result = %+v", result)
+	}
+}
+
+func TestSubagentControlMessageAndCancel(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	taskID, err := registry.SpawnAsync(context.Background(), "worker", "long task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-model.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for child to start")
+	}
+
+	tool := &subagentControlTool{registry: registry}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"action":"message","task_id":"`+taskID+`","message":"narrow the scope"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(result.Content, "message_queued") {
+		t.Fatalf("message result = %+v", result)
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{"action":"message","task_id":"`+taskID+`"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "message is required") {
+		t.Fatalf("empty message result = %+v", result)
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{"action":"bogus","task_id":"`+taskID+`"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "invalid action") {
+		t.Fatalf("invalid action result = %+v", result)
+	}
+
+	result, err = tool.Execute(context.Background(), json.RawMessage(`{"action":"cancel","task_id":"`+taskID+`"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(result.Content, "cancellation_requested") {
+		t.Fatalf("cancel result = %+v", result)
+	}
+	task, err := registry.WaitForTask(context.Background(), taskID, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != SubAgentTaskCancelled {
+		t.Fatalf("task.Status = %s, want cancelled", task.Status)
 	}
 }
 
