@@ -14,7 +14,11 @@ const (
 	autoTrackerMaxRecentTools  = 10
 	autoTrackerMaxRecentErrors = 5
 
-	defaultCBMaxNoToolTurns   = 3
+	// Reasoning-heavy models (e.g. claude-fable-5) legitimately produce a few
+	// consecutive planning turns with no tool calls before acting; the
+	// breaker allows five such turns and the strong warning starts at three.
+	defaultCBMaxNoToolTurns   = 5
+	cbNoToolWarningTurns      = 3
 	defaultCBMaxSameErrors    = 5
 	defaultCBMaxRepeatedCycle = 6
 )
@@ -216,10 +220,10 @@ func BuildSmartNudge(t *AutoTracker, phase string) string {
 			errCount, truncateTitle(errMsg, 120), autonomousFinishGuidance())
 	}
 
-	if t.consecutiveNoToolTurns >= 2 {
-		return "[SYSTEM] WARNING: You have produced text without tool calls for 2 consecutive turns. In autonomous mode, every turn MUST include at least one tool call. Do NOT output only text." + autonomousFinishGuidance()
+	if t.consecutiveNoToolTurns >= cbNoToolWarningTurns {
+		return fmt.Sprintf("[SYSTEM] WARNING: You have produced text without tool calls for %d consecutive turns. In autonomous mode, every turn MUST include at least one tool call. Do NOT output only text.", t.consecutiveNoToolTurns) + autonomousFinishGuidance()
 	}
-	if t.consecutiveNoToolTurns == 1 {
+	if t.consecutiveNoToolTurns >= 1 {
 		return "[SYSTEM] You produced text without tool calls. In autonomous mode, every turn must include at least one tool call." + autonomousFinishGuidance()
 	}
 	return fmt.Sprintf("[SYSTEM] Continue.%s %d tool calls so far. Use tools to make progress.%s", phaseHint, t.toolCallCount, autonomousFinishGuidance())

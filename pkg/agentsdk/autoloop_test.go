@@ -10,9 +10,15 @@ func TestAutoTrackerDetectsNoToolStall(t *testing.T) {
 	t.Parallel()
 
 	var tracker AutoTracker
-	for i := 0; i < 3; i++ {
+	// Reasoning models may legitimately plan without tools for a few turns;
+	// the breaker must stay quiet below the threshold and trip at it.
+	for i := 0; i < defaultCBMaxNoToolTurns-1; i++ {
 		tracker.Update([]RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "thinking"}}})
+		if cb := tracker.CheckCircuitBreakers(); cb.Tripped {
+			t.Fatalf("circuit breaker tripped after %d no-tool turns: %+v", i+1, cb)
+		}
 	}
+	tracker.Update([]RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "thinking"}}})
 	cb := tracker.CheckCircuitBreakers()
 	if !cb.Tripped || !strings.Contains(cb.Reason, "no tool calls") {
 		t.Fatalf("circuit breaker = %+v, want no-tool stall", cb)
@@ -23,8 +29,9 @@ func TestBuildSmartNudgeWarnsOnRepeatedNoToolTurns(t *testing.T) {
 	t.Parallel()
 
 	var tracker AutoTracker
-	tracker.Update([]RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done soon"}}})
-	tracker.Update([]RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "still done soon"}}})
+	for i := 0; i < cbNoToolWarningTurns; i++ {
+		tracker.Update([]RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done soon"}}})
+	}
 
 	nudge := BuildSmartNudge(&tracker, "shipping")
 	if !strings.Contains(nudge, "WARNING") || !strings.Contains(nudge, "tool calls") {

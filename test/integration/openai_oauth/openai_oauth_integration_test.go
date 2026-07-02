@@ -1077,7 +1077,7 @@ Find facts carefully.
 	}
 
 	auto := &agentsdk.AutoTracker{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		auto.Update([]agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "no tools"}}})
 	}
 	if breaker := auto.CheckCircuitBreakers(); !breaker.Tripped || !strings.Contains(breaker.Reason, "no tool") {

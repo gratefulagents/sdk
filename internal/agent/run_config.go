@@ -59,6 +59,11 @@ type CompactionConfig struct {
 	PreserveRecentItems         int
 	PreserveInitialUserMessages int
 	SummaryBulletLimit          int
+	// UseLLMSummary asks the active model to write the compaction summary
+	// (findings, decisions, state, pending work) instead of the mechanical
+	// tool/file digest. Falls back to the deterministic summary whenever the
+	// model call fails or produces an unusable result.
+	UseLLMSummary bool
 }
 
 // DefaultCompactionConfig returns a conservative default policy for long-running sessions.
@@ -70,6 +75,7 @@ func DefaultCompactionConfig() CompactionConfig {
 		PreserveRecentItems:         12,
 		PreserveInitialUserMessages: 2,
 		SummaryBulletLimit:          4,
+		UseLLMSummary:               true,
 	}
 }
 
@@ -112,6 +118,12 @@ func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) 
 		return 360000, 200000
 	case strings.HasPrefix(m, "gpt-5.2"), strings.HasPrefix(m, "gpt-5.1"):
 		return 360000, 200000
+	// Claude Fable 5: 1M context on Copilot and Anthropic (models.dev).
+	// Provider /models limits under-report this deployment (claims a 200K
+	// prompt cap while 1M-context requests succeed), so the models.dev
+	// resolver is authoritative; this static fallback matches it.
+	case strings.Contains(m, "fable"):
+		return 900000, 500000
 	// Claude Opus 4: 200K context → trigger at 180K, target 100K
 	case strings.Contains(m, "opus-4"):
 		return 180000, 100000
@@ -255,6 +267,14 @@ type RunConfig struct {
 	// disables escalation.
 	ConsecutiveToolErrorLimit int
 
+	// ReadOnlyStallTurnLimit nudges when this many consecutive tool turns use
+	// only read-only tools (exploration without any state-changing action or
+	// final answer). Deep-reasoning models legitimately explore for several
+	// turns, so the limit is generous; the nudge asks the model to converge —
+	// act on what it knows or deliver its answer — instead of re-reading.
+	// 0 uses DefaultReadOnlyStallTurnLimit; negative disables the nudge.
+	ReadOnlyStallTurnLimit int
+
 	// StopGate is a deterministic finalization gate. When set, it runs on
 	// every candidate final answer; returning ok=false blocks finalization
 	// and feeds the feedback back to the model. After StopGateMaxBlocks
@@ -339,6 +359,15 @@ const DefaultMaxToolOutputBytes = 64 * 1024
 // threshold that triggers a corrective escalation note.
 const DefaultConsecutiveToolErrorLimit = 3
 
+// DefaultReadOnlyStallTurnLimit is the consecutive read-only tool-turn
+// threshold that triggers a converge nudge. Ten turns gives reasoning-heavy
+// models room for legitimate exploration before being asked to commit.
+const DefaultReadOnlyStallTurnLimit = 10
+
+// maxReadOnlyStallNudgesPerRun caps converge nudges per run so a genuinely
+// research-only task is not nagged forever.
+const maxReadOnlyStallNudgesPerRun = 3
+
 // DefaultStopGateMaxBlocks caps consecutive StopGate blocks before the gate
 // is bypassed.
 const DefaultStopGateMaxBlocks = 8
@@ -353,6 +382,18 @@ func (c *RunConfig) EffectiveConsecutiveToolErrorLimit() int {
 		return DefaultConsecutiveToolErrorLimit
 	}
 	return c.ConsecutiveToolErrorLimit
+}
+
+// EffectiveReadOnlyStallTurnLimit returns the converge-nudge threshold, or 0
+// when the nudge is disabled.
+func (c *RunConfig) EffectiveReadOnlyStallTurnLimit() int {
+	if c.ReadOnlyStallTurnLimit < 0 {
+		return 0
+	}
+	if c.ReadOnlyStallTurnLimit == 0 {
+		return DefaultReadOnlyStallTurnLimit
+	}
+	return c.ReadOnlyStallTurnLimit
 }
 
 // EffectiveStopGateMaxBlocks returns the consecutive-block cap for StopGate.

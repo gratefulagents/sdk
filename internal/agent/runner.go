@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -323,6 +324,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// returned an error; escalation fires at the configured limit.
 	consecutiveToolErrorTurns := 0
 	toolErrorEscalated := false
+	// consecutiveReadOnlyTurns counts tool turns where every executed tool is
+	// read-only; a converge nudge fires at the configured limit.
+	consecutiveReadOnlyTurns := 0
+	readOnlyStallNudges := 0
+	// estimateCalibration corrects the token estimator against the actual
+	// input tokens reported by provider usage. The estimator historically
+	// undercounts (~25% on Claude histories), which delays compaction past
+	// the real context limit; dividing thresholds by this ratio makes the
+	// trigger fire at true window pressure. Only upward corrections apply.
+	estimateCalibration := 1.0
 	// stopGateBlocks counts consecutive StopGate blocks; the gate is bypassed
 	// once the cap is hit so a broken gate cannot loop forever.
 	stopGateBlocks := 0
@@ -440,6 +451,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				compactionCfg.TargetTokens = target
 			}
 		}
+		if compactionCfg.Enabled && estimateCalibration > 1.0 {
+			normalized := compactionCfg.normalized()
+			compactionCfg.TriggerTokens = maxInt(1, int(float64(normalized.TriggerTokens)/estimateCalibration))
+			compactionCfg.TargetTokens = maxInt(1, int(float64(normalized.TargetTokens)/estimateCalibration))
+		}
 
 		requestOverheadTokens := estimateModelRequestOverheadTokens(instructions, tools, settings)
 		compactRequest := ModelRequest{
@@ -468,15 +484,23 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if compactErr != nil {
 				log.Printf("[runner] WARN: provider compaction failed; falling back to local compaction: %v", compactErr)
 			}
-			if compacted, before, after, ok, reason := MaybeCompactRunItemsForRequest(currentInput, compactionCfg, requestOverheadTokens); ok {
+			if plan, before, ok, reason := PlanRunItemsCompactionForRequest(currentInput, compactionCfg, requestOverheadTokens); ok {
+				compactedItems := plan.Items
+				if compactionCfg.UseLLMSummary {
+					rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
+					runCtx.Usage.Add(usage)
+					if llmOK {
+						compactedItems = rebuilt
+					}
+				}
 				var carryForward string
-				currentInput, carryForward = applyCompactionCarryForward(ctx, compacted, currentInput, cfg)
+				currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
 				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 					return nil, guardErr
 				}
-				after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
+				after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
 				if cfg.CompactionRecorder != nil {
-					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(compacted), carryForward))
+					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
 				}
 			} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 				if compactErr != nil {
@@ -656,15 +680,23 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				beforeEstimate := estimateRunItemsTokens(currentInput)
 				forcedCfg.TriggerTokens = 1
 				forcedCfg.TargetTokens = minInt(forcedCfg.TargetTokens, maxInt(1, beforeEstimate/2))
-				if compacted, before, after, ok, reason := MaybeCompactRunItems(currentInput, forcedCfg); ok {
+				if plan, before, ok, reason := planRunItemsCompaction(currentInput, forcedCfg); ok {
+					compactedItems := plan.Items
+					if forcedCfg.UseLLMSummary {
+						rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
+						runCtx.Usage.Add(usage)
+						if llmOK {
+							compactedItems = rebuilt
+						}
+					}
 					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compacted, currentInput, cfg)
+					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
 					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 						return nil, guardErr
 					}
-					after = estimateRunItemsTokens(currentInput)
+					after := estimateRunItemsTokens(currentInput)
 					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(compacted), carryForward))
+						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
 					}
 					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
 					ev.RetryPlanned = true
@@ -805,6 +837,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// Track usage.
 		runCtx.Usage.Add(resp.Usage)
 		allResponses = append(allResponses, *resp)
+
+		// Calibrate the token estimator against the actual context consumed
+		// (prompt + cache read + cache creation tokens) for this request.
+		if actual := resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheCreateTokens; actual > 0 {
+			if sentEstimate := estimateRunItemsTokens(requestInput) + requestOverheadTokens; sentEstimate > 0 {
+				ratio := float64(actual) / float64(sentEstimate)
+				blended := 0.5*estimateCalibration + 0.5*ratio
+				estimateCalibration = math.Max(1.0, math.Min(2.5, blended))
+			}
+		}
 
 		// Process response items.
 		newItems := resp.ToRunItems()
@@ -1057,6 +1099,44 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						currentInput = append(currentInput, escalation)
 						allItems = append(allItems, escalation)
 						emitRunItems(ctx, streamEvents, []RunItem{escalation})
+					}
+				}
+			}
+
+			// Converge nudge: reasoning models can spiral into open-ended
+			// exploration — dozens of read-only turns re-deriving a plan
+			// without ever editing or answering. After a generous run of
+			// consecutive read-only tool turns, inject a nudge to commit.
+			if limit := cfg.EffectiveReadOnlyStallTurnLimit(); limit > 0 {
+				readOnlyByName := make(map[string]bool, len(tools))
+				for _, t := range tools {
+					readOnlyByName[t.Name()] = t.IsReadOnly()
+				}
+				executed, readOnly := 0, 0
+				for _, call := range s.toolCalls {
+					executed++
+					if readOnlyByName[call.Name] {
+						readOnly++
+					}
+				}
+				if executed > 0 {
+					if readOnly == executed {
+						consecutiveReadOnlyTurns++
+					} else {
+						consecutiveReadOnlyTurns = 0
+					}
+					if consecutiveReadOnlyTurns >= limit && readOnlyStallNudges < maxReadOnlyStallNudgesPerRun {
+						readOnlyStallNudges++
+						consecutiveReadOnlyTurns = 0
+						nudge := RunItem{
+							Type: RunItemMessage,
+							Message: &MessageOutput{Text: fmt.Sprintf(
+								"[SYSTEM] Your last %d tool turns were read-only exploration with no state-changing action and no final answer. Converge now: if you have enough context, act — make the edit, run the command, or deliver your answer/plan. Do not re-read files you have already seen. If key questions genuinely remain, name them explicitly and answer them with the minimum further reads.",
+								limit)},
+						}
+						currentInput = append(currentInput, nudge)
+						allItems = append(allItems, nudge)
+						emitRunItems(ctx, streamEvents, []RunItem{nudge})
 					}
 				}
 			}

@@ -15,14 +15,50 @@ const (
 // MaybeCompactRunItems reduces history size while preserving the original task
 // framing and the most recent turn context.
 func MaybeCompactRunItems(items []RunItem, cfg CompactionConfig) ([]RunItem, int, int, bool, string) {
+	plan, before, ok, reason := planRunItemsCompaction(items, cfg)
+	if !ok {
+		return items, before, before, false, reason
+	}
+	return plan.Items, before, plan.After, true, ""
+}
+
+// CompactionPlan is a selected compaction split: the deterministic compacted
+// items plus the raw removed items, so callers can regenerate the summary
+// (e.g. with an LLM) without re-running the selection search.
+type CompactionPlan struct {
+	// Items is the deterministically compacted history (summary already inserted).
+	Items []RunItem
+	// Removed are the original items that were collapsed into the summary.
+	Removed []RunItem
+	// Protected is the set of source indices preserved verbatim.
+	Protected map[int]struct{}
+	// Source is the original, uncompacted history the plan was built from.
+	Source []RunItem
+	// After is the estimated token size of Items.
+	After int
+}
+
+// RebuildWithSummary rebuilds the compacted history using a replacement
+// summary body. The body is prefixed with the standard compaction marker and
+// scope line so downstream extraction (ExtractCompactionSummary) keeps working.
+func (p CompactionPlan) RebuildWithSummary(summaryBody string) []RunItem {
+	summary := "[COMPACTED HISTORY SUMMARY]\n" +
+		summarizeCompactionScope(p.Removed) + "\n" +
+		strings.TrimSpace(summaryBody)
+	return buildCompactedRunItems(p.Source, p.Protected, summary)
+}
+
+// planRunItemsCompaction runs the compaction selection search and returns the
+// best plan alongside the pre-compaction token estimate.
+func planRunItemsCompaction(items []RunItem, cfg CompactionConfig) (CompactionPlan, int, bool, string) {
 	cfg = cfg.normalized()
 	if !cfg.Enabled || len(items) == 0 {
-		return items, 0, 0, false, "disabled"
+		return CompactionPlan{}, 0, false, "disabled"
 	}
 
 	before := estimateRunItemsTokens(items)
 	if before <= cfg.TriggerTokens {
-		return items, before, before, false, "below-threshold"
+		return CompactionPlan{}, before, false, "below-threshold"
 	}
 
 	protectedPrefix := selectInitialUserMessageIndices(items, cfg.PreserveInitialUserMessages)
@@ -32,41 +68,52 @@ func MaybeCompactRunItems(items []RunItem, cfg CompactionConfig) ([]RunItem, int
 	}
 
 	var (
-		bestItems  []RunItem
+		bestPlan   CompactionPlan
 		bestAfter  = before
 		bestOK     bool
 		bestReason = "no-removable-history"
 	)
 	for recent := maxRecent; recent >= 1; recent-- {
-		compacted, after, ok, reason := compactRunItemsToRecentLimit(items, protectedPrefix, recent, cfg.SummaryBulletLimit, cfg.TargetTokens)
+		plan, ok, reason := compactRunItemsToRecentLimit(items, protectedPrefix, recent, cfg.SummaryBulletLimit, cfg.TargetTokens)
 		if !ok {
 			if bestReason == "no-removable-history" {
 				bestReason = reason
 			}
 			continue
 		}
-		if !bestOK || after < bestAfter {
-			bestItems = compacted
-			bestAfter = after
+		if !bestOK || plan.After < bestAfter {
+			bestPlan = plan
+			bestAfter = plan.After
 			bestOK = true
 		}
-		if after <= cfg.TargetTokens {
-			return compacted, before, after, true, ""
+		if plan.After <= cfg.TargetTokens {
+			return plan, before, true, ""
 		}
 	}
 	if !bestOK {
-		return items, before, before, false, bestReason
+		return CompactionPlan{}, before, false, bestReason
 	}
-	return bestItems, before, bestAfter, true, ""
+	return bestPlan, before, true, ""
 }
 
 // MaybeCompactRunItemsForRequest applies compaction against the estimated full
 // request size, not just the persisted run items. Instructions, tool schemas,
 // output reserve, and a safety buffer consume the same model context window.
 func MaybeCompactRunItemsForRequest(items []RunItem, cfg CompactionConfig, requestOverheadTokens int) ([]RunItem, int, int, bool, string) {
+	plan, beforeTotal, ok, reason := PlanRunItemsCompactionForRequest(items, cfg, requestOverheadTokens)
+	if !ok {
+		return items, beforeTotal, beforeTotal, false, reason
+	}
+	return plan.Items, beforeTotal, plan.After, true, ""
+}
+
+// PlanRunItemsCompactionForRequest is the plan-returning variant of
+// MaybeCompactRunItemsForRequest. The returned plan's After includes the
+// request overhead so it is directly comparable with the returned before.
+func PlanRunItemsCompactionForRequest(items []RunItem, cfg CompactionConfig, requestOverheadTokens int) (CompactionPlan, int, bool, string) {
 	cfg = cfg.normalized()
 	if !cfg.Enabled || len(items) == 0 {
-		return items, 0, 0, false, "disabled"
+		return CompactionPlan{}, 0, false, "disabled"
 	}
 	if requestOverheadTokens < 0 {
 		requestOverheadTokens = 0
@@ -75,17 +122,18 @@ func MaybeCompactRunItemsForRequest(items []RunItem, cfg CompactionConfig, reque
 	beforeItems := estimateRunItemsTokens(items)
 	beforeTotal := beforeItems + requestOverheadTokens
 	if beforeTotal <= cfg.TriggerTokens {
-		return items, beforeTotal, beforeTotal, false, "below-threshold"
+		return CompactionPlan{}, beforeTotal, false, "below-threshold"
 	}
 
 	adjusted := cfg
 	adjusted.TriggerTokens = maxInt(1, cfg.TriggerTokens-requestOverheadTokens)
 	adjusted.TargetTokens = maxInt(1, cfg.TargetTokens-requestOverheadTokens)
-	compacted, _, afterItems, ok, reason := MaybeCompactRunItems(items, adjusted)
+	plan, _, ok, reason := planRunItemsCompaction(items, adjusted)
 	if !ok {
-		return items, beforeTotal, beforeTotal, false, reason
+		return CompactionPlan{}, beforeTotal, false, reason
 	}
-	return compacted, beforeTotal, afterItems + requestOverheadTokens, true, ""
+	plan.After += requestOverheadTokens
+	return plan, beforeTotal, true, ""
 }
 
 func ExtractCompactionSummary(items []RunItem) string {
@@ -765,7 +813,7 @@ func pluralSuffix(n int) string {
 	return "s"
 }
 
-func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recentLimit, bulletLimit, targetTokens int) ([]RunItem, int, bool, string) {
+func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recentLimit, bulletLimit, targetTokens int) (CompactionPlan, bool, string) {
 	tailStart := len(items) - recentLimit
 	if tailStart < 0 {
 		tailStart = 0
@@ -792,7 +840,7 @@ func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recent
 		removed = append(removed, item)
 	}
 	if len(removed) == 0 {
-		return nil, 0, false, "no-removable-history"
+		return CompactionPlan{}, false, "no-removable-history"
 	}
 
 	before := estimateRunItemsTokens(items)
@@ -817,9 +865,15 @@ func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recent
 	// call (including the forced post-overflow path). Reject it regardless of
 	// how many items were collapsed.
 	if after >= before {
-		return nil, 0, false, "ineffective-summary"
+		return CompactionPlan{}, false, "ineffective-summary"
 	}
-	return result, after, true, ""
+	return CompactionPlan{
+		Items:     result,
+		Removed:   removed,
+		Protected: protected,
+		Source:    items,
+		After:     after,
+	}, true, ""
 }
 
 func buildCompactedRunItems(items []RunItem, protected map[int]struct{}, summary string) []RunItem {
