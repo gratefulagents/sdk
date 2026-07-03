@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 )
 
@@ -98,6 +99,14 @@ func BuiltinToolInputGuardrails() []agentsdk.ToolInputGuardrail {
 		{
 			Name: "block-destructive-commands",
 			Fn: func(_ *agentsdk.RunContext, _ *agentsdk.Agent, tool agentsdk.Tool, input json.RawMessage) (*agentsdk.GuardrailResult, error) {
+				// When shell commands run inside the enforcing subprocess
+				// sandbox (worker pods with GRATEFULAGENTS_COMMAND_SANDBOX=
+				// required), the OS boundary already contains filesystem
+				// destruction; the textual classifier would only add false
+				// positives, so it is skipped there.
+				if sandbox.DefaultEnforcesFilesystem() {
+					return &agentsdk.GuardrailResult{}, nil
+				}
 				toolLower := strings.ToLower(tool.Name())
 				if !strings.Contains(toolLower, "bash") &&
 					!strings.Contains(toolLower, "shell") &&

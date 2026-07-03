@@ -30,60 +30,36 @@ func TestSafeEnvDoesNotInheritSecrets(t *testing.T) {
 	if strings.Contains(joined, "postgres://secret") || strings.Contains(joined, "ghp_secret") || strings.Contains(joined, "sk-secret") {
 		t.Fatalf("SafeEnv expanded parent secret in env:\n%s", joined)
 	}
-	if !strings.Contains(joined, "CUSTOM=/opt/gratefulagents/bin:") || !strings.Contains(joined, "/usr/local/go/bin") {
+	// $PATH expands from the safe environment; $DATABASE_URL expands empty.
+	wantCustom := "CUSTOM=" + SafeEnvMap()["PATH"] + ":"
+	if !strings.Contains(joined, wantCustom+"\n") && !strings.HasSuffix(joined, wantCustom) {
 		t.Fatalf("SafeEnv did not expand safe PATH override, env:\n%s", joined)
 	}
 }
 
-func TestSafeEnvIncludesWorkerToolchainDefaults(t *testing.T) {
-	env := SafeEnvMapWithConfig(Config{GOROOT: "/custom/go"})
-	path := env["PATH"]
-	for _, want := range []string{
-		"/opt/gratefulagents/bin",
-		"/opt/conda/bin",
-		"/usr/local/go/bin",
-		"/usr/local/bin",
-		"/tmp/home/.local/bin",
-		"/tmp/pnpm",
-		"/tmp/go/bin",
-		"/tmp/cargo/bin",
-		"/workspace/.cache/go/bin",
-	} {
-		if !strings.Contains(path, want) {
-			t.Fatalf("PATH = %q, missing %q", path, want)
-		}
+func TestSafeEnvInheritsSystemVarsOnly(t *testing.T) {
+	t.Setenv("LC_COLLATE", "C")
+	t.Setenv("MY_APP_SECRET", "hidden")
+
+	env := SafeEnvMap()
+	if env["PATH"] != cleanPathList(os.Getenv("PATH")) {
+		t.Fatalf("PATH = %q, want inherited parent PATH", env["PATH"])
 	}
-	if env["GOROOT"] != "/custom/go" {
-		t.Fatalf("GOROOT = %q, want /custom/go", env["GOROOT"])
+	if env["HOME"] != os.Getenv("HOME") {
+		t.Fatalf("HOME = %q, want inherited parent HOME", env["HOME"])
 	}
-	if env["GOTOOLCHAIN"] != "local" {
-		t.Fatalf("GOTOOLCHAIN = %q, want local", env["GOTOOLCHAIN"])
+	if env["LC_COLLATE"] != "C" {
+		t.Fatalf("LC_COLLATE = %q, want inherited LC_* variable", env["LC_COLLATE"])
 	}
-	if env["GO_TELEMETRY_CHILD"] != "2" {
-		t.Fatalf("GO_TELEMETRY_CHILD = %q, want 2", env["GO_TELEMETRY_CHILD"])
-	}
-	for key, want := range map[string]string{
-		"XDG_CACHE_HOME":   "/tmp/.cache",
-		"NPM_CONFIG_CACHE": "/tmp/npm-cache",
-		"PNPM_HOME":        "/tmp/pnpm",
-		"PIP_CACHE_DIR":    "/tmp/pip-cache",
-		"CARGO_HOME":       "/tmp/cargo",
-		"GRADLE_USER_HOME": "/tmp/gradle",
-		"DOTNET_CLI_HOME":  "/tmp/dotnet",
-		"GEM_HOME":         "/tmp/gems",
-		"COMPOSER_HOME":    "/tmp/composer",
-		"DENO_DIR":         "/tmp/deno",
-		"BUN_INSTALL":      "/tmp/bun",
-	} {
-		if env[key] != want {
-			t.Fatalf("%s = %q, want %q", key, env[key], want)
-		}
+	if _, ok := env["MY_APP_SECRET"]; ok {
+		t.Fatal("non-system parent variable leaked into safe env")
 	}
 }
 
 func TestSafeEnvSandboxConfiguration(t *testing.T) {
 	env := SafeEnvMapWithConfig(Config{
-		Path: "/custom/bin:relative:/usr/bin:/custom/bin",
+		Path:   "/custom/bin:relative:/usr/bin:/custom/bin",
+		GOROOT: "/custom/go",
 		ExtraEnv: map[string]string{
 			"JAVA_HOME": "/opt/jdk",
 			"TOOL_PATH": "$PATH:/extra,with-comma",
@@ -92,6 +68,9 @@ func TestSafeEnvSandboxConfiguration(t *testing.T) {
 	})
 	if env["PATH"] != "/custom/bin:/usr/bin" {
 		t.Fatalf("PATH = %q, want configured clean path", env["PATH"])
+	}
+	if env["GOROOT"] != "/custom/go" {
+		t.Fatalf("GOROOT = %q, want /custom/go", env["GOROOT"])
 	}
 	if env["JAVA_HOME"] != "/opt/jdk" {
 		t.Fatalf("JAVA_HOME = %q, want /opt/jdk", env["JAVA_HOME"])
@@ -168,8 +147,8 @@ func TestSafeEnvSandboxPathPrependAndAppend(t *testing.T) {
 		PathPrepend: []string{"/custom/bin", "relative"},
 		PathAppend:  []string{"/tail/bin"},
 	})["PATH"]
-	if !strings.HasPrefix(path, "/custom/bin:/opt/gratefulagents/bin:") {
-		t.Fatalf("PATH = %q, want configured prepend before defaults", path)
+	if !strings.HasPrefix(path, "/custom/bin:") {
+		t.Fatalf("PATH = %q, want configured prepend before inherited entries", path)
 	}
 	if !strings.HasSuffix(path, ":/tail/bin") {
 		t.Fatalf("PATH = %q, want configured append", path)
@@ -223,6 +202,9 @@ func TestExecutorRunCapsOutputWithoutTerminatingProcess(t *testing.T) {
 }
 
 func TestBubblewrapArgsReadOnlyWorkspace(t *testing.T) {
+	restore := overrideProcfsMountUsable(true)
+	defer restore()
+
 	config := Config{WorkspaceRoot: "/workspace"}
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "pwd"},
@@ -232,14 +214,19 @@ func TestBubblewrapArgsReadOnlyWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
+	assertArgSequence(t, args, "--proc", "/proc")
+	assertArgAbsent(t, args, "--tmpfs", "/proc")
+	assertArgSequence(t, args, "--dev", "/dev")
+	assertArgSequence(t, args, "--tmpfs", "/tmp")
+	assertArgAbsent(t, args, "--bind", "/tmp", "/tmp")
+	assertArgSequence(t, args, "--dir", "/tmp/home")
 	assertArgSequence(t, args, "--ro-bind", "/workspace", "/workspace")
 	assertArgAbsent(t, args, "--bind", "/workspace", "/workspace")
-	assertArgAbsent(t, args, "--proc", "/proc")
-	assertArgSequence(t, args, "--dir", "/proc")
-	assertArgSequence(t, args, "--tmpfs", "/tmp")
 	assertArgSequence(t, args, "--clearenv")
-	assertArgSequence(t, args, "--setenv", "PATH", SafeEnvMapWithConfig(config)["PATH"])
-	assertArgSequence(t, args, "--setenv", "GO_TELEMETRY_CHILD", "2")
+	assertArgSequence(t, args, "--setenv", "HOME", "/tmp/home")
+	assertArgSequence(t, args, "--setenv", "TMPDIR", "/tmp")
+	assertArgSequence(t, args, "--setenv", "GIT_TERMINAL_PROMPT", "0")
 	assertArgSequence(t, args, "--chdir", "/workspace/repo")
 	assertArgSequence(t, args, "--", "bash", "--noprofile", "--norc", "-c", "pwd")
 }
@@ -253,50 +240,62 @@ func TestBubblewrapArgsWorkspaceWriteWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
 	assertArgSequence(t, args, "--bind", "/workspace", "/workspace")
 	assertArgAbsent(t, args, "--ro-bind", "/workspace", "/workspace")
+	// Real /tmp persists caches and installed tooling across commands.
+	assertArgSequence(t, args, "--bind", "/tmp", "/tmp")
+	assertArgAbsent(t, args, "--tmpfs", "/tmp")
 }
 
-func TestBubblewrapArgsIncludesConfiguredReadOnlyToolchainPaths(t *testing.T) {
-	workspace := t.TempDir()
-	toolchain := t.TempDir()
-	workspaceToolchain := filepath.Join(workspace, "toolchain")
-	config := Config{
-		WorkspaceRoot: workspace,
-		ExtraReadOnlyPaths: []string{
-			toolchain,
-			workspaceToolchain,
-			"relative",
-			"/opt",
-			"/tmp",
-			"/var/run/secrets/kubernetes.io/serviceaccount",
-			"/home/worker",
-		},
-	}
+func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
+	restore := overrideProcfsMountUsable(false)
+	defer restore()
 
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "true"},
-		WorkDir:        filepath.Join(workspace, "repo"),
+		WorkDir:        "/workspace/repo",
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
-	}, config)
+	}, Config{WorkspaceRoot: "/workspace"})
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgSequence(t, args, "--ro-bind", toolchain, toolchain)
-	assertArgAbsent(t, args, "--ro-bind", workspaceToolchain, workspaceToolchain)
-	assertArgAbsent(t, args, "--ro-bind", "/opt", "/opt")
-	assertArgAbsent(t, args, "--ro-bind", "/tmp", "/tmp")
-	assertArgAbsent(t, args, "--ro-bind", "/var/run/secrets/kubernetes.io/serviceaccount", "/var/run/secrets/kubernetes.io/serviceaccount")
+	// Without a fresh procfs the rec-bound host /proc must be masked so
+	// /proc/<pid>/environ of the agent process is unreachable.
+	assertArgSequence(t, args, "--tmpfs", "/proc")
+	assertArgAbsent(t, args, "--proc", "/proc")
+}
+
+func TestBubblewrapArgsExposeWholeFilesystemWithoutExtraMounts(t *testing.T) {
+	toolchain := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "true"},
+		WorkDir:        "/workspace/repo",
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{
+		WorkspaceRoot:      "/workspace",
+		ExtraReadOnlyPaths: []string{toolchain, "/opt/tooling", "/home/worker"},
+	})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	// The whole filesystem is already visible read-only; per-path read-only
+	// mounts must not be emitted.
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
+	assertArgAbsent(t, args, "--ro-bind", toolchain, toolchain)
+	assertArgAbsent(t, args, "--ro-bind", "/opt/tooling", "/opt/tooling")
 	assertArgAbsent(t, args, "--ro-bind", "/home/worker", "/home/worker")
 }
 
 func TestBubblewrapArgsIncludesConfiguredWritableScratchPaths(t *testing.T) {
 	workspace := t.TempDir()
-	scratch, err := os.MkdirTemp("/tmp", "sdk-scratch-")
+	scratch, err := os.MkdirTemp("", "sdk-scratch-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
+	// Binds are emitted for symlink-resolved sources (macOS /var -> /private/var).
+	scratch = resolveExistingPrefix(scratch)
 	nestedScratch := filepath.Join(scratch, "nested")
 	if err := os.MkdirAll(nestedScratch, 0o755); err != nil {
 		t.Fatal(err)
@@ -318,18 +317,39 @@ func TestBubblewrapArgsIncludesConfiguredWritableScratchPaths(t *testing.T) {
 			workspaceScratch,
 			"relative",
 			"/tmp",
-			"/etc/tmp",
+			"/etc/does-not-exist-scratch",
 		},
 	})
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgSequence(t, args, "--dir", scratch)
 	assertArgSequence(t, args, "--bind", scratch, scratch)
 	assertArgAbsent(t, args, "--bind", nestedScratch, nestedScratch)
 	assertArgAbsent(t, args, "--bind", workspaceScratch, workspaceScratch)
-	assertArgAbsent(t, args, "--bind", "/tmp", "/tmp")
-	assertArgAbsent(t, args, "--bind", "/etc/tmp", "/etc/tmp")
+	assertArgAbsent(t, args, "--bind", "/etc/does-not-exist-scratch", "/etc/does-not-exist-scratch")
+}
+
+func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
+	wantEnforcing := subprocessSandboxAvailable()
+
+	if got := ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "required"}), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("required mode enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "disabled"}), policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("disabled mode must not report enforcement")
+	}
+	if got := ExecutorEnforcesFilesystem(DefaultWithConfig(Config{RunningInKubernetes: true}), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("auto+kubernetes enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if got := ExecutorEnforcesFilesystem(Default(), policy.PermissionModeReadOnly); got != wantEnforcing {
+		t.Fatalf("auto read-only enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if ExecutorEnforcesFilesystem(Default(), policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("auto workspace-write outside kubernetes must not report enforcement")
+	}
+	if ExecutorEnforcesFilesystem(LocalExecutor{}, policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("LocalExecutor must not report enforcement")
+	}
 }
 
 func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {

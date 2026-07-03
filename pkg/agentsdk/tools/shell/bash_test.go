@@ -75,3 +75,20 @@ func TestCommandBlockedForModeHandlesRootRemoveVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandBlockedSkipsDestructiveClassifierWhenSandboxEnforces(t *testing.T) {
+	t.Parallel()
+
+	// With an enforcing OS sandbox the filesystem classifier is redundant and
+	// must not block; git policy still applies because the sandbox cannot
+	// contain remote-side effects.
+	if blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "rm -rf /", true); blocked {
+		t.Fatalf("destructive classifier ran despite enforcing sandbox: %q", reason)
+	}
+	if blocked, _ := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "git push origin main", true); !blocked {
+		t.Fatal("git protected-branch policy must apply even under an enforcing sandbox")
+	}
+	if blocked, _ := isCommandBlockedForMode(policy.PermissionModeReadOnly, "git commit -m x", true); !blocked {
+		t.Fatal("read-only git policy must apply even under an enforcing sandbox")
+	}
+}

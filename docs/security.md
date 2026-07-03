@@ -101,6 +101,33 @@ is available it now **fails closed** rather than silently downgrading to a
 permissive backend. The `LocalExecutor` is intentionally permissive and is
 not selected automatically in this mode.
 
+### Sandbox filesystem and environment model
+
+The bubblewrap sandbox exposes the entire host filesystem **read-only**
+(`--ro-bind / /`) with a minimal `/dev`. `/proc` is freshly mounted for the
+sandbox's pid namespace when the host allows it, and masked entirely when it
+does not (container runtimes with masked `/proc` reject procfs mounts inside
+user namespaces) — either way, `/proc/<pid>/environ` of host processes is
+unreachable. Writes are confined to
+the workspace root, `/tmp` (a persistent bind for write-capable modes, an
+ephemeral tmpfs for read-only), and explicitly configured extra writable
+paths. There are no read-path allowlists: confidentiality of host files is
+not a sandbox goal, write and environment containment are.
+
+Subprocess environments are explicit: only system variables (`PATH`, `HOME`,
+`USER`, `LOGNAME`, `SHELL`, `TERM`, `COLORTERM`, `LANG`, `LC_*`, `TZ`,
+`TMPDIR`) are inherited from the host process; everything else must be
+granted via sandbox `ExtraEnv` configuration, so host secrets can never leak
+into tool subprocesses implicitly. Inside bubblewrap, `HOME` and `TMPDIR`
+are homed into the writable `/tmp` so toolchain caches work and persist
+across commands.
+
+When the enforcing sandbox runs a command, the textual destructive-command
+classifier is skipped (the OS boundary already contains filesystem damage);
+it remains active as defense in depth for advisory local execution. Git
+policy (protected-branch pushes, per-mode git denylists) applies in all
+cases because the sandbox cannot contain remote-side effects.
+
 ### Subprocess lifecycle
 
 Long-running tools (shell, sandboxed exec, MCP children) run in a dedicated

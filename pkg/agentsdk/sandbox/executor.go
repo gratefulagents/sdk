@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	SandboxModeEnv               = "GRATEFULAGENTS_COMMAND_SANDBOX"
-	SandboxPathEnv               = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH"
-	SandboxPathPrependEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_PREPEND"
-	SandboxPathAppendEnv         = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_APPEND"
+	SandboxModeEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX"
+	SandboxPathEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH"
+	SandboxPathPrependEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_PREPEND"
+	SandboxPathAppendEnv  = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_APPEND"
+	// SandboxExtraReadOnlyPathsEnv is accepted for compatibility but is a
+	// no-op: the sandbox exposes the whole host filesystem read-only.
 	SandboxExtraReadOnlyPathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RO_PATHS"
 	SandboxExtraWritablePathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RW_PATHS"
 	SandboxExtraEnvEnv           = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_ENV"
@@ -37,55 +39,27 @@ const (
 	sandboxModeRequired = "required"
 )
 
-var defaultSandboxPathEntries = []string{
-	"/opt/gratefulagents/bin",
-	"/opt/conda/bin",
-	"/opt/flutter/bin",
-	"/opt/android-sdk/cmdline-tools/latest/bin",
-	"/opt/android-sdk/platform-tools",
-	"/nix/var/nix/profiles/default/bin",
-	"/usr/local/go/bin",
-	"/usr/local/sbin",
-	"/usr/local/bin",
-	"/usr/sbin",
-	"/usr/bin",
-	"/sbin",
-	"/bin",
-	"/tmp/home/.local/bin",
-	"/tmp/npm-global/bin",
-	"/tmp/pnpm",
-	"/tmp/go/bin",
-	"/tmp/cargo/bin",
-	"/tmp/gems/bin",
-	"/tmp/bun/bin",
-	"/tmp/dotnet/tools",
-	"/workspace/.cache/go/bin",
+// inheritedSystemEnvVars lists the only parent-process environment variables
+// that untrusted subprocesses inherit. Everything else must be granted
+// explicitly through Config.ExtraEnv or per-request overrides, so secrets in
+// the host process environment can never leak implicitly. LC_* locale
+// variables are additionally inherited by prefix.
+var inheritedSystemEnvVars = []string{
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"TERM",
+	"COLORTERM",
+	"LANG",
+	"TZ",
+	"TMPDIR",
 }
 
-var defaultSandboxReadOnlyPaths = []string{
-	"/usr",
-	"/bin",
-	"/lib",
-	"/lib64",
-	"/sbin",
-	"/etc",
-	"/opt/gratefulagents",
-	"/opt/conda",
-	"/opt/flutter",
-	"/opt/android-sdk",
-	"/nix",
-}
-
-var deniedSandboxReadOnlyPathPrefixes = []string{
-	"/home",
-	"/root",
-	"/run",
-	"/var/lib",
-	"/var/log",
-	"/var/run",
-	"/var/spool",
-	"/var/tmp",
-}
+// fallbackPathEntries keeps the child usable when the parent PATH is empty
+// and no PATH configuration is supplied.
+var fallbackPathEntries = []string{"/usr/local/bin", "/usr/bin", "/bin"}
 
 // Config controls subprocess sandbox behavior. Hosts should populate this from
 // their own configuration layer before constructing an executor.
@@ -93,13 +67,18 @@ type Config struct {
 	Mode                string
 	RunningInKubernetes bool
 	WorkspaceRoot       string
-	Path                string
-	PathPrepend         []string
-	PathAppend          []string
-	ExtraReadOnlyPaths  []string
-	ExtraWritablePaths  []string
-	ExtraEnv            map[string]string
-	GOROOT              string
+	// Path fully replaces the inherited PATH when set. PathPrepend/PathAppend
+	// adjust the inherited (or configured) PATH instead.
+	Path        string
+	PathPrepend []string
+	PathAppend  []string
+	// ExtraReadOnlyPaths is retained for configuration compatibility but is a
+	// no-op: the sandbox now exposes the entire host filesystem read-only, so
+	// there is nothing extra to mount.
+	ExtraReadOnlyPaths []string
+	ExtraWritablePaths []string
+	ExtraEnv           map[string]string
+	GOROOT             string
 	// AllowUnsafeReadOnlyLocal lets a host explicitly skip the enforcing
 	// subprocess sandbox for read-only requests when Mode is disabled. This is
 	// a compatibility escape hatch, not a security boundary.
@@ -162,6 +141,29 @@ type Executor interface {
 	Run(ctx context.Context, req Request) (Result, error)
 }
 
+// FilesystemEnforcer is optionally implemented by executors that can report
+// whether requests with a given permission mode run under an enforcing OS
+// filesystem sandbox. Tool layers use it to skip textual command heuristics
+// that would double-guard what the OS boundary already contains.
+type FilesystemEnforcer interface {
+	EnforcesFilesystem(mode policy.PermissionMode) bool
+}
+
+// ExecutorEnforcesFilesystem reports whether executor runs commands with the
+// given permission mode under an enforcing OS filesystem sandbox. Executors
+// that do not report enforcement are assumed advisory-only.
+func ExecutorEnforcesFilesystem(executor Executor, mode policy.PermissionMode) bool {
+	enforcer, ok := executor.(FilesystemEnforcer)
+	return ok && enforcer.EnforcesFilesystem(mode)
+}
+
+// DefaultEnforcesFilesystem reports whether the environment-configured default
+// executor runs write-capable commands inside the enforcing subprocess sandbox
+// (true in worker pods, where GRATEFULAGENTS_COMMAND_SANDBOX=required).
+func DefaultEnforcesFilesystem() bool {
+	return defaultExecutor{config: ConfigFromEnv()}.EnforcesFilesystem(policy.PermissionModeWorkspaceWrite)
+}
+
 // Default returns the production command executor with deterministic SDK
 // defaults. Read-only command runs require the subprocess sandbox; local
 // write-capable development falls back to a sanitized process unless
@@ -219,6 +221,25 @@ func (e defaultExecutor) Run(ctx context.Context, req Request) (Result, error) {
 	return runBuiltCommand(ctx, cmd, req.Timeout)
 }
 
+// EnforcesFilesystem mirrors the executor-selection logic in Build: it reports
+// true exactly when a request with the given mode would run under the
+// enforcing bubblewrap sandbox on this platform.
+func (e defaultExecutor) EnforcesFilesystem(mode policy.PermissionMode) bool {
+	config := normalizeConfig(e.config)
+	switch strings.ToLower(strings.TrimSpace(config.Mode)) {
+	case sandboxModeDisabled:
+		return false
+	case sandboxModeRequired:
+		return subprocessSandboxAvailable()
+	default: // auto (or empty)
+		if !subprocessSandboxAvailable() {
+			return false
+		}
+		return config.RunningInKubernetes ||
+			policy.NormalizePermissionMode(string(mode)) == policy.PermissionModeReadOnly
+	}
+}
+
 func normalizeConfig(config Config) Config {
 	config.Mode = strings.TrimSpace(config.Mode)
 	config.WorkspaceRoot = strings.TrimSpace(config.WorkspaceRoot)
@@ -232,6 +253,60 @@ func normalizeConfig(config Config) Config {
 // BubblewrapExecutor fails with a "requires linux" error.
 func subprocessSandboxAvailable() bool {
 	return runtime.GOOS == "linux"
+}
+
+// procfsSupport caches whether bwrap can mount a fresh procfs inside the
+// sandbox namespaces on this host. Container runtimes usually mask parts of
+// /proc, which makes the kernel reject new procfs mounts in a user namespace
+// (EPERM); the mount plan falls back to masking /proc in that case.
+var procfsSupport = struct {
+	mu     sync.Mutex
+	probed bool
+	usable bool
+	probe  func() bool
+}{probe: probeProcfsMount}
+
+func procfsMountUsable() bool {
+	procfsSupport.mu.Lock()
+	defer procfsSupport.mu.Unlock()
+	if !procfsSupport.probed {
+		procfsSupport.usable = procfsSupport.probe()
+		procfsSupport.probed = true
+	}
+	return procfsSupport.usable
+}
+
+// overrideProcfsMountUsable pins the probe result and returns a restore
+// function. Test-only.
+func overrideProcfsMountUsable(usable bool) (restore func()) {
+	procfsSupport.mu.Lock()
+	defer procfsSupport.mu.Unlock()
+	prevProbed, prevUsable := procfsSupport.probed, procfsSupport.usable
+	procfsSupport.probed, procfsSupport.usable = true, usable
+	return func() {
+		procfsSupport.mu.Lock()
+		defer procfsSupport.mu.Unlock()
+		procfsSupport.probed, procfsSupport.usable = prevProbed, prevUsable
+	}
+}
+
+func probeProcfsMount() bool {
+	if !subprocessSandboxAvailable() {
+		return false
+	}
+	resolved, err := exec.LookPath("bwrap")
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, resolved,
+		"--unshare-user", "--unshare-pid",
+		"--ro-bind", "/", "/",
+		"--proc", "/proc",
+		"--dev", "/dev",
+		"true")
+	return cmd.Run() == nil
 }
 
 // envFlag parses a boolean-ish environment value ("1", "true", "yes", "on").
@@ -251,12 +326,14 @@ func envFlag(value string) bool {
 	}
 }
 
-// LocalExecutor is the compatibility fallback. It never inherits the parent
-// environment, but it does not provide a filesystem or /proc boundary, and
-// therefore CANNOT enforce read-only permission modes. It is advisory-only
-// for non-readonly workloads; requests with PermissionMode == ReadOnly are
-// rejected so that callers cannot silently downgrade an enforcement boundary
-// when no real sandbox executor is available.
+// LocalExecutor is the compatibility fallback. Its child environment is the
+// explicit safe environment (inherited system variables plus configured
+// extras — never arbitrary parent variables), but it does not provide a
+// filesystem or /proc boundary, and therefore CANNOT enforce read-only
+// permission modes. It is advisory-only for non-readonly workloads; requests
+// with PermissionMode == ReadOnly are rejected so that callers cannot
+// silently downgrade an enforcement boundary when no real sandbox executor
+// is available.
 type LocalExecutor struct {
 	Config Config
 }
@@ -323,6 +400,12 @@ func (e BubblewrapExecutor) Run(ctx context.Context, req Request) (Result, error
 	return runBuiltCommand(ctx, cmd, req.Timeout)
 }
 
+// EnforcesFilesystem reports whether this executor can actually enforce the
+// filesystem boundary on the current platform.
+func (e BubblewrapExecutor) EnforcesFilesystem(policy.PermissionMode) bool {
+	return subprocessSandboxAvailable()
+}
+
 // BubblewrapArgs returns the bwrap argument vector for tests and diagnostics.
 func BubblewrapArgs(req Request) ([]string, error) {
 	return BubblewrapArgsWithConfig(req, Config{})
@@ -330,6 +413,13 @@ func BubblewrapArgs(req Request) ([]string, error) {
 
 // BubblewrapArgsWithConfig returns the bwrap argument vector using explicit
 // sandbox configuration.
+//
+// Filesystem model (codex-style): the entire host filesystem is visible
+// read-only via `--ro-bind / /`, /proc is either freshly mounted for the new
+// pid namespace or masked when the host forbids procfs mounts (so
+// /proc/<pid>/environ of host processes is unreachable either way), and a
+// minimal /dev is mounted. Writes are enabled only for the workspace root,
+// /tmp, and explicitly configured extra writable paths.
 func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 	if err := validateRequest(req); err != nil {
 		return nil, err
@@ -345,6 +435,7 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		return nil, err
 	}
 	mode := policy.NormalizePermissionMode(string(req.PermissionMode))
+	readOnly := mode == policy.PermissionModeReadOnly
 
 	args := []string{
 		"--die-with-parent",
@@ -357,30 +448,47 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		"--gid", fmt.Sprintf("%d", os.Getgid()),
 		"--clearenv",
 	}
-	for _, pair := range SafeEnvWithConfig(req.Env, config) {
+	for _, pair := range bwrapProcessEnv(req.Env, config) {
 		key, val, _ := strings.Cut(pair, "=")
 		args = append(args, "--setenv", key, val)
 	}
+
+	args = append(args,
+		"--ro-bind", "/", "/",
+	)
+	if procfsMountUsable() {
+		// Fresh pid-namespaced /proc: host process environments are
+		// unreachable and tools that need /proc/self work.
+		args = append(args, "--proc", "/proc")
+	} else {
+		// Container runtimes usually mask parts of /proc, which makes the
+		// kernel reject fresh procfs mounts inside a user namespace. Mask the
+		// recursively-bound host /proc entirely so /proc/<pid>/environ of the
+		// agent process (which holds host secrets) stays unreachable.
+		args = append(args, "--tmpfs", "/proc")
+	}
 	args = append(args,
 		"--dev", "/dev",
-		"--tmpfs", "/tmp",
-		"--dir", "/tmp/home",
-		"--dir", "/proc",
 	)
-
-	for _, path := range sandboxReadOnlyPaths(workspaceRoot, config) {
-		if pathExists(path) {
-			args = append(args, "--ro-bind", path, path)
-		}
+	if readOnly {
+		// Ephemeral scratch: read-only commands get a writable /tmp that
+		// vanishes when the command exits.
+		args = append(args, "--tmpfs", "/tmp")
+	} else {
+		// Real /tmp so caches and tooling installed under HOME=/tmp/home
+		// persist across commands.
+		args = append(args, "--bind", "/tmp", "/tmp")
 	}
-	writablePaths := existingPaths(sandboxWritablePaths(workspaceRoot, config))
-	args = append(args, bindMountPointDirs(writablePaths)...)
-	for _, path := range writablePaths {
+	args = append(args, "--dir", "/tmp/home")
+
+	for _, path := range existingPaths(sandboxWritablePaths(workspaceRoot, config)) {
 		args = append(args, "--bind", path, path)
 	}
 
-	args = append(args, mountPointDirs(workspaceRoot)...)
-	if mode == policy.PermissionModeReadOnly {
+	// The workspace mount is emitted even though `--ro-bind / /` already covers
+	// reads: it re-exposes workspaces that live under /tmp (shadowed by the
+	// mounts above) and enables writes outside read-only mode.
+	if readOnly {
 		args = append(args, "--ro-bind", workspaceRoot, workspaceRoot)
 	} else {
 		args = append(args, "--bind", workspaceRoot, workspaceRoot)
@@ -621,65 +729,6 @@ func resolveExistingPrefix(path string) string {
 	return filepath.Join(resolveExistingPrefix(parent), filepath.Base(clean))
 }
 
-func mountPointDirs(path string) []string {
-	clean := filepath.Clean(path)
-	if clean == string(os.PathSeparator) {
-		return nil
-	}
-	var dirs []string
-	for _, part := range strings.Split(strings.TrimPrefix(clean, string(os.PathSeparator)), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		if len(dirs) == 0 {
-			dirs = append(dirs, string(os.PathSeparator)+part)
-		} else {
-			dirs = append(dirs, filepath.Join(dirs[len(dirs)-1], part))
-		}
-	}
-	args := make([]string, 0, len(dirs)*2)
-	for _, dir := range dirs {
-		args = append(args, "--dir", dir)
-	}
-	return args
-}
-
-func bindMountPointDirs(paths []string) []string {
-	seen := map[string]struct{}{
-		"/tmp": {},
-	}
-	var args []string
-	for _, path := range paths {
-		for _, dir := range mountPointDirPaths(path) {
-			if _, ok := seen[dir]; ok {
-				continue
-			}
-			seen[dir] = struct{}{}
-			args = append(args, "--dir", dir)
-		}
-	}
-	return args
-}
-
-func mountPointDirPaths(path string) []string {
-	clean := filepath.Clean(path)
-	if clean == string(os.PathSeparator) {
-		return nil
-	}
-	var dirs []string
-	for _, part := range strings.Split(strings.TrimPrefix(clean, string(os.PathSeparator)), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		if len(dirs) == 0 {
-			dirs = append(dirs, string(os.PathSeparator)+part)
-		} else {
-			dirs = append(dirs, filepath.Join(dirs[len(dirs)-1], part))
-		}
-	}
-	return dirs
-}
-
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -695,17 +744,6 @@ func existingPaths(paths []string) []string {
 	return out
 }
 
-func sandboxReadOnlyPaths(workspaceRoot string, config Config) []string {
-	paths := make([]string, 0, len(defaultSandboxReadOnlyPaths))
-	for _, path := range defaultSandboxReadOnlyPaths {
-		paths = appendSandboxReadOnlyPath(paths, path, workspaceRoot)
-	}
-	for _, path := range config.ExtraReadOnlyPaths {
-		paths = appendSandboxReadOnlyPath(paths, path, workspaceRoot)
-	}
-	return paths
-}
-
 func sandboxWritablePaths(workspaceRoot string, config Config) []string {
 	var paths []string
 	for _, path := range config.ExtraWritablePaths {
@@ -716,7 +754,13 @@ func sandboxWritablePaths(workspaceRoot string, config Config) []string {
 
 func appendSandboxWritablePath(paths []string, path, workspaceRoot string) []string {
 	clean := cleanAbsolutePath(path)
-	if clean == "" || isForbiddenSandboxWritablePath(clean, workspaceRoot) {
+	if clean == "" {
+		return paths
+	}
+	// Compare and mount symlink-resolved paths so containment checks against
+	// the (resolved) workspace root hold and bind sources are real targets.
+	clean = resolveExistingPrefix(clean)
+	if isForbiddenSandboxWritablePath(clean, workspaceRoot) {
 		return paths
 	}
 	for _, existing := range paths {
@@ -727,47 +771,14 @@ func appendSandboxWritablePath(paths []string, path, workspaceRoot string) []str
 	return append(paths, clean)
 }
 
-func appendSandboxReadOnlyPath(paths []string, path, workspaceRoot string) []string {
-	clean := cleanAbsolutePath(path)
-	if clean == "" || isForbiddenSandboxReadOnlyPath(clean, workspaceRoot) {
-		return paths
-	}
-	for _, existing := range paths {
-		if clean == existing || isPathWithin(clean, existing) {
-			return paths
-		}
-	}
-	return append(paths, clean)
-}
-
-func isForbiddenSandboxReadOnlyPath(path, workspaceRoot string) bool {
-	if path == "" || path == string(os.PathSeparator) || path == "/tmp" || path == "/proc" || path == "/dev" {
-		return true
-	}
-	for _, root := range []string{"/opt", "/var"} {
-		if path == root {
-			return true
-		}
-	}
-	if workspaceRoot != "" && isPathWithin(path, filepath.Clean(workspaceRoot)) {
-		return true
-	}
-	for _, prefix := range deniedSandboxReadOnlyPathPrefixes {
-		if isPathWithin(path, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
+// isForbiddenSandboxWritablePath rejects only paths whose mounts the sandbox
+// manages itself (/, /proc, /dev, /tmp) and paths inside the workspace root,
+// which is governed by the per-request permission mode. Hosts are otherwise
+// free to configure any writable root.
 func isForbiddenSandboxWritablePath(path, workspaceRoot string) bool {
-	if path == "" || path == string(os.PathSeparator) || path == "/tmp" || path == "/proc" || path == "/dev" {
+	switch path {
+	case "", string(os.PathSeparator), "/tmp", "/proc", "/dev", "/sys":
 		return true
-	}
-	for _, root := range []string{"/etc", "/opt", "/usr", "/bin", "/lib", "/lib64", "/sbin", "/nix", "/var", "/home", "/root", "/run", "/boot", "/sys"} {
-		if path == root || isPathWithin(path, root) {
-			return true
-		}
 	}
 	if workspaceRoot != "" && isPathWithin(path, filepath.Clean(workspaceRoot)) {
 		return true
@@ -775,14 +786,20 @@ func isForbiddenSandboxWritablePath(path, workspaceRoot string) bool {
 	return false
 }
 
-func sandboxPath(config Config) string {
+// sandboxPath resolves the child PATH: an explicit Config.Path replaces the
+// inherited value entirely; otherwise the parent PATH is inherited with
+// configured prepends/appends applied.
+func sandboxPath(config Config, inherited string) string {
 	if configured := strings.TrimSpace(config.Path); configured != "" {
 		if path := cleanPathList(configured); path != "" {
 			return path
 		}
 	}
 
-	entries := append([]string(nil), defaultSandboxPathEntries...)
+	entries := splitPathList(inherited)
+	if len(entries) == 0 {
+		entries = append([]string(nil), fallbackPathEntries...)
+	}
 	if prepend := cleanPathEntryList(config.PathPrepend); len(prepend) > 0 {
 		entries = append(prepend, entries...)
 	}
@@ -892,7 +909,12 @@ func SafeEnv(overrides map[string]string) []string {
 // SafeEnvWithConfig returns the only environment passed to untrusted
 // subprocesses, using explicit sandbox configuration.
 func SafeEnvWithConfig(overrides map[string]string, config Config) []string {
-	base := SafeEnvMapWithConfig(config)
+	return flattenSafeEnv(SafeEnvMapWithConfig(config), overrides)
+}
+
+// flattenSafeEnv applies overrides (expanded against the base environment
+// only) and returns a sorted KEY=value slice.
+func flattenSafeEnv(base map[string]string, overrides map[string]string) []string {
 	for key, val := range overrides {
 		k := strings.TrimSpace(key)
 		if !validEnvKey(k) {
@@ -914,74 +936,49 @@ func SafeEnvWithConfig(overrides map[string]string, config Config) []string {
 	return env
 }
 
+// bwrapProcessEnv is the child environment for bubblewrap runs. It starts from
+// the explicit safe environment, then homes HOME and TMPDIR into the writable
+// /tmp: the rest of the filesystem is read-only inside the sandbox, and
+// toolchain caches (~/.cache, ~/go, ~/.npm, ~/.cargo, ...) follow HOME
+// automatically.
+func bwrapProcessEnv(overrides map[string]string, config Config) []string {
+	base := SafeEnvMapWithConfig(config)
+	base["HOME"] = "/tmp/home"
+	base["TMPDIR"] = "/tmp"
+	// Non-interactive process tree: git must fail fast instead of prompting.
+	base["GIT_TERMINAL_PROMPT"] = "0"
+	return flattenSafeEnv(base, overrides)
+}
+
 // SafeEnvMap returns the deterministic base environment for subprocesses.
 func SafeEnvMap() map[string]string {
 	return SafeEnvMapWithConfig(Config{})
 }
 
-// SafeEnvMapWithConfig returns the deterministic base environment for
-// subprocesses using explicit sandbox configuration.
+// SafeEnvMapWithConfig returns the base environment for subprocesses using
+// explicit sandbox configuration: the system variables inherited from the
+// parent process (identity, locale, terminal, PATH) plus explicitly configured
+// extra variables. Nothing else from the parent environment is passed through.
 func SafeEnvMapWithConfig(config Config) map[string]string {
 	config = normalizeConfig(config)
-	env := map[string]string{
-		"PATH":                sandboxPath(config),
-		"HOME":                "/tmp/home",
-		"TMPDIR":              "/tmp",
-		"LANG":                "C.UTF-8",
-		"LC_ALL":              "C.UTF-8",
-		"GIT_TERMINAL_PROMPT": "0",
-		"GIT_CONFIG_GLOBAL":   "/dev/null",
-		"GIT_CONFIG_NOSYSTEM": "1",
-		"XDG_CACHE_HOME":      "/tmp/.cache",
-		"XDG_CONFIG_HOME":     "/tmp/.config",
-		"XDG_DATA_HOME":       "/tmp/.local/share",
-		"XDG_STATE_HOME":      "/tmp/.local/state",
-		"GOPATH":              "/tmp/go",
-		"GOBIN":               "/tmp/go/bin",
-		"GOMODCACHE":          "/tmp/go/pkg/mod",
-		"GOCACHE":             "/tmp/go-build",
-		"GOTOOLCHAIN":         "local",
-		"GO_TELEMETRY_CHILD":  "2",
-		"NPM_CONFIG_CACHE":    "/tmp/npm-cache",
-		"NPM_CONFIG_PREFIX":   "/tmp/npm-global",
-		"PNPM_HOME":           "/tmp/pnpm",
-		"COREPACK_HOME":       "/tmp/corepack",
-		"YARN_CACHE_FOLDER":   "/tmp/yarn-cache",
-		"PIP_CACHE_DIR":       "/tmp/pip-cache",
-		"PIPX_HOME":           "/tmp/pipx",
-		"PIPX_BIN_DIR":        "/tmp/home/.local/bin",
-		"UV_CACHE_DIR":        "/tmp/uv-cache",
-		"CARGO_HOME":          "/tmp/cargo",
-		"RUSTUP_HOME":         "/tmp/rustup",
-		"MIX_HOME":            "/tmp/mix",
-		"HEX_HOME":            "/tmp/hex",
-		"REBAR_CACHE_DIR":     "/tmp/rebar-cache",
-		"GRADLE_USER_HOME":    "/tmp/gradle",
-		"DOTNET_CLI_HOME":     "/tmp/dotnet",
-		"NUGET_PACKAGES":      "/tmp/nuget",
-		"GEM_HOME":            "/tmp/gems",
-		"GEM_PATH":            "/tmp/gems",
-		"BUNDLE_USER_HOME":    "/tmp/bundle-home",
-		"BUNDLE_PATH":         "/tmp/bundle",
-		"COMPOSER_HOME":       "/tmp/composer",
-		"DENO_DIR":            "/tmp/deno",
-		"BUN_INSTALL":         "/tmp/bun",
+	env := make(map[string]string)
+	for _, key := range inheritedSystemEnvVars {
+		if value := os.Getenv(key); strings.TrimSpace(value) != "" {
+			env[key] = value
+		}
 	}
-	if goroot := sandboxGOROOT(config); goroot != "" {
-		env["GOROOT"] = goroot
+	for _, pair := range os.Environ() {
+		key, value, ok := strings.Cut(pair, "=")
+		if ok && strings.HasPrefix(key, "LC_") && validEnvKey(key) {
+			env[key] = value
+		}
+	}
+	env["PATH"] = sandboxPath(config, env["PATH"])
+	if goroot := strings.TrimSpace(config.GOROOT); goroot != "" && filepath.IsAbs(goroot) {
+		env["GOROOT"] = filepath.Clean(goroot)
 	}
 	applySandboxExtraEnv(env, config)
 	return env
-}
-
-func sandboxGOROOT(config Config) string {
-	if configured := strings.TrimSpace(config.GOROOT); configured != "" && filepath.IsAbs(configured) {
-		return filepath.Clean(configured)
-	}
-	if pathExists("/usr/local/go") {
-		return "/usr/local/go"
-	}
-	return ""
 }
 
 func applySandboxExtraEnv(env map[string]string, config Config) {

@@ -294,7 +294,7 @@ func (t *ReadOnlyBashTool) Execute(ctx context.Context, input json.RawMessage, w
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Invalid input: %v", err), IsError: true}, nil
 	}
 
-	if blocked, reason := IsCommandBlockedForMode(policy.PermissionModeReadOnly, in.Command); blocked {
+	if blocked, reason := t.commandBlocked(policy.PermissionModeReadOnly, in.Command); blocked {
 		return agentsdk.ToolResult{Content: reason, IsError: true}, nil
 	}
 	return t.BashTool.execute(ctx, input, workDir, policy.PermissionModeReadOnly)
@@ -319,10 +319,23 @@ func (t *WorkspaceWriteBashTool) Execute(ctx context.Context, input json.RawMess
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Invalid input: %v", err), IsError: true}, nil
 	}
 
-	if blocked, reason := IsCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, in.Command); blocked {
+	if blocked, reason := t.commandBlocked(policy.PermissionModeWorkspaceWrite, in.Command); blocked {
 		return agentsdk.ToolResult{Content: reason, IsError: true}, nil
 	}
 	return t.BashTool.execute(ctx, input, workDir, policy.PermissionModeWorkspaceWrite)
+}
+
+// commandBlocked applies the tool-layer command policy for the given mode.
+// The destructive-command classifier is defense in depth for hosts without an
+// enforcing OS sandbox: when the executor reports filesystem enforcement, the
+// classifier is skipped and only git policy (remote-side effects the sandbox
+// cannot contain) applies.
+func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (bool, string) {
+	executor := t.Executor
+	if executor == nil {
+		executor = sandbox.Default()
+	}
+	return isCommandBlockedForMode(mode, command, sandbox.ExecutorEnforcesFilesystem(executor, mode))
 }
 
 // IsCommandBlockedForMode is the public entry point for the Bash tools'
@@ -331,16 +344,22 @@ func (t *WorkspaceWriteBashTool) Execute(ctx context.Context, input json.RawMess
 // policy, so naive evasions like \rm, "rm", $'\x2drf', ${IFS}, command
 // substitution, and `bash -c "..."` are normalized first.
 //
-// NOTE on policy boundaries: this tool-layer denylist is defense in depth
-// only. The primary read-only enforcement is the bubblewrap subprocess
-// sandbox (see pkg/agentsdk/sandbox). A read-only command running outside the
-// bubblewrap sandbox is a configuration error, not something this guard can
-// safely cover.
+// NOTE on policy boundaries: this tool-layer denylist is defense in depth for
+// hosts running commands without an enforcing OS sandbox. When the bubblewrap
+// subprocess sandbox enforces the filesystem boundary (see
+// pkg/agentsdk/sandbox), the bash tools skip the destructive classifier and
+// apply only git policy, which guards remote-side effects the sandbox cannot
+// contain.
 func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, string) {
+	return isCommandBlockedForMode(mode, command, false)
+}
+
+func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnforced bool) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
 
-	// Universal destructive-command checks (apply when not danger-full-access).
-	if readOnly || workspaceWrite {
+	// Universal destructive-command checks (apply when not danger-full-access
+	// and no OS sandbox enforces the filesystem boundary).
+	if (readOnly || workspaceWrite) && !fsEnforced {
 		// classifyDestructive recurses into command substitutions ($()/backticks),
 		// and the git policy below scans inside them too, so a substitution grants
 		// no capability its inner command would not already have at top level.
