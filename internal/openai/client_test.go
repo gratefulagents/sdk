@@ -558,6 +558,8 @@ func TestNormalizeBaseURL(t *testing.T) {
 		{in: "https://chatgpt.com/backend-api/codex/responses", want: "https://chatgpt.com/backend-api/codex"},
 		{in: "https://api.githubcopilot.com", want: "https://api.githubcopilot.com"},
 		{in: "https://api.githubcopilot.com/chat/completions", want: "https://api.githubcopilot.com"},
+		{in: "https://api.individual.githubcopilot.com", want: "https://api.individual.githubcopilot.com"},
+		{in: "https://api.individual.githubcopilot.com/responses", want: "https://api.individual.githubcopilot.com"},
 	}
 
 	for _, tt := range tests {
@@ -604,6 +606,12 @@ func TestNormalizeCompletionsURL(t *testing.T) {
 			rawBaseURL: "https://api.githubcopilot.com",
 			baseURL:    "https://api.githubcopilot.com",
 			want:       "https://api.githubcopilot.com/chat/completions",
+		},
+		{
+			name:       "individual copilot base appends unversioned chat path",
+			rawBaseURL: "https://api.individual.githubcopilot.com",
+			baseURL:    "https://api.individual.githubcopilot.com",
+			want:       "https://api.individual.githubcopilot.com/chat/completions",
 		},
 	}
 

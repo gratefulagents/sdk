@@ -973,7 +973,8 @@ func normalizeBaseURL(raw string) string {
 }
 
 func isGitHubCopilotHost(host string) bool {
-	return strings.EqualFold(strings.TrimSpace(host), "api.githubcopilot.com")
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == "api.githubcopilot.com" || h == "api.individual.githubcopilot.com"
 }
 
 func normalizeCompletionsURL(rawBaseURL, normalizedBaseURL string) string {

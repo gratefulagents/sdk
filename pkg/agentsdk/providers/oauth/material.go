@@ -19,6 +19,7 @@ const (
 	AnthropicOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
 	AnthropicOAuthScope    = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 	CopilotTokenURL        = "https://api.github.com/copilot_internal/v2/token"
+	CopilotDefaultBaseURL  = "https://api.individual.githubcopilot.com"
 )
 
 type AnthropicAuth struct {
@@ -228,6 +229,34 @@ func CopilotAPIToken(authJSON []byte) (string, error) {
 		return "", fmt.Errorf("copilot oauth material is missing Copilot API token")
 	}
 	return token, nil
+}
+
+// CopilotAPIBaseURLFromToken derives the API host encoded in a Copilot API
+// token. GitHub returns semicolon-delimited metadata such as
+// "proxy-ep=proxy.individual.githubcopilot.com"; Copilot clients convert that
+// proxy host into the API host used for model requests.
+func CopilotAPIBaseURLFromToken(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	for _, part := range strings.Split(trimmed, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "proxy-ep") {
+			continue
+		}
+		host := strings.TrimSpace(value)
+		host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
+		host = strings.Trim(host, "/")
+		if host == "" {
+			return ""
+		}
+		if strings.HasPrefix(strings.ToLower(host), "proxy.") {
+			host = "api." + host[len("proxy."):]
+		}
+		return "https://" + host
+	}
+	return ""
 }
 
 func OpenAINeedsRefresh(authJSON []byte, now time.Time) (bool, error) {

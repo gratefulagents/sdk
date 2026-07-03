@@ -149,6 +149,22 @@ func TestCopilotNeedsRefresh(t *testing.T) {
 	}
 }
 
+func TestCopilotAPIBaseURLFromToken(t *testing.T) {
+	cases := map[string]string{
+		"":           "",
+		"token-only": "",
+		"proxy-ep=proxy.individual.githubcopilot.com":         "https://api.individual.githubcopilot.com",
+		"tid=1; proxy-ep=proxy.individual.githubcopilot.com;": "https://api.individual.githubcopilot.com",
+		"proxy-ep=https://proxy.business.githubcopilot.com":   "https://api.business.githubcopilot.com",
+		"proxy-ep=api.individual.githubcopilot.com":           "https://api.individual.githubcopilot.com",
+	}
+	for token, want := range cases {
+		if got := CopilotAPIBaseURLFromToken(token); got != want {
+			t.Fatalf("CopilotAPIBaseURLFromToken(%q) = %q, want %q", token, got, want)
+		}
+	}
+}
+
 func TestOpenAINeedsRefreshUsesLastRefreshAge(t *testing.T) {
 	now := time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC)
 	old := now.Add(-OpenAIRefreshMaxAge).UTC().Format(time.RFC3339Nano)

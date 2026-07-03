@@ -90,8 +90,8 @@ func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {
 	if got := gotHeaders.Get("X-GitHub-Api-Version"); got != copilotGitHubAPIVersion {
 		t.Fatalf("X-GitHub-Api-Version = %q, want %q", got, copilotGitHubAPIVersion)
 	}
-	if got := gotHeaders.Get("X-Initiator"); got != "agent" {
-		t.Fatalf("X-Initiator = %q, want agent", got)
+	if got := gotHeaders.Get("X-Initiator"); got != "user" {
+		t.Fatalf("X-Initiator = %q, want user", got)
 	}
 	if gotModel != "gpt-4.1" {
 		t.Fatalf("model = %q, want gpt-4.1", gotModel)

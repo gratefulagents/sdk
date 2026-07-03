@@ -8,6 +8,7 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	sdkanthropic "github.com/gratefulagents/sdk/pkg/agentsdk/providers/anthropic"
+	sdkoauth "github.com/gratefulagents/sdk/pkg/agentsdk/providers/oauth"
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 )
 
@@ -78,7 +79,7 @@ var openAICompatibleProviderNames = []string{
 	DefaultProviderLocal,
 }
 
-const defaultCopilotBaseURL = "https://api.githubcopilot.com"
+const defaultCopilotBaseURL = sdkoauth.CopilotDefaultBaseURL
 
 func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	provider := strings.ToLower(strings.TrimSpace(spec.Provider))
@@ -248,7 +249,11 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 
 func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 	apiKey := apiKeyForProvider(spec, DefaultProviderCopilot)
-	baseURL := firstNonEmpty(baseURLForProvider(spec, DefaultProviderCopilot), defaultCopilotBaseURL)
+	configuredBaseURL := baseURLForProvider(spec, DefaultProviderCopilot)
+	baseURL := configuredBaseURL
+	if baseURL == "" || isDefaultCopilotBaseURL(baseURL) {
+		baseURL = firstNonEmpty(sdkoauth.CopilotAPIBaseURLFromToken(apiKey), baseURL, defaultCopilotBaseURL)
+	}
 	openAIHeaders := func(context.Context) (map[string]string, error) {
 		token := strings.TrimSpace(apiKey)
 		if token == "" {
@@ -267,44 +272,40 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		SDKAPIKey:      "copilot-placeholder",
 		RequestHeaders: openAIHeaders,
 	})
-	openAIProvider := sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
+	chatProvider := sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
 		ProviderName: DefaultProviderCopilot,
 		BaseURL:      baseURL,
 		AuthMode:     sdkopenai.AuthModeAPIKey,
-		APIMode:      apiModeForProvider(spec, DefaultProviderCopilot, "chat-completions"),
+		APIMode:      "chat-completions",
 		AuthSession:  session,
 	})
-	// Claude models on Copilot default to the chat-completions path. It is the
-	// only Copilot endpoint that returns plaintext reasoning (message.reasoning_text
-	// + reasoning_opaque); the Anthropic /v1/messages shim returns signature-only
-	// thinking even with the interleaved-thinking beta. The chat path derives
-	// stop_reason from actual tool calls, so the narration-turn tool_calls quirk
-	// that previously forced /v1/messages no longer corrupts the agent loop.
-	//
-	// Set GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES=1 to route Claude back through
-	// the Anthropic Messages shim (native tool_use semantics, but no visible
-	// reasoning).
-	if !copilotClaudeViaMessages() {
-		return openAIProvider
+	if copilotForceChatCompletions() {
+		return chatProvider
 	}
-	anthropicProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
+	responsesProvider := sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
+		ProviderName: DefaultProviderCopilot,
+		BaseURL:      baseURL,
+		AuthMode:     sdkopenai.AuthModeAPIKey,
+		APIMode:      "responses",
+		AuthSession:  session,
+	})
+	messagesProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
 		BaseURL:          copilotAnthropicBaseURL(baseURL),
 		BearerToken:      strings.TrimSpace(apiKey),
 		RequestHeaders:   anthropicHeaders,
 		AdaptiveThinking: true,
 	})
-	return &copilotProvider{
-		openai:    openAIProvider,
-		anthropic: anthropicProvider,
+	return &copilotRoutingProvider{
+		chat:      chatProvider,
+		responses: responsesProvider,
+		messages:  messagesProvider,
 	}
 }
 
-// copilotClaudeViaMessages reports whether Claude models on Copilot should be
-// routed through the Anthropic /v1/messages shim instead of the default
-// chat-completions path, via GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES
-// (1/true/yes/on). The default chat path is required for visible reasoning.
-func copilotClaudeViaMessages() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GRATEFULAGENTS_COPILOT_CLAUDE_VIA_MESSAGES"))) {
+// copilotForceChatCompletions restores the previous Copilot routing path for
+// debugging or rollback.
+func copilotForceChatCompletions() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GRATEFULAGENTS_COPILOT_CHAT_COMPLETIONS"))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
@@ -312,44 +313,99 @@ func copilotClaudeViaMessages() bool {
 	}
 }
 
-// copilotProvider routes Claude models to the Anthropic Messages API and all
-// other models to the OpenAI chat-completions API, both backed by GitHub
-// Copilot.
-type copilotProvider struct {
-	openai    agentsdk.ModelProvider
-	anthropic agentsdk.ModelProvider
+// copilotRoutingProvider mirrors Copilot clients that choose the wire protocol
+// from /models supported_endpoints: messages first, then responses, then chat.
+// The SDK does not fetch /models in the hot path, so it uses the same fallback
+// heuristic used by several clients when metadata is unavailable.
+type copilotRoutingProvider struct {
+	chat      agentsdk.ModelProvider
+	responses agentsdk.ModelProvider
+	messages  agentsdk.ModelProvider
 }
 
-func (p *copilotProvider) GetModel(name string) (agentsdk.Model, error) {
-	if isClaudeModelName(name) {
-		return p.anthropic.GetModel(name)
+func (p *copilotRoutingProvider) GetModel(name string) (agentsdk.Model, error) {
+	if p == nil {
+		return nil, fmt.Errorf("Copilot provider is not configured")
 	}
-	return p.openai.GetModel(name)
+	normalized := normalizeCopilotModelName(name)
+	var provider agentsdk.ModelProvider
+	switch {
+	case copilotModelUsesMessages(normalized):
+		provider = p.messages
+	case copilotModelUsesResponses(normalized):
+		provider = p.responses
+	default:
+		provider = p.chat
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("Copilot provider is not configured")
+	}
+	model, err := provider.GetModel(normalized)
+	if err != nil {
+		return nil, err
+	}
+	return &copilotModel{Model: model}, nil
 }
 
-func (p *copilotProvider) Close() error {
+func (p *copilotRoutingProvider) Close() error {
+	if p == nil {
+		return nil
+	}
 	var err error
-	if p.anthropic != nil {
-		if cerr := p.anthropic.Close(); cerr != nil {
-			err = cerr
+	for _, provider := range []agentsdk.ModelProvider{p.chat, p.responses, p.messages} {
+		if provider == nil {
+			continue
 		}
-	}
-	if p.openai != nil {
-		if cerr := p.openai.Close(); cerr != nil && err == nil {
-			err = cerr
+		if closeErr := provider.Close(); closeErr != nil && err == nil {
+			err = closeErr
 		}
 	}
 	return err
 }
 
-// isClaudeModelName reports whether a model identifier names a Claude model,
-// ignoring any "provider/" routing prefix (e.g. "copilot/claude-sonnet-4.5").
-func isClaudeModelName(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
+type copilotModel struct {
+	agentsdk.Model
+}
+
+func (m *copilotModel) GetResponse(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.ModelResponse, error) {
+	req.Model = normalizeCopilotModelName(req.Model)
+	return m.Model.GetResponse(ctx, req)
+}
+
+func (m *copilotModel) StreamResponse(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.ModelStream, error) {
+	req.Model = normalizeCopilotModelName(req.Model)
+	return m.Model.StreamResponse(ctx, req)
+}
+
+func (m *copilotModel) Provider() string {
+	return DefaultProviderCopilot
+}
+
+func normalizeCopilotModelName(name string) string {
+	if prefix, bare := agentsdk.ParseModelPrefix(name); strings.EqualFold(strings.TrimSpace(prefix), DefaultProviderCopilot) {
+		return strings.TrimSpace(bare)
 	}
-	return strings.HasPrefix(name, "claude")
+	return strings.TrimSpace(name)
+}
+
+func isDefaultCopilotBaseURL(baseURL string) bool {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	switch strings.ToLower(trimmed) {
+	case "https://api.githubcopilot.com", "https://api.individual.githubcopilot.com":
+		return true
+	default:
+		return false
+	}
+}
+
+func copilotModelUsesMessages(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(normalized, "claude-")
+}
+
+func copilotModelUsesResponses(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(normalized, "gpt-5") || strings.Contains(normalized, "codex")
 }
 
 // copilotAnthropicBaseURL derives the host root for Copilot's Anthropic
@@ -368,8 +424,8 @@ func copilotAnthropicBaseURL(baseURL string) string {
 // the copilot-api proxy so the gateway treats requests like the VS Code Copilot
 // Chat client.
 const (
-	copilotChatVersion      = "0.26.7"
-	copilotEditorVersion    = "vscode/1.99.3"
+	copilotChatVersion      = "0.35.0"
+	copilotEditorVersion    = "vscode/1.107.0"
 	copilotGitHubAPIVersion = "2026-06-01"
 	// copilotAnthropicBeta is the beta opencode enables for Claude models on
 	// Copilot's /v1/messages shim.
@@ -388,7 +444,7 @@ func copilotRequestHeaders(token string, forAnthropic bool) map[string]string {
 		"User-Agent":             "GitHubCopilotChat/" + copilotChatVersion,
 		"Openai-Intent":          "conversation-edits",
 		"X-GitHub-Api-Version":   copilotGitHubAPIVersion,
-		"X-Initiator":            "agent",
+		"X-Initiator":            "user",
 	}
 	if forAnthropic {
 		headers["anthropic-beta"] = copilotAnthropicBeta
