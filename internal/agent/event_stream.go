@@ -434,11 +434,15 @@ func subagentTaskContentEvent(task SubAgentTask, message string) ContentEvent {
 		message = string(task.Status)
 	}
 	ev := ContentEvent{
-		Type:                      "subagent_status",
-		TaskID:                    task.ID,
-		Status:                    string(task.Status),
-		Message:                   message,
-		AgentName:                 task.AgentName,
+		Type:      "subagent_status",
+		TaskID:    task.ID,
+		Status:    string(task.Status),
+		Message:   message,
+		AgentName: task.AgentName,
+		// The task's objective rides on every snapshot so UIs can title nodes
+		// with what the agent was asked to do rather than lifecycle noise
+		// ("spawned", "dependency_wait", ...).
+		SubagentPrompt:            Truncate(task.Message, 4096),
 		SubagentType:              task.AgentName,
 		SubagentDependsOn:         append([]string(nil), task.DependsOn...),
 		SubagentWaitingOn:         append([]string(nil), task.WaitingOn...),
