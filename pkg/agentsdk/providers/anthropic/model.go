@@ -19,6 +19,8 @@ type AnthropicProvider struct {
 	bearerToken      string
 	requestHeaders   func(context.Context) (map[string]string, error)
 	adaptiveThinking bool
+	promptCaching    bool
+	defaultMaxTokens int
 }
 
 type ProviderConfig struct {
@@ -37,6 +39,15 @@ type ProviderConfig struct {
 	// thinking-budget. Required by GitHub Copilot's /v1/messages shim for newer
 	// Claude models, which reject thinking.type=enabled.
 	AdaptiveThinking bool
+	// PromptCaching enables Anthropic prompt-cache breakpoints: the tool
+	// prefix, system prompt, and the last two conversation positions are
+	// marked ephemeral so replayed agent context bills at the cache-read rate
+	// (0.1x input) instead of full price.
+	PromptCaching bool
+	// DefaultMaxTokens overrides the built-in 16384 default for requests that
+	// do not set Settings.MaxTokens (e.g. 64000 on Copilot's shim, which caps
+	// rather than rejects oversized values).
+	DefaultMaxTokens int
 }
 
 // NewAnthropicProvider creates a provider that must be configured with an API
@@ -53,6 +64,8 @@ func NewAnthropicProviderWithConfig(cfg ProviderConfig) *AnthropicProvider {
 		bearerToken:      strings.TrimSpace(cfg.BearerToken),
 		requestHeaders:   cfg.RequestHeaders,
 		adaptiveThinking: cfg.AdaptiveThinking,
+		promptCaching:    cfg.PromptCaching,
+		defaultMaxTokens: cfg.DefaultMaxTokens,
 	}
 }
 
@@ -70,6 +83,8 @@ func (p *AnthropicProvider) GetModel(name string) (agentsdk.Model, error) {
 	}
 	m.model = name
 	m.adaptiveThinking = p.adaptiveThinking
+	m.promptCaching = p.promptCaching
+	m.defaultMaxTokens = p.defaultMaxTokens
 	return m, nil
 }
 
@@ -80,6 +95,8 @@ type AnthropicModel struct {
 	client           *internalanthropic.Client
 	model            string
 	adaptiveThinking bool
+	promptCaching    bool
+	defaultMaxTokens int
 }
 
 type anthropicModelConfig struct {
@@ -203,6 +220,8 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 
 	if req.Settings.MaxTokens > 0 {
 		apiReq.MaxTokens = req.Settings.MaxTokens
+	} else if m.defaultMaxTokens > 0 {
+		apiReq.MaxTokens = m.defaultMaxTokens
 	} else {
 		apiReq.MaxTokens = 16384
 	}
@@ -238,7 +257,48 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 	// Convert input items to messages.
 	apiReq.Messages = itemsToAnthropicMessages(req.Input)
 
+	if m.promptCaching {
+		applyPromptCacheBreakpoints(&apiReq)
+	}
+
 	return apiReq
+}
+
+// applyPromptCacheBreakpoints marks the standard agent-loop cache boundaries
+// with ephemeral cache_control (Anthropic allows at most 4 breakpoints):
+// the last tool definition (caches the whole tool prefix), the last system
+// block, and the last cacheable content block of the final two messages —
+// a sliding window where the previous turn's write becomes this turn's read.
+// Blocks below the provider's minimum cacheable size are ignored server-side,
+// so unconditionally marking these boundaries is safe.
+func applyPromptCacheBreakpoints(apiReq *internalanthropic.CreateMessageRequest) {
+	ephemeral := &internalanthropic.CacheControl{Type: "ephemeral"}
+	if n := len(apiReq.Tools); n > 0 {
+		apiReq.Tools[n-1].CacheControl = ephemeral
+	}
+	if n := len(apiReq.System); n > 0 {
+		apiReq.System[n-1].CacheControl = ephemeral
+	}
+	marked := 0
+	for i := len(apiReq.Messages) - 1; i >= 0 && marked < 2; i-- {
+		if markLastCacheableBlock(apiReq.Messages[i].Content, ephemeral) {
+			marked++
+		}
+	}
+}
+
+// markLastCacheableBlock sets cache_control on the last block of a message
+// that accepts it. Thinking, redacted_thinking, and compaction blocks cannot
+// carry cache_control.
+func markLastCacheableBlock(blocks []internalanthropic.ContentBlock, cc *internalanthropic.CacheControl) bool {
+	for i := len(blocks) - 1; i >= 0; i-- {
+		switch blocks[i].Type {
+		case "text", "tool_result", "tool_use", "image", "document":
+			blocks[i].CacheControl = cc
+			return true
+		}
+	}
+	return false
 }
 
 // mapReasoningEffortToAnthropic maps a host reasoning-effort label to a Messages
@@ -284,6 +344,10 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 				}
 				for _, img := range item.Message.Images {
 					if img.Data == "" {
+						continue
+					}
+					if strings.EqualFold(strings.TrimSpace(img.MediaType), "application/pdf") {
+						blocks = append(blocks, internalanthropic.NewDocumentBlock(img.MediaType, img.Data))
 						continue
 					}
 					blocks = append(blocks, internalanthropic.NewImageBlock(img.MediaType, img.Data))

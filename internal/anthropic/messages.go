@@ -132,6 +132,7 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 					Properties: props["properties"],
 					Required:   required,
 				},
+				CacheControl: toolCacheControl(tool.CacheControl),
 			},
 		})
 	}
@@ -181,6 +182,14 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 	return params, nil
 }
 
+// toolCacheControl converts an optional cache-control marker to the SDK param.
+func toolCacheControl(cc *CacheControl) sdk.BetaCacheControlEphemeralParam {
+	if cc == nil {
+		return sdk.BetaCacheControlEphemeralParam{}
+	}
+	return sdk.BetaCacheControlEphemeralParam{Type: "ephemeral"}
+}
+
 // toSDKContentBlock converts our ContentBlock to SDK's BetaContentBlockParamUnion.
 func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 	switch block.Type {
@@ -216,6 +225,9 @@ func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 				{OfText: &sdk.BetaTextBlockParam{Text: block.Content}},
 			}
 		}
+		if block.CacheControl != nil {
+			result.CacheControl = sdk.BetaCacheControlEphemeralParam{Type: "ephemeral"}
+		}
 		return sdk.BetaContentBlockParamUnion{OfToolResult: result}
 	case "thinking":
 		return sdk.BetaContentBlockParamUnion{
@@ -234,16 +246,31 @@ func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 		if block.Source == nil {
 			return sdk.BetaContentBlockParamUnion{OfText: &sdk.BetaTextBlockParam{Text: ""}}
 		}
-		return sdk.BetaContentBlockParamUnion{
-			OfImage: &sdk.BetaImageBlockParam{
-				Source: sdk.BetaImageBlockParamSourceUnion{
-					OfBase64: &sdk.BetaBase64ImageSourceParam{
-						Data:      block.Source.Data,
-						MediaType: sdk.BetaBase64ImageSourceMediaType(block.Source.MediaType),
-					},
+		img := &sdk.BetaImageBlockParam{
+			Source: sdk.BetaImageBlockParamSourceUnion{
+				OfBase64: &sdk.BetaBase64ImageSourceParam{
+					Data:      block.Source.Data,
+					MediaType: sdk.BetaBase64ImageSourceMediaType(block.Source.MediaType),
 				},
 			},
 		}
+		if block.CacheControl != nil {
+			img.CacheControl = sdk.BetaCacheControlEphemeralParam{Type: "ephemeral"}
+		}
+		return sdk.BetaContentBlockParamUnion{OfImage: img}
+	case "document":
+		if block.Source == nil {
+			return sdk.BetaContentBlockParamUnion{OfText: &sdk.BetaTextBlockParam{Text: ""}}
+		}
+		doc := &sdk.BetaRequestDocumentBlockParam{
+			Source: sdk.BetaRequestDocumentBlockSourceUnionParam{
+				OfBase64: &sdk.BetaBase64PDFSourceParam{Data: block.Source.Data},
+			},
+		}
+		if block.CacheControl != nil {
+			doc.CacheControl = sdk.BetaCacheControlEphemeralParam{Type: "ephemeral"}
+		}
+		return sdk.BetaContentBlockParamUnion{OfDocument: doc}
 	case "compaction":
 		// Round-trip server compaction blocks verbatim. Content carries the
 		// summary; the API requires null (not "") when no summary is present.

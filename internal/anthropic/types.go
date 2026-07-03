@@ -91,6 +91,12 @@ func NewImageBlock(mediaType, base64Data string) ContentBlock {
 	return ContentBlock{Type: "image", Source: &ImageSource{Type: "base64", MediaType: mediaType, Data: base64Data}}
 }
 
+// NewDocumentBlock creates a document content block (e.g. application/pdf)
+// from base64-encoded data.
+func NewDocumentBlock(mediaType, base64Data string) ContentBlock {
+	return ContentBlock{Type: "document", Source: &ImageSource{Type: "base64", MediaType: mediaType, Data: base64Data}}
+}
+
 // CacheControl for prompt caching.
 type CacheControl struct {
 	Type string `json:"type"` // "ephemeral"
@@ -109,6 +115,9 @@ type ToolDefinition struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	// CacheControl marks a prompt-cache breakpoint after this tool. Set on the
+	// last tool so the whole tool prefix is cached.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // SystemBlock for system prompt segments.

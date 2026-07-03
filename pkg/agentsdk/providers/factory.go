@@ -99,9 +99,10 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 		return newOpenAIProviderFromSpec(spec)
 	case DefaultProviderAnthropic:
 		return sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-			BaseURL:  baseURLForProvider(spec, DefaultProviderAnthropic),
-			APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
-			AuthMode: authModeForAnthropicProvider(spec),
+			BaseURL:       baseURLForProvider(spec, DefaultProviderAnthropic),
+			APIKey:        apiKeyForProvider(spec, DefaultProviderAnthropic),
+			AuthMode:      authModeForAnthropicProvider(spec),
+			PromptCaching: true,
 		}), nil
 	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderLocal:
 		return newOpenAICompatibleProviderFromSpec(provider, spec), nil
@@ -167,9 +168,10 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 	}
 	mp.Register(DefaultProviderOpenAI, openAIProvider)
 	mp.Register(DefaultProviderAnthropic, sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-		BaseURL:  baseURLForProvider(spec, DefaultProviderAnthropic),
-		APIKey:   apiKeyForProvider(spec, DefaultProviderAnthropic),
-		AuthMode: authModeForAnthropicProvider(spec),
+		BaseURL:       baseURLForProvider(spec, DefaultProviderAnthropic),
+		APIKey:        apiKeyForProvider(spec, DefaultProviderAnthropic),
+		AuthMode:      authModeForAnthropicProvider(spec),
+		PromptCaching: true,
 	}))
 	for _, provider := range openAICompatibleProviderNames {
 		mp.Register(provider, newOpenAICompatibleProviderFromSpec(provider, spec))
@@ -294,6 +296,12 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		BearerToken:      strings.TrimSpace(apiKey),
 		RequestHeaders:   anthropicHeaders,
 		AdaptiveThinking: true,
+		// Verified against the Copilot /v1/messages shim: cache_control
+		// breakpoints bill cache reads at 0.1x, and oversized max_tokens is
+		// capped (not rejected), so the 64000 streaming ceiling from /models
+		// is a safe default for every Claude model it serves.
+		PromptCaching:    true,
+		DefaultMaxTokens: 64000,
 	})
 	return &copilotRoutingProvider{
 		chat:      chatProvider,
