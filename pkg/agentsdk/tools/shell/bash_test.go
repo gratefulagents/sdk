@@ -65,6 +65,71 @@ func TestCommandBlockedForModeHandlesGitPushSpacing(t *testing.T) {
 	}
 }
 
+func TestCommandBlockedForModeBlocksGHCLI(t *testing.T) {
+	t.Parallel()
+
+	blockedCommands := []string{
+		"gh pr merge 5 --squash",
+		"gh api repos/acme/repo/pulls",
+		"bash -c 'gh pr create --fill'",
+		"/usr/local/bin/gh auth token",
+		"echo body | gh issue create --title t --body-file -",
+		"wc -l $(gh pr list)",
+		"eval gh pr view 7",
+		// Wrappers whose options take operands must not hide the gh head.
+		"env -u GITHUB_TOKEN gh pr merge 5",
+		"env FOO=bar --unset GH_TOKEN gh pr view 7",
+		"env -S 'gh pr list'",
+		"sudo -u deploy gh pr merge 5",
+		"nice -n 10 gh api /user",
+		"timeout 30 gh pr checks 5",
+	}
+	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
+		for _, cmd := range blockedCommands {
+			blocked, reason := IsCommandBlockedForMode(mode, cmd)
+			if !blocked || !strings.Contains(reason, "gh CLI is not allowed") {
+				t.Fatalf("IsCommandBlockedForMode(%v, %q) = %v, %q; want gh CLI block", mode, cmd, blocked, reason)
+			}
+		}
+	}
+
+	for _, cmd := range []string{
+		"echo gh",             // gh as argument, not an invocation
+		"ghost --version",     // different binary
+		"grep -rn gh_token .", // substring only
+		"git status",
+		"env -u GITHUB_TOKEN ls", // wrapper hiding a benign command
+		"timeout 30 make test",
+	} {
+		if blocked, reason := IsCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, cmd); blocked {
+			t.Fatalf("IsCommandBlockedForMode(workspace-write, %q) blocked: %q", cmd, reason)
+		}
+	}
+
+	// The same operand-aware wrapper stripping must keep protecting git
+	// policy: env/sudo/nice must not hide a protected-branch push.
+	for _, cmd := range []string{
+		"env -u GIT_ASKPASS git push origin main",
+		"sudo -u deploy git push origin HEAD:master",
+		"nice -n 5 git push origin main",
+	} {
+		blocked, reason := IsCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, cmd)
+		if !blocked || !strings.Contains(reason, "main/master") {
+			t.Fatalf("IsCommandBlockedForMode(workspace-write, %q) = %v, %q; want protected-branch block", cmd, blocked, reason)
+		}
+	}
+
+	// gh side effects are remote, so the policy applies even when an
+	// enforcing OS sandbox skips the destructive-command classifier.
+	if blocked, _ := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "gh pr merge 5", true); !blocked {
+		t.Fatal("gh policy must apply even under an enforcing sandbox")
+	}
+	// Unrestricted mode keeps raw gh available.
+	if blocked, reason := IsCommandBlockedForMode(policy.PermissionModeDangerFullAccess, "gh pr view 5"); blocked {
+		t.Fatalf("gh blocked in danger-full-access mode: %q", reason)
+	}
+}
+
 func TestCommandBlockedForModeHandlesRootRemoveVariants(t *testing.T) {
 	t.Parallel()
 

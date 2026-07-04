@@ -128,6 +128,9 @@ func (t *CreatePullRequestTool) Execute(ctx context.Context, input json.RawMessa
 	}
 
 	runner := t.runner()
+	if err := GuardBranchForPush(ctx, runner, repoDir, in.BaseBranch); err != nil {
+		return prError(err.Error())
+	}
 	statusOut, err := runner.RunGit(ctx, repoDir, "status", "--porcelain")
 	if err == nil && strings.TrimSpace(statusOut) != "" {
 		if _, err := runner.RunGit(ctx, repoDir, "add", "-A"); err != nil {
@@ -201,6 +204,47 @@ func (t *CreatePullRequestTool) recordPR(ctx context.Context, url string) {
 	if err := t.Sink.RecordPullRequestURL(ctx, url); err != nil {
 		log.Printf("WARN: failed to record pull request URL: %v", err)
 	}
+}
+
+// GuardBranchForPush refuses to push from a branch that must never receive
+// direct pushes: the repository default branch (resolved from
+// refs/remotes/origin/HEAD when available), main, master, a detached HEAD, or
+// a branch equal to the requested PR base. Hosts can reuse it to guard their
+// own push paths. A nil error means the current branch is a pushable work
+// branch.
+func GuardBranchForPush(ctx context.Context, runner CommandRunner, repoDir, baseBranch string) error {
+	out, err := runner.RunGit(ctx, repoDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fmt.Errorf("refusing to push: could not determine the current branch: %v\n%s", err, out)
+	}
+	branch := strings.TrimSpace(out)
+	if branch == "" {
+		return fmt.Errorf("refusing to push: could not determine the current branch")
+	}
+	if branch == "HEAD" {
+		return fmt.Errorf("refusing to push from a detached HEAD; create a work branch first (git checkout -b <branch>)")
+	}
+	if branch == "main" || branch == "master" {
+		return fmt.Errorf("refusing to push protected branch %q; create a work branch first (git checkout -b <branch>) and open the pull request from it", branch)
+	}
+	if def := remoteDefaultBranch(ctx, runner, repoDir); def != "" && branch == def {
+		return fmt.Errorf("refusing to push default branch %q; create a work branch first (git checkout -b <branch>) and open the pull request from it", branch)
+	}
+	if base := strings.TrimSpace(baseBranch); base != "" && base == branch {
+		return fmt.Errorf("current branch %q is the same as base_branch; create a work branch first (git checkout -b <branch>)", branch)
+	}
+	return nil
+}
+
+// remoteDefaultBranch resolves origin's default branch (e.g. "main") from
+// refs/remotes/origin/HEAD. Returns "" when it cannot be determined, e.g. in
+// clones where origin/HEAD was never set.
+func remoteDefaultBranch(ctx context.Context, runner CommandRunner, repoDir string) string {
+	out, err := runner.RunGit(ctx, repoDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSpace(out), "origin/")
 }
 
 func ghPRViewURL(ctx context.Context, runner CommandRunner, workDir string) (string, error) {

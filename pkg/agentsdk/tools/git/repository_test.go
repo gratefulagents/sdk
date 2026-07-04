@@ -271,7 +271,8 @@ func TestCreatePullRequestToolUsesRepoPath(t *testing.T) {
 	repoDir := requireRepoPathTestRepo(t, workDir, "repos/helm")
 	runner := &fakeRunner{
 		gitOut: map[string]string{
-			"status --porcelain": "",
+			"rev-parse --abbrev-ref HEAD": "agent/work\n",
+			"status --porcelain":          "",
 		},
 		ghOut: map[string]string{
 			"pr create --fill":           "https://github.com/acme/helm/pull/9\n",
@@ -286,8 +287,9 @@ func TestCreatePullRequestToolUsesRepoPath(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("Execute() returned error result: %s", result.Content)
 	}
-	if !reflect.DeepEqual(runner.gitDirs, []string{repoDir, repoDir}) {
-		t.Fatalf("git dirs = %#v, want %#v", runner.gitDirs, []string{repoDir, repoDir})
+	wantDirs := []string{repoDir, repoDir, repoDir, repoDir}
+	if !reflect.DeepEqual(runner.gitDirs, wantDirs) {
+		t.Fatalf("git dirs = %#v, want %#v", runner.gitDirs, wantDirs)
 	}
 	if !reflect.DeepEqual(runner.ghDirs, []string{repoDir, repoDir}) {
 		t.Fatalf("gh dirs = %#v, want %#v", runner.ghDirs, []string{repoDir, repoDir})

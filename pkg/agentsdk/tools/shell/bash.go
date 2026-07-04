@@ -387,6 +387,17 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 		}
 	}
 
+	// GitHub CLI policy: restricted modes may not shell out to gh at all.
+	// GitHub side effects (pushes, PRs, reviews, issues) must go through the
+	// built-in GitHub tools, which enforce guardrails — protected-branch push
+	// refusal, artifact recording, required commit trailers — that raw gh
+	// invocations would bypass.
+	if readOnly || workspaceWrite {
+		if len(ghInvocations(command)) > 0 {
+			return true, fmt.Sprintf("Command blocked in %s mode: the gh CLI is not allowed; use the built-in GitHub tools (create_pull_request, get_pull_request, list_review_threads, submit_pull_request_review, create_github_issue, ...) instead", mode)
+		}
+	}
+
 	return false, ""
 }
 

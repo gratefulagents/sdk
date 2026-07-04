@@ -12,7 +12,8 @@ import (
 func TestCreatePullRequestToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 	runner := &fakeRunner{
 		gitOut: map[string]string{
-			"status --porcelain": " M changed.go\n?? new.go\n",
+			"rev-parse --abbrev-ref HEAD": "agent/work\n",
+			"status --porcelain":          " M changed.go\n?? new.go\n",
 		},
 		ghOut: map[string]string{
 			"pr create --title Add feature --body  --base main --draft": "",
@@ -37,7 +38,14 @@ func TestCreatePullRequestToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 	if sink.prURL != "https://github.com/acme/repo/pull/7" {
 		t.Fatalf("recorded PR URL = %q", sink.prURL)
 	}
-	wantGit := []string{"status --porcelain", "add -A", "commit --no-verify -m Add feature", "push --no-verify -u origin HEAD"}
+	wantGit := []string{
+		"rev-parse --abbrev-ref HEAD",
+		"symbolic-ref --short refs/remotes/origin/HEAD",
+		"status --porcelain",
+		"add -A",
+		"commit --no-verify -m Add feature",
+		"push --no-verify -u origin HEAD",
+	}
 	if !reflect.DeepEqual(runner.gitCalls, wantGit) {
 		t.Fatalf("git calls = %#v, want %#v", runner.gitCalls, wantGit)
 	}
@@ -49,7 +57,8 @@ func TestCreatePullRequestToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 func TestCreatePullRequestToolCommitsUntrackedOnlyChanges(t *testing.T) {
 	runner := &fakeRunner{
 		gitOut: map[string]string{
-			"status --porcelain": "?? new.go\n",
+			"rev-parse --abbrev-ref HEAD": "agent/work\n",
+			"status --porcelain":          "?? new.go\n",
 		},
 		ghOut: map[string]string{
 			"pr create --fill":           "https://github.com/acme/repo/pull/9\n",
@@ -64,7 +73,14 @@ func TestCreatePullRequestToolCommitsUntrackedOnlyChanges(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("Execute() returned error result: %s", result.Content)
 	}
-	wantGit := []string{"status --porcelain", "add -A", "commit --no-verify -m changes from agent run", "push --no-verify -u origin HEAD"}
+	wantGit := []string{
+		"rev-parse --abbrev-ref HEAD",
+		"symbolic-ref --short refs/remotes/origin/HEAD",
+		"status --porcelain",
+		"add -A",
+		"commit --no-verify -m changes from agent run",
+		"push --no-verify -u origin HEAD",
+	}
 	if !reflect.DeepEqual(runner.gitCalls, wantGit) {
 		t.Fatalf("git calls = %#v, want %#v", runner.gitCalls, wantGit)
 	}
@@ -72,6 +88,9 @@ func TestCreatePullRequestToolCommitsUntrackedOnlyChanges(t *testing.T) {
 
 func TestCreatePullRequestToolUsesExistingPRWhenCreateFails(t *testing.T) {
 	runner := &fakeRunner{
+		gitOut: map[string]string{
+			"rev-parse --abbrev-ref HEAD": "agent/work\n",
+		},
 		ghOut: map[string]string{
 			"pr view --json url -q .url": "https://github.com/acme/repo/pull/8\n",
 		},
@@ -91,6 +110,78 @@ func TestCreatePullRequestToolUsesExistingPRWhenCreateFails(t *testing.T) {
 	}
 	if sink.prURL != "https://github.com/acme/repo/pull/8" {
 		t.Fatalf("recorded PR URL = %q", sink.prURL)
+	}
+}
+
+func TestCreatePullRequestToolRefusesProtectedAndUnknownBranches(t *testing.T) {
+	cases := []struct {
+		name    string
+		gitOut  map[string]string
+		gitErr  map[string]error
+		input   map[string]any
+		wantMsg string
+	}{
+		{
+			name:    "main is refused",
+			gitOut:  map[string]string{"rev-parse --abbrev-ref HEAD": "main\n"},
+			wantMsg: "refusing to push protected branch",
+		},
+		{
+			name:    "master is refused",
+			gitOut:  map[string]string{"rev-parse --abbrev-ref HEAD": "master\n"},
+			wantMsg: "refusing to push protected branch",
+		},
+		{
+			name: "remote default branch is refused",
+			gitOut: map[string]string{
+				"rev-parse --abbrev-ref HEAD":                   "develop\n",
+				"symbolic-ref --short refs/remotes/origin/HEAD": "origin/develop\n",
+			},
+			wantMsg: "refusing to push default branch",
+		},
+		{
+			name:    "detached HEAD is refused",
+			gitOut:  map[string]string{"rev-parse --abbrev-ref HEAD": "HEAD\n"},
+			wantMsg: "detached HEAD",
+		},
+		{
+			name:    "branch equal to base_branch is refused",
+			gitOut:  map[string]string{"rev-parse --abbrev-ref HEAD": "release\n"},
+			input:   map[string]any{"base_branch": "release"},
+			wantMsg: "is the same as base_branch",
+		},
+		{
+			name:    "undeterminable branch is refused",
+			gitErr:  map[string]error{"rev-parse --abbrev-ref HEAD": errors.New("not a git repository")},
+			wantMsg: "could not determine the current branch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{gitOut: tc.gitOut, gitErr: tc.gitErr}
+			input := tc.input
+			if input == nil {
+				input = map[string]any{}
+			}
+			result, err := NewCreatePullRequestTool(runner, nil).Execute(context.Background(), mustJSON(t, input), "/repo")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if !result.IsError {
+				t.Fatalf("Execute() = %s, want refusal", result.Content)
+			}
+			if !strings.Contains(result.Content, tc.wantMsg) {
+				t.Fatalf("result = %s, want message containing %q", result.Content, tc.wantMsg)
+			}
+			for _, call := range runner.gitCalls {
+				if strings.HasPrefix(call, "push") {
+					t.Fatalf("push was executed despite refusal: %#v", runner.gitCalls)
+				}
+			}
+			if len(runner.ghCalls) != 0 {
+				t.Fatalf("gh was invoked despite refusal: %#v", runner.ghCalls)
+			}
+		})
 	}
 }
 

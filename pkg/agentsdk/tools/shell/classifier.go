@@ -335,54 +335,85 @@ func basename(p string) string {
 	return p
 }
 
+// wrapperOperandOpts lists, per transparent prefix wrapper, the options that
+// consume the FOLLOWING token as an operand (e.g. `env -u NAME`, `sudo -u
+// user`, `nice -n 10`). Without this, the operand would be mistaken for the
+// command head and invocations of interest (git, gh, destructive commands)
+// hidden behind the wrapper would escape classification.
+var wrapperOperandOpts = map[string]map[string]bool{
+	"sudo": {
+		"-u": true, "--user": true, "-g": true, "--group": true,
+		"-h": true, "--host": true, "-p": true, "--prompt": true,
+		"-C": true, "--close-from": true, "-D": true, "--chdir": true,
+		"-R": true, "--chroot": true, "-r": true, "--role": true,
+		"-t": true, "--type": true, "-T": true, "--command-timeout": true,
+		"-U": true, "--other-user": true,
+	},
+	"doas":    {"-C": true, "-u": true},
+	"env":     {"-u": true, "--unset": true, "-C": true, "--chdir": true},
+	"nice":    {"-n": true, "--adjustment": true},
+	"ionice":  {"-c": true, "--class": true, "-n": true, "--classdata": true, "-p": true, "--pid": true},
+	"stdbuf":  {"-i": true, "--input": true, "-o": true, "--output": true, "-e": true, "--error": true},
+	"exec":    {"-a": true},
+	"timeout": {"-k": true, "--kill-after": true, "-s": true, "--signal": true},
+	"command": {},
+	"nohup":   {},
+	"setsid":  {},
+}
+
 // stripPrefixWrappers removes leading transparent wrappers (sudo, doas,
-// command, exec, nice, nohup, env-with-no-assignments) so that the underlying
-// program is what gets classified. Returns the remaining argv.
+// command, exec, env, nice, nohup, ionice, stdbuf, timeout, setsid) so that
+// the underlying program is what gets classified. Returns the remaining argv.
 func stripPrefixWrappers(argv []string) []string {
 	for len(argv) > 0 {
 		head := basename(argv[0])
-		switch head {
-		case "sudo", "doas":
-			// Skip flags consumed by sudo (only the obvious ones) and any
-			// VAR=value args.
-			i := 1
-			for i < len(argv) {
-				a := argv[i]
-				if strings.HasPrefix(a, "-") {
-					i++
-					continue
-				}
-				if strings.Contains(a, "=") && !strings.Contains(a, "/") {
-					i++
-					continue
-				}
-				break
-			}
-			argv = argv[i:]
-		case "command", "exec", "nice", "nohup", "ionice", "stdbuf":
-			i := 1
-			for i < len(argv) && strings.HasPrefix(argv[i], "-") {
-				i++
-			}
-			argv = argv[i:]
-		case "env":
-			i := 1
-			for i < len(argv) {
-				a := argv[i]
-				if strings.HasPrefix(a, "-") {
-					i++
-					continue
-				}
-				if strings.Contains(a, "=") {
-					i++
-					continue
-				}
-				break
-			}
-			argv = argv[i:]
-		default:
+		operandOpts, isWrapper := wrapperOperandOpts[head]
+		if !isWrapper {
 			return argv
 		}
+		// env accepts VAR=value assignments; sudo/doas accept VAR=value that
+		// is clearly not a path.
+		allowAssignments := head == "env" || head == "sudo" || head == "doas"
+		i := 1
+		spliced := false
+		for i < len(argv) {
+			a := argv[i]
+			if strings.HasPrefix(a, "-") {
+				name, value, hasEq := strings.Cut(a, "=")
+				// env -S/--split-string embeds the real command in its
+				// operand; splice its fields back in so the head is visible.
+				if head == "env" && (name == "-S" || name == "--split-string") {
+					operand := value
+					rest := argv[min(i+1, len(argv)):]
+					if !hasEq && len(rest) > 0 {
+						operand, rest = rest[0], rest[1:]
+					}
+					argv = append(strings.Fields(operand), rest...)
+					spliced = true
+					break
+				}
+				if !hasEq && operandOpts[name] {
+					i = min(i+2, len(argv))
+					continue
+				}
+				i++
+				continue
+			}
+			if allowAssignments && strings.Contains(a, "=") &&
+				(head == "env" || !strings.Contains(a, "/")) {
+				i++
+				continue
+			}
+			break
+		}
+		if spliced {
+			continue
+		}
+		// timeout's first positional is the duration, not the command.
+		if head == "timeout" && i < len(argv) {
+			i++
+		}
+		argv = argv[i:]
 	}
 	return argv
 }
@@ -465,10 +496,11 @@ func mentionsForbiddenSystemFile(s string) bool {
 	return false
 }
 
-// gitInvocations returns all argv slices in cmdLine that look like a git
-// invocation, with leading `git`-equivalent token at index 0. Used by
-// IsPushToProtectedBranch and the read-only-mode git denylist.
-func gitInvocations(cmdLine string) [][]string {
+// invocationsOf returns all argv slices in cmdLine whose head matches
+// isBinary, recursing into shell -c strings, eval arguments, heredoc/
+// herestring bodies, and command substitutions. Shared by the git and gh
+// command policies.
+func invocationsOf(cmdLine string, isBinary func(string) bool) [][]string {
 	var out [][]string
 	pipelines := parseStatements(tokenize(cmdLine))
 	for _, pl := range pipelines {
@@ -478,7 +510,7 @@ func gitInvocations(cmdLine string) [][]string {
 				continue
 			}
 			head := argv[0]
-			if isGitBinary(head) {
+			if isBinary(head) {
 				out = append(out, argv)
 				continue
 			}
@@ -486,24 +518,33 @@ func gitInvocations(cmdLine string) [][]string {
 			if isShellInterpreter(head) {
 				for i := 1; i < len(argv); i++ {
 					if argv[i] == "-c" && i+1 < len(argv) {
-						out = append(out, gitInvocations(argv[i+1])...)
+						out = append(out, invocationsOf(argv[i+1], isBinary)...)
 					}
 				}
 				for _, rd := range cmd.redirects {
 					if rd.op == "<<<" || rd.op == "<<" {
-						out = append(out, gitInvocations(rd.target)...)
+						out = append(out, invocationsOf(rd.target, isBinary)...)
 					}
 				}
 			}
 			if basename(head) == "eval" {
-				out = append(out, gitInvocations(strings.Join(argv[1:], " "))...)
+				out = append(out, invocationsOf(strings.Join(argv[1:], " "), isBinary)...)
 			}
 			// Recurse into command substitutions.
 			for _, sub := range cmd.cmdSubs {
-				out = append(out, gitInvocations(sub)...)
+				out = append(out, invocationsOf(sub, isBinary)...)
 			}
 		}
 	}
+	return out
+}
+
+// gitInvocations returns all argv slices in cmdLine that look like a git
+// invocation, with leading `git`-equivalent token at index 0. Used by
+// IsPushToProtectedBranch and the read-only-mode git denylist.
+func gitInvocations(cmdLine string) [][]string {
+	out := invocationsOf(cmdLine, isGitBinary)
+	pipelines := parseStatements(tokenize(cmdLine))
 	// Synthesize: `git;push origin main` and similar patterns where a bare
 	// `git` token is followed by a separate statement whose head is a known
 	// git subcommand. Real bash would not interpret these as `git push`, but
@@ -545,6 +586,22 @@ func isGitBinary(token string) bool {
 		return true
 	}
 	return basename(token) == "git"
+}
+
+// ghInvocations returns all argv slices in cmdLine that invoke the GitHub CLI
+// (gh), including through shell wrappers, eval, and command substitution.
+// Used by the restricted-mode gh policy: GitHub side effects must go through
+// the host's built-in GitHub tools, which enforce guardrails that raw gh
+// invocations bypass.
+func ghInvocations(cmdLine string) [][]string {
+	return invocationsOf(cmdLine, isGHBinary)
+}
+
+func isGHBinary(token string) bool {
+	if token == "gh" {
+		return true
+	}
+	return basename(token) == "gh"
 }
 
 // gitSubcommand returns the subcommand name (e.g. "push") for a git argv, or
