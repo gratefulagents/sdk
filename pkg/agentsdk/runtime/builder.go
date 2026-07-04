@@ -39,9 +39,13 @@ type Config struct {
 	OpenAIOAuthAccountID     string
 	OpenAIOAuthAccountIDPath string
 	OpenAIAuthSession        *sdkopenai.AuthSession
-	ProviderAPIKeys          map[string]string
-	ProviderBaseURLs         map[string]string
-	ProviderAPIModes         map[string]string
+	// CopilotOAuthPath points at Copilot auth JSON holding the long-lived
+	// GitHub OAuth token so the copilot provider can self-refresh the
+	// short-lived (~25–30 min) Copilot API token per request.
+	CopilotOAuthPath string
+	ProviderAPIKeys  map[string]string
+	ProviderBaseURLs map[string]string
+	ProviderAPIModes map[string]string
 	// Routes declares named provider instances registered under arbitrary
 	// routing prefixes, letting the same base provider be exposed under
 	// multiple prefixes with independent auth (e.g. "anthropic" via API key and
@@ -370,6 +374,7 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 		OpenAIOAuthAccountID:     cfg.OpenAIOAuthAccountID,
 		OpenAIOAuthAccountIDPath: strings.TrimSpace(cfg.OpenAIOAuthAccountIDPath),
 		OpenAIAuthSession:        cfg.OpenAIAuthSession,
+		CopilotOAuthPath:         strings.TrimSpace(cfg.CopilotOAuthPath),
 		ProviderAPIKeys:          cloneStringMap(cfg.ProviderAPIKeys),
 		ProviderBaseURLs:         cloneStringMap(cfg.ProviderBaseURLs),
 		ProviderAPIModes:         cloneStringMap(cfg.ProviderAPIModes),

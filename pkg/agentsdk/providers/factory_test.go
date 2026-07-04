@@ -98,6 +98,52 @@ func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {
 	}
 }
 
+func TestNewProviderFromConfigCopilotOAuthPathServesMountedToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_test","object":"chat.completion","created":0,"model":"copilot-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	// Far-future expiry: the token source must serve the mounted token without
+	// attempting an exchange.
+	if err := os.WriteFile(authPath, []byte(`{"oauth_token":"github-oauth","token":"mounted-token","expires_at":4070908800}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(auth.json) error = %v", err)
+	}
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:         "multi",
+		DefaultProvider:  DefaultProviderCopilot,
+		Model:            DefaultProviderCopilot + "/gpt-4.1",
+		CopilotOAuthPath: authPath,
+		// Stale startup token: per-request headers must prefer the mounted one.
+		ProviderAPIKeys:  map[string]string{DefaultProviderCopilot: "startup-token"},
+		ProviderBaseURLs: map[string]string{DefaultProviderCopilot: srv.URL + "/chat/completions"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel(DefaultProviderCopilot + "/gpt-4.1")
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Input: []agentsdk.RunItem{{
+			Type:    agentsdk.RunItemMessage,
+			Message: &agentsdk.MessageOutput{Text: "hello"},
+		}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if gotAuth != "Bearer mounted-token" {
+		t.Fatalf("Authorization = %q, want Bearer mounted-token", gotAuth)
+	}
+}
+
 func TestNewProviderFromConfigConfiguresOpenAIOAuthForMulti(t *testing.T) {
 	dir := t.TempDir()
 	authPath := filepath.Join(dir, "auth.json")

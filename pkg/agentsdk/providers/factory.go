@@ -26,9 +26,15 @@ type ProviderSpec struct {
 	OpenAIOAuthAccountID     string
 	OpenAIOAuthAccountIDPath string
 	OpenAIAuthSession        *sdkopenai.AuthSession
-	ProviderAPIKeys          map[string]string
-	ProviderBaseURLs         map[string]string
-	ProviderAPIModes         map[string]string
+	// CopilotOAuthPath, when set for the copilot provider, points at Copilot
+	// auth JSON containing the long-lived GitHub OAuth token. The provider
+	// then self-refreshes the short-lived Copilot API token per request
+	// (re-reading the file to pick up external rotations) instead of pinning
+	// the startup token, which GitHub expires after ~25–30 minutes.
+	CopilotOAuthPath string
+	ProviderAPIKeys  map[string]string
+	ProviderBaseURLs map[string]string
+	ProviderAPIModes map[string]string
 	// ModelFallbacks is an ordered list of fallback model identifiers sent as
 	// the OpenRouter "models" array so the provider retries the next model when
 	// one is unavailable. It is only forwarded to OpenRouter; other
@@ -70,6 +76,11 @@ type ProviderRoute struct {
 	OpenAIOAuthAccountID     string
 	OpenAIOAuthAccountIDPath string
 	OpenAIAuthSession        *sdkopenai.AuthSession
+
+	// CopilotOAuthPath mirrors ProviderSpec.CopilotOAuthPath for routes whose
+	// Provider is "copilot": auth JSON with the GitHub OAuth token enabling
+	// per-request self-refresh of the short-lived Copilot API token.
+	CopilotOAuthPath string
 }
 
 var openAICompatibleProviderNames = []string{
@@ -222,6 +233,7 @@ func specForRoute(route ProviderRoute, base string) ProviderSpec {
 		OpenAIOAuthAccountID:     route.OpenAIOAuthAccountID,
 		OpenAIOAuthAccountIDPath: route.OpenAIOAuthAccountIDPath,
 		OpenAIAuthSession:        route.OpenAIAuthSession,
+		CopilotOAuthPath:         route.CopilotOAuthPath,
 	}
 }
 
@@ -251,22 +263,51 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 
 func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 	apiKey := apiKeyForProvider(spec, DefaultProviderCopilot)
+	// With an auth-JSON path the provider self-refreshes: GitHub mints Copilot
+	// API tokens with a ~25–30 minute lifetime, so long-lived processes must
+	// re-exchange the GitHub OAuth token instead of pinning the startup token.
+	var tokenSource *sdkoauth.CopilotTokenSource
+	if authPath := strings.TrimSpace(spec.CopilotOAuthPath); authPath != "" {
+		tokenSource = sdkoauth.NewCopilotTokenSource(sdkoauth.CopilotTokenSourceConfig{
+			Auth:     sdkoauth.CopilotAuth{Token: strings.TrimSpace(apiKey)},
+			AuthPath: authPath,
+			Refresh: sdkoauth.RefreshConfig{
+				CopilotEditorVersion:       copilotEditorVersion,
+				CopilotEditorPluginVersion: "copilot-chat/" + copilotChatVersion,
+				CopilotUserAgent:           "GitHubCopilotChat/" + copilotChatVersion,
+			},
+		})
+	}
+	currentToken := func(ctx context.Context) (string, error) {
+		if tokenSource != nil {
+			return tokenSource.Token(ctx)
+		}
+		token := strings.TrimSpace(apiKey)
+		if token == "" {
+			return "", fmt.Errorf("Copilot API token is required")
+		}
+		return token, nil
+	}
+	initialToken := strings.TrimSpace(apiKey)
+	if initialToken == "" && tokenSource != nil {
+		initialToken = tokenSource.CurrentToken()
+	}
 	configuredBaseURL := baseURLForProvider(spec, DefaultProviderCopilot)
 	baseURL := configuredBaseURL
 	if baseURL == "" || isDefaultCopilotBaseURL(baseURL) {
-		baseURL = firstNonEmpty(sdkoauth.CopilotAPIBaseURLFromToken(apiKey), baseURL, defaultCopilotBaseURL)
+		baseURL = firstNonEmpty(sdkoauth.CopilotAPIBaseURLFromToken(initialToken), baseURL, defaultCopilotBaseURL)
 	}
-	openAIHeaders := func(context.Context) (map[string]string, error) {
-		token := strings.TrimSpace(apiKey)
-		if token == "" {
-			return nil, fmt.Errorf("Copilot API token is required")
+	openAIHeaders := func(ctx context.Context) (map[string]string, error) {
+		token, err := currentToken(ctx)
+		if err != nil {
+			return nil, err
 		}
 		return copilotRequestHeaders(token, false), nil
 	}
-	anthropicHeaders := func(context.Context) (map[string]string, error) {
-		token := strings.TrimSpace(apiKey)
-		if token == "" {
-			return nil, fmt.Errorf("Copilot API token is required")
+	anthropicHeaders := func(ctx context.Context) (map[string]string, error) {
+		token, err := currentToken(ctx)
+		if err != nil {
+			return nil, err
 		}
 		return copilotRequestHeaders(token, true), nil
 	}
@@ -292,8 +333,10 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		AuthSession:  session,
 	})
 	messagesProvider := sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-		BaseURL:          copilotAnthropicBaseURL(baseURL),
-		BearerToken:      strings.TrimSpace(apiKey),
+		BaseURL: copilotAnthropicBaseURL(baseURL),
+		// The per-request header hook overwrites Authorization with the current
+		// token; the static bearer only satisfies the client's credential check.
+		BearerToken:      firstNonEmpty(initialToken, "copilot-placeholder"),
 		RequestHeaders:   anthropicHeaders,
 		AdaptiveThinking: true,
 		// Verified against the Copilot /v1/messages shim: cache_control
