@@ -960,11 +960,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
-			// recordAndPruneResponseCompaction is invoked purely for its side
-			// effect (recording compaction stats / firing the recorder hook);
-			// the pruned slice is unused on the final-output branch because the
-			// run is about to return.
-			_ = recordAndPruneResponseCompaction(append(append([]RunItem(nil), currentInput...), newItems...))
+			// Record compaction stats and keep the pruned transcript: when
+			// the final response itself carries a provider compaction item,
+			// FinalHistory must reflect the post-compaction state — replaying
+			// the unpruned transcript would resend the compacted history.
+			finalHistory := recordAndPruneResponseCompaction(append(append([]RunItem(nil), currentInput...), newItems...))
 
 			// Run output guardrails.
 			var outputGuardrailResults []OutputGuardrailResult
@@ -988,6 +988,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				ToolInputGuardrailResults:  allToolInputResults,
 				ToolOutputGuardrailResults: allToolOutputResults,
 				Usage:                      runCtx.Usage,
+				// The final-output branch returns before this turn's newItems
+				// are folded into currentInput, so the continuation state is
+				// currentInput + newItems — pruned when the final response
+				// carried a provider compaction item.
+				FinalHistory: finalHistory,
 			}, nil
 
 		case *handoffStep:
@@ -1123,6 +1128,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					Usage:                      runCtx.Usage,
 					Interruption:               interruptions[0],
 					Interruptions:              interruptions,
+					// currentInput already includes this turn's newItems and
+					// tool results; pending approvals are still unresolved.
+					FinalHistory: append([]RunItem(nil), currentInput...),
 				}, nil
 			}
 
@@ -1145,6 +1153,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ToolOutputGuardrailResults: allToolOutputResults,
 					OutputGuardrailResults:     outputGuardrailResults,
 					Usage:                      runCtx.Usage,
+					// currentInput already includes this turn's newItems and
+					// tool results.
+					FinalHistory: append([]RunItem(nil), currentInput...),
 				}, nil
 			}
 
@@ -1167,6 +1178,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ToolInputGuardrailResults:  allToolInputResults,
 					ToolOutputGuardrailResults: allToolOutputResults,
 					Usage:                      runCtx.Usage,
+					// currentInput already includes this turn's newItems and
+					// tool results (pause tools produce paired outputs).
+					FinalHistory: append([]RunItem(nil), currentInput...),
 				}, nil
 			}
 		}

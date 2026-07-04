@@ -16,6 +16,17 @@ type RunResult struct {
 	Interruption               *Interruption   // non-nil if run was interrupted (e.g. approval gate); first of Interruptions
 	Interruptions              []*Interruption // all pending interruptions from the turn (parallel tool calls can trigger several)
 	LastResponseID             string          // last model response ID for continuation
+
+	// FinalHistory is the complete post-run conversation state: the input
+	// items as the runner last used them (after any mid-run compaction
+	// rewrote or summarized older items) plus every item generated during
+	// the run. Hosts that replay full transcripts across turns should feed
+	// this back as the next Run's input (after appending the new user
+	// message) instead of re-deriving history from NewItems — replaying
+	// input+NewItems after a compaction would resend the uncompacted
+	// history. On interrupted runs it may end with an unresolved tool
+	// approval; resolve (or drop) pending calls before replaying.
+	FinalHistory []RunItem
 }
 
 // ToInputList converts the result's items into a format suitable for resuming a run.

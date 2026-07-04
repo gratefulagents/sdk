@@ -175,7 +175,14 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		allNewItems = append(allNewItems, result.NewItems...)
 		allResponses = append(allResponses, result.RawResponses...)
 		totalUsage.Add(result.Usage)
-		history = append(history, result.NewItems...)
+		if len(result.FinalHistory) > 0 {
+			// Adopt the runner's post-run conversation state: mid-run
+			// compaction rewrites the input items, so replaying
+			// history+NewItems would resend the uncompacted transcript.
+			history = append([]RunItem(nil), result.FinalHistory...)
+		} else {
+			history = append(history, result.NewItems...)
+		}
 		if l.opts.SessionStore != nil {
 			if err := l.opts.SessionStore.AppendRunItems(ctx, result.NewItems); err != nil {
 				combined := combineLoopResult(result, allNewItems, allResponses, totalUsage)
