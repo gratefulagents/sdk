@@ -24,7 +24,32 @@ const (
 	defaultMaxConcurrent = 2 // max in-flight API requests across all goroutines
 	maxRetries           = 3
 	maxRetryAfterSeconds = 5 * 60
+
+	// oauthUserAgent identifies OAuth (Claude subscription) requests the way
+	// Claude Code does. Anthropic's OAuth endpoints expect Claude Code-shaped
+	// traffic; other OAuth integrations (pi-anthropic-oauth, opencode) send an
+	// equivalent identity for compatibility.
+	oauthUserAgent = "claude-cli/2.1.158 (external, cli)"
+
+	// rateLimitBaseBackoff is the first-retry delay for 429/529 responses that
+	// carry no Retry-After or rate-limit reset headers. Rate limits recover on
+	// the provider's clock, not ours, so hammering with sub-second retries
+	// only burns attempts; 5s doubling mirrors pi-anthropic-oauth.
+	rateLimitBaseBackoff = 5 * time.Second
+	// rateLimitMaxBackoff caps the headerless rate-limit backoff.
+	rateLimitMaxBackoff = 60 * time.Second
 )
+
+// TokenSource supplies OAuth bearer tokens per request so long-lived clients
+// pick up rotated/refreshed credentials instead of pinning the token captured
+// at construction time.
+type TokenSource interface {
+	// Token returns the current access token.
+	Token(ctx context.Context) (string, error)
+	// Invalidate marks the cached token as suspect (e.g. after a 401) so the
+	// next Token call re-reads or refreshes the underlying credential.
+	Invalidate()
+}
 
 // Client wraps Anthropic API calls.
 type Client struct {
@@ -32,6 +57,7 @@ type Client struct {
 
 	sessionID    string
 	sem          chan struct{} // concurrency limiter
+	tokenSource  TokenSource
 	mu           sync.Mutex
 	backoffUntil time.Time
 }
@@ -40,11 +66,12 @@ type Client struct {
 type Option func(*clientConfig)
 
 type clientConfig struct {
-	baseURL       string
-	maxConcurrent int
-	authToken     string
-	oauth         bool
-	bearerToken   string
+	baseURL        string
+	maxConcurrent  int
+	authToken      string
+	oauth          bool
+	bearerToken    string
+	tokenSource    TokenSource
 	headerProvider func(context.Context) (map[string]string, error)
 }
 
@@ -64,6 +91,20 @@ func WithOAuthToken(token string) Option {
 	return func(c *clientConfig) {
 		c.authToken = strings.TrimSpace(token)
 		c.oauth = true
+	}
+}
+
+// WithOAuthTokenSource configures OAuth auth like WithOAuthToken but resolves
+// the bearer token per request from source, so rotated or self-refreshed
+// credentials take effect mid-run. On a 401 the client invalidates the source
+// and retries once with a fresh token.
+func WithOAuthTokenSource(source TokenSource) Option {
+	return func(c *clientConfig) {
+		if source == nil {
+			return
+		}
+		c.oauth = true
+		c.tokenSource = source
 	}
 }
 
@@ -112,9 +153,23 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	switch {
 	case cfg.oauth:
 		sdkOpts = append(sdkOpts,
-			option.WithAuthToken(cfg.authToken),
 			option.WithHeaderAdd("anthropic-beta", "oauth-2025-04-20"),
+			// Claude Code-compatible OAuth shaping: subscription OAuth expects
+			// Claude Code-shaped traffic. See pi-anthropic-oauth / opencode.
+			option.WithHeader("User-Agent", oauthUserAgent),
+			option.WithHeader("anthropic-dangerous-direct-browser-access", "true"),
 		)
+		if cfg.tokenSource != nil {
+			// Per-request bearer resolution so refreshed/rotated tokens take
+			// effect mid-run. A static fallback keeps requests authenticated
+			// if the source starts failing after construction.
+			if cfg.authToken != "" {
+				sdkOpts = append(sdkOpts, option.WithAuthToken(cfg.authToken))
+			}
+			sdkOpts = append(sdkOpts, option.WithMiddleware(tokenSourceMiddleware(cfg.tokenSource)))
+		} else {
+			sdkOpts = append(sdkOpts, option.WithAuthToken(cfg.authToken))
+		}
 	case cfg.bearerToken != "":
 		// Bearer auth for Anthropic-compatible gateways (e.g. Copilot). No
 		// x-api-key and no oauth beta header.
@@ -135,9 +190,24 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	}
 
 	return &Client{
-		sdk:       sdk.NewClient(sdkOpts...),
-		sessionID: sessionID,
-		sem:       sem,
+		sdk:         sdk.NewClient(sdkOpts...),
+		sessionID:   sessionID,
+		sem:         sem,
+		tokenSource: cfg.tokenSource,
+	}
+}
+
+// tokenSourceMiddleware resolves the OAuth bearer token per request.
+func tokenSourceMiddleware(source TokenSource) option.Middleware {
+	return func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+		token, err := source.Token(req.Context())
+		if err != nil {
+			return nil, fmt.Errorf("resolve anthropic oauth token: %w", err)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return next(req)
 	}
 }
 
@@ -226,15 +296,48 @@ func (c *Client) createMessageStreamSDK(ctx context.Context, req CreateMessageRe
 
 // RequestError represents an API error with status code.
 type RequestError struct {
-	StatusCode     int
-	Body           string
-	retryAfter     int
-	shouldRetry    *bool
+	StatusCode  int
+	Body        string
+	retryAfter  int
+	shouldRetry *bool
+	// RateLimitReset is the raw anthropic-ratelimit-requests-reset header
+	// (RFC 3339), kept for callers that want the provider's request-bucket
+	// reset time.
 	RateLimitReset string
+	// UnifiedStatus is the anthropic-ratelimit-unified-status header sent on
+	// OAuth (Claude subscription) traffic: e.g. "allowed", "allowed_warning",
+	// "rejected". "rejected" means the subscription usage window is exhausted.
+	UnifiedStatus string
+	// resetAt is the earliest known rate-limit reset instant derived from
+	// anthropic-ratelimit-unified-reset / -requests-reset / -tokens-reset.
+	resetAt time.Time
+	// now is injectable for tests; nil means time.Now.
+	now func() time.Time
 }
 
 func (e *RequestError) Error() string {
-	return fmt.Sprintf("API request failed with status %d: %s", e.StatusCode, e.Body)
+	msg := fmt.Sprintf("API request failed with status %d", e.StatusCode)
+	if hint := e.rateLimitHint(); hint != "" {
+		msg += " (" + hint + ")"
+	}
+	if e.Body != "" {
+		msg += ": " + e.Body
+	}
+	return msg
+}
+
+// rateLimitHint renders a concise human-readable summary of any rate-limit
+// headers so logs and run errors say when the limit clears instead of dumping
+// raw headers.
+func (e *RequestError) rateLimitHint() string {
+	var parts []string
+	if e.UnifiedStatus != "" {
+		parts = append(parts, "unified-status "+e.UnifiedStatus)
+	}
+	if ms := e.retryAfterMSUncapped(); ms > 0 {
+		parts = append(parts, "rate limit resets in "+time.Duration(ms*int64(time.Millisecond)).Round(time.Second).String())
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Retryable returns true if the error is retryable.
@@ -245,12 +348,44 @@ func (e *RequestError) Retryable() bool {
 	if e.StatusCode == 429 {
 		return true
 	}
+	if e.shouldRetry != nil && *e.shouldRetry {
+		return true
+	}
 	return e.StatusCode == 529 || e.StatusCode >= 500
 }
 
-// RetryAfterMS returns the retry-after value in milliseconds.
+// IsRateLimit reports whether the error is a rate-limit (429) response.
+func (e *RequestError) IsRateLimit() bool { return e.StatusCode == 429 }
+
+// retryAfterMSUncapped derives the provider-directed retry delay: an explicit
+// Retry-After wins, otherwise the earliest rate-limit reset timestamp.
+func (e *RequestError) retryAfterMSUncapped() int64 {
+	if e.retryAfter > 0 {
+		return int64(e.retryAfter) * 1000
+	}
+	if !e.resetAt.IsZero() {
+		nowFn := e.now
+		if nowFn == nil {
+			nowFn = time.Now
+		}
+		if d := e.resetAt.Sub(nowFn()); d > 0 {
+			return d.Milliseconds()
+		}
+	}
+	return 0
+}
+
+// RetryAfterMS returns the provider-directed retry delay in milliseconds,
+// capped at maxRetryAfterSeconds. Zero means the provider gave no guidance.
 func (e *RequestError) RetryAfterMS() int {
-	return capRetryAfterSeconds(e.retryAfter) * 1000
+	ms := e.retryAfterMSUncapped()
+	if ms <= 0 {
+		return 0
+	}
+	if capMS := int64(maxRetryAfterSeconds) * 1000; ms > capMS {
+		return int(capMS)
+	}
+	return int(ms)
 }
 
 // waitForBackoff blocks until any global backoff expires or ctx is cancelled.
@@ -281,9 +416,10 @@ func (c *Client) setGlobalBackoff(d time.Duration) {
 
 // doWithRetry wraps an API call with retry logic for transient errors.
 func (c *Client) doWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
-	retryAfterUsed := false
+	sleptForRetry := false
+	tokenRefreshed := false
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 && !retryAfterUsed {
+		if attempt > 0 && !sleptForRetry {
 			baseDelay := time.Duration(1<<uint(attempt-1)) * time.Second
 			jitter := time.Duration(rand.Int63n(int64(baseDelay / 2)))
 			select {
@@ -292,7 +428,7 @@ func (c *Client) doWithRetry(ctx context.Context, fn func(ctx context.Context) e
 			case <-time.After(baseDelay + jitter):
 			}
 		}
-		retryAfterUsed = false
+		sleptForRetry = false
 
 		if err := c.waitForBackoff(ctx); err != nil {
 			return err
@@ -323,38 +459,71 @@ func (c *Client) doWithRetry(ctx context.Context, fn func(ctx context.Context) e
 			return err
 		}
 
-		log.Printf("[anthropic] HTTP %d (attempt %d/%d): %s", reqErr.StatusCode, attempt+1, maxRetries+1, reqErr.Body)
+		log.Printf("[anthropic] HTTP %d (attempt %d/%d): %s", reqErr.StatusCode, attempt+1, maxRetries+1, errorLogBody(reqErr))
+
+		// An auth failure with a refreshable token source usually means the
+		// in-memory token was rotated or expired mid-run: invalidate once and
+		// retry immediately with a freshly resolved token.
+		if reqErr.StatusCode == http.StatusUnauthorized && c.tokenSource != nil && !tokenRefreshed {
+			tokenRefreshed = true
+			c.tokenSource.Invalidate()
+			sleptForRetry = true // no backoff needed; the retry uses a new credential
+			continue
+		}
 
 		if !reqErr.Retryable() || attempt >= maxRetries {
 			return reqErr
 		}
 
-		retryAfter := capRetryAfterSeconds(reqErr.retryAfter)
-		if reqErr.StatusCode == 429 && retryAfter > 0 {
-			c.setGlobalBackoff(time.Duration(retryAfter) * time.Second)
+		// Prefer provider-directed delay (Retry-After or rate-limit reset
+		// headers). A headerless 429/529 still gets a rate-limit-scale
+		// backoff: those limits recover on the provider's clock, so the
+		// generic 1s ladder just wastes attempts.
+		delay := time.Duration(reqErr.RetryAfterMS()) * time.Millisecond
+		if delay == 0 && (reqErr.StatusCode == 429 || reqErr.StatusCode == 529) {
+			delay = rateLimitBackoff(attempt)
+		}
+		if reqErr.StatusCode == 429 && delay > 0 {
+			c.setGlobalBackoff(delay)
 		}
 
-		if retryAfter > 0 {
+		if delay > 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(retryAfter) * time.Second):
+			case <-time.After(delay):
 			}
-			retryAfterUsed = true
+			sleptForRetry = true
 		}
 	}
 
 	return fmt.Errorf("max retries exceeded")
 }
 
-func capRetryAfterSeconds(seconds int) int {
-	if seconds <= 0 {
-		return 0
+// rateLimitBackoff returns the headerless 429/529 backoff for a 0-indexed
+// attempt: rateLimitBaseBackoff doubling per attempt plus up to 50% jitter,
+// capped at rateLimitMaxBackoff.
+func rateLimitBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
 	}
-	if seconds > maxRetryAfterSeconds {
-		return maxRetryAfterSeconds
+	delay := rateLimitBaseBackoff << uint(attempt)
+	if delay > rateLimitMaxBackoff {
+		delay = rateLimitMaxBackoff
 	}
-	return seconds
+	return delay + time.Duration(rand.Int63n(int64(delay/2)+1))
+}
+
+// errorLogBody truncates error bodies for logs.
+func errorLogBody(e *RequestError) string {
+	body := strings.TrimSpace(e.Body)
+	if hint := e.rateLimitHint(); hint != "" {
+		body = "[" + hint + "] " + body
+	}
+	if len(body) > 2048 {
+		return body[:2048] + "..."
+	}
+	return body
 }
 
 // toRequestError converts an error to our RequestError, or nil if not an API error.
@@ -370,16 +539,81 @@ func toRequestError(err error) *RequestError {
 	if errors.As(err, &sdkErr) {
 		reqErr := &RequestError{
 			StatusCode: sdkErr.StatusCode,
-			Body:       string(sdkErr.DumpResponse(true)),
+			Body:       compactErrorBody(sdkErr),
 		}
 		if sdkErr.Response != nil {
-			reqErr.retryAfter = parseRetryAfterSeconds(sdkErr.Response.Header)
-			reqErr.RateLimitReset = strings.TrimSpace(sdkErr.Response.Header.Get("anthropic-ratelimit-requests-reset"))
+			applyRateLimitHeaders(reqErr, sdkErr.Response.Header)
 		}
 		return reqErr
 	}
 
 	return nil
+}
+
+// compactErrorBody prefers the response's JSON error body over a full
+// header+body dump so run errors and traces stay readable.
+func compactErrorBody(sdkErr *sdk.Error) string {
+	if raw := strings.TrimSpace(sdkErr.RawJSON()); raw != "" && raw != "null" {
+		return raw
+	}
+	return string(sdkErr.DumpResponse(true))
+}
+
+// applyRateLimitHeaders populates retry guidance from response headers:
+//   - Retry-After (delta-seconds or HTTP date)
+//   - X-Should-Retry ("true"/"false"), Anthropic's explicit retry hint
+//   - anthropic-ratelimit-unified-status/-reset: subscription (OAuth) usage
+//     window state; reset is unix epoch seconds
+//   - anthropic-ratelimit-requests-reset / -tokens-reset: API-key bucket
+//     resets in RFC 3339
+func applyRateLimitHeaders(e *RequestError, h http.Header) {
+	e.retryAfter = parseRetryAfterSeconds(h)
+	e.RateLimitReset = strings.TrimSpace(h.Get("anthropic-ratelimit-requests-reset"))
+	e.UnifiedStatus = strings.TrimSpace(h.Get("anthropic-ratelimit-unified-status"))
+	if raw := strings.TrimSpace(h.Get("X-Should-Retry")); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			e.shouldRetry = &parsed
+		}
+	}
+	e.resetAt = earliestRateLimitReset(h)
+}
+
+// earliestRateLimitReset returns the soonest future reset instant advertised
+// by any rate-limit reset header, or the zero time when none parse.
+func earliestRateLimitReset(h http.Header) time.Time {
+	var earliest time.Time
+	consider := func(t time.Time) {
+		if t.IsZero() || !t.After(time.Now()) {
+			return
+		}
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	// Unified (subscription/OAuth) reset: unix epoch seconds.
+	if raw := strings.TrimSpace(h.Get("anthropic-ratelimit-unified-reset")); raw != "" {
+		if secs, err := strconv.ParseInt(raw, 10, 64); err == nil && secs > 0 {
+			consider(time.Unix(secs, 0))
+		} else if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			consider(t)
+		}
+	}
+	// API-key bucket resets: RFC 3339.
+	for _, key := range []string{
+		"anthropic-ratelimit-requests-reset",
+		"anthropic-ratelimit-input-tokens-reset",
+		"anthropic-ratelimit-output-tokens-reset",
+		"anthropic-ratelimit-tokens-reset",
+	} {
+		raw := strings.TrimSpace(h.Get(key))
+		if raw == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			consider(t)
+		}
+	}
+	return earliest
 }
 
 // parseRetryAfterSeconds extracts a retry delay in seconds from response

@@ -43,9 +43,14 @@ type Config struct {
 	// GitHub OAuth token so the copilot provider can self-refresh the
 	// short-lived (~25–30 min) Copilot API token per request.
 	CopilotOAuthPath string
-	ProviderAPIKeys  map[string]string
-	ProviderBaseURLs map[string]string
-	ProviderAPIModes map[string]string
+	// AnthropicOAuthPath points at Anthropic OAuth auth JSON (Claude Code
+	// .credentials.json or the SDK flat shape) so the anthropic provider can
+	// resolve the bearer token per request: re-reading external rotations and
+	// self-refreshing near expiry instead of pinning the startup token.
+	AnthropicOAuthPath string
+	ProviderAPIKeys    map[string]string
+	ProviderBaseURLs   map[string]string
+	ProviderAPIModes   map[string]string
 	// Routes declares named provider instances registered under arbitrary
 	// routing prefixes, letting the same base provider be exposed under
 	// multiple prefixes with independent auth (e.g. "anthropic" via API key and
@@ -375,6 +380,7 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 		OpenAIOAuthAccountIDPath: strings.TrimSpace(cfg.OpenAIOAuthAccountIDPath),
 		OpenAIAuthSession:        cfg.OpenAIAuthSession,
 		CopilotOAuthPath:         strings.TrimSpace(cfg.CopilotOAuthPath),
+		AnthropicOAuthPath:       strings.TrimSpace(cfg.AnthropicOAuthPath),
 		ProviderAPIKeys:          cloneStringMap(cfg.ProviderAPIKeys),
 		ProviderBaseURLs:         cloneStringMap(cfg.ProviderBaseURLs),
 		ProviderAPIModes:         cloneStringMap(cfg.ProviderAPIModes),

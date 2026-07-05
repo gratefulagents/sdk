@@ -41,3 +41,24 @@ func (p *RetryPolicy) DelayForAttempt(attempt int) time.Duration {
 	}
 	return time.Duration(delay) * time.Millisecond
 }
+
+// maxAdviceRetriesPerTurn bounds provider-advised retries (advice.ShouldRetry)
+// for a single turn, counting all failed attempts of that turn. Without a
+// bound, a persistently rate-limited provider would be retried until MaxTurns,
+// burning the whole turn budget on one request.
+const maxAdviceRetriesPerTurn = 10
+
+// adviceRetryDelay returns the backoff floor for a provider-advised retry that
+// carries no provider-directed delay. It follows the run's retry policy curve
+// (attempt is 1-indexed) so advised retries after the policy budget keep
+// growing instead of hammering with zero delay.
+func adviceRetryDelay(policy *RetryPolicy, attempt int) time.Duration {
+	p := DefaultRetryPolicy()
+	if policy != nil && policy.Backoff.InitialDelayMS > 0 {
+		p = *policy
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	return p.DelayForAttempt(attempt - 1)
+}

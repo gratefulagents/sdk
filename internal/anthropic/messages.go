@@ -363,6 +363,12 @@ const (
 	BetaContextManagement = "context-management-2025-06-27"
 )
 
+// ClaudeCodeIdentity is the exact first system block Claude Code sends.
+// Anthropic's OAuth (Claude subscription) endpoints expect requests shaped
+// like Claude Code, and this identity line is the load-bearing part of that
+// shape (see pi-anthropic-oauth and opencode, which prepend the same text).
+const ClaudeCodeIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
+
 // ModelBetas returns the beta headers for a given model.
 func ModelBetas(model string) []string {
 	betas := []string{BetaClaudeCode}

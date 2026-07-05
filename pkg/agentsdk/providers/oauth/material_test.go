@@ -187,3 +187,36 @@ func TestOpenAINeedsRefreshUsesLastRefreshAge(t *testing.T) {
 		t.Fatal("OpenAINeedsRefresh before max age = true, want false")
 	}
 }
+
+func TestAnthropicNeedsRefreshAdaptiveLead(t *testing.T) {
+	now := time.Now()
+
+	// 8h token: default 4h lead applies.
+	longLived := AnthropicAuth{
+		AccessToken:  "tok",
+		RefreshToken: "refresh",
+		LastRefresh:  now,
+		ExpiresAt:    now.Add(8 * time.Hour),
+	}
+	if AnthropicNeedsRefresh(longLived, now) {
+		t.Fatalf("8h token should not need refresh immediately")
+	}
+	if !AnthropicNeedsRefresh(longLived, now.Add(5*time.Hour)) {
+		t.Fatalf("8h token should need refresh within the 4h lead")
+	}
+
+	// 1h token: lead adapts to 30m so a fresh token is not refreshed on
+	// every check (which would churn the single-use refresh-token chain).
+	shortLived := AnthropicAuth{
+		AccessToken:  "tok",
+		RefreshToken: "refresh",
+		LastRefresh:  now.Add(-15 * time.Minute),
+		ExpiresAt:    now.Add(45 * time.Minute),
+	}
+	if AnthropicNeedsRefresh(shortLived, now) {
+		t.Fatalf("1h token with 45m left should not need refresh (adaptive 30m lead)")
+	}
+	if !AnthropicNeedsRefresh(shortLived, now.Add(20*time.Minute)) {
+		t.Fatalf("1h token with 25m left should need refresh")
+	}
+}

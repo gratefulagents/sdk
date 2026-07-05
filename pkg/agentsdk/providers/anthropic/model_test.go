@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	internalanthropic "github.com/gratefulagents/sdk/internal/anthropic"
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
 
@@ -128,5 +129,48 @@ func TestItemsToMessagesRoutesPDFToDocumentBlock(t *testing.T) {
 	want := []string{"text", "document", "image"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("block types = %v, want %v", types, want)
+	}
+}
+
+func TestBuildRequestOAuthPrependsClaudeCodeIdentity(t *testing.T) {
+	m, err := newAnthropicModel(anthropicModelConfig{
+		apiKey:   "sk-ant-oat01-test",
+		authMode: "oauth",
+	})
+	if err != nil {
+		t.Fatalf("newAnthropicModel() error = %v", err)
+	}
+	req := m.buildRequest(agentsdk.ModelRequest{
+		Model:        "claude-sonnet-4-5",
+		Instructions: "Be helpful.",
+	})
+	if len(req.System) != 2 {
+		t.Fatalf("System blocks = %d, want 2", len(req.System))
+	}
+	if req.System[0].Text != internalanthropic.ClaudeCodeIdentity {
+		t.Fatalf("first system block = %q, want Claude Code identity", req.System[0].Text)
+	}
+	if req.System[1].Text != "Be helpful." {
+		t.Fatalf("second system block = %q, want instructions", req.System[1].Text)
+	}
+
+	// Identity block present even without instructions.
+	req = m.buildRequest(agentsdk.ModelRequest{Model: "claude-sonnet-4-5"})
+	if len(req.System) != 1 || req.System[0].Text != internalanthropic.ClaudeCodeIdentity {
+		t.Fatalf("System without instructions = %+v, want identity only", req.System)
+	}
+}
+
+func TestBuildRequestAPIKeyOmitsClaudeCodeIdentity(t *testing.T) {
+	m, err := newAnthropicModel(anthropicModelConfig{apiKey: "sk-ant-api-test"})
+	if err != nil {
+		t.Fatalf("newAnthropicModel() error = %v", err)
+	}
+	req := m.buildRequest(agentsdk.ModelRequest{
+		Model:        "claude-sonnet-4-5",
+		Instructions: "Be helpful.",
+	})
+	if len(req.System) != 1 || req.System[0].Text != "Be helpful." {
+		t.Fatalf("System = %+v, want instructions only", req.System)
 	}
 }

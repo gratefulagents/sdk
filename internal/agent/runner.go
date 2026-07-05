@@ -101,15 +101,15 @@ func isSubAgentTool(t Tool) bool {
 // (finding M3). These tools manage run lifecycle / user interaction and are
 // always allowed regardless of tool access level.
 var controlFlowToolNames = map[string]struct{}{
-	"finish":                        {},
-	"AskUserQuestion":               {},
-	"present_plan":                  {},
-	"save_plan":                     {},
-	"get_plan":                      {},
-	"RequestMCPBreakGlass":          {},
-	"subagent":                      {},
-	"subagent_status":               {},
-	"subagent_control":              {},
+	"finish":               {},
+	"AskUserQuestion":      {},
+	"present_plan":         {},
+	"save_plan":            {},
+	"get_plan":             {},
+	"RequestMCPBreakGlass": {},
+	"subagent":             {},
+	"subagent_status":      {},
+	"subagent_control":     {},
 }
 
 type subAgentFinalJoinProvider interface {
@@ -307,7 +307,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	defer func() {
 		for _, s := range []*Span{openGenSpan, openHandoffSpan} {
 			if s != nil {
-				s.Finish()
+				if s.EndTime.IsZero() {
+					s.Finish()
+				}
 				tp.OnSpanEnd(s)
 			}
 		}
@@ -649,12 +651,19 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			genData.FailureKind = generationFailureKind(err, advice)
 			genData.Status = "failed"
 			genSpan.Data = genData
+			// Capture the attempt's end time now, but export the span only at
+			// the decision points below: exporting here would freeze
+			// retry_scheduled/retry_after_ms/fallback_* at their zero values
+			// before the retry/fallback decision is made.
 			genSpan.Finish()
-			tp.OnSpanEnd(genSpan)
-			openGenSpan = nil
-			trace.AddSpan(genSpan)
+			exportGenSpan := func() {
+				tp.OnSpanEnd(genSpan)
+				openGenSpan = nil
+				trace.AddSpan(genSpan)
+			}
 
 			if isContextCancellation(err) && !perCallTimeout {
+				exportGenSpan()
 				ev := attemptFailureEvent(attemptEvent("failed"), genData)
 				emitLLMAttemptEvent(cfg.Hooks, ev)
 				return nil, err
@@ -686,6 +695,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
 					ev.RetryPlanned = true
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					continue
 				} else if compactErr != nil {
 					log.Printf("[runner] WARN: provider compaction after context error failed; falling back to local compaction: %v", compactErr)
@@ -716,6 +726,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
 					ev.RetryPlanned = true
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					continue
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 					cfg.CompactionFailureReporter("run", reason, before, after)
@@ -742,6 +753,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ev.FallbackToModel = fallbackModel
 					ev.FallbackReason = reason
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					continue
 				}
 			}
@@ -756,15 +768,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
 					ev.RetryPlanned = true
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					continue
 				case ErrorActionContinue:
 					log.Printf("[runner] error handler chose continue on turn %d: %v", turn, err)
 					ev := attemptFailureEvent(attemptEvent("failed"), genData)
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					continue
 				case ErrorActionAbort:
 					ev := attemptFailureEvent(attemptEvent("failed"), genData)
 					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
 					return nil, &AgentError{Message: fmt.Sprintf("model call failed on turn %d", turn), Cause: err}
 				}
 			}
@@ -781,6 +796,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				ev.RetryPlanned = true
 				ev.RetryAfterMs = genData.RetryAfterMS
 				emitLLMAttemptEvent(cfg.Hooks, ev)
+				exportGenSpan()
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -789,8 +805,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				continue
 			}
 
-			if advice != nil && advice.ShouldRetry {
+			if advice != nil && advice.ShouldRetry && turnRetryAttempt <= maxAdviceRetriesPerTurn {
 				cappedMS := capRetryAfterMS(int64(advice.RetryAfterMS))
+				if cappedMS <= 0 {
+					// The provider asked for a retry without saying when (e.g.
+					// a 429 with no Retry-After/reset headers). Never retry
+					// immediately: rate limits recover on the provider's
+					// clock, and a zero delay hammers the API in a tight loop.
+					cappedMS = capRetryAfterMS(adviceRetryDelay(cfg.RetryPolicy, turnRetryAttempt).Milliseconds())
+				}
 				genData.RetryScheduled = true
 				genData.RetryAfterMS = cappedMS
 				genData.Status = "retrying"
@@ -799,6 +822,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				ev.RetryPlanned = true
 				ev.RetryAfterMs = genData.RetryAfterMS
 				emitLLMAttemptEvent(cfg.Hooks, ev)
+				exportGenSpan()
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -808,6 +832,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			ev := attemptFailureEvent(attemptEvent("failed"), genData)
 			emitLLMAttemptEvent(cfg.Hooks, ev)
+			exportGenSpan()
 			return nil, &AgentError{Message: fmt.Sprintf("model call failed on turn %d", turn), Cause: err}
 		}
 
