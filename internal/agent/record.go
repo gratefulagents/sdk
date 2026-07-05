@@ -184,7 +184,9 @@ func (t *ProgressTracker) RecordSubagentStarted(taskID, toolUseID, description, 
 		EventType: "agent_spawn",
 		Summary:   fmt.Sprintf("Spawned agent [%s]: %s", subagentType, description),
 	})
-	// Emit OTel span for subagent start.
+	// Emit OTel span for subagent start. The span is kept open (stored per
+	// task ID) so RecordSubagentCompleted ends this same span and the span's
+	// time range covers the subagent's actual lifetime.
 	if t.tp != nil {
 		span := NewSpan("subagent."+subagentType, t.rootSpanID, SubagentSpanData{
 			TaskID:      taskID,
@@ -194,6 +196,10 @@ func (t *ProgressTracker) RecordSubagentStarted(taskID, toolUseID, description, 
 			Status:      "initializing",
 		})
 		t.tp.OnSpanStart(span)
+		if t.subagentSpans == nil {
+			t.subagentSpans = make(map[string]*Span)
+		}
+		t.subagentSpans[taskID] = span
 	}
 }
 
@@ -224,9 +230,12 @@ func (t *ProgressTracker) RecordSubagentCompleted(taskID, status, summary string
 	t.sessionCostUsd += costUSD
 	t.inputTokens += usage.InputTokens
 	t.outputTokens += usage.OutputTokens
-	// Emit OTel span for subagent completion with full metrics.
+	// Close the lifecycle span opened by RecordSubagentStarted with the full
+	// final metrics so its duration reflects the subagent's real runtime.
 	if t.tp != nil {
-		span := NewSpan("subagent."+meta.SubagentType, t.rootSpanID, SubagentSpanData{
+		span := t.subagentSpans[taskID]
+		delete(t.subagentSpans, taskID)
+		data := SubagentSpanData{
 			TaskID:       taskID,
 			Type:         meta.SubagentType,
 			Description:  meta.Description,
@@ -237,15 +246,21 @@ func (t *ProgressTracker) RecordSubagentCompleted(taskID, status, summary string
 			TotalTokens:  usage.InputTokens + usage.OutputTokens,
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
-			DurationMS:   0, // filled by span.Finish()
 			StopReason:   stopReason,
 			Isolation:    meta.Isolation,
 			Prompt:       meta.Prompt,
 			ResultText:   Truncate(summary, 4096),
 			FilesRead:    filesRead,
 			FilesWritten: filesWritten,
-		})
-		t.tp.OnSpanStart(span)
+		}
+		if span == nil {
+			// No matching start (tracker restarted or processor wired late):
+			// emit a point-in-time completion span so the data still lands.
+			span = NewSpan("subagent."+meta.SubagentType, t.rootSpanID, data)
+			t.tp.OnSpanStart(span)
+		}
+		data.DurationMS = time.Since(span.StartTime).Milliseconds()
+		span.Data = data
 		span.Finish()
 		t.tp.OnSpanEnd(span)
 	}

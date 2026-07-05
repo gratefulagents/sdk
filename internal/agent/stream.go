@@ -98,6 +98,10 @@ type ProgressTracker struct {
 	// session, subagent, retry, compaction). Updated by plan.go when the
 	// active phase changes.
 	rootSpanID string
+	// subagentSpans holds the open lifecycle span per subagent task so
+	// RecordSubagentCompleted can end the span RecordSubagentStarted opened
+	// (one span covering the subagent's real lifetime).
+	subagentSpans map[string]*Span
 }
 
 // TrackerOption configures a ProgressTracker.
@@ -124,6 +128,7 @@ func NewProgressTracker(opts ...TrackerOption) *ProgressTracker {
 		modelUsage:         make(map[string]ModelUsageEntry),
 		taskAgents:         make(map[string]AgentMeta),
 		maxToolResultBytes: DefaultMaxToolResultBytes,
+		subagentSpans:      make(map[string]*Span),
 	}
 	for _, opt := range opts {
 		opt(t)
@@ -149,6 +154,7 @@ func NewChildTracker(parent *ProgressTracker, taskID string) *ProgressTracker {
 		maxToolResultBytes: maxBytes,
 		tp:                 parent.tp,
 		rootSpanID:         rootSpan,
+		subagentSpans:      make(map[string]*Span),
 	}
 }
 
