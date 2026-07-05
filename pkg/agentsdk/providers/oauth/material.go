@@ -101,7 +101,22 @@ func AnthropicNeedsRefresh(auth AnthropicAuth, now time.Time) bool {
 	if auth.ExpiresAt.IsZero() {
 		return false
 	}
-	return !auth.ExpiresAt.After(now.Add(AnthropicRefreshLead))
+	return !auth.ExpiresAt.After(now.Add(anthropicRefreshLeadFor(auth)))
+}
+
+// anthropicRefreshLeadFor adapts the refresh lead to the token's actual
+// lifetime: min(AnthropicRefreshLead, lifetime/2). Anthropic has issued OAuth
+// access tokens with lifetimes both longer (8h) and shorter (1h) than the 4h
+// default lead; a fixed 4h lead against a 1h token would make every check
+// "needs refresh" and churn the single-use refresh-token chain on each tick.
+func anthropicRefreshLeadFor(auth AnthropicAuth) time.Duration {
+	lead := AnthropicRefreshLead
+	if !auth.LastRefresh.IsZero() && auth.ExpiresAt.After(auth.LastRefresh) {
+		if half := auth.ExpiresAt.Sub(auth.LastRefresh) / 2; half < lead {
+			lead = half
+		}
+	}
+	return lead
 }
 
 func MarshalAnthropicAuthJSON(auth AnthropicAuth) ([]byte, error) {

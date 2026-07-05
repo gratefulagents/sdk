@@ -32,9 +32,16 @@ type ProviderSpec struct {
 	// (re-reading the file to pick up external rotations) instead of pinning
 	// the startup token, which GitHub expires after ~25–30 minutes.
 	CopilotOAuthPath string
-	ProviderAPIKeys  map[string]string
-	ProviderBaseURLs map[string]string
-	ProviderAPIModes map[string]string
+	// AnthropicOAuthPath, when set with AuthMode "oauth", points at Anthropic
+	// OAuth auth JSON (Claude Code .credentials.json or the SDK's flat shape).
+	// The provider then resolves the bearer token per request — re-reading the
+	// file to pick up external rotations (e.g. a Kubernetes Secret refreshed
+	// by the platform) and self-refreshing near expiry — instead of pinning
+	// the startup access token, which Anthropic expires within hours.
+	AnthropicOAuthPath string
+	ProviderAPIKeys    map[string]string
+	ProviderBaseURLs   map[string]string
+	ProviderAPIModes   map[string]string
 	// ModelFallbacks is an ordered list of fallback model identifiers sent as
 	// the OpenRouter "models" array so the provider retries the next model when
 	// one is unavailable. It is only forwarded to OpenRouter; other
@@ -81,6 +88,10 @@ type ProviderRoute struct {
 	// Provider is "copilot": auth JSON with the GitHub OAuth token enabling
 	// per-request self-refresh of the short-lived Copilot API token.
 	CopilotOAuthPath string
+
+	// AnthropicOAuthPath mirrors ProviderSpec.AnthropicOAuthPath for routes
+	// whose Provider is "anthropic" with AuthMode "oauth".
+	AnthropicOAuthPath string
 }
 
 var openAICompatibleProviderNames = []string{
@@ -109,12 +120,7 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 	case DefaultProviderOpenAI:
 		return newOpenAIProviderFromSpec(spec)
 	case DefaultProviderAnthropic:
-		return sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-			BaseURL:       baseURLForProvider(spec, DefaultProviderAnthropic),
-			APIKey:        apiKeyForProvider(spec, DefaultProviderAnthropic),
-			AuthMode:      authModeForAnthropicProvider(spec),
-			PromptCaching: true,
-		}), nil
+		return sdkanthropic.NewProviderWithConfig(anthropicProviderConfig(spec)), nil
 	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderLocal:
 		return newOpenAICompatibleProviderFromSpec(provider, spec), nil
 	case DefaultProviderCopilot:
@@ -178,12 +184,7 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 		return nil, err
 	}
 	mp.Register(DefaultProviderOpenAI, openAIProvider)
-	mp.Register(DefaultProviderAnthropic, sdkanthropic.NewProviderWithConfig(sdkanthropic.ProviderConfig{
-		BaseURL:       baseURLForProvider(spec, DefaultProviderAnthropic),
-		APIKey:        apiKeyForProvider(spec, DefaultProviderAnthropic),
-		AuthMode:      authModeForAnthropicProvider(spec),
-		PromptCaching: true,
-	}))
+	mp.Register(DefaultProviderAnthropic, sdkanthropic.NewProviderWithConfig(anthropicProviderConfig(spec)))
 	for _, provider := range openAICompatibleProviderNames {
 		mp.Register(provider, newOpenAICompatibleProviderFromSpec(provider, spec))
 	}
@@ -234,6 +235,7 @@ func specForRoute(route ProviderRoute, base string) ProviderSpec {
 		OpenAIOAuthAccountIDPath: route.OpenAIOAuthAccountIDPath,
 		OpenAIAuthSession:        route.OpenAIAuthSession,
 		CopilotOAuthPath:         route.CopilotOAuthPath,
+		AnthropicOAuthPath:       route.AnthropicOAuthPath,
 	}
 }
 
@@ -501,6 +503,25 @@ func copilotRequestHeaders(token string, forAnthropic bool) map[string]string {
 		headers["anthropic-beta"] = copilotAnthropicBeta
 	}
 	return headers
+}
+
+// anthropicProviderConfig assembles the Anthropic provider configuration for
+// a spec, wiring a file-backed OAuth token source when AnthropicOAuthPath is
+// set so rotated/refreshed credentials take effect per request instead of
+// pinning the startup token.
+func anthropicProviderConfig(spec ProviderSpec) sdkanthropic.ProviderConfig {
+	cfg := sdkanthropic.ProviderConfig{
+		BaseURL:       baseURLForProvider(spec, DefaultProviderAnthropic),
+		APIKey:        apiKeyForProvider(spec, DefaultProviderAnthropic),
+		AuthMode:      authModeForAnthropicProvider(spec),
+		PromptCaching: true,
+	}
+	if cfg.AuthMode == "oauth" {
+		if path := strings.TrimSpace(spec.AnthropicOAuthPath); path != "" {
+			cfg.OAuthTokenSource = sdkoauth.NewAnthropicFileTokenSource(path, sdkoauth.RefreshConfig{})
+		}
+	}
+	return cfg
 }
 
 func authModeForAnthropicProvider(spec ProviderSpec) string {
