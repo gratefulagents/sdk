@@ -196,6 +196,11 @@ type RunConfig struct {
 	ModelSettings    ModelSettings // override agent's model settings
 	ModelOverride    string        // override agent's model name
 	FallbackModels   []string      // ordered cross-provider fallback models for failed model calls
+	// TracingDisabled suppresses the spans the runner itself emits
+	// (generation, function, handoff, trace lifecycle) for this run. It does
+	// NOT affect spans emitted by a ProgressTracker wired via
+	// SetTracingProcessor (session, subagent, retry, compaction) — the host
+	// owns that processor and controls it directly.
 	TracingDisabled  bool
 	TracingProcessor TracingProcessor // export spans to external systems
 

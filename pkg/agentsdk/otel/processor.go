@@ -2,9 +2,12 @@ package otel
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,12 +15,14 @@ import (
 
 	gootel "go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/credentials"
 )
 
 // OTelTracingProcessor bridges our TracingProcessor interface to the
@@ -30,31 +35,44 @@ type OTelTracingProcessor struct {
 	mu              sync.Mutex
 	spans           map[string]oteltrace.Span // our span ID -> OTel span
 	ctxs            map[string]context.Context
-	traceID         string // OTel trace ID (hex) of the root trace
+	rootCtx         context.Context // ctx of the most recent root trace span
+	traceID         string          // OTel trace ID (hex) of the root trace
 	onTraceIDReady  func(string)
 	traceIDNotified bool
 }
 
-// NewOTelTracingProcessor creates a processor that exports spans to stdout.
+// NewOTelTracingProcessor creates a processor that exports spans via OTLP
+// gRPC to the endpoint in $OTEL_EXPORTER_OTLP_ENDPOINT, falling back to
+// stdout pretty-print when the variable is unset (dev mode).
 func NewOTelTracingProcessor(ctx context.Context, serviceName string) (*OTelTracingProcessor, error) {
 	return NewOTelTracingProcessorWithEndpoint(ctx, serviceName, "")
 }
 
 // NewOTelTracingProcessorWithEndpoint creates a processor that exports spans
-// to an explicit OTLP gRPC endpoint. Leave endpoint empty for stdout.
+// to an explicit OTLP gRPC endpoint. The endpoint may be schemeless
+// ("host:4317") or carry a scheme per the OTel spec ("http://host:4317");
+// https selects TLS. When endpoint is empty it falls back to
+// $OTEL_EXPORTER_OTLP_ENDPOINT, then to stdout pretty-print.
 func NewOTelTracingProcessorWithEndpoint(ctx context.Context, serviceName, endpoint string) (*OTelTracingProcessor, error) {
 	var exporter sdktrace.SpanExporter
 	var err error
 
-	if endpoint != "" {
-		exporter, err = otlptracegrpc.New(ctx,
-			otlptracegrpc.WithEndpoint(endpoint),
-			otlptracegrpc.WithInsecure(),
-		)
+	if strings.TrimSpace(endpoint) == "" {
+		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	hostPort, secure := normalizeOTLPEndpoint(endpoint)
+	if hostPort != "" {
+		opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(hostPort)}
+		if secure {
+			opts = append(opts, otlptracegrpc.WithTLSCredentials(credentials.NewTLS(&tls.Config{})))
+		} else {
+			opts = append(opts, otlptracegrpc.WithInsecure())
+		}
+		exporter, err = otlptracegrpc.New(ctx, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("create OTLP exporter: %w", err)
 		}
-		log.Printf("OTel tracing: exporting to %s", endpoint)
+		log.Printf("OTel tracing: exporting to %s", hostPort)
 	} else {
 		exporter, err = stdouttrace.New(stdouttrace.WithPrettyPrint())
 		if err != nil {
@@ -84,6 +102,25 @@ func NewOTelTracingProcessorWithEndpoint(ctx context.Context, serviceName, endpo
 	}, nil
 }
 
+// normalizeOTLPEndpoint converts an OTLP endpoint value into the host:port
+// form the gRPC exporter expects. Accepts schemeless "host:4317" as well as
+// scheme'd "http://host:4317" / "https://host:4317" (per the OTel env spec);
+// an https scheme selects TLS. Any URL path suffix is dropped.
+func normalizeOTLPEndpoint(endpoint string) (hostPort string, secure bool) {
+	e := strings.TrimSpace(endpoint)
+	if e == "" {
+		return "", false
+	}
+	if i := strings.Index(e, "://"); i >= 0 {
+		secure = strings.EqualFold(e[:i], "https")
+		e = e[i+3:]
+	}
+	if i := strings.IndexByte(e, '/'); i >= 0 {
+		e = e[:i]
+	}
+	return e, secure
+}
+
 func (o *OTelTracingProcessor) OnTraceStart(trace *agent.Trace) {
 	ctx, span := o.tracer.Start(context.Background(), trace.Name,
 		oteltrace.WithAttributes(
@@ -93,6 +130,7 @@ func (o *OTelTracingProcessor) OnTraceStart(trace *agent.Trace) {
 	o.mu.Lock()
 	o.spans[trace.ID] = span
 	o.ctxs[trace.ID] = ctx
+	o.rootCtx = ctx
 	o.traceID = span.SpanContext().TraceID().String()
 	cb := o.onTraceIDReady
 	shouldNotify := cb != nil && !o.traceIDNotified
@@ -128,7 +166,10 @@ func (o *OTelTracingProcessor) OnTraceEnd(trace *agent.Trace) {
 	o.mu.Lock()
 	span, ok := o.spans[trace.ID]
 	delete(o.spans, trace.ID)
-	delete(o.ctxs, trace.ID)
+	// Release every span context retained for parent lookups. rootCtx is kept
+	// so any straggler span that starts after the trace ended still joins
+	// this trace instead of minting a disconnected one.
+	o.ctxs = make(map[string]context.Context)
 	o.mu.Unlock()
 	if ok {
 		span.End()
@@ -139,7 +180,15 @@ func (o *OTelTracingProcessor) OnSpanStart(s *agent.Span) {
 	o.mu.Lock()
 	parentCtx, ok := o.ctxs[s.ParentID]
 	if !ok {
-		parentCtx = context.Background()
+		// Unknown parent (e.g. a tracker span with no root wired, or a child
+		// starting after its trace ended): attach to the most recent trace
+		// root so the span stays in the run's waterfall instead of starting
+		// a disconnected single-span trace.
+		if o.rootCtx != nil {
+			parentCtx = o.rootCtx
+		} else {
+			parentCtx = context.Background()
+		}
 	}
 	o.mu.Unlock()
 
@@ -162,27 +211,55 @@ func (o *OTelTracingProcessor) OnSpanEnd(s *agent.Span) {
 	o.mu.Lock()
 	otelSpan, ok := o.spans[s.ID]
 	delete(o.spans, s.ID)
-	delete(o.ctxs, s.ID)
+	// Keep o.ctxs[s.ID]: descendants may legitimately start after this span
+	// ends (async subagents parented under their spawn tool call). Retained
+	// contexts are released when the trace ends.
 	o.mu.Unlock()
 	if !ok {
 		return
 	}
 
-	// Add duration as an attribute for completed spans.
+	// Span data is typically mutated between start and end (final status,
+	// tool output, usage, cost): re-apply the mapped attributes so the
+	// exported span carries final values, then add the measured duration.
+	_, attrs := mapSpanData(s)
+	otelSpan.SetAttributes(attrs...)
 	otelSpan.SetAttributes(attribute.Int64("duration_ms", s.DurationMS()))
 
-	// Add completion attributes from agent.SpanData.
-	if gen, ok := spanGenerationData(s.Data); ok {
-		otelSpan.SetAttributes(generationAttributes(gen)...)
-	}
-	if fn, ok := s.Data.(agent.FunctionSpanData); ok && fn.IsError {
+	if errMsg, isErr := spanErrorStatus(s.Data); isErr {
 		otelSpan.SetAttributes(attribute.Bool("error", true))
-	}
-	if fn, ok := s.Data.(*agent.FunctionSpanData); ok && fn != nil && fn.IsError {
-		otelSpan.SetAttributes(attribute.Bool("error", true))
+		otelSpan.SetStatus(codes.Error, truncate(errMsg, 256))
 	}
 
 	otelSpan.End()
+}
+
+// spanErrorStatus reports whether the span's final data represents a failure
+// and returns a human-readable error message for the OTel span status.
+func spanErrorStatus(data agent.SpanData) (string, bool) {
+	switch d := data.(type) {
+	case agent.FunctionSpanData:
+		if d.IsError {
+			return d.Output, true
+		}
+	case *agent.FunctionSpanData:
+		if d != nil && d.IsError {
+			return d.Output, true
+		}
+	case agent.SubagentSpanData:
+		if d.Status == "failed" {
+			return d.ResultText, true
+		}
+	case *agent.SubagentSpanData:
+		if d != nil && d.Status == "failed" {
+			return d.ResultText, true
+		}
+	default:
+		if gen, ok := spanGenerationData(data); ok && !gen.Success && (gen.Error != "" || gen.Status == "failed") {
+			return gen.Error, true
+		}
+	}
+	return "", false
 }
 
 // Shutdown flushes pending spans and shuts down the provider.

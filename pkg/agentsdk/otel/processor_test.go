@@ -155,3 +155,26 @@ func TestOTelTruncate(t *testing.T) {
 		t.Errorf("expected 'hello worl...', got %s", got)
 	}
 }
+
+func TestNormalizeOTLPEndpoint(t *testing.T) {
+	cases := []struct {
+		in     string
+		host   string
+		secure bool
+	}{
+		{"", "", false},
+		{"   ", "", false},
+		{"jaeger.jaeger.svc:4317", "jaeger.jaeger.svc:4317", false},
+		{"http://jaeger.jaeger.svc:4317", "jaeger.jaeger.svc:4317", false},
+		{"https://collector.example.com:4317", "collector.example.com:4317", true},
+		{"HTTPS://collector.example.com:4317", "collector.example.com:4317", true},
+		{"http://host:4317/v1/traces", "host:4317", false},
+		{" host:4317 ", "host:4317", false},
+	}
+	for _, c := range cases {
+		host, secure := normalizeOTLPEndpoint(c.in)
+		if host != c.host || secure != c.secure {
+			t.Errorf("normalizeOTLPEndpoint(%q) = (%q, %v), want (%q, %v)", c.in, host, secure, c.host, c.secure)
+		}
+	}
+}

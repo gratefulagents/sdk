@@ -198,6 +198,10 @@ func (r *Runner) Run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 // already been approved by the host, so this method executes the matching tool
 // directly while still applying access adapters, IsEnabled filtering, policy
 // timeouts, hooks, tracing, and tool input/output guardrails.
+//
+// Tracing: pass the originating run's cfg.Trace (and ParentSpanID) so the
+// approved tool's span joins that run's waterfall; when cfg.Trace is nil a
+// fresh single-call trace is created for this execution.
 func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call ToolCallData, cfg RunConfig) (RunItem, []ToolGuardrailResult, []ToolGuardrailResult, bool, error) {
 	if r == nil {
 		return RunItem{}, nil, nil, false, fmt.Errorf("runner is nil")
@@ -293,6 +297,21 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		if ownTrace {
 			trace.Finish()
 			tp.OnTraceEnd(trace)
+		}
+	}()
+	// Panic-safety net: a panic between a span's start and its normal end
+	// (model call, hooks, guardrails) must not leak a started-but-never-ended
+	// span — un-ended spans are never exported and leak processor state. This
+	// runs before the trace-end defer above (LIFO).
+	var openGenSpan, openHandoffSpan *Span
+	defer func() {
+		for _, s := range []*Span{openGenSpan, openHandoffSpan} {
+			if s != nil {
+				if s.EndTime.IsZero() {
+					s.Finish()
+				}
+				tp.OnSpanEnd(s)
+			}
 		}
 	}()
 
@@ -606,6 +625,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 		emitLLMAttemptEvent(cfg.Hooks, attemptEvent("started"))
 		tp.OnSpanStart(genSpan)
+		openGenSpan = genSpan
 
 		// Call model under a per-attempt timeout so a hung or unresponsive
 		// provider connection cannot freeze the run forever. The timeout is
@@ -638,6 +658,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			genSpan.Finish()
 			exportGenSpan := func() {
 				tp.OnSpanEnd(genSpan)
+				openGenSpan = nil
 				trace.AddSpan(genSpan)
 			}
 
@@ -835,6 +856,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		genSpan.Data = genData
 		genSpan.Finish()
 		tp.OnSpanEnd(genSpan)
+		openGenSpan = nil
 		trace.AddSpan(genSpan)
 		ev := attemptEvent("completed")
 		ev.UsageAvailable = true
@@ -1021,6 +1043,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		case *handoffStep:
 			handoffSpan := NewSpan("handoff", spanParent, &HandoffSpanData{FromAgent: currentAgent.Name, ToAgent: s.target.Name})
 			tp.OnSpanStart(handoffSpan)
+			openHandoffSpan = handoffSpan
 
 			fireAgentHook(currentAgent.Hooks, func(h AgentHooks) { h.OnHandoff(runCtx, currentAgent, s.target) })
 			fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnHandoff(runCtx, currentAgent, s.target) })
@@ -1068,6 +1091,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 			handoffSpan.Finish()
 			tp.OnSpanEnd(handoffSpan)
+			openHandoffSpan = nil
 			trace.AddSpan(handoffSpan)
 
 		case *toolCallStep:
@@ -1720,6 +1744,23 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	if runCtx.TracingProcessor != nil {
 		runCtx.TracingProcessor.OnSpanStart(funcSpan)
 	}
+	// End exactly once; the defer covers panics in guardrails/hooks so a
+	// started span is never leaked un-ended (un-ended spans never export).
+	funcSpanEnded := false
+	endFuncSpan := func() {
+		if funcSpanEnded {
+			return
+		}
+		funcSpanEnded = true
+		funcSpan.Finish()
+		if runCtx.TracingProcessor != nil {
+			runCtx.TracingProcessor.OnSpanEnd(funcSpan)
+		}
+		if runCtx.Trace != nil {
+			runCtx.Trace.AddSpan(funcSpan)
+		}
+	}
+	defer endFuncSpan()
 
 	var result ToolResult
 	var err error
@@ -1761,13 +1802,7 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	// Finish function span after output guardrails so blocked content is not
 	// exported as the tool output in tracing.
 	funcSpan.Data = &FunctionSpanData{ToolName: call.Name, Input: string(call.Input), Output: result.Content, IsError: result.IsError}
-	funcSpan.Finish()
-	if runCtx.TracingProcessor != nil {
-		runCtx.TracingProcessor.OnSpanEnd(funcSpan)
-	}
-	if runCtx.Trace != nil {
-		runCtx.Trace.AddSpan(funcSpan)
-	}
+	endFuncSpan()
 
 	fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
 	fireAgentHook(agent.Hooks, func(h AgentHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
