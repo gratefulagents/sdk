@@ -533,6 +533,13 @@ func authModeForAnthropicProvider(spec ProviderSpec) string {
 	if provider == DefaultProviderAnthropic || defaultProviderForSpec(spec) == DefaultProviderAnthropic {
 		return authMode
 	}
+	// Explicit Anthropic OAuth material keeps the always-registered Anthropic
+	// leg OAuth-capable even when the OAuth default provider is another one
+	// (e.g. a copilot-OAuth run that live-switches to Anthropic mid-run with
+	// the platform's mounted per-provider OAuth credentials).
+	if strings.TrimSpace(spec.AnthropicOAuthPath) != "" {
+		return authMode
+	}
 	return ""
 }
 
@@ -547,6 +554,15 @@ func authModeForOpenAIProvider(spec ProviderSpec) sdkopenai.AuthMode {
 	}
 	provider := normalizeProviderName(spec.Provider)
 	if provider == DefaultProviderOpenAI || defaultProviderForSpec(spec) == DefaultProviderOpenAI {
+		return authMode
+	}
+	// Explicit OpenAI OAuth material (mounted auth file or in-memory session)
+	// keeps the always-registered OpenAI leg OAuth-capable even when the OAuth
+	// default provider is another one. Required for live mid-run provider
+	// switches: a copilot/anthropic-OAuth run with mounted OpenAI OAuth
+	// credentials must resolve "openai/..." models via OAuth, not fail with
+	// "OpenAI API key is required".
+	if strings.TrimSpace(spec.OpenAIOAuthPath) != "" || spec.OpenAIAuthSession != nil {
 		return authMode
 	}
 	return sdkopenai.NormalizeAuthMode("")

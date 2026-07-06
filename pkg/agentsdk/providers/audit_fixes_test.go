@@ -4,6 +4,8 @@ package providers
 // leak into the always-registered OpenAI leg of a multi-provider spec.
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
@@ -28,6 +30,21 @@ func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
 		{
 			name: "oauth aimed at anthropic default does not leak",
 			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth"},
+			want: sdkopenai.AuthModeAPIKey,
+		},
+		{
+			name: "oauth with mounted openai oauth material stays oauth for copilot default",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "copilot", AuthMode: "oauth", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json"},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "oauth with in-memory openai session stays oauth for anthropic default",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIAuthSession: &sdkopenai.AuthSession{}},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "api-key mode with mounted openai oauth material stays api-key",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "copilot", AuthMode: "", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json"},
 			want: sdkopenai.AuthModeAPIKey,
 		},
 		{
@@ -83,5 +100,62 @@ func TestAPIModeForCanonicalOpenAIIsScoped(t *testing.T) {
 	spec.ProviderAPIModes = map[string]string{"openai": "responses"}
 	if got := apiModeForProvider(spec, DefaultProviderOpenAI, ""); got != "responses" {
 		t.Fatalf("apiModeForProvider(openai) with explicit map = %q, want responses", got)
+	}
+}
+
+// TestMultiProviderResolvesOpenAIOAuthWhenDefaultIsCopilot reproduces the
+// mid-run provider switch failure: a run started on copilot with OAuth (and
+// the platform's additional OpenAI OAuth material mounted) must resolve
+// "openai/..." models via OAuth instead of failing with "OpenAI API key is
+// required".
+func TestMultiProviderResolvesOpenAIOAuthWhenDefaultIsCopilot(t *testing.T) {
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh","account_id":"acct-1"},"last_refresh":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(auth.json) error = %v", err)
+	}
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:        "multi",
+		DefaultProvider: "copilot",
+		Model:           "copilot/claude-sonnet-4-5",
+		AuthMode:        "oauth",
+		OpenAIOAuthPath: authPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("openai/gpt-5.5")
+	if err != nil {
+		t.Fatalf("GetModel(openai/gpt-5.5) error = %v", err)
+	}
+	if got := model.Provider(); got != "openai" {
+		t.Fatalf("Provider() = %q, want openai", got)
+	}
+}
+
+// TestAuthModeForAnthropicProviderHonorsMountedOAuthPath mirrors the OpenAI
+// case: explicit Anthropic OAuth material keeps the anthropic leg on OAuth
+// even when the multi spec's default provider is another OAuth provider.
+func TestAuthModeForAnthropicProviderHonorsMountedOAuthPath(t *testing.T) {
+	spec := ProviderSpec{
+		Provider:           "multi",
+		DefaultProvider:    "copilot",
+		AuthMode:           "oauth",
+		AnthropicOAuthPath: "/var/run/oauth/anthropic/auth.json",
+	}
+	if got := authModeForAnthropicProvider(spec); got != "oauth" {
+		t.Fatalf("authModeForAnthropicProvider() = %q, want oauth", got)
+	}
+	// Without mounted material the scoping guard still applies.
+	spec.AnthropicOAuthPath = ""
+	if got := authModeForAnthropicProvider(spec); got != "" {
+		t.Fatalf("authModeForAnthropicProvider() without material = %q, want \"\"", got)
+	}
+	// The anthropic leg's OAuth config wires the file-backed token source.
+	spec.AnthropicOAuthPath = "/var/run/oauth/anthropic/auth.json"
+	cfg := anthropicProviderConfig(spec)
+	if cfg.AuthMode != "oauth" || cfg.OAuthTokenSource == nil {
+		t.Fatalf("anthropicProviderConfig() = {AuthMode:%q OAuthTokenSource:%v}, want oauth with token source", cfg.AuthMode, cfg.OAuthTokenSource)
 	}
 }
