@@ -1,4 +1,4 @@
-package skills
+package mcpcatalog
 
 import (
 	"encoding/json"
@@ -10,7 +10,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/internal/pathutil"
 )
 
-// Installer manages skill installation in workspaces via .mcp.json.
+// Installer manages catalog entry installation in workspaces via .mcp.json.
 type Installer struct {
 	registry *Registry
 }
@@ -20,29 +20,29 @@ func NewInstaller(registry *Registry) *Installer {
 	return &Installer{registry: registry}
 }
 
-// Skill returns the catalog entry for name from the installer's registry.
-func (inst *Installer) Skill(name string) (*SkillEntry, bool) {
+// Entry returns the catalog entry for name from the installer's registry.
+func (inst *Installer) Entry(name string) (*CatalogEntry, bool) {
 	if inst == nil || inst.registry == nil {
 		return nil, false
 	}
 	return inst.registry.Get(name)
 }
 
-// Install adds the named skill's MCP server config to the workspace's .mcp.json.
+// Install adds the named entry's MCP server config to the workspace's .mcp.json.
 //
-// The entry's allowEnv is seeded from the skill's requiresEnvVars so that
+// The entry's allowEnv is seeded from its requiresEnvVars so that
 // credential-looking variables the server genuinely needs pass the SDK's
 // credential env filter once the host supplies them (via the entry's env map
 // or a host-level secret mechanism). If an entry with the same name already
 // exists, its hardening fields (allowEnv, allowedTools, enabled, env) are
 // preserved and merged rather than silently clobbered.
-func (inst *Installer) Install(workDir, skillName string) error {
+func (inst *Installer) Install(workDir, entryName string) error {
 	if inst == nil || inst.registry == nil {
-		return fmt.Errorf("skill installer registry is not configured")
+		return fmt.Errorf("catalog installer registry is not configured")
 	}
-	skill, ok := inst.registry.Get(skillName)
+	ce, ok := inst.registry.Get(entryName)
 	if !ok {
-		return fmt.Errorf("skill %q not found in registry", skillName)
+		return fmt.Errorf("catalog entry %q not found in registry", entryName)
 	}
 
 	cfgPath, err := mcpConfigPath(workDir)
@@ -55,13 +55,13 @@ func (inst *Installer) Install(workDir, skillName string) error {
 	}
 
 	entry := mcp.ServerConfig{
-		Type:     skill.MCPConfig.Type,
-		Command:  skill.MCPConfig.Command,
-		Args:     skill.MCPConfig.Args,
-		Env:      cloneStringMap(skill.MCPConfig.Env),
-		AllowEnv: append([]string(nil), skill.RequiresEnvVars...),
+		Type:     ce.MCPConfig.Type,
+		Command:  ce.MCPConfig.Command,
+		Args:     ce.MCPConfig.Args,
+		Env:      cloneStringMap(ce.MCPConfig.Env),
+		AllowEnv: append([]string(nil), ce.RequiresEnvVars...),
 	}
-	if existing, ok := cfg.MCPServers[skill.Name]; ok {
+	if existing, ok := cfg.MCPServers[ce.Name]; ok {
 		// Reinstall/update: keep user- or platform-applied hardening.
 		entry.AllowEnv = mergeUnique(existing.AllowEnv, entry.AllowEnv)
 		entry.AllowedTools = existing.AllowedTools
@@ -75,7 +75,7 @@ func (inst *Installer) Install(workDir, skillName string) error {
 			}
 		}
 	}
-	cfg.MCPServers[skill.Name] = entry
+	cfg.MCPServers[ce.Name] = entry
 
 	return saveMCPConfig(cfgPath, cfg)
 }
@@ -106,10 +106,10 @@ func mergeUnique(lists ...[]string) []string {
 	return out
 }
 
-// Uninstall removes the named skill's MCP server config from .mcp.json.
-func (inst *Installer) Uninstall(workDir, skillName string) error {
+// Uninstall removes the named entry's MCP server config from .mcp.json.
+func (inst *Installer) Uninstall(workDir, entryName string) error {
 	if inst == nil || inst.registry == nil {
-		return fmt.Errorf("skill installer registry is not configured")
+		return fmt.Errorf("catalog installer registry is not configured")
 	}
 	cfgPath, err := mcpConfigPath(workDir)
 	if err != nil {
@@ -120,11 +120,11 @@ func (inst *Installer) Uninstall(workDir, skillName string) error {
 		return fmt.Errorf("loading .mcp.json: %w", err)
 	}
 
-	if _, exists := cfg.MCPServers[skillName]; !exists {
-		return fmt.Errorf("skill %q is not installed", skillName)
+	if _, exists := cfg.MCPServers[entryName]; !exists {
+		return fmt.Errorf("catalog entry %q is not installed", entryName)
 	}
 
-	delete(cfg.MCPServers, skillName)
+	delete(cfg.MCPServers, entryName)
 
 	if len(cfg.MCPServers) == 0 {
 		return os.Remove(cfgPath)
@@ -132,10 +132,10 @@ func (inst *Installer) Uninstall(workDir, skillName string) error {
 	return saveMCPConfig(cfgPath, cfg)
 }
 
-// ListInstalled returns the names of skills currently configured in .mcp.json.
+// ListInstalled returns the names of MCP servers currently configured in .mcp.json.
 func (inst *Installer) ListInstalled(workDir string) ([]string, error) {
 	if inst == nil || inst.registry == nil {
-		return nil, fmt.Errorf("skill installer registry is not configured")
+		return nil, fmt.Errorf("catalog installer registry is not configured")
 	}
 	cfgPath, err := mcpConfigPath(workDir)
 	if err != nil {

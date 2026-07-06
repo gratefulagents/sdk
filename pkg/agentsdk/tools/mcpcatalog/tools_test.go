@@ -1,4 +1,4 @@
-package skills
+package mcpcatalog
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // NewRegistryFromEntries), so behavior tests use fixtures.
 func mustNewSkillRegistry(t *testing.T) *Registry {
 	t.Helper()
-	return NewRegistryFromEntries([]SkillEntry{
+	return NewRegistryFromEntries([]CatalogEntry{
 		{
 			Name:        "search-duckduckgo",
 			Description: "Web search via DuckDuckGo - no API key required",

@@ -1,4 +1,4 @@
-package skills
+package mcpcatalog
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
 
-// Tools returns the skill search, install, and list-installed tools.
+// Tools returns the catalog search, install, and list-installed tools.
 func Tools(registry *Registry, installer *Installer, workDir string) []agentsdk.Tool {
 	return []agentsdk.Tool{
 		&SearchTool{Registry: registry},
@@ -20,14 +20,14 @@ func Tools(registry *Registry, installer *Installer, workDir string) []agentsdk.
 	}
 }
 
-// SearchTool searches the skill catalog by query, category, or tag.
+// SearchTool searches the MCP server catalog by query, category, or tag.
 type SearchTool struct {
 	Registry *Registry
 }
 
-func (t *SearchTool) Name() string { return "skill_search" }
+func (t *SearchTool) Name() string { return "mcp_catalog_search" }
 func (t *SearchTool) Description() string {
-	return "Search the skill catalog for MCP tools that can be installed. Use this to discover available integrations (search, browser, GitHub, Slack, etc)."
+	return "Search the MCP server catalog for tools that can be installed into the workspace. Use this to discover available integrations."
 }
 func (t *SearchTool) IsReadOnly() bool { return true }
 func (t *SearchTool) IsEnabled(_ *agentsdk.RunContext) bool {
@@ -47,7 +47,7 @@ func (t *SearchTool) InputSchema() json.RawMessage {
 
 func (t *SearchTool) Execute(_ context.Context, input json.RawMessage, _ string) (agentsdk.ToolResult, error) {
 	if t.Registry == nil {
-		return agentsdk.ToolResult{Content: "skill_search requires a configured registry", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "mcp_catalog_search requires a configured registry", IsError: true}, nil
 	}
 	var in struct {
 		Query    string `json:"query"`
@@ -59,32 +59,32 @@ func (t *SearchTool) Execute(_ context.Context, input json.RawMessage, _ string)
 		}
 	}
 
-	var skills []SkillEntry
+	var entries []CatalogEntry
 	if in.Query != "" {
-		skills = t.Registry.Search(in.Query)
+		entries = t.Registry.Search(in.Query)
 	} else {
 		var opts []FilterOption
 		if in.Category != "" {
 			opts = append(opts, WithCategory(in.Category))
 		}
-		skills = t.Registry.List(opts...)
+		entries = t.Registry.List(opts...)
 	}
 
-	if len(skills) == 0 {
-		return agentsdk.ToolResult{Content: "No skills found matching your criteria."}, nil
+	if len(entries) == 0 {
+		return agentsdk.ToolResult{Content: "No catalog entries found matching your criteria."}, nil
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Found %d skill(s):\n\n", len(skills)))
-	for _, skill := range skills {
+	sb.WriteString(fmt.Sprintf("Found %d catalog entr(y/ies):\n\n", len(entries)))
+	for _, entry := range entries {
 		verified := ""
-		if skill.Verified {
+		if entry.Verified {
 			verified = " ✓"
 		}
 		sb.WriteString(fmt.Sprintf("• **%s** (v%s, %s%s)\n  %s\n  Tags: %s\n",
-			skill.Name, skill.Version, skill.Category, verified, skill.Description, strings.Join(skill.Tags, ", ")))
-		if len(skill.RequiresEnvVars) > 0 {
-			sb.WriteString(fmt.Sprintf("  Requires env: %s\n", describeEnvVars(skill.RequiresEnvVars)))
+			entry.Name, entry.Version, entry.Category, verified, entry.Description, strings.Join(entry.Tags, ", ")))
+		if len(entry.RequiresEnvVars) > 0 {
+			sb.WriteString(fmt.Sprintf("  Requires env: %s\n", describeEnvVars(entry.RequiresEnvVars)))
 		}
 		sb.WriteString("\n")
 	}
@@ -93,7 +93,7 @@ func (t *SearchTool) Execute(_ context.Context, input json.RawMessage, _ string)
 
 // describeEnvVars annotates each required env var with whether it is
 // currently present in the agent's environment, so callers can tell up front
-// whether an installed skill will be able to authenticate.
+// whether an installed server will be able to authenticate.
 func describeEnvVars(names []string) string {
 	parts := make([]string, 0, len(names))
 	for _, name := range names {
@@ -106,15 +106,15 @@ func describeEnvVars(names []string) string {
 	return strings.Join(parts, ", ")
 }
 
-// InstallTool installs a skill from the catalog into the workspace's .mcp.json.
+// InstallTool installs a catalog entry into the workspace's .mcp.json.
 type InstallTool struct {
 	Installer *Installer
 	WorkDir   string
 }
 
-func (t *InstallTool) Name() string { return "skill_install" }
+func (t *InstallTool) Name() string { return "mcp_catalog_install" }
 func (t *InstallTool) Description() string {
-	return "Install a skill from the catalog into the workspace. This writes the MCP server config to .mcp.json. MCP configs are loaded at session start, so the new server's tools become available after the agent restarts (they are NOT available in the current session)."
+	return "Install an MCP server from the catalog into the workspace. This writes the MCP server config to .mcp.json. MCP configs are loaded at session start, so the new server's tools become available after the agent restarts (they are NOT available in the current session)."
 }
 func (t *InstallTool) IsReadOnly() bool { return false }
 func (t *InstallTool) IsEnabled(ctx *agentsdk.RunContext) bool {
@@ -134,7 +134,7 @@ func (t *InstallTool) InputSchema() json.RawMessage {
 
 func (t *InstallTool) Execute(_ context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
 	if t.Installer == nil {
-		return agentsdk.ToolResult{Content: "skill_install requires a configured installer", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "mcp_catalog_install requires a configured installer", IsError: true}, nil
 	}
 	var in struct {
 		Name string `json:"name"`
@@ -182,7 +182,7 @@ type ListInstalledTool struct {
 	WorkDir   string
 }
 
-func (t *ListInstalledTool) Name() string { return "skill_list_installed" }
+func (t *ListInstalledTool) Name() string { return "mcp_catalog_list_installed" }
 func (t *ListInstalledTool) Description() string {
 	return "List skills currently installed in the workspace's .mcp.json."
 }
@@ -198,7 +198,7 @@ func (t *ListInstalledTool) InputSchema() json.RawMessage {
 
 func (t *ListInstalledTool) Execute(_ context.Context, _ json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
 	if t.Installer == nil {
-		return agentsdk.ToolResult{Content: "skill_list_installed requires a configured installer", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "mcp_catalog_list_installed requires a configured installer", IsError: true}, nil
 	}
 	dir := workDir
 	if dir == "" {
