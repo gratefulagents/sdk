@@ -103,6 +103,68 @@ func TestRecordSubagentCompletedDoesNotDoubleCountForwardedUsage(t *testing.T) {
 	}
 }
 
+// Compaction model calls (provider-side or LLM-summary) bypass OnLLMEnd and
+// add their usage straight to RunResult.Usage. They must still be booked on
+// the platform tracker, or run-level totals drift below RunResult.Usage —
+// and for subagents (whose completion no longer re-adds RunResult.Usage to
+// the parent) the compaction spend would vanish entirely.
+func TestCompactionUsageReachesTracker(t *testing.T) {
+	model := &mockModel{
+		costPerCall: 0.10,
+		responses: []*ModelResponse{
+			{ // LLM-summary compaction call
+				Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "Findings: earlier work summarized."}}},
+				Usage: Usage{InputTokens: 500, OutputTokens: 40, CacheReadTokens: 30, CacheCreateTokens: 5},
+			},
+			{ // the actual turn
+				Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}},
+				Usage: Usage{InputTokens: 15, OutputTokens: 8, CacheReadTokens: 2, CacheCreateTokens: 1},
+			},
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	tracker := NewProgressTracker()
+	tracker.SetSession(1, "implementing")
+	var buf strings.Builder
+	hooks := NewPlatformHooks(tracker, NewEventStream(&buf))
+
+	result, err := runner.Run(context.Background(), &Agent{Name: "test"}, manyCompactableItems(30), RunConfig{
+		Hooks:    hooks,
+		MaxTurns: 3,
+		CompactionConfig: CompactionConfig{
+			Enabled: true, TriggerTokens: 100, TargetTokens: 80,
+			PreserveRecentItems: 3, PreserveInitialUserMessages: 1,
+			SummaryBulletLimit: 4, UseLLMSummary: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText() != "done" {
+		t.Fatalf("final text = %q", result.FinalText())
+	}
+	if result.Usage.InputTokens != 515 || result.Usage.OutputTokens != 48 {
+		t.Fatalf("result usage = %d/%d, want 515/48 (compaction call not counted?)",
+			result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+
+	// The tracker must account for everything RunResult.Usage does,
+	// including the compaction call that bypasses OnLLMEnd.
+	snap := tracker.Snapshot()
+	if snap.InputTokens != result.Usage.InputTokens || snap.OutputTokens != result.Usage.OutputTokens {
+		t.Errorf("tracker tokens = %d/%d, want %d/%d (RunResult.Usage)",
+			snap.InputTokens, snap.OutputTokens, result.Usage.InputTokens, result.Usage.OutputTokens)
+	}
+	if snap.CacheReadInputTokens != result.Usage.CacheReadTokens || snap.CacheCreationInputTokens != result.Usage.CacheCreateTokens {
+		t.Errorf("tracker cache tokens = %d/%d, want %d/%d",
+			snap.CacheReadInputTokens, snap.CacheCreationInputTokens,
+			result.Usage.CacheReadTokens, result.Usage.CacheCreateTokens)
+	}
+	if math.Abs(snap.CostUsd-0.20) > 1e-9 {
+		t.Errorf("tracker CostUsd = %v, want 0.20 (compaction call + turn)", snap.CostUsd)
+	}
+}
+
 // A subagent that fails mid-run must still contribute everything it consumed
 // before failing: to the run totals (via live forwarding) and to its own
 // completion outcome/event (recovered from the child tracker, since
