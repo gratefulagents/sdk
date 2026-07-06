@@ -9,27 +9,44 @@ import (
 	"testing"
 )
 
+// mustNewSkillRegistry returns a registry with fixture entries. The SDK ships
+// an empty default catalog (hosts supply their own entries via
+// NewRegistryFromEntries), so behavior tests use fixtures.
 func mustNewSkillRegistry(t *testing.T) *Registry {
 	t.Helper()
-	r, err := NewRegistry()
-	if err != nil {
-		t.Fatalf("failed to create skill registry: %v", err)
-	}
-	return r
+	return NewRegistryFromEntries([]SkillEntry{
+		{
+			Name:        "search-duckduckgo",
+			Description: "Web search via DuckDuckGo - no API key required",
+			Category:    "search",
+			Version:     "0.1.0",
+			MCPConfig:   MCPServerConfig{Type: "stdio", Command: "uvx", Args: []string{"duckduckgo-mcp-server"}},
+			Tags:        []string{"search", "web", "free"},
+			Verified:    true,
+		},
+		{
+			Name:            "search-exa",
+			Description:     "AI-powered web search via Exa",
+			Category:        "search",
+			Version:         "0.1.0",
+			MCPConfig:       MCPServerConfig{Type: "stdio", Command: "npx", Args: []string{"-y", "exa-mcp-server"}},
+			Tags:            []string{"search", "web", "ai"},
+			Verified:        true,
+			RequiresEnvVars: []string{"EXA_API_KEY"},
+		},
+	})
 }
 
+// TestLoadDefaultCatalog pins the contract that the SDK ships no default MCP
+// servers: the embedded catalog must stay empty. Hosts that want an
+// installable catalog provide their own entries via NewRegistryFromEntries.
 func TestLoadDefaultCatalog(t *testing.T) {
 	skills, err := LoadDefaultCatalog()
 	if err != nil {
 		t.Fatalf("LoadDefaultCatalog() error = %v", err)
 	}
-	if len(skills) == 0 {
-		t.Fatal("expected non-empty catalog")
-	}
-	for _, skill := range skills {
-		if skill.Name == "" || skill.Description == "" || skill.Category == "" || skill.MCPConfig.Command == "" {
-			t.Fatalf("skill missing required fields: %+v", skill)
-		}
+	if len(skills) != 0 {
+		t.Fatalf("default catalog must be empty, got %d entries", len(skills))
 	}
 }
 

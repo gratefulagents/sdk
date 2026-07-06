@@ -11,8 +11,9 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/mcp"
 )
 
-// TestDefaultCatalogHygiene guards the invariants that made past catalog
-// entries silently broken: ${VAR} placeholders in env/args never expand to
+// TestDefaultCatalogHygiene guards invariants for any entry that may be added
+// to the embedded catalog in the future (it ships empty today — see
+// TestLoadDefaultCatalog): ${VAR} placeholders in env/args never expand to
 // parent-process values (the SDK expands only against the safe base env), and
 // credential-looking env keys are stripped unless listed in allowEnv. Catalog
 // entries must therefore declare credentials via requiresEnvVars only.
@@ -20,9 +21,6 @@ func TestDefaultCatalogHygiene(t *testing.T) {
 	skills, err := LoadDefaultCatalog()
 	if err != nil {
 		t.Fatalf("LoadDefaultCatalog() error = %v", err)
-	}
-	if len(skills) == 0 {
-		t.Fatal("expected non-empty catalog")
 	}
 	seen := make(map[string]bool)
 	for _, skill := range skills {
