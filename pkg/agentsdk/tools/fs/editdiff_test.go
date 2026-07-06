@@ -149,6 +149,84 @@ func TestBuildEditDiffDeletionOfWholeLine(t *testing.T) {
 	}
 }
 
+func TestBuildEditDiffLineJoinWhenMatchConsumesNewline(t *testing.T) {
+	// Replacing "foo\n" with "baz" joins the following line: the file
+	// becomes "bazbar\n", so "bar" must not render as unchanged context.
+	got := buildEditDiff("foo\nbar\n", "foo\n", "baz", false)
+	want := strings.Join([]string{
+		"@@ -1,2 +1,1 @@",
+		"-foo",
+		"-bar",
+		"+bazbar",
+	}, "\n")
+	if got != want {
+		t.Errorf("buildEditDiff() =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestBuildEditDiffNoLineJoinWhenReplacementKeepsNewline(t *testing.T) {
+	got := buildEditDiff("foo\nbar\n", "foo\n", "baz\n", false)
+	want := strings.Join([]string{
+		"@@ -1,2 +1,2 @@",
+		"-foo",
+		"+baz",
+		" bar",
+	}, "\n")
+	if got != want {
+		t.Errorf("buildEditDiff() =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestBuildEditDiffLineJoinWithMidLinePrefix(t *testing.T) {
+	// The match starts mid-line and swallows the newline: "xfoo\nbar\n"
+	// becomes "xbar\n", joining the remainder of the first line with the
+	// second.
+	got := buildEditDiff("a\nxfoo\nbar\nc\n", "foo\n", "", false)
+	want := strings.Join([]string{
+		"@@ -1,4 +1,3 @@",
+		" a",
+		"-xfoo",
+		"-bar",
+		"+xbar",
+		" c",
+	}, "\n")
+	if got != want {
+		t.Errorf("buildEditDiff() =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestBuildEditDiffLineJoinCascadesAcrossReplaceAll(t *testing.T) {
+	// Each replacement joins the next line, so consecutive matches collapse
+	// into one run: "a\na\nb\n" -> "AAb\n".
+	got := buildEditDiff("a\na\nb\n", "a\n", "A", true)
+	want := strings.Join([]string{
+		"@@ -1,3 +1,1 @@",
+		"-a",
+		"-a",
+		"-b",
+		"+AAb",
+	}, "\n")
+	if got != want {
+		t.Errorf("buildEditDiff() =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestBuildEditDiffNoLineJoinAtEOF(t *testing.T) {
+	// The consumed newline is the last byte of the file: there is no
+	// following line to join, so the replacement simply becomes the new
+	// final line.
+	got := buildEditDiff("foo\nbar\n", "bar\n", "B", false)
+	want := strings.Join([]string{
+		"@@ -1,2 +1,2 @@",
+		" foo",
+		"-bar",
+		"+B",
+	}, "\n")
+	if got != want {
+		t.Errorf("buildEditDiff() =\n%s\nwant\n%s", got, want)
+	}
+}
+
 func TestBuildEditDiffAppendAtEOFWithoutTrailingNewline(t *testing.T) {
 	content := "a\nb"
 	got := buildEditDiff(content, "b", "b\nc", false)

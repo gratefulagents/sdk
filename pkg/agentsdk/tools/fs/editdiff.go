@@ -36,7 +36,7 @@ func buildEditDiff(content, oldStr, newStr string, replaceAll bool) string {
 		return ""
 	}
 	li := newLineIndex(content)
-	runs := buildEditRuns(li, offsets, len(oldStr))
+	runs := buildEditRuns(li, offsets, oldStr, newStr)
 
 	// Group runs into hunks: runs separated by more than twice the context
 	// width get their own hunk, mirroring standard diff behavior.
@@ -149,21 +149,42 @@ type editRun struct {
 	offsets             []int // match offsets applied within the range
 }
 
-func buildEditRuns(li *lineIndex, offsets []int, oldLen int) []editRun {
+func buildEditRuns(li *lineIndex, offsets []int, oldStr, newStr string) []editRun {
 	var runs []editRun
 	for _, off := range offsets {
 		first := li.lineOf(off)
-		last := li.lineOf(off + oldLen - 1)
+		last := li.lineOf(off + len(oldStr) - 1)
 		if n := len(runs); n > 0 && first <= runs[n-1].lastLine {
 			if last > runs[n-1].lastLine {
 				runs[n-1].lastLine = last
 			}
 			runs[n-1].offsets = append(runs[n-1].offsets, off)
+			extendRunForLineJoin(li, &runs[n-1], oldStr, newStr)
 			continue
 		}
-		runs = append(runs, editRun{firstLine: first, lastLine: last, offsets: []int{off}})
+		run := editRun{firstLine: first, lastLine: last, offsets: []int{off}}
+		extendRunForLineJoin(li, &run, oldStr, newStr)
+		runs = append(runs, run)
 	}
 	return runs
+}
+
+// extendRunForLineJoin widens run to include following lines that the
+// replacement joins onto its last line. When a match consumes a line's
+// trailing newline and the replacement text doesn't end with one, the next
+// line merges into the replacement (e.g. replacing "foo\n" with "baz" in
+// "foo\nbar\n" yields "bazbar\n"); rendering that next line as unchanged
+// context would show a materially wrong edit. An empty replacement region
+// deletes whole lines and leaves the following line's boundary intact, so
+// no extension is needed then.
+func extendRunForLineJoin(li *lineIndex, run *editRun, oldStr, newStr string) {
+	for run.lastLine+1 < li.lineCount() {
+		newText := runNewText(li, *run, oldStr, newStr)
+		if newText == "" || strings.HasSuffix(newText, "\n") {
+			return
+		}
+		run.lastLine++
+	}
 }
 
 // runNewText applies the run's replacements to its line-expanded old range
