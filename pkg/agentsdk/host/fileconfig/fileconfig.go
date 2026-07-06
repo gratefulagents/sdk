@@ -202,10 +202,6 @@ func (s *Source) RoleCatalog(ctx context.Context) (agentsdk.RoleCatalog, error) 
 	return LoadRoleCatalog(s.AgentDir())
 }
 
-func (s *Source) MCPServers(context.Context) (map[string]agentsdk.MCPServerConfig, error) {
-	return nil, nil
-}
-
 func (s *Source) ModeDirective(ctx context.Context) (string, error) {
 	spec, err := s.ModeSnapshot(ctx)
 	if err != nil {

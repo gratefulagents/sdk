@@ -1372,10 +1372,6 @@ func (integrationConfigSource) RoleCatalog(context.Context) (agentsdk.RoleCatalo
 	return nil, nil
 }
 
-func (integrationConfigSource) MCPServers(context.Context) (map[string]agentsdk.MCPServerConfig, error) {
-	return nil, nil
-}
-
 func (integrationConfigSource) ModeDirective(context.Context) (string, error) {
 	return "", nil
 }

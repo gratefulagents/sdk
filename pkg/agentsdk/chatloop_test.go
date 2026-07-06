@@ -417,10 +417,6 @@ func (staticConfigSource) RoleCatalog(context.Context) (RoleCatalog, error) {
 	return nil, nil
 }
 
-func (staticConfigSource) MCPServers(context.Context) (map[string]MCPServerConfig, error) {
-	return nil, nil
-}
-
 func (staticConfigSource) ModeDirective(context.Context) (string, error) {
 	return "", nil
 }

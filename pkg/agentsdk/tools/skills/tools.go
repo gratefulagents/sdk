@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
@@ -212,5 +213,25 @@ func (t *ListInstalledTool) Execute(_ context.Context, _ json.RawMessage, workDi
 	if len(names) == 0 {
 		return agentsdk.ToolResult{Content: "No skills currently installed in .mcp.json."}, nil
 	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Installed skills: %s", strings.Join(names, ", "))}, nil
+
+	sort.Strings(names)
+	var skills, others []string
+	for _, name := range names {
+		if _, ok := t.Installer.Skill(name); ok {
+			skills = append(skills, name)
+		} else {
+			others = append(others, name)
+		}
+	}
+
+	var lines []string
+	if len(skills) > 0 {
+		lines = append(lines, fmt.Sprintf("Installed skills: %s", strings.Join(skills, ", ")))
+	} else {
+		lines = append(lines, "No skills from the catalog are installed in .mcp.json.")
+	}
+	if len(others) > 0 {
+		lines = append(lines, fmt.Sprintf("Other MCP servers in .mcp.json (not from the skill catalog): %s", strings.Join(others, ", ")))
+	}
+	return agentsdk.ToolResult{Content: strings.Join(lines, "\n")}, nil
 }
