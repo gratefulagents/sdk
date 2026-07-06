@@ -20,7 +20,22 @@ func NewInstaller(registry *Registry) *Installer {
 	return &Installer{registry: registry}
 }
 
+// Skill returns the catalog entry for name from the installer's registry.
+func (inst *Installer) Skill(name string) (*SkillEntry, bool) {
+	if inst == nil || inst.registry == nil {
+		return nil, false
+	}
+	return inst.registry.Get(name)
+}
+
 // Install adds the named skill's MCP server config to the workspace's .mcp.json.
+//
+// The entry's allowEnv is seeded from the skill's requiresEnvVars so that
+// credential-looking variables the server genuinely needs pass the SDK's
+// credential env filter once the host supplies them (via the entry's env map
+// or a host-level secret mechanism). If an entry with the same name already
+// exists, its hardening fields (allowEnv, allowedTools, enabled, env) are
+// preserved and merged rather than silently clobbered.
 func (inst *Installer) Install(workDir, skillName string) error {
 	if inst == nil || inst.registry == nil {
 		return fmt.Errorf("skill installer registry is not configured")
@@ -39,14 +54,56 @@ func (inst *Installer) Install(workDir, skillName string) error {
 		return fmt.Errorf("loading .mcp.json: %w", err)
 	}
 
-	cfg.MCPServers[skill.Name] = mcp.ServerConfig{
-		Type:    skill.MCPConfig.Type,
-		Command: skill.MCPConfig.Command,
-		Args:    skill.MCPConfig.Args,
-		Env:     skill.MCPConfig.Env,
+	entry := mcp.ServerConfig{
+		Type:     skill.MCPConfig.Type,
+		Command:  skill.MCPConfig.Command,
+		Args:     skill.MCPConfig.Args,
+		Env:      cloneStringMap(skill.MCPConfig.Env),
+		AllowEnv: append([]string(nil), skill.RequiresEnvVars...),
 	}
+	if existing, ok := cfg.MCPServers[skill.Name]; ok {
+		// Reinstall/update: keep user- or platform-applied hardening.
+		entry.AllowEnv = mergeUnique(existing.AllowEnv, entry.AllowEnv)
+		entry.AllowedTools = existing.AllowedTools
+		entry.Enabled = existing.Enabled
+		for k, v := range existing.Env {
+			if entry.Env == nil {
+				entry.Env = make(map[string]string)
+			}
+			if _, exists := entry.Env[k]; !exists {
+				entry.Env[k] = v
+			}
+		}
+	}
+	cfg.MCPServers[skill.Name] = entry
 
 	return saveMCPConfig(cfgPath, cfg)
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func mergeUnique(lists ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range lists {
+		for _, v := range list {
+			if v == "" || seen[v] {
+				continue
+			}
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // Uninstall removes the named skill's MCP server config from .mcp.json.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
@@ -79,10 +80,29 @@ func (t *SearchTool) Execute(_ context.Context, input json.RawMessage, _ string)
 		if skill.Verified {
 			verified = " ✓"
 		}
-		sb.WriteString(fmt.Sprintf("• **%s** (v%s, %s%s)\n  %s\n  Tags: %s\n\n",
+		sb.WriteString(fmt.Sprintf("• **%s** (v%s, %s%s)\n  %s\n  Tags: %s\n",
 			skill.Name, skill.Version, skill.Category, verified, skill.Description, strings.Join(skill.Tags, ", ")))
+		if len(skill.RequiresEnvVars) > 0 {
+			sb.WriteString(fmt.Sprintf("  Requires env: %s\n", describeEnvVars(skill.RequiresEnvVars)))
+		}
+		sb.WriteString("\n")
 	}
 	return agentsdk.ToolResult{Content: sb.String()}, nil
+}
+
+// describeEnvVars annotates each required env var with whether it is
+// currently present in the agent's environment, so callers can tell up front
+// whether an installed skill will be able to authenticate.
+func describeEnvVars(names []string) string {
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		if v, ok := os.LookupEnv(name); ok && strings.TrimSpace(v) != "" {
+			parts = append(parts, name+" (set)")
+		} else {
+			parts = append(parts, name+" (NOT set)")
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // InstallTool installs a skill from the catalog into the workspace's .mcp.json.
@@ -93,7 +113,7 @@ type InstallTool struct {
 
 func (t *InstallTool) Name() string { return "skill_install" }
 func (t *InstallTool) Description() string {
-	return "Install a skill from the catalog into the workspace. This writes the MCP server config to .mcp.json so it becomes available as a tool."
+	return "Install a skill from the catalog into the workspace. This writes the MCP server config to .mcp.json. MCP configs are loaded at session start, so the new server's tools become available after the agent restarts (they are NOT available in the current session)."
 }
 func (t *InstallTool) IsReadOnly() bool { return false }
 func (t *InstallTool) IsEnabled(ctx *agentsdk.RunContext) bool {
@@ -130,7 +150,29 @@ func (t *InstallTool) Execute(_ context.Context, input json.RawMessage, workDir 
 	if err := t.Installer.Install(dir, in.Name); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to install skill %q: %v", in.Name, err), IsError: true}, nil
 	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Skill %q installed successfully. Its MCP server config has been added to .mcp.json.", in.Name)}, nil
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Skill %q installed: its MCP server config was added to .mcp.json.", in.Name))
+	sb.WriteString(" MCP configs are loaded at session start, so its tools become available after the agent restarts — they are NOT available in this session.")
+	if skill, ok := t.Installer.Skill(in.Name); ok {
+		if missing := missingEnvVars(skill.RequiresEnvVars); len(missing) > 0 {
+			sb.WriteString(fmt.Sprintf("\n\nWARNING: required environment variable(s) not set: %s. The server will likely fail to authenticate until they are provided (e.g. via the host's secret mechanism or the entry's env map in .mcp.json; they are already listed in the entry's allowEnv).",
+				strings.Join(missing, ", ")))
+		}
+	}
+	return agentsdk.ToolResult{Content: sb.String()}, nil
+}
+
+// missingEnvVars returns the subset of names absent or empty in the agent's
+// environment.
+func missingEnvVars(names []string) []string {
+	var missing []string
+	for _, name := range names {
+		if v, ok := os.LookupEnv(name); !ok || strings.TrimSpace(v) == "" {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 // ListInstalledTool lists skills currently installed in the workspace.

@@ -5,8 +5,8 @@
       "description": "Browser automation via Playwright for web testing and UI verification",
       "category": "browser",
       "version": "0.1.0",
-      "source": { "repository": "https://github.com/anthropics/mcp-server-playwright" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@anthropic/mcp-server-playwright"] },
+      "source": { "repository": "https://github.com/microsoft/playwright-mcp" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp"] },
       "tags": ["browser", "automation", "testing", "screenshots"],
       "verified": true
     },
@@ -22,22 +22,22 @@
     },
     {
       "name": "search-exa",
-      "description": "High-quality AI-powered web search via Exa",
+      "description": "High-quality AI-powered web search via Exa (requires EXA_API_KEY in the agent environment)",
       "category": "search",
       "version": "0.1.0",
       "source": { "repository": "https://github.com/exa-labs/exa-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "exa-mcp-server"], "env": {"EXA_API_KEY": "${EXA_API_KEY}"} },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "exa-mcp-server"] },
       "tags": ["search", "web", "ai"],
       "verified": true,
       "requiresEnvVars": ["EXA_API_KEY"]
     },
     {
       "name": "search-brave",
-      "description": "Web, image, video, and news search via Brave Search API",
+      "description": "Web, image, video, and news search via the official Brave Search MCP server (requires BRAVE_API_KEY in the agent environment)",
       "category": "search",
       "version": "0.1.0",
-      "source": { "repository": "https://github.com/anthropics/mcp-server-brave-search" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@anthropic/mcp-server-brave-search"], "env": {"BRAVE_API_KEY": "${BRAVE_API_KEY}"} },
+      "source": { "repository": "https://github.com/brave/brave-search-mcp-server" },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@brave/brave-search-mcp-server"] },
       "tags": ["search", "web", "images", "news"],
       "verified": true,
       "requiresEnvVars": ["BRAVE_API_KEY"]
@@ -73,17 +73,6 @@
       "verified": true
     },
     {
-      "name": "github-mcp",
-      "description": "GitHub API integration - repositories, issues, PRs, and more",
-      "category": "vcs",
-      "version": "0.1.0",
-      "source": { "repository": "https://github.com/github/github-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@github/mcp-server"], "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"} },
-      "tags": ["github", "vcs", "api"],
-      "verified": true,
-      "requiresEnvVars": ["GITHUB_TOKEN"]
-    },
-    {
       "name": "sequential-thinking",
       "description": "Dynamic problem-solving through structured thought sequences (official MCP reference server)",
       "category": "reasoning",
@@ -94,59 +83,15 @@
       "verified": true
     },
     {
-      "name": "postgres-mcp",
-      "description": "PostgreSQL database access and querying via MCP",
-      "category": "database",
-      "version": "0.1.0",
-      "source": { "repository": "https://github.com/modelcontextprotocol/servers", "ref": "main" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"], "env": {"DATABASE_URL": "${DATABASE_URL}"} },
-      "tags": ["database", "postgres", "sql", "official"],
-      "verified": true,
-      "requiresEnvVars": ["DATABASE_URL"]
-    },
-    {
-      "name": "slack-mcp",
-      "description": "Slack workspace integration - channels, messages, and users",
-      "category": "communication",
-      "version": "0.1.0",
-      "source": { "repository": "https://github.com/zencoderai/slack-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "slack-mcp-server"], "env": {"SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"} },
-      "tags": ["slack", "messaging", "communication"],
-      "verified": true,
-      "requiresEnvVars": ["SLACK_BOT_TOKEN"]
-    },
-    {
-      "name": "sentry-mcp",
-      "description": "Sentry error tracking and monitoring integration",
-      "category": "monitoring",
-      "version": "0.1.0",
-      "source": { "repository": "https://github.com/getsentry/sentry-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@sentry/mcp-server"], "env": {"SENTRY_AUTH_TOKEN": "${SENTRY_AUTH_TOKEN}"} },
-      "tags": ["monitoring", "errors", "sentry"],
-      "verified": true,
-      "requiresEnvVars": ["SENTRY_AUTH_TOKEN"]
-    },
-    {
       "name": "firecrawl",
-      "description": "Web scraping and search via Firecrawl - crawl, scrape, and extract web content",
+      "description": "Web scraping and search via Firecrawl - crawl, scrape, and extract web content (requires FIRECRAWL_API_KEY in the agent environment)",
       "category": "search",
       "version": "0.1.0",
       "source": { "repository": "https://github.com/firecrawl/firecrawl-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "firecrawl-mcp-server"], "env": {"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"} },
+      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "firecrawl-mcp"] },
       "tags": ["search", "scraping", "web"],
       "verified": true,
       "requiresEnvVars": ["FIRECRAWL_API_KEY"]
-    },
-    {
-      "name": "linear-mcp",
-      "description": "Linear project management - issues, projects, and teams",
-      "category": "project-management",
-      "version": "0.1.0",
-      "source": { "repository": "https://github.com/linear/linear-mcp-server" },
-      "mcpConfig": { "type": "stdio", "command": "npx", "args": ["-y", "@linear/mcp-server"], "env": {"LINEAR_API_KEY": "${LINEAR_API_KEY}"} },
-      "tags": ["linear", "project-management", "issues"],
-      "verified": true,
-      "requiresEnvVars": ["LINEAR_API_KEY"]
     },
     {
       "name": "memory-knowledge-graph",
