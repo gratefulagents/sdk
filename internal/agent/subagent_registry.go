@@ -891,7 +891,7 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 				if outcome.Status == subAgentStatusCancelled {
 					finalStatus = SubAgentTaskCancelled
 				}
-				r.setTerminal(taskID, finalStatus, "", outcome.ErrMsg, outcome.Duration, 0, 0)
+				r.setTerminal(taskID, finalStatus, "", outcome.ErrMsg, outcome.Duration, outcome.ToolCount, outcome.Tokens)
 			case outcome.Status == subAgentStatusStopped:
 				r.setTerminal(taskID, SubAgentTaskCancelled, outcome.FinalText, "", outcome.Duration, outcome.ToolCount, outcome.Tokens)
 			default:

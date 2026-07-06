@@ -137,7 +137,11 @@ func NewProgressTracker(opts ...TrackerOption) *ProgressTracker {
 }
 
 // NewChildTracker creates a child tracker for a subagent.
-// It has its own counters (doesn't affect parent's snapshot).
+// It keeps its own event/activity state, but forwards LLM usage (cost and
+// tokens, including cache tokens) and tool-call counts up the parent chain as
+// they happen, so the run-level tracker always reflects total consumption —
+// even for subagents that later fail or are cancelled, and for nested
+// subagents.
 func NewChildTracker(parent *ProgressTracker, taskID string) *ProgressTracker {
 	parent.mu.Lock()
 	sessionNum := parent.sessionNumber
