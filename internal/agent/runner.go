@@ -492,6 +492,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
 			runCtx.Usage.Add(compactResult.Usage)
+			recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
 			if cfg.CompactionRecorder != nil {
 				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
 			}
@@ -504,6 +505,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if compactionCfg.UseLLMSummary {
 					rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
 					runCtx.Usage.Add(usage)
+					recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
 					if llmOK {
 						compactedItems = rebuilt
 					}
@@ -689,6 +691,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
 					runCtx.Usage.Add(compactResult.Usage)
+					recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
 					if cfg.CompactionRecorder != nil {
 						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
 					}
@@ -710,6 +713,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					if forcedCfg.UseLLMSummary {
 						rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
 						runCtx.Usage.Add(usage)
+						recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
 						if llmOK {
 							compactedItems = rebuilt
 						}
@@ -2062,6 +2066,24 @@ func emitLLMAttemptEvent(hooks RunHooks, event ContentEvent) {
 		return
 	}
 	platformHooks.EventStream.EmitLLMAttempt(event)
+}
+
+// recordCompactionUsage books model usage consumed by history compaction
+// (provider-side compaction or LLM-summary calls) on the platform tracker.
+// These calls bypass OnLLMEnd, so without this the usage would reach
+// RunResult.Usage but never the run-level tracker totals (cost caps, session
+// metrics) — and for subagent runs, whose completion no longer re-adds
+// RunResult.Usage to the parent tracker, it would be lost entirely.
+func recordCompactionUsage(hooks RunHooks, model Model, modelName string, usage Usage) {
+	if usage == (Usage{}) {
+		return
+	}
+	platformHooks := findPlatformHooks(hooks)
+	if platformHooks == nil || platformHooks.Tracker == nil {
+		return
+	}
+	costUSD, _ := estimateModelCost(model, usage)
+	platformHooks.Tracker.RecordLLMUsage(modelName, costUSD, usage)
 }
 
 // findPlatformHooks locates a *PlatformHooks inside hooks, unwrapping

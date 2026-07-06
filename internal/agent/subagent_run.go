@@ -141,15 +141,33 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 			outcome.Status = subAgentStatusCancelled
 		}
 		outcome.ErrMsg = fmt.Sprintf("agent %q %s: %v", spec.Agent.Name, outcome.Status, err)
+		// Runner.Run returns a nil result on error, so recover the partial
+		// usage the child tracker observed (its own LLM calls plus anything
+		// forwarded from nested subagents) for outcome accounting and the
+		// completion event/span. Run-level totals are unaffected either way:
+		// per-call forwarding already recorded this usage on the parent.
+		if childTracker != nil {
+			snap := childTracker.Snapshot()
+			outcome.CostUSD = snap.CostUsd
+			outcome.CostKnown = snap.CostUsd > 0
+			outcome.Usage = Usage{
+				InputTokens:       snap.InputTokens,
+				OutputTokens:      snap.OutputTokens,
+				CacheReadTokens:   snap.CacheReadInputTokens,
+				CacheCreateTokens: snap.CacheCreationInputTokens,
+			}
+			outcome.Tokens = snap.InputTokens + snap.OutputTokens
+			outcome.ToolCount = snap.ToolCallCount
+		}
 		if spec.OnTerminal != nil {
 			spec.OnTerminal(outcome)
 		}
 		filesRead, filesWritten := spec.activityFiles()
 		if spec.Tracker != nil {
-			spec.Tracker.RecordSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, 0, 0, Usage{}, "", filesRead, filesWritten)
+			spec.Tracker.RecordSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, outcome.CostUSD, 0, outcome.Usage, "", filesRead, filesWritten)
 		}
 		if spec.EventStream != nil {
-			spec.EventStream.EmitSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, 0, 0, outcome.Duration.Milliseconds(), 0, false, 0, outcome.Status, "")
+			spec.EventStream.EmitSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, 0, outcome.Status, "")
 		}
 		return outcome
 	}

@@ -49,11 +49,31 @@ func (t *ProgressTracker) RecordToolUse(toolName, inputSummary, toolUseID string
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.toolCallCount++
 	t.sessionToolCallCount++
 	t.lastActivity = fmt.Sprintf("Tool: %s", toolName)
 	t.inferStepLocked(toolName, inputSummary)
+	parent := t.parent
+	t.mu.Unlock()
+	// Forward the counter up the tracker chain so run-level tool-call totals
+	// include subagent activity. Only the counters propagate: ancestors keep
+	// their own lastActivity/step state.
+	parent.recordForwardedToolCall()
+}
+
+// recordForwardedToolCall bumps tool-call counters for a descendant tracker's
+// tool use without touching activity/step-inference state, then continues up
+// the parent chain so arbitrarily nested subagent tool calls roll up.
+func (t *ProgressTracker) recordForwardedToolCall() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.toolCallCount++
+	t.sessionToolCallCount++
+	parent := t.parent
+	t.mu.Unlock()
+	parent.recordForwardedToolCall()
 }
 
 // RecordToolResult logs a tool execution result.
@@ -117,12 +137,15 @@ func (t *ProgressTracker) RecordHookDecision(event HookEvent, result HookResult)
 
 // RecordLLMUsage accumulates cost and token counts from a single LLM call
 // so the tracker's Snapshot() stays current between session-complete events.
+// Child trackers forward every call up the parent chain, so run-level totals
+// (cost caps, session metrics) include subagent usage — cache tokens included
+// — as it happens, and usage from subagents that later fail or are cancelled
+// is never lost. Nested subagents roll up the same way, one level at a time.
 func (t *ProgressTracker) RecordLLMUsage(model string, costUSD float64, usage Usage) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.costUsd += costUSD
 	t.sessionCostUsd += costUSD
 	t.inputTokens += usage.InputTokens
@@ -131,6 +154,9 @@ func (t *ProgressTracker) RecordLLMUsage(model string, costUSD float64, usage Us
 	t.cacheCreationInputTokens += usage.CacheCreateTokens
 	t.updateModelUsageLocked(model, usage.InputTokens, usage.OutputTokens,
 		usage.CacheReadTokens, usage.CacheCreateTokens)
+	parent := t.parent
+	t.mu.Unlock()
+	parent.RecordLLMUsage(model, costUSD, usage)
 }
 
 // RecordSessionComplete logs session completion with final metrics.
@@ -225,11 +251,11 @@ func (t *ProgressTracker) RecordSubagentCompleted(taskID, status, summary string
 	defer t.mu.Unlock()
 	meta := t.taskAgents[taskID]
 	t.lastActivity = Truncate(summary, 120)
-	// Accumulate subagent cost and tokens so aggregate metrics stay accurate.
-	t.costUsd += costUSD
-	t.sessionCostUsd += costUSD
-	t.inputTokens += usage.InputTokens
-	t.outputTokens += usage.OutputTokens
+	// Aggregate cost/token accounting is NOT updated here: the child tracker
+	// forwards every LLM call and tool use to this tracker live (see
+	// RecordLLMUsage / recordForwardedToolCall), so re-adding the subagent's
+	// totals at completion would double count. The costUSD/usage parameters
+	// only feed the completion span below.
 	// Close the lifecycle span opened by RecordSubagentStarted with the full
 	// final metrics so its duration reflects the subagent's real runtime.
 	if t.tp != nil {
