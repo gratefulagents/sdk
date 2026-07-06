@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -174,13 +175,37 @@ func (s *AnthropicFileTokenSource) refreshLocked(ctx context.Context) error {
 }
 
 // writeBackLocked persists refreshed material so restarts and sibling
-// processes see it. Failures are expected on read-only mounts and ignored;
-// the refreshed token stays usable in memory.
+// processes see it. It writes to a temp file and renames it into place: the
+// refresh token just consumed was single-use, so a torn write on crash would
+// lose the only durable copy of its replacement. Failures are expected on
+// read-only mounts and ignored; the refreshed token stays usable in memory.
 func (s *AnthropicFileTokenSource) writeBackLocked(raw []byte) {
 	if s.path == "" {
 		return
 	}
-	if err := os.WriteFile(s.path, raw, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".anthropic-auth-*.tmp")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		cleanup()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		_ = os.Remove(tmpName)
 		return
 	}
 	if info, err := os.Stat(s.path); err == nil {

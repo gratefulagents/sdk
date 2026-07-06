@@ -78,8 +78,14 @@ func TestRefreshAnthropicTokens(t *testing.T) {
 			if body["grant_type"] != "refresh_token" || body["refresh_token"] != "old-refresh" {
 				t.Fatalf("refresh request body = %#v", body)
 			}
-			if body["scope"] != AnthropicOAuthScope {
-				t.Fatalf("scope = %q, want %q", body["scope"], AnthropicOAuthScope)
+			if scope, ok := body["scope"]; ok {
+				t.Fatalf("scope = %q, want omitted (Claude Code omits scope on refresh)", scope)
+			}
+			if got := req.Header.Get("User-Agent"); got != anthropicTokenUserAgent {
+				t.Fatalf("User-Agent = %q, want %q", got, anthropicTokenUserAgent)
+			}
+			if got := req.Header.Get("Accept"); got != "application/json, text/plain, */*" {
+				t.Fatalf("Accept = %q", got)
 			}
 			return jsonResponse(http.StatusOK, `{
 				"access_token":"new-access",

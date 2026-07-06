@@ -23,7 +23,10 @@ type RefreshConfig struct {
 
 	AnthropicClientID string
 	AnthropicTokenURL string
-	AnthropicScope    string
+	// AnthropicScope, when set, is sent with refresh_token grants. Leave empty
+	// for parity with Claude Code and other OAuth clients, which omit scope on
+	// refresh: the issued token keeps the scopes granted at authorization.
+	AnthropicScope string
 
 	CopilotTokenURL            string
 	CopilotEditorVersion       string
@@ -82,35 +85,69 @@ func RefreshAnthropicAuthJSON(ctx context.Context, authJSON []byte, cfg RefreshC
 // RefreshAnthropicTokens exchanges an Anthropic OAuth refresh token and returns
 // serialized flat auth JSON containing the updated access token.
 func RefreshAnthropicTokens(ctx context.Context, auth AnthropicAuth, cfg RefreshConfig) ([]byte, error) {
-	clientID := firstNonEmpty(cfg.AnthropicClientID, AnthropicOAuthClientID)
-	tokenURL := firstNonEmpty(cfg.AnthropicTokenURL, AnthropicOAuthTokenURL)
-	scope := firstNonEmpty(cfg.AnthropicScope, AnthropicOAuthScope)
-	body, err := json.Marshal(map[string]string{
-		"client_id":     clientID,
+	body := map[string]string{
+		"client_id":     firstNonEmpty(cfg.AnthropicClientID, AnthropicOAuthClientID),
 		"grant_type":    "refresh_token",
 		"refresh_token": strings.TrimSpace(auth.RefreshToken),
-		"scope":         scope,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal anthropic refresh request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(body))
+	// Claude Code (and opencode-anthropic-auth) omit scope on refresh; the
+	// issued token keeps the scopes granted at authorization. Only an explicit
+	// override is forwarded.
+	if scope := strings.TrimSpace(cfg.AnthropicScope); scope != "" {
+		body["scope"] = scope
+	}
+	raw, err := postAnthropicToken(ctx, cfg, "refresh", body)
 	if err != nil {
-		return nil, fmt.Errorf("build anthropic refresh request: %w", err)
+		return nil, err
+	}
+	updated, err := adoptAnthropicTokenResponse(auth, raw, "refresh", refreshNow(cfg))
+	if err != nil {
+		return nil, err
+	}
+	return MarshalAnthropicAuthJSON(updated)
+}
+
+// anthropicTokenUserAgent matches the client fingerprint Claude Code's own
+// runtime (a Node/axios app) presents to the OAuth token endpoint, mirroring
+// opencode-anthropic-auth. Go's default "Go-http-client" UA is an unnecessary
+// giveaway on an endpoint that expects Claude Code-shaped traffic.
+const anthropicTokenUserAgent = "axios/1.13.6"
+
+// postAnthropicToken POSTs a JSON grant body to the Anthropic OAuth token
+// endpoint and returns the raw success body. op names the grant ("refresh",
+// "code exchange") for error messages.
+func postAnthropicToken(ctx context.Context, cfg RefreshConfig, op string, body map[string]string) ([]byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal anthropic %s request: %w", op, err)
+	}
+	tokenURL := firstNonEmpty(cfg.AnthropicTokenURL, AnthropicOAuthTokenURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build anthropic %s request: %w", op, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", anthropicTokenUserAgent)
 	resp, err := refreshHTTPClient(cfg).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic refresh request failed: %w", err)
+		return nil, fmt.Errorf("anthropic %s request failed: %w", op, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, responseBodyByteLimit(cfg)))
 	if err != nil {
-		return nil, fmt.Errorf("read anthropic refresh response: %w", err)
+		return nil, fmt.Errorf("read anthropic %s response: %w", op, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("anthropic refresh failed with status %d: %s", resp.StatusCode, SanitizeLogBody(string(raw)))
+		return nil, fmt.Errorf("anthropic %s failed with status %d: %s", op, resp.StatusCode, SanitizeLogBody(string(raw)))
 	}
+	return raw, nil
+}
+
+// adoptAnthropicTokenResponse merges an OAuth token-endpoint response into
+// auth: access/refresh tokens, expiry derived from expires_in, and account
+// identity when present.
+func adoptAnthropicTokenResponse(auth AnthropicAuth, raw []byte, op string, now time.Time) (AnthropicAuth, error) {
 	var tokenResp struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
@@ -121,18 +158,17 @@ func RefreshAnthropicTokens(ctx context.Context, auth AnthropicAuth, cfg Refresh
 		} `json:"account"`
 	}
 	if err := json.Unmarshal(raw, &tokenResp); err != nil {
-		return nil, fmt.Errorf("parse anthropic refresh response: %w", err)
+		return AnthropicAuth{}, fmt.Errorf("parse anthropic %s response: %w", op, err)
 	}
 	tokenResp.AccessToken = strings.TrimSpace(tokenResp.AccessToken)
 	tokenResp.RefreshToken = strings.TrimSpace(tokenResp.RefreshToken)
 	if tokenResp.AccessToken == "" {
-		return nil, fmt.Errorf("anthropic refresh response missing access_token")
+		return AnthropicAuth{}, fmt.Errorf("anthropic %s response missing access_token", op)
 	}
 	auth.AccessToken = tokenResp.AccessToken
 	if tokenResp.RefreshToken != "" {
 		auth.RefreshToken = tokenResp.RefreshToken
 	}
-	now := refreshNow(cfg)
 	if tokenResp.ExpiresIn > 0 {
 		auth.ExpiresAt = now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	}
@@ -143,7 +179,7 @@ func RefreshAnthropicTokens(ctx context.Context, auth AnthropicAuth, cfg Refresh
 		auth.AccountUUID = uuid
 	}
 	auth.LastRefresh = now
-	return MarshalAnthropicAuthJSON(auth)
+	return auth, nil
 }
 
 // RefreshCopilotAuthJSON refreshes serialized Copilot OAuth material when the

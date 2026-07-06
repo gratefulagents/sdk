@@ -205,3 +205,82 @@ func TestAnthropicFileTokenSource_InvalidateForcesRefresh(t *testing.T) {
 		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
 	}
 }
+
+func TestAnthropicFileTokenSource_WriteBackAtomicAndPrivate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "tok-refreshed",
+			"refresh_token": "refresh-2",
+			"expires_in":    28800,
+		})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := writeAuthFile(t, dir, AnthropicAuth{
+		AccessToken:  "tok-stale",
+		RefreshToken: "refresh-1",
+		ExpiresAt:    time.Now().Add(30 * time.Second),
+	})
+	src := NewAnthropicFileTokenSource(path, RefreshConfig{AnthropicTokenURL: srv.URL})
+	if got, err := src.Token(context.Background()); err != nil || got != "tok-refreshed" {
+		t.Fatalf("Token() = %q, %v; want tok-refreshed", got, err)
+	}
+
+	// The write-back must not leave temp files behind and must keep the
+	// credential file private.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != "auth.json" {
+			t.Fatalf("unexpected leftover file %q in credential dir", entry.Name())
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat auth file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("auth file mode = %o, want 600", perm)
+	}
+}
+
+func TestAnthropicFileTokenSource_WriteBackReadOnlyDirKeepsTokenInMemory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "tok-refreshed",
+			"refresh_token": "refresh-2",
+			"expires_in":    28800,
+		})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := writeAuthFile(t, dir, AnthropicAuth{
+		AccessToken:  "tok-stale",
+		RefreshToken: "refresh-1",
+		ExpiresAt:    time.Now().Add(30 * time.Second),
+	})
+	// Simulate a read-only mount: temp-file creation and rename must fail
+	// without breaking the in-memory refresh.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	src := NewAnthropicFileTokenSource(path, RefreshConfig{AnthropicTokenURL: srv.URL})
+	if got, err := src.Token(context.Background()); err != nil || got != "tok-refreshed" {
+		t.Fatalf("Token() = %q, %v; want refreshed token despite read-only dir", got, err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	if auth, err := ParseAnthropicAuthJSON(raw); err != nil || auth.AccessToken != "tok-stale" {
+		t.Fatalf("file auth = %+v, %v; want untouched stale material", auth, err)
+	}
+}
