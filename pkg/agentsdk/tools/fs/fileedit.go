@@ -80,22 +80,9 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 	}
 	origMode := info.Mode().Perm()
 
-	fileContent := string(data)
-	count := strings.Count(fileContent, in.OldString)
-	if count == 0 {
-		return agentsdk.ToolResult{Content: "old_string not found in file. The match must be byte-exact including whitespace, indentation, and line endings; re-read the relevant lines with read_file and copy them verbatim", IsError: true}, nil
-	}
-	if count > 1 && !in.ReplaceAll {
-		return agentsdk.ToolResult{
-			Content: fmt.Sprintf("old_string is not unique in file (found %d times). Use replace_all or provide more context to make it unique.", count),
-			IsError: true,
-		}, nil
-	}
-	var newContent string
-	if in.ReplaceAll {
-		newContent = strings.ReplaceAll(fileContent, in.OldString, in.NewString)
-	} else {
-		newContent = strings.Replace(fileContent, in.OldString, in.NewString, 1)
+	newContent, count, diff, errMsg := applyEdit(string(data), in)
+	if errMsg != "" {
+		return agentsdk.ToolResult{Content: errMsg, IsError: true}, nil
 	}
 	wf, err := pathutil.OpenInWorkspace(workDir, canonical, os.O_WRONLY|os.O_TRUNC, origMode)
 	if err != nil {
@@ -108,10 +95,7 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 	if err := wf.Close(); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error closing file: %v", err), IsError: true}, nil
 	}
-	if in.ReplaceAll {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Successfully replaced %d occurrences in %s", count, canonical)}, nil
-	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Successfully edited %s", canonical)}, nil
+	return agentsdk.ToolResult{Content: editSuccessMessage(canonical, count, in.ReplaceAll, diff)}, nil
 }
 
 func (t *FileEditTool) Name() string { return "Edit" }
@@ -186,23 +170,9 @@ func executeFileEdit(ctx context.Context, input json.RawMessage, workDir string,
 	}
 	origMode := info.Mode()
 
-	fileContent := string(content)
-	count := strings.Count(fileContent, in.OldString)
-	if count == 0 {
-		return agentsdk.ToolResult{Content: "old_string not found in file. The match must be byte-exact including whitespace, indentation, and line endings; re-read the relevant lines with read_file and copy them verbatim", IsError: true}, nil
-	}
-	if count > 1 && !in.ReplaceAll {
-		return agentsdk.ToolResult{
-			Content: fmt.Sprintf("old_string is not unique in file (found %d times). Use replace_all or provide more context to make it unique.", count),
-			IsError: true,
-		}, nil
-	}
-
-	var newContent string
-	if in.ReplaceAll {
-		newContent = strings.ReplaceAll(fileContent, in.OldString, in.NewString)
-	} else {
-		newContent = strings.Replace(fileContent, in.OldString, in.NewString, 1)
+	newContent, count, diff, errMsg := applyEdit(string(content), in)
+	if errMsg != "" {
+		return agentsdk.ToolResult{Content: errMsg, IsError: true}, nil
 	}
 
 	resolvedPath, err = resolvePath(workDir, resolvedPath)
@@ -212,10 +182,41 @@ func executeFileEdit(ctx context.Context, input json.RawMessage, workDir string,
 	if err := writeFileNoFollow(resolvedPath, []byte(newContent), origMode); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
 	}
-	if in.ReplaceAll {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Successfully replaced %d occurrences in %s", count, resolvedPath)}, nil
+	return agentsdk.ToolResult{Content: editSuccessMessage(resolvedPath, count, in.ReplaceAll, diff)}, nil
+}
+
+// applyEdit validates the match and applies the requested replacement to
+// fileContent. It returns the new content, the number of replacements, and a
+// unified diff of the change for the tool result. A non-empty errMsg reports
+// a match failure the caller must surface as a tool error.
+func applyEdit(fileContent string, in fileEditInput) (newContent string, count int, diff string, errMsg string) {
+	count = strings.Count(fileContent, in.OldString)
+	if count == 0 {
+		return "", 0, "", "old_string not found in file. The match must be byte-exact including whitespace, indentation, and line endings; re-read the relevant lines with read_file and copy them verbatim"
 	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Successfully edited %s", resolvedPath)}, nil
+	if count > 1 && !in.ReplaceAll {
+		return "", 0, "", fmt.Sprintf("old_string is not unique in file (found %d times). Use replace_all or provide more context to make it unique.", count)
+	}
+	if in.ReplaceAll {
+		newContent = strings.ReplaceAll(fileContent, in.OldString, in.NewString)
+	} else {
+		newContent = strings.Replace(fileContent, in.OldString, in.NewString, 1)
+	}
+	return newContent, count, buildEditDiff(fileContent, in.OldString, in.NewString, in.ReplaceAll), ""
+}
+
+// editSuccessMessage builds the Edit tool result content: a summary line
+// followed by a unified diff of what changed, so the model can verify the
+// edit landed and host UIs (e.g. the dashboard) can visualize it.
+func editSuccessMessage(path string, count int, replaceAll bool, diff string) string {
+	summary := fmt.Sprintf("Successfully edited %s", path)
+	if replaceAll {
+		summary = fmt.Sprintf("Successfully replaced %d occurrences in %s", count, path)
+	}
+	if diff == "" {
+		return summary
+	}
+	return summary + "\n" + diff
 }
 
 func readEditableFileNoFollow(path string) ([]byte, os.FileInfo, error) {
