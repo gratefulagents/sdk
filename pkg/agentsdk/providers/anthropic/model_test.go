@@ -2,6 +2,9 @@ package anthropic
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -172,5 +175,213 @@ func TestBuildRequestAPIKeyOmitsClaudeCodeIdentity(t *testing.T) {
 	})
 	if len(req.System) != 1 || req.System[0].Text != "Be helpful." {
 		t.Fatalf("System = %+v, want instructions only", req.System)
+	}
+}
+
+// TestBuildRequestThinkingShapePerModel pins the per-model thinking request
+// shape. On effort-first gateways (adaptiveThinking, e.g. Copilot's
+// /v1/messages shim) the 4.5-and-older Claude generations must keep
+// thinking.type=enabled + budget_tokens — the shim returns no thinking blocks
+// for adaptive requests against them — while 4.6+/fable/5.x use adaptive +
+// output_config.effort. On the first-party API only the effort-only models
+// (fable, opus 4.7+, generation 5) switch to adaptive.
+func TestBuildRequestThinkingShapePerModel(t *testing.T) {
+	cases := []struct {
+		name       string
+		adaptive   bool // provider AdaptiveThinking (effort-first gateway)
+		model      string
+		settings   agentsdk.ModelSettings
+		wantType   string // "" = no thinking config
+		wantBudget int
+		wantEffort string
+	}{
+		{
+			name:       "copilot 4.5 generation keeps enabled+budget",
+			adaptive:   true,
+			model:      "claude-sonnet-4.5",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 8192, ReasoningEffort: "high"},
+			wantType:   "enabled",
+			wantBudget: 8192,
+		},
+		{
+			name:       "copilot 4.5 with effort only derives a budget",
+			adaptive:   true,
+			model:      "claude-haiku-4.5",
+			settings:   agentsdk.ModelSettings{ReasoningEffort: "medium"},
+			wantType:   "enabled",
+			wantBudget: 4096,
+		},
+		{
+			name:       "copilot 4.6+ uses adaptive+effort",
+			adaptive:   true,
+			model:      "claude-opus-4.8",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 8192, ReasoningEffort: "xhigh"},
+			wantType:   "adaptive",
+			wantEffort: "max",
+		},
+		{
+			name:       "copilot adaptive with budget only defaults to medium effort",
+			adaptive:   true,
+			model:      "claude-fable-5",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 8192},
+			wantType:   "adaptive",
+			wantEffort: "medium",
+		},
+		{
+			name:       "first-party 4.5 keeps enabled+budget",
+			adaptive:   false,
+			model:      "claude-sonnet-4-5",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 4096, ReasoningEffort: "medium"},
+			wantType:   "enabled",
+			wantBudget: 4096,
+		},
+		{
+			name:       "first-party 4.6 still accepts budget so keeps enabled",
+			adaptive:   false,
+			model:      "claude-sonnet-4-6",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 4096, ReasoningEffort: "medium"},
+			wantType:   "enabled",
+			wantBudget: 4096,
+		},
+		{
+			name:       "first-party effort-only model switches to adaptive",
+			adaptive:   false,
+			model:      "claude-fable-5",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 4096},
+			wantType:   "adaptive",
+			wantEffort: "medium",
+		},
+		{
+			name:       "first-party opus 4.7 is effort-only",
+			adaptive:   false,
+			model:      "claude-opus-4-7",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 8192, ReasoningEffort: "high"},
+			wantType:   "adaptive",
+			wantEffort: "high",
+		},
+		{
+			name:     "reasoning none without budget disables thinking",
+			adaptive: true,
+			model:    "claude-sonnet-4.5",
+			settings: agentsdk.ModelSettings{ReasoningEffort: "none"},
+			wantType: "",
+		},
+		{
+			name:     "no reasoning settings sends no thinking config",
+			adaptive: false,
+			model:    "claude-sonnet-4-5",
+			wantType: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &AnthropicModel{model: tc.model, adaptiveThinking: tc.adaptive}
+			apiReq := m.buildRequest(agentsdk.ModelRequest{Model: tc.model, Settings: tc.settings})
+			if tc.wantType == "" {
+				if apiReq.Thinking != nil {
+					t.Fatalf("Thinking = %+v, want none", apiReq.Thinking)
+				}
+				return
+			}
+			if apiReq.Thinking == nil || apiReq.Thinking.Type != tc.wantType {
+				t.Fatalf("Thinking = %+v, want type %q", apiReq.Thinking, tc.wantType)
+			}
+			if apiReq.Thinking.BudgetTokens != tc.wantBudget {
+				t.Fatalf("budget_tokens = %d, want %d", apiReq.Thinking.BudgetTokens, tc.wantBudget)
+			}
+			if apiReq.OutputEffort != tc.wantEffort {
+				t.Fatalf("output_config.effort = %q, want %q", apiReq.OutputEffort, tc.wantEffort)
+			}
+		})
+	}
+}
+
+// TestThinkingShapeFlipOn400 verifies the self-healing retry: when the API
+// rejects the derived thinking shape with the thinking.type 400, the request
+// is retried once with the opposite shape and the working shape sticks for
+// subsequent requests from the same model handle.
+func TestThinkingShapeFlipOn400(t *testing.T) {
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"\"thinking.type.enabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	m, err := newAnthropicModel(anthropicModelConfig{apiKey: "test-key", baseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.model = "claude-sonnet-4-5" // resolves to enabled+budget
+
+	req := agentsdk.ModelRequest{
+		Model:    "claude-sonnet-4-5",
+		Settings: agentsdk.ModelSettings{ThinkingBudget: 4096, ReasoningEffort: "medium"},
+		Input:    []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	}
+	resp, err := m.GetResponse(context.Background(), req)
+	if err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2 (original + flipped retry)", len(bodies))
+	}
+	first, _ := bodies[0]["thinking"].(map[string]any)
+	if got, _ := first["type"].(string); got != "enabled" {
+		t.Fatalf("first thinking.type = %q, want enabled", got)
+	}
+	second, _ := bodies[1]["thinking"].(map[string]any)
+	if got, _ := second["type"].(string); got != "adaptive" {
+		t.Fatalf("retry thinking.type = %q, want adaptive", got)
+	}
+	if _, hasBudget := second["budget_tokens"]; hasBudget {
+		t.Fatalf("retry thinking must not carry budget_tokens: %v", second)
+	}
+	if resp == nil {
+		t.Fatal("GetResponse() = nil response after flipped retry")
+	}
+
+	// The working shape sticks: the next request goes straight to adaptive.
+	if apiReq := m.buildRequest(req); apiReq.Thinking == nil || apiReq.Thinking.Type != "adaptive" {
+		t.Fatalf("post-flip Thinking = %+v, want adaptive", apiReq.Thinking)
+	}
+}
+
+// TestThinkingShapeFlipIgnoresUnrelated400 ensures ordinary bad-request errors
+// are not retried with a different thinking shape.
+func TestThinkingShapeFlipIgnoresUnrelated400(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is too large"}}`))
+	}))
+	defer srv.Close()
+
+	m, err := newAnthropicModel(anthropicModelConfig{apiKey: "test-key", baseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.model = "claude-sonnet-4-5"
+
+	_, err = m.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Model:    "claude-sonnet-4-5",
+		Settings: agentsdk.ModelSettings{ThinkingBudget: 4096},
+		Input:    []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	})
+	if err == nil {
+		t.Fatal("GetResponse() = nil error, want 400 passthrough")
+	}
+	if calls != 1 {
+		t.Fatalf("requests = %d, want 1 (no shape-flip retry)", calls)
 	}
 }

@@ -340,6 +340,10 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		// token; the static bearer only satisfies the client's credential check.
 		BearerToken:      firstNonEmpty(initialToken, "copilot-placeholder"),
 		RequestHeaders:   anthropicHeaders,
+		// Effort-first shim: Claude 4.6+/fable/5.x take thinking.type=adaptive +
+		// output_config.effort here (they 400 on enabled), while the 4.5-and-older
+		// family still resolves to enabled + budget_tokens per model — the shim
+		// returns no thinking blocks for adaptive requests against those models.
 		AdaptiveThinking: true,
 		// Verified against the Copilot /v1/messages shim: cache_control
 		// breakpoints bill cache reads at 0.1x, and oversized max_tokens is

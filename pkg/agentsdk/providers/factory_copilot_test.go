@@ -301,3 +301,52 @@ func TestCopilotChatCompletionsEscapeHatch(t *testing.T) {
 		t.Fatalf("path = %q, want /v1/chat/completions", gotPath)
 	}
 }
+
+// TestCopilotClaude45UsesEnabledThinking locks in the restored thinking path
+// for the budget-tokens-only Claude generation on Copilot's /v1/messages shim
+// (claude-haiku-4.5 / claude-sonnet-4.5 / claude-opus-4.5): these models
+// return no thinking blocks for thinking.type=adaptive, and Copilot upstream
+// verifies thinking.type=enabled + budget_tokens end-to-end (see
+// BerriAI/litellm#28053). Only the 4.6+/fable/5.x generations use adaptive.
+func TestCopilotClaude45UsesEnabledThinking(t *testing.T) {
+	var body struct {
+		Thinking     map[string]any `json:"thinking"`
+		OutputConfig map[string]any `json:"output_config"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4.5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:         DefaultProviderCopilot,
+		Model:            "claude-sonnet-4.5",
+		ProviderAPIKeys:  map[string]string{DefaultProviderCopilot: "copilot-token"},
+		ProviderBaseURLs: map[string]string{DefaultProviderCopilot: srv.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("claude-sonnet-4.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Model:    "claude-sonnet-4.5",
+		Settings: agentsdk.ModelSettings{ThinkingBudget: 8192, ReasoningEffort: "high"},
+		Input:    []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if got, _ := body.Thinking["type"].(string); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled (adaptive yields no thinking blocks on the 4.5 family)", got)
+	}
+	if got, _ := body.Thinking["budget_tokens"].(float64); int(got) != 8192 {
+		t.Fatalf("thinking.budget_tokens = %v, want 8192", body.Thinking["budget_tokens"])
+	}
+	if len(body.OutputConfig) != 0 {
+		t.Fatalf("output_config must be empty on the enabled path: %v", body.OutputConfig)
+	}
+}

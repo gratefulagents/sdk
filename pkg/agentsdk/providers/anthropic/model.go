@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	internalanthropic "github.com/gratefulagents/sdk/internal/anthropic"
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
@@ -40,10 +41,13 @@ type ProviderConfig struct {
 	// RequestHeaders, when set, supplies per-request headers (gateway auth and
 	// integration headers) via SDK middleware.
 	RequestHeaders func(context.Context) (map[string]string, error)
-	// AdaptiveThinking makes the provider emit adaptive thinking
-	// (thinking.type=adaptive + output_config.effort) instead of a fixed
-	// thinking-budget. Required by GitHub Copilot's /v1/messages shim for newer
-	// Claude models, which reject thinking.type=enabled.
+	// AdaptiveThinking marks the deployment as effort-first: an
+	// Anthropic-compatible gateway (e.g. GitHub Copilot's /v1/messages shim)
+	// that controls reasoning via thinking.type=adaptive + output_config.effort
+	// on every model generation that supports it. The shape is still resolved
+	// per model: generations that only implement thinking.type=enabled +
+	// budget_tokens (claude-*-4.5 and older) keep the enabled shape, which is
+	// the only one that returns thinking blocks for them.
 	AdaptiveThinking bool
 	// PromptCaching enables Anthropic prompt-cache breakpoints: the tool
 	// prefix, system prompt, and the last two conversation positions are
@@ -106,6 +110,11 @@ type AnthropicModel struct {
 	adaptiveThinking bool
 	promptCaching    bool
 	defaultMaxTokens int
+
+	// thinkingShape overrides the per-model thinking-shape heuristic after the
+	// API rejected the derived shape with the thinking.type 400 (see
+	// flipThinkingShapeOnError). 0 = auto, 1 = adaptive, 2 = enabled.
+	thinkingShape atomic.Int32
 }
 
 type anthropicModelConfig struct {
@@ -162,7 +171,13 @@ func (m *AnthropicModel) GetResponse(ctx context.Context, req agentsdk.ModelRequ
 	apiReq := m.buildRequest(req)
 	resp, err := m.client.CreateMessage(ctx, apiReq)
 	if err != nil {
-		return nil, err
+		flipped, ok := m.flipThinkingShapeOnError(err, apiReq, req)
+		if !ok {
+			return nil, err
+		}
+		if resp, err = m.client.CreateMessage(ctx, flipped); err != nil {
+			return nil, err
+		}
 	}
 	return m.convertResponse(resp), nil
 }
@@ -174,7 +189,13 @@ func (m *AnthropicModel) StreamResponse(ctx context.Context, req agentsdk.ModelR
 	apiReq := m.buildRequest(req)
 	stream, err := m.client.CreateMessageStream(ctx, apiReq)
 	if err != nil {
-		return nil, err
+		flipped, ok := m.flipThinkingShapeOnError(err, apiReq, req)
+		if !ok {
+			return nil, err
+		}
+		if stream, err = m.client.CreateMessageStream(ctx, flipped); err != nil {
+			return nil, err
+		}
 	}
 	return m.wrapStream(stream), nil
 }
@@ -248,24 +269,7 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 		apiReq.MaxTokens = 16384
 	}
 
-	if m.adaptiveThinking {
-		// Gateways such as Copilot's /v1/messages shim reject thinking.type=enabled
-		// for newer Claude models and instead control reasoning via adaptive
-		// thinking + output_config.effort. Emit that shape whenever reasoning is
-		// requested (a thinking budget or an explicit effort).
-		if effort := mapReasoningEffortToAnthropic(req.Settings.ReasoningEffort); effort != "" {
-			apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
-			apiReq.OutputEffort = effort
-		} else if req.Settings.ThinkingBudget > 0 {
-			apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
-			apiReq.OutputEffort = string(internalanthropic.OutputEffortMedium)
-		}
-	} else if req.Settings.ThinkingBudget > 0 {
-		apiReq.Thinking = &internalanthropic.ThinkingConfig{
-			Type:         "enabled",
-			BudgetTokens: req.Settings.ThinkingBudget,
-		}
-	}
+	m.applyThinkingConfig(&apiReq, model, req.Settings)
 
 	// Convert tools.
 	for _, t := range req.Tools {
@@ -284,6 +288,111 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 	}
 
 	return apiReq
+}
+
+// Thinking-shape override states recorded after a thinking.type 400.
+const (
+	thinkingShapeAuto     int32 = iota // resolve per model
+	thinkingShapeAdaptive              // force adaptive + output_config.effort
+	thinkingShapeEnabled               // force enabled + budget_tokens
+)
+
+// applyThinkingConfig emits the extended-thinking request config in the shape
+// the target model implements. Claude generations up to 4.5 only accept
+// thinking.type=enabled + budget_tokens; the 4.6+/fable/5.x generations accept
+// (and on effort-first gateways such as Copilot's /v1/messages shim, require)
+// thinking.type=adaptive + output_config.effort. Sending the wrong shape either
+// 400s or — on the Copilot shim's 4.5 family — silently returns no thinking
+// blocks, which is what used to hide Claude reasoning on Copilot.
+func (m *AnthropicModel) applyThinkingConfig(apiReq *internalanthropic.CreateMessageRequest, model string, settings agentsdk.ModelSettings) {
+	effort := mapReasoningEffortToAnthropic(settings.ReasoningEffort)
+	if effort == "" && settings.ThinkingBudget <= 0 {
+		// No reasoning requested (or explicitly "none" without a budget).
+		return
+	}
+	if m.useAdaptiveThinking(model) {
+		if effort == "" {
+			effort = string(internalanthropic.OutputEffortMedium)
+		}
+		apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
+		apiReq.OutputEffort = effort
+		return
+	}
+	budget := settings.ThinkingBudget
+	if budget <= 0 {
+		budget = thinkingBudgetForEffort(effort)
+	}
+	if budget <= 0 {
+		return
+	}
+	apiReq.Thinking = &internalanthropic.ThinkingConfig{
+		Type:         "enabled",
+		BudgetTokens: budget,
+	}
+	apiReq.OutputEffort = ""
+}
+
+// useAdaptiveThinking picks the thinking request shape for a model. A shape
+// recorded by flipThinkingShapeOnError wins; otherwise effort-first gateways
+// (adaptiveThinking, e.g. Copilot's /v1/messages shim) use adaptive on every
+// generation that supports it, and the first-party API keeps enabled +
+// budget_tokens except on the models that reject it.
+func (m *AnthropicModel) useAdaptiveThinking(model string) bool {
+	switch m.thinkingShape.Load() {
+	case thinkingShapeAdaptive:
+		return true
+	case thinkingShapeEnabled:
+		return false
+	}
+	if m.adaptiveThinking {
+		return internalanthropic.ModelSupportsAdaptiveThinking(model)
+	}
+	return internalanthropic.ModelRequiresAdaptiveThinking(model)
+}
+
+// thinkingBudgetForEffort converts a reasoning-effort label into a fixed
+// thinking budget for models that only implement enabled + budget_tokens.
+// The ladder mirrors agent.ModeReasoningSettings so an effort-only request
+// behaves the same as the equivalent mode-level reasoning setting.
+func thinkingBudgetForEffort(effort string) int {
+	switch effort {
+	case internalanthropic.OutputEffortLow:
+		return 2048
+	case internalanthropic.OutputEffortMedium:
+		return 4096
+	case internalanthropic.OutputEffortHigh:
+		return 8192
+	case internalanthropic.OutputEffortXHigh, internalanthropic.OutputEffortMax:
+		return 12288
+	default:
+		return 0
+	}
+}
+
+// flipThinkingShapeOnError rebuilds the request with the opposite thinking
+// shape when the API rejected the current one, and records the working shape
+// for the rest of the model's lifetime. The per-model generation split is a
+// heuristic mirror of the provider catalogs, so a drifted deployment answers
+// with HTTP 400 bodies like `"thinking.type.enabled" is not supported for this
+// model. Use "thinking.type.adaptive" and "output_config.effort" ...` — the
+// one-shot flip self-heals in both directions instead of failing the run.
+func (m *AnthropicModel) flipThinkingShapeOnError(err error, sent internalanthropic.CreateMessageRequest, req agentsdk.ModelRequest) (internalanthropic.CreateMessageRequest, bool) {
+	if sent.Thinking == nil {
+		return sent, false
+	}
+	var reqErr *internalanthropic.RequestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != 400 {
+		return sent, false
+	}
+	if !strings.Contains(strings.ToLower(reqErr.Body), "thinking.type") {
+		return sent, false
+	}
+	if sent.Thinking.Type == "adaptive" {
+		m.thinkingShape.Store(thinkingShapeEnabled)
+	} else {
+		m.thinkingShape.Store(thinkingShapeAdaptive)
+	}
+	return m.buildRequest(req), true
 }
 
 // applyPromptCacheBreakpoints marks the standard agent-loop cache boundaries
