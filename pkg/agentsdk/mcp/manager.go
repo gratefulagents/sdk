@@ -69,6 +69,8 @@ type serverConn struct {
 	// cfg is the server's config, retained so the manager can reconnect a
 	// crashed stdio server mid-session.
 	cfg ServerConfig
+	// stderr retains the tail of the child's stderr for diagnostics.
+	stderr *stderrTail
 }
 
 // reconnectState serializes reconnect attempts for one server and rate-limits
@@ -202,7 +204,9 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 
 		tools, err := listAllTools(ctx, conn.session)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("MCP server %q: list tools: %w", serverName, err))
+			errs = append(errs, errWithStderr(
+				fmt.Errorf("MCP server %q: list tools: %w", serverName, err),
+				conn.stderr.tailAfterGrace(250*time.Millisecond)))
 			continue
 		}
 
@@ -661,6 +665,11 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 		return nil, fmt.Errorf("MCP server %q sandbox: %w", name, err)
 	}
 	configureProcessGroup(cmd)
+	// Capture the child's stderr so failures report the real reason (panic,
+	// traceback, missing binary chatter) instead of a bare EOF. The go-sdk
+	// CommandTransport does not touch cmd.Stderr.
+	stderr := newStderrTail(stderrTailCap)
+	cmd.Stderr = stderr
 
 	client := mcpsdk.NewClient(&mcpsdk.Implementation{
 		Name:    clientName,
@@ -669,7 +678,8 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 
 	session, err := client.Connect(connectCtx, &mcpsdk.CommandTransport{Command: cmd}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("MCP server %q connect: %w", name, err)
+		return nil, errWithStderr(fmt.Errorf("MCP server %q connect: %w", name, err),
+			stderr.tailAfterGrace(250*time.Millisecond))
 	}
 
 	return &serverConn{
@@ -679,6 +689,7 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 		capabilities: session.InitializeResult().Capabilities,
 		cmd:          cmd,
 		cfg:          cfg,
+		stderr:       stderr,
 	}, nil
 }
 
