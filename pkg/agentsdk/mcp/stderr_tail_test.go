@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"os/exec"
+	"os"
 	"strings"
 	"testing"
 
@@ -10,12 +11,17 @@ import (
 )
 
 // directExecutor runs commands without a sandbox so tests can exercise real
-// child processes deterministically.
+// child processes deterministically. It mirrors the real executors' use of
+// exec.CommandContext so context-lifetime regressions reproduce.
 type directExecutor struct{}
 
 func (directExecutor) Build(ctx context.Context, req sandbox.Request) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = req.WorkDir
+	cmd.Env = os.Environ()
+	for k, v := range req.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	return cmd, nil
 }
 
