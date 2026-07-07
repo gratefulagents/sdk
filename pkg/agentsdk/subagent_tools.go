@@ -780,12 +780,16 @@ func (t *subagentWaitTool) InputSchema() json.RawMessage {
 
 // subagentWaitResponse is the JSON payload returned by subagent_wait.
 type subagentWaitResponse struct {
-	WaitComplete bool                   `json:"wait_complete"`
-	TimedOut     bool                   `json:"timed_out,omitempty"`
-	WaitFor      string                 `json:"wait_for,omitempty"`
-	Finished     []joinedTaskJSON       `json:"finished,omitempty"`
-	StillActive  []subagentProgressTask `json:"still_active,omitempty"`
-	Note         string                 `json:"note,omitempty"`
+	WaitComplete bool             `json:"wait_complete"`
+	TimedOut     bool             `json:"timed_out,omitempty"`
+	WaitFor      string           `json:"wait_for,omitempty"`
+	Finished     []joinedTaskJSON `json:"finished,omitempty"`
+	// PreviouslyDelivered lists watched tasks that were already terminal with
+	// results delivered before this call. Their result payloads are omitted so
+	// stale output is never re-delivered as if it were new.
+	PreviouslyDelivered []joinedTaskJSON       `json:"previously_delivered,omitempty"`
+	StillActive         []subagentProgressTask `json:"still_active,omitempty"`
+	Note                string                 `json:"note,omitempty"`
 }
 
 func (t *subagentWaitTool) Execute(ctx context.Context, input json.RawMessage, _ string) (ToolResult, error) {
@@ -840,11 +844,20 @@ func (t *subagentWaitTool) Execute(ctx context.Context, input json.RawMessage, _
 	for i := range tasks {
 		task := tasks[i]
 		if task.IsTerminal() {
-			// Mark delivered so the same result is not injected again later.
-			if delivered, err := t.registry.CollectResult(task.ID); err == nil && delivered != nil {
+			// Mark delivered so the same result is not injected again later,
+			// and keep results that were already delivered on an earlier call
+			// out of finished so stale output is never re-delivered as new.
+			delivered, firstDelivery, err := t.registry.CollectResultIfUndelivered(task.ID)
+			if err == nil && delivered != nil {
 				task = *delivered
 			}
-			response.Finished = append(response.Finished, joinedTaskJSONs([]SubAgentTask{task})[0])
+			entry := joinedTaskJSONs([]SubAgentTask{task})[0]
+			if err == nil && !firstDelivery {
+				entry.Result = ""
+				response.PreviouslyDelivered = append(response.PreviouslyDelivered, entry)
+				continue
+			}
+			response.Finished = append(response.Finished, entry)
 			continue
 		}
 		response.StillActive = append(response.StillActive, subagentProgressTaskFromTask(&task))

@@ -548,6 +548,11 @@ type subagentWaitToolResponse struct {
 		Status string `json:"status"`
 		Result string `json:"result"`
 	} `json:"finished"`
+	PreviouslyDelivered []struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+		Result string `json:"result"`
+	} `json:"previously_delivered"`
 	StillActive []struct {
 		TaskID string `json:"task_id"`
 		Status string `json:"status"`
@@ -736,14 +741,41 @@ func TestSubagentWaitForAnyDeliversEachResultOnce(t *testing.T) {
 		t.Fatalf("second any-wait re-delivered results: %+v", resp.Finished)
 	}
 
+	// Same with explicit task_ids that reuse the already-delivered fast id:
+	// the stale result must be reported under previously_delivered without its
+	// payload, never under finished.
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any","task_ids":["`+fastID+`","`+slowID+`"],"timeout_ms":100}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSubagentWaitResponse(t, result)
+	if resp.WaitComplete || !resp.TimedOut {
+		t.Fatalf("explicit-ids any-wait must block until a new result: %s", result.Content)
+	}
+	if len(resp.Finished) != 0 {
+		t.Fatalf("explicit-ids any-wait re-delivered stale results as finished: %+v", resp.Finished)
+	}
+	if len(resp.PreviouslyDelivered) != 1 || resp.PreviouslyDelivered[0].TaskID != fastID {
+		t.Fatalf("previously_delivered = %+v, want fast task %s", resp.PreviouslyDelivered, fastID)
+	}
+	if resp.PreviouslyDelivered[0].Result != "" {
+		t.Fatalf("previously_delivered must omit the stale result payload: %+v", resp.PreviouslyDelivered)
+	}
+
 	close(slow.release)
-	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any"}`), "")
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any","task_ids":["`+fastID+`","`+slowID+`"]}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp = decodeSubagentWaitResponse(t, result)
 	if !resp.WaitComplete || len(resp.Finished) != 1 || resp.Finished[0].TaskID != slowID {
 		t.Fatalf("third any-wait = %s, want slow task result", result.Content)
+	}
+	if resp.Finished[0].Result != "blocked child done" {
+		t.Fatalf("third any-wait finished = %+v, want slow task payload", resp.Finished)
+	}
+	if len(resp.PreviouslyDelivered) != 1 || resp.PreviouslyDelivered[0].TaskID != fastID || resp.PreviouslyDelivered[0].Result != "" {
+		t.Fatalf("third any-wait previously_delivered = %+v, want payload-free fast task", resp.PreviouslyDelivered)
 	}
 	if registry.HasPendingFinalJoinTasks() {
 		t.Fatal("all results should be marked delivered")

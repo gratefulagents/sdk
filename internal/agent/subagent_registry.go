@@ -1417,18 +1417,29 @@ func (r *SubAgentRegistry) undeliveredResultState(markDelivered bool) ([]SubAgen
 
 // CollectResult returns the result of a completed task.
 func (r *SubAgentRegistry) CollectResult(taskID string) (*SubAgentTask, error) {
+	task, _, err := r.CollectResultIfUndelivered(taskID)
+	return task, err
+}
+
+// CollectResultIfUndelivered returns the result of a completed task and marks
+// it delivered, reporting whether this call performed the first delivery.
+// firstDelivery=false means the parent already received this result earlier
+// (via CollectResult, FinalJoinSnapshot, WaitForUndeliveredResults, or a
+// previous wait) and callers should avoid repeating the payload.
+func (r *SubAgentRegistry) CollectResultIfUndelivered(taskID string) (*SubAgentTask, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok := r.tasks[taskID]
 	if !ok {
-		return nil, fmt.Errorf("task %q not found", taskID)
+		return nil, false, fmt.Errorf("task %q not found", taskID)
 	}
 	if !entry.task.IsTerminal() {
-		return nil, fmt.Errorf("task %q is still %s", taskID, entry.task.Status)
+		return nil, false, fmt.Errorf("task %q is still %s", taskID, entry.task.Status)
 	}
+	firstDelivery := !entry.resultDelivered
 	entry.resultDelivered = true
 	task := subAgentTaskSnapshot(entry)
-	return &task, nil
+	return &task, firstDelivery, nil
 }
 
 // Cancel cancels a running task.
