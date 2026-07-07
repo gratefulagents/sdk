@@ -286,6 +286,11 @@ func TestBuildRequestThinkingShapePerModel(t *testing.T) {
 			if apiReq.Thinking == nil || apiReq.Thinking.Type != tc.wantType {
 				t.Fatalf("Thinking = %+v, want type %q", apiReq.Thinking, tc.wantType)
 			}
+			if tc.wantType == "adaptive" && apiReq.Thinking.Display != "summarized" {
+				// Copilot's shim treats a missing display as omitted and returns
+				// signature-only thinking blocks, hiding reasoning end-to-end.
+				t.Fatalf("thinking.display = %q, want %q", apiReq.Thinking.Display, "summarized")
+			}
 			if apiReq.Thinking.BudgetTokens != tc.wantBudget {
 				t.Fatalf("budget_tokens = %d, want %d", apiReq.Thinking.BudgetTokens, tc.wantBudget)
 			}

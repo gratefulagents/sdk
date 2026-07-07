@@ -304,6 +304,11 @@ const (
 // thinking.type=adaptive + output_config.effort. Sending the wrong shape either
 // 400s or — on the Copilot shim's 4.5 family — silently returns no thinking
 // blocks, which is what used to hide Claude reasoning on Copilot.
+//
+// Adaptive requests always pin display=summarized: the Messages API documents
+// summarized as the default, but Copilot's shim behaves as display=omitted when
+// the field is absent and returns signature-only thinking blocks with no text
+// (verified live against claude-fable-5), which hides reasoning end-to-end.
 func (m *AnthropicModel) applyThinkingConfig(apiReq *internalanthropic.CreateMessageRequest, model string, settings agentsdk.ModelSettings) {
 	effort := mapReasoningEffortToAnthropic(settings.ReasoningEffort)
 	if effort == "" && settings.ThinkingBudget <= 0 {
@@ -314,7 +319,7 @@ func (m *AnthropicModel) applyThinkingConfig(apiReq *internalanthropic.CreateMes
 		if effort == "" {
 			effort = string(internalanthropic.OutputEffortMedium)
 		}
-		apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive"}
+		apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive", Display: "summarized"}
 		apiReq.OutputEffort = effort
 		return
 	}
