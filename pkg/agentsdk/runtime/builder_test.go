@@ -362,7 +362,7 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 	for _, tool := range bundle.Agent.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"subagent", "subagent_status", "subagent_control"} {
+	for _, want := range []string{"subagent", "subagent_status", "subagent_wait", "subagent_control"} {
 		if !names[want] {
 			t.Fatalf("missing sub-agent tool %q; names=%v", want, toolNames(bundle.Agent.Tools))
 		}

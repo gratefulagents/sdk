@@ -57,6 +57,7 @@ func TestBuildDelegationGuideIncludesCompactTaskPacketGuidance(t *testing.T) {
 		"mode=\"background\"",
 		"tasks=[{key, message, depends_on:[keys]}",
 		"subagent_status",
+		"subagent_wait",
 		"subagent_control",
 	} {
 		if !strings.Contains(guide, want) {

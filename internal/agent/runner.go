@@ -109,6 +109,7 @@ var controlFlowToolNames = map[string]struct{}{
 	"RequestMCPBreakGlass": {},
 	"subagent":             {},
 	"subagent_status":      {},
+	"subagent_wait":        {},
 	"subagent_control":     {},
 }
 

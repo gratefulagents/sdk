@@ -89,6 +89,8 @@ One execution engine, one model-facing spawn tool.
     `depends_on`); `mode:"sync"` (default) returns results in the same call,
     `mode:"background"` returns task ids immediately.
   - `subagent_status` — `detail:"summary" | "activity" | "graph"` introspection.
+  - `subagent_wait` — event-driven blocking join on background tasks
+    (`wait_for:"all" | "any"`, optional `timeout_ms`); replaces sleep/poll loops.
   - `subagent_control` — `action:"message"` (steering) or `action:"cancel"`.
 - **Lifecycle.** Background tasks are managed: the runner injects each terminal
   result at the next turn boundary (incremental delivery), blocks parent final

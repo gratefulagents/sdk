@@ -200,7 +200,10 @@ Read the file yourself only when needed. Passing lightweight references instead 
 STATUS AND RESULTS: Background task progress streams through the runtime; you do not need to poll to check whether tasks are still running.
 Completed task results are delivered to you automatically as soon as each task finishes; act on early results while slower tasks keep running.
 Use subagent_status (detail="activity") for evidence on a specific task before steering; detail="graph" shows the dependency DAG.
-The SDK will not let you final-answer while background tasks are still active; keep supervising until results arrive.
+The SDK will not let you final-answer while background tasks are still active.
+
+WAITING: When you have nothing left to do but wait for background tasks, call subagent_wait — it blocks and wakes the moment tasks finish, returning their results (wait_for=any returns on the first new result; omit task_ids to wait on everything; timeout_ms caps the wait).
+NEVER wait by sleeping in Bash or by polling subagent_status in a loop: sleeps overshoot and waste turns, subagent_wait cannot.
 
 STEERING: If a running task needs an update, correction, or narrower constraint, subagent_control action="message" queues a parent message for its next model turn; action="cancel" stops it.
 Keep steering messages short and specific.`)

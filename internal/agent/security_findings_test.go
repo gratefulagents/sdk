@@ -149,7 +149,7 @@ func TestRunner_M3_ControlFlowAllowlistIsExplicit(t *testing.T) {
 		t.Fatalf("prefix-style false positive: arbitrary subagent_* should not be control-flow")
 	}
 	// The real tool names must still be allowed.
-	for _, name := range []string{"subagent", "subagent_status", "subagent_control"} {
+	for _, name := range []string{"subagent", "subagent_status", "subagent_wait", "subagent_control"} {
 		if !isControlFlowTool(name) {
 			t.Fatalf("canonical %s must be control-flow", name)
 		}
