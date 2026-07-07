@@ -655,7 +655,15 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 	}
 	defer cancel()
 
-	cmd, err := opts.executor.Build(connectCtx, sandbox.Request{
+	// Build the child on a context that is NOT the connect timeout: executors
+	// use exec.CommandContext, so a child bound to connectCtx is SIGKILLed the
+	// moment this function returns and the deferred cancel() runs — every
+	// server then died silently right after a successful handshake, and the
+	// first tools/list read EOF from the dead pipe (with nothing on stderr).
+	// The connect timeout below applies to the handshake only; process
+	// lifetime is owned by the manager (Close/terminateProcess) and the
+	// sandbox's --die-with-parent.
+	cmd, err := opts.executor.Build(context.WithoutCancel(ctx), sandbox.Request{
 		Argv:           append([]string{command}, args...),
 		WorkDir:        workDir,
 		PermissionMode: opts.permissionMode,
