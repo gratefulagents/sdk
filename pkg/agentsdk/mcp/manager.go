@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
@@ -21,6 +24,10 @@ const (
 	defaultConnectTimeout = 15 * time.Second
 	clientName            = "gratefulagents"
 	clientVersion         = "0.1.0"
+	// reconnectCooldown is the minimum interval between reconnect attempts
+	// for a single server. Within the cooldown, callers get the original
+	// call error instead of a fresh reconnect attempt.
+	reconnectCooldown = 10 * time.Second
 )
 
 // ToolDescriptor describes an MCP tool exposed to the LLM.
@@ -59,6 +66,16 @@ type serverConn struct {
 	// termination even if the SDK's graceful shutdown stalls. Nil when the
 	// transport did not expose an exec.Cmd (e.g. injected for tests).
 	cmd *exec.Cmd
+	// cfg is the server's config, retained so the manager can reconnect a
+	// crashed stdio server mid-session.
+	cfg ServerConfig
+}
+
+// reconnectState serializes reconnect attempts for one server and rate-limits
+// them to at most one per reconnectCooldown.
+type reconnectState struct {
+	mu          sync.Mutex
+	lastAttempt time.Time
 }
 
 // Manager holds connected MCP sessions and their exposed tools/resources.
@@ -74,6 +91,14 @@ type Manager struct {
 	// only set when the manager was constructed via NewManager. Silent
 	// reloads are refused — see ConfigSnapshot.VerifyUnchanged.
 	snapshot ConfigSnapshot
+	// workDir and opts are retained so crashed stdio servers can be
+	// reconnected mid-session.
+	workDir string
+	opts    managerOptions
+	// reconnectMu guards reconnects; each reconnectState serializes
+	// reconnect attempts for one server.
+	reconnectMu sync.Mutex
+	reconnects  map[string]*reconnectState
 }
 
 // ConfigSnapshot returns the pinned snapshot of .mcp.json, if any. Callers
@@ -142,6 +167,9 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 	m := &Manager{
 		servers:             make(map[string]*serverConn),
 		toolByQualifiedName: make(map[string]ToolDescriptor),
+		workDir:             workDir,
+		opts:                options,
+		reconnects:          make(map[string]*reconnectState),
 	}
 
 	var errs []error
@@ -373,10 +401,16 @@ func (m *Manager) CallTool(ctx context.Context, qualifiedName string, args map[s
 		return nil, err
 	}
 
-	result, err := conn.session.CallTool(ctx, &mcpsdk.CallToolParams{
+	params := &mcpsdk.CallToolParams{
 		Name:      desc.ToolName,
 		Arguments: args,
-	})
+	}
+	result, err := conn.session.CallTool(ctx, params)
+	if err != nil && isSessionClosedErr(err) {
+		if fresh, rerr := m.reconnectServer(ctx, desc.ServerName, conn); rerr == nil {
+			result, err = fresh.session.CallTool(ctx, params)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("MCP %s/%s: %w", desc.ServerName, desc.ToolName, err)
 	}
@@ -449,10 +483,107 @@ func (m *Manager) ReadResource(ctx context.Context, serverName, uri string) (*mc
 	}
 
 	result, err := conn.session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: uri})
+	if err != nil && isSessionClosedErr(err) {
+		if fresh, rerr := m.reconnectServer(ctx, serverName, conn); rerr == nil {
+			result, err = fresh.session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: uri})
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("MCP server %q read %q: %w", serverName, uri, err)
 	}
 	return result, nil
+}
+
+// isSessionClosedErr reports whether err indicates the MCP session or its
+// transport is gone (subprocess died, pipe closed), i.e. a reconnect may help.
+func isSessionClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, mcpsdk.ErrConnectionClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "file already closed") ||
+		strings.Contains(msg, "process already finished")
+}
+
+// shouldAttemptReconnect reports whether a reconnect attempt is allowed given
+// the previous attempt time. A zero lastAttempt means no attempt has been made.
+func shouldAttemptReconnect(lastAttempt, now time.Time, cooldown time.Duration) bool {
+	if lastAttempt.IsZero() {
+		return true
+	}
+	return now.Sub(lastAttempt) >= cooldown
+}
+
+func (m *Manager) reconnectStateFor(name string) *reconnectState {
+	m.reconnectMu.Lock()
+	defer m.reconnectMu.Unlock()
+	if m.reconnects == nil {
+		m.reconnects = make(map[string]*reconnectState)
+	}
+	st, ok := m.reconnects[name]
+	if !ok {
+		st = &reconnectState{}
+		m.reconnects[name] = st
+	}
+	return st
+}
+
+// reconnectServer attempts a single reconnect of a crashed stdio server and
+// returns the replacement connection. failed is the connection the caller
+// observed the failure on; if another goroutine already replaced it, the
+// current connection is returned without spawning a new process. Attempts are
+// rate-limited to one per reconnectCooldown per server.
+//
+// Note: tool descriptors are NOT refreshed on reconnect — the tool list pinned
+// at construction time keeps serving; a server that changes its tools across
+// restarts is not supported mid-session.
+func (m *Manager) reconnectServer(ctx context.Context, name string, failed *serverConn) (*serverConn, error) {
+	st := m.reconnectStateFor(name)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	m.mu.RLock()
+	current := m.servers[name]
+	m.mu.RUnlock()
+	if current == nil {
+		return nil, fmt.Errorf("MCP server %q is no longer registered", name)
+	}
+	if current != failed {
+		// A concurrent caller already reconnected; reuse its connection.
+		return current, nil
+	}
+
+	if !shouldAttemptReconnect(st.lastAttempt, time.Now(), reconnectCooldown) {
+		return nil, fmt.Errorf("MCP server %q: reconnect attempted too recently", name)
+	}
+	st.lastAttempt = time.Now()
+
+	fresh, err := connectStdioServer(ctx, m.workDir, name, current.cfg, m.opts)
+	if err != nil {
+		return nil, fmt.Errorf("MCP server %q reconnect: %w", name, err)
+	}
+
+	m.mu.Lock()
+	old := m.servers[name]
+	m.servers[name] = fresh
+	m.mu.Unlock()
+
+	if old != nil {
+		if old.session != nil {
+			_ = old.session.Close()
+		}
+		_ = terminateProcess(old.cmd, 2*time.Second)
+	}
+	return fresh, nil
 }
 
 func (m *Manager) getServer(name string) (*serverConn, error) {
@@ -547,6 +678,7 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 		session:      session,
 		capabilities: session.InitializeResult().Capabilities,
 		cmd:          cmd,
+		cfg:          cfg,
 	}, nil
 }
 
@@ -604,15 +736,23 @@ func normalizeInputSchema(schema any) json.RawMessage {
 	if err := json.Unmarshal(data, &obj); err != nil {
 		return json.RawMessage(defaultSchema)
 	}
+	mutated := false
 	if typ, _ := obj["type"].(string); typ == "" || typ == "object" {
-		obj["type"] = "object"
+		if typ != "object" {
+			obj["type"] = "object"
+			mutated = true
+		}
 		if _, ok := obj["properties"]; !ok {
 			obj["properties"] = map[string]any{}
-			normalized, err := json.Marshal(obj)
-			if err == nil && json.Valid(normalized) {
-				return json.RawMessage(normalized)
-			}
+			mutated = true
 		}
+	}
+	if mutated {
+		normalized, err := json.Marshal(obj)
+		if err != nil || !json.Valid(normalized) {
+			return json.RawMessage(defaultSchema)
+		}
+		return json.RawMessage(normalized)
 	}
 
 	return json.RawMessage(data)

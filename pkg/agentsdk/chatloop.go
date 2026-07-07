@@ -85,7 +85,6 @@ type ConfigSource interface {
 	ModeSnapshot(ctx context.Context) (*sdkmode.TemplateSpec, error)
 	GuardrailRules(ctx context.Context) ([]GuardrailRule, error)
 	RoleCatalog(ctx context.Context) (RoleCatalog, error)
-	MCPServers(ctx context.Context) (map[string]MCPServerConfig, error)
 	ModeDirective(ctx context.Context) (string, error)
 	HandoffHistory(ctx context.Context) ([]RunItem, error)
 }

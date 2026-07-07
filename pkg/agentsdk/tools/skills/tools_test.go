@@ -7,29 +7,48 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gratefulagents/sdk/pkg/agentsdk/mcp"
 )
 
+// mustNewSkillRegistry returns a registry with fixture entries. The SDK ships
+// an empty default catalog (hosts supply their own entries via
+// NewRegistryFromEntries), so behavior tests use fixtures.
 func mustNewSkillRegistry(t *testing.T) *Registry {
 	t.Helper()
-	r, err := NewRegistry()
-	if err != nil {
-		t.Fatalf("failed to create skill registry: %v", err)
-	}
-	return r
+	return NewRegistryFromEntries([]SkillEntry{
+		{
+			Name:        "search-duckduckgo",
+			Description: "Web search via DuckDuckGo - no API key required",
+			Category:    "search",
+			Version:     "0.1.0",
+			MCPConfig:   MCPServerConfig{Type: "stdio", Command: "uvx", Args: []string{"duckduckgo-mcp-server"}},
+			Tags:        []string{"search", "web", "free"},
+			Verified:    true,
+		},
+		{
+			Name:            "search-exa",
+			Description:     "AI-powered web search via Exa",
+			Category:        "search",
+			Version:         "0.1.0",
+			MCPConfig:       MCPServerConfig{Type: "stdio", Command: "npx", Args: []string{"-y", "exa-mcp-server"}},
+			Tags:            []string{"search", "web", "ai"},
+			Verified:        true,
+			RequiresEnvVars: []string{"EXA_API_KEY"},
+		},
+	})
 }
 
+// TestLoadDefaultCatalog pins the contract that the SDK ships no default MCP
+// servers: the embedded catalog must stay empty. Hosts that want an
+// installable catalog provide their own entries via NewRegistryFromEntries.
 func TestLoadDefaultCatalog(t *testing.T) {
 	skills, err := LoadDefaultCatalog()
 	if err != nil {
 		t.Fatalf("LoadDefaultCatalog() error = %v", err)
 	}
-	if len(skills) == 0 {
-		t.Fatal("expected non-empty catalog")
-	}
-	for _, skill := range skills {
-		if skill.Name == "" || skill.Description == "" || skill.Category == "" || skill.MCPConfig.Command == "" {
-			t.Fatalf("skill missing required fields: %+v", skill)
-		}
+	if len(skills) != 0 {
+		t.Fatalf("default catalog must be empty, got %d entries", len(skills))
 	}
 }
 
@@ -158,7 +177,58 @@ func TestSkillListInstalledTool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !strings.Contains(result.Content, "search-duckduckgo") {
+	if !strings.Contains(result.Content, "Installed skills: search-duckduckgo") {
 		t.Fatalf("result = %+v", result)
+	}
+	if strings.Contains(result.Content, "Other MCP servers") {
+		t.Fatalf("catalog-only install should not list other servers: %+v", result)
+	}
+}
+
+func TestSkillListInstalledToolSeparatesNonCatalogServers(t *testing.T) {
+	registry := mustNewSkillRegistry(t)
+	installer := NewInstaller(registry)
+	dir := t.TempDir()
+	tool := &ListInstalledTool{Installer: installer, WorkDir: dir}
+
+	if err := installer.Install(dir, "search-duckduckgo"); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	cfgPath, err := mcpConfigPath(dir)
+	if err != nil {
+		t.Fatalf("mcpConfigPath() error = %v", err)
+	}
+	cfg, err := loadMCPConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("loadMCPConfig() error = %v", err)
+	}
+	cfg.MCPServers["custom-server"] = mcp.ServerConfig{Type: "stdio", Command: "custom-mcp"}
+	if err := saveMCPConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("saveMCPConfig() error = %v", err)
+	}
+
+	result, err := tool.Execute(context.Background(), nil, dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(result.Content, "Installed skills: search-duckduckgo") {
+		t.Fatalf("result = %+v", result)
+	}
+	if !strings.Contains(result.Content, "Other MCP servers in .mcp.json (not from the skill catalog): custom-server") {
+		t.Fatalf("result missing non-catalog server line: %+v", result)
+	}
+
+	if err := installer.Uninstall(dir, "search-duckduckgo"); err != nil {
+		t.Fatalf("Uninstall() error = %v", err)
+	}
+	onlyOther, err := tool.Execute(context.Background(), nil, dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(onlyOther.Content, "No skills from the catalog are installed") {
+		t.Fatalf("result = %+v", onlyOther)
+	}
+	if !strings.Contains(onlyOther.Content, "custom-server") {
+		t.Fatalf("result missing non-catalog server: %+v", onlyOther)
 	}
 }
