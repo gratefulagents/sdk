@@ -3,6 +3,7 @@ package agentsdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 //
 //   - subagent: spawn one task or a keyed DAG of tasks, sync or background
 //   - subagent_status: progress, activity, and dependency-graph introspection
+//   - subagent_wait: block until background tasks finish (no sleep-polling)
 //   - subagent_control: steer (message) or cancel a running task
 //
 // All spawned tasks are managed by the scheduler: results are injected into
@@ -21,6 +23,7 @@ func BuildSubAgentTaskTools(reg *SubAgentScheduler, defaultAgent string) []Tool 
 	return []Tool{
 		&subagentTool{registry: reg, defaultAgent: defaultAgent},
 		&subagentStatusTool{registry: reg},
+		&subagentWaitTool{registry: reg},
 		&subagentControlTool{registry: reg},
 	}
 }
@@ -552,23 +555,29 @@ func buildSubagentProgressSnapshot(registry *SubAgentScheduler, taskIDs []string
 			}
 		}
 
-		snapshot = append(snapshot, subagentProgressTask{
-			TaskID:            task.ID,
-			Agent:             task.AgentName,
-			Status:            string(task.Status),
-			Duration:          subagentTaskDurationString(task),
-			DependsOn:         append([]string(nil), task.DependsOn...),
-			WaitingOn:         append([]string(nil), task.WaitingOn...),
-			CurrentStep:       task.CurrentStep,
-			LastTool:          task.LastTool,
-			FilesWritten:      task.FilesWritten,
-			MessagesReceived:  task.MessagesReceived,
-			LastParentMessage: task.LastParentMessage,
-			ResultAvailable:   task.IsTerminal() && task.Result != "",
-			Error:             task.Error,
-		})
+		snapshot = append(snapshot, subagentProgressTaskFromTask(task))
 	}
 	return summary, snapshot, nil
+}
+
+// subagentProgressTaskFromTask maps a task snapshot to its model-facing
+// progress representation shared by subagent_status and subagent_wait.
+func subagentProgressTaskFromTask(task *SubAgentTask) subagentProgressTask {
+	return subagentProgressTask{
+		TaskID:            task.ID,
+		Agent:             task.AgentName,
+		Status:            string(task.Status),
+		Duration:          subagentTaskDurationString(task),
+		DependsOn:         append([]string(nil), task.DependsOn...),
+		WaitingOn:         append([]string(nil), task.WaitingOn...),
+		CurrentStep:       task.CurrentStep,
+		LastTool:          task.LastTool,
+		FilesWritten:      task.FilesWritten,
+		MessagesReceived:  task.MessagesReceived,
+		LastParentMessage: task.LastParentMessage,
+		ResultAvailable:   task.IsTerminal() && task.Result != "",
+		Error:             task.Error,
+	}
 }
 
 func subagentTaskDurationString(task *SubAgentTask) string {
@@ -732,6 +741,131 @@ func (t *subagentStatusTool) executeGraph() (ToolResult, error) {
 		Nodes []node `json:"nodes"`
 		Edges []edge `json:"edges"`
 	}{Nodes: nodes, Edges: edges}, "", "  ")
+	return ToolResult{Content: string(resp)}, nil
+}
+
+// --- subagent_wait ----------------------------------------------------------
+
+type subagentWaitTool struct {
+	subagentTaskToolBase
+	registry *SubAgentScheduler
+}
+
+func (t *subagentWaitTool) Name() string { return "subagent_wait" }
+func (t *subagentWaitTool) Description() string {
+	return "Block until sub-agent tasks finish, then return their results. Use this instead of polling subagent_status or sleeping in Bash: it wakes the moment tasks finish, so it never overshoots. wait_for=all (default) waits for every watched task; wait_for=any returns as soon as one finishes with a new result. Omit task_ids to wait on all active tasks. timeout_ms caps the wait (timing out is a normal outcome, not an error)."
+}
+func (t *subagentWaitTool) IsReadOnly() bool { return false }
+func (t *subagentWaitTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"task_ids": {
+				"type": "array",
+				"items": {"type": "string"},
+				"description": "Task ids to wait on. Omit to wait on every task whose result you have not received yet (active or just-finished)."
+			},
+			"wait_for": {
+				"type": "string",
+				"enum": ["all", "any"],
+				"description": "all (default): return when every watched task is terminal. any: return as soon as one watched task finishes with a result not yet delivered to you."
+			},
+			"timeout_ms": {
+				"type": "integer",
+				"description": "Maximum wait before returning the current state. Omit or 0 to wait until the condition is met or the run is cancelled."
+			}
+		}
+	}`)
+}
+
+// subagentWaitResponse is the JSON payload returned by subagent_wait.
+type subagentWaitResponse struct {
+	WaitComplete bool             `json:"wait_complete"`
+	TimedOut     bool             `json:"timed_out,omitempty"`
+	WaitFor      string           `json:"wait_for,omitempty"`
+	Finished     []joinedTaskJSON `json:"finished,omitempty"`
+	// PreviouslyDelivered lists watched tasks that were already terminal with
+	// results delivered before this call. Their result payloads are omitted so
+	// stale output is never re-delivered as if it were new.
+	PreviouslyDelivered []joinedTaskJSON       `json:"previously_delivered,omitempty"`
+	StillActive         []subagentProgressTask `json:"still_active,omitempty"`
+	Note                string                 `json:"note,omitempty"`
+}
+
+func (t *subagentWaitTool) Execute(ctx context.Context, input json.RawMessage, _ string) (ToolResult, error) {
+	var params struct {
+		TaskIDs   []string `json:"task_ids"`
+		WaitFor   string   `json:"wait_for"`
+		TimeoutMS int64    `json:"timeout_ms"`
+	}
+	if len(input) > 0 {
+		if err := json.Unmarshal(input, &params); err != nil {
+			return ToolResult{Content: fmt.Sprintf("invalid input: %v", err), IsError: true}, nil
+		}
+	}
+	var waitAny bool
+	switch strings.ToLower(strings.TrimSpace(params.WaitFor)) {
+	case "", "all":
+		waitAny = false
+	case "any":
+		waitAny = true
+	default:
+		return ToolResult{Content: fmt.Sprintf("invalid wait_for %q: use \"all\" or \"any\"", params.WaitFor), IsError: true}, nil
+	}
+	waitFor := "all"
+	if waitAny {
+		waitFor = "any"
+	}
+
+	taskIDs := uniqueNonEmptyTaskIDs(params.TaskIDs)
+	if len(taskIDs) == 0 {
+		taskIDs = t.registry.PendingResultTaskIDs()
+	}
+	if len(taskIDs) == 0 {
+		resp, _ := json.MarshalIndent(subagentWaitResponse{
+			WaitComplete: true,
+			WaitFor:      waitFor,
+			Note:         "no active sub-agent tasks and no undelivered results",
+		}, "", "  ")
+		return ToolResult{Content: string(resp)}, nil
+	}
+
+	tasks, waitErr := t.registry.AwaitTasks(ctx, taskIDs, waitAny, params.TimeoutMS)
+	timedOut := errors.Is(waitErr, context.DeadlineExceeded)
+	if waitErr != nil && !timedOut {
+		return ToolResult{Content: fmt.Sprintf("subagent_wait failed: %v", waitErr), IsError: true}, nil
+	}
+
+	response := subagentWaitResponse{
+		WaitComplete: waitErr == nil,
+		TimedOut:     timedOut,
+		WaitFor:      waitFor,
+	}
+	for i := range tasks {
+		task := tasks[i]
+		if task.IsTerminal() {
+			// Mark delivered so the same result is not injected again later,
+			// and keep results that were already delivered on an earlier call
+			// out of finished so stale output is never re-delivered as new.
+			delivered, firstDelivery, err := t.registry.CollectResultIfUndelivered(task.ID)
+			if err == nil && delivered != nil {
+				task = *delivered
+			}
+			entry := joinedTaskJSONs([]SubAgentTask{task})[0]
+			if err == nil && !firstDelivery {
+				entry.Result = ""
+				response.PreviouslyDelivered = append(response.PreviouslyDelivered, entry)
+				continue
+			}
+			response.Finished = append(response.Finished, entry)
+			continue
+		}
+		response.StillActive = append(response.StillActive, subagentProgressTaskFromTask(&task))
+	}
+	if timedOut {
+		response.Note = fmt.Sprintf("timed out after %dms; %d task(s) still active — call subagent_wait again to keep waiting", params.TimeoutMS, len(response.StillActive))
+	}
+	resp, _ := json.MarshalIndent(response, "", "  ")
 	return ToolResult{Content: string(resp)}, nil
 }
 

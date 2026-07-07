@@ -59,8 +59,10 @@ type SubAgentFeatures struct {
 }
 
 // AsyncSubAgentFeatures gates the managed sub-agent tool surface:
-// subagent (spawn sync/background, single or DAG), subagent_status
-// (summary/activity/graph introspection), subagent_control (steer/cancel).
+// subagent (spawn sync/background, single or DAG) and subagent_wait
+// (block until background tasks finish) under Task, subagent_status
+// (summary/activity/graph introspection) under Status, subagent_control
+// (steer/cancel) under Control.
 type AsyncSubAgentFeatures struct {
 	Task    bool
 	Status  bool

@@ -524,3 +524,317 @@ func TestSubagentResultsDeliveredIncrementallyAtTurnBoundary(t *testing.T) {
 		t.Fatal("terminal sub-agent result was not injected incrementally at the turn boundary")
 	}
 }
+
+// --- subagent_wait ----------------------------------------------------------
+
+type subagentWaitModelProvider struct {
+	models map[string]Model
+}
+
+func (p subagentWaitModelProvider) GetModel(name string) (Model, error) {
+	if m, ok := p.models[name]; ok {
+		return m, nil
+	}
+	return nil, errors.New("unknown model " + name)
+}
+func (p subagentWaitModelProvider) Close() error { return nil }
+
+type subagentWaitToolResponse struct {
+	WaitComplete bool   `json:"wait_complete"`
+	TimedOut     bool   `json:"timed_out"`
+	Note         string `json:"note"`
+	Finished     []struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+		Result string `json:"result"`
+	} `json:"finished"`
+	PreviouslyDelivered []struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+		Result string `json:"result"`
+	} `json:"previously_delivered"`
+	StillActive []struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+	} `json:"still_active"`
+}
+
+func decodeSubagentWaitResponse(t *testing.T, result ToolResult) subagentWaitToolResponse {
+	t.Helper()
+	var resp subagentWaitToolResponse
+	if err := json.Unmarshal([]byte(result.Content), &resp); err != nil {
+		t.Fatalf("invalid wait response %q: %v", result.Content, err)
+	}
+	return resp
+}
+
+func spawnBackgroundSubagentTask(t *testing.T, tool *subagentTool, input string) string {
+	t.Helper()
+	result, err := tool.Execute(context.Background(), json.RawMessage(input), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("spawn failed: %s", result.Content)
+	}
+	var spawned struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &spawned); err != nil {
+		t.Fatal(err)
+	}
+	if spawned.TaskID == "" {
+		t.Fatalf("no task_id in spawn response: %s", result.Content)
+	}
+	return spawned.TaskID
+}
+
+func TestSubagentWaitBlocksUntilTaskFinishesAndDeliversResult(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	spawnTool := &subagentTool{registry: registry, defaultAgent: "worker"}
+	waitTool := &subagentWaitTool{registry: registry}
+
+	taskID := spawnBackgroundSubagentTask(t, spawnTool, `{"message":"do it","mode":"background"}`)
+	select {
+	case <-model.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for child to start")
+	}
+
+	done := make(chan ToolResult, 1)
+	go func() {
+		result, _ := waitTool.Execute(context.Background(), json.RawMessage(`{}`), "")
+		done <- result
+	}()
+
+	select {
+	case result := <-done:
+		t.Fatalf("subagent_wait returned while task was active: %s", result.Content)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(model.release)
+	var result ToolResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subagent_wait did not return after task completion")
+	}
+	if result.IsError {
+		t.Fatalf("result.IsError = true: %s", result.Content)
+	}
+	resp := decodeSubagentWaitResponse(t, result)
+	if !resp.WaitComplete || resp.TimedOut {
+		t.Fatalf("wait_complete=%v timed_out=%v, want complete wait: %s", resp.WaitComplete, resp.TimedOut, result.Content)
+	}
+	if len(resp.Finished) != 1 || resp.Finished[0].TaskID != taskID || resp.Finished[0].Result != "blocked child done" {
+		t.Fatalf("finished = %+v", resp.Finished)
+	}
+	if len(resp.StillActive) != 0 {
+		t.Fatalf("still_active = %+v, want empty", resp.StillActive)
+	}
+	if registry.HasPendingFinalJoinTasks() {
+		t.Fatal("result returned by subagent_wait must be marked delivered")
+	}
+}
+
+func TestSubagentWaitTimeoutReturnsSnapshotNotError(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	spawnTool := &subagentTool{registry: registry, defaultAgent: "worker"}
+	waitTool := &subagentWaitTool{registry: registry}
+
+	taskID := spawnBackgroundSubagentTask(t, spawnTool, `{"message":"do it","mode":"background"}`)
+	select {
+	case <-model.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for child to start")
+	}
+
+	result, err := waitTool.Execute(context.Background(), json.RawMessage(`{"timeout_ms":100}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("timeout must not be a tool error: %s", result.Content)
+	}
+	resp := decodeSubagentWaitResponse(t, result)
+	if resp.WaitComplete || !resp.TimedOut {
+		t.Fatalf("wait_complete=%v timed_out=%v, want timed-out wait: %s", resp.WaitComplete, resp.TimedOut, result.Content)
+	}
+	if len(resp.StillActive) != 1 || resp.StillActive[0].TaskID != taskID {
+		t.Fatalf("still_active = %+v, want the running task", resp.StillActive)
+	}
+
+	close(model.release)
+	if _, err := registry.WaitForTask(context.Background(), taskID, 2000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubagentWaitForAnyDeliversEachResultOnce(t *testing.T) {
+	fast := &blockingSubagentToolModel{started: make(chan struct{}), release: make(chan struct{})}
+	slow := &blockingSubagentToolModel{started: make(chan struct{}), release: make(chan struct{})}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{
+			"fast-model": fast,
+			"slow-model": slow,
+		}}),
+		Agents: map[string]*Agent{
+			"fast-worker": {Name: "fast-worker", Model: "fast-model"},
+			"slow-worker": {Name: "slow-worker", Model: "slow-model"},
+		},
+	})
+	spawnTool := &subagentTool{registry: registry, defaultAgent: "fast-worker"}
+	waitTool := &subagentWaitTool{registry: registry}
+
+	fastID := spawnBackgroundSubagentTask(t, spawnTool, `{"message":"quick","agent_name":"fast-worker","mode":"background"}`)
+	slowID := spawnBackgroundSubagentTask(t, spawnTool, `{"message":"long","agent_name":"slow-worker","mode":"background"}`)
+	for name, started := range map[string]chan struct{}{"fast": fast.started, "slow": slow.started} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s child to start", name)
+		}
+	}
+
+	close(fast.release)
+	result, err := waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSubagentWaitResponse(t, result)
+	if !resp.WaitComplete {
+		t.Fatalf("wait_for=any should complete on first result: %s", result.Content)
+	}
+	if len(resp.Finished) != 1 || resp.Finished[0].TaskID != fastID {
+		t.Fatalf("finished = %+v, want only fast task %s", resp.Finished, fastID)
+	}
+	if len(resp.StillActive) != 1 || resp.StillActive[0].TaskID != slowID {
+		t.Fatalf("still_active = %+v, want slow task %s", resp.StillActive, slowID)
+	}
+
+	// The fast result was delivered above: a second any-wait must keep
+	// blocking on the slow task instead of returning the same result again.
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any","timeout_ms":100}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSubagentWaitResponse(t, result)
+	if resp.WaitComplete || !resp.TimedOut {
+		t.Fatalf("second any-wait must block until a new result: %s", result.Content)
+	}
+	if len(resp.Finished) != 0 {
+		t.Fatalf("second any-wait re-delivered results: %+v", resp.Finished)
+	}
+
+	// Same with explicit task_ids that reuse the already-delivered fast id:
+	// the stale result must be reported under previously_delivered without its
+	// payload, never under finished.
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any","task_ids":["`+fastID+`","`+slowID+`"],"timeout_ms":100}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSubagentWaitResponse(t, result)
+	if resp.WaitComplete || !resp.TimedOut {
+		t.Fatalf("explicit-ids any-wait must block until a new result: %s", result.Content)
+	}
+	if len(resp.Finished) != 0 {
+		t.Fatalf("explicit-ids any-wait re-delivered stale results as finished: %+v", resp.Finished)
+	}
+	if len(resp.PreviouslyDelivered) != 1 || resp.PreviouslyDelivered[0].TaskID != fastID {
+		t.Fatalf("previously_delivered = %+v, want fast task %s", resp.PreviouslyDelivered, fastID)
+	}
+	if resp.PreviouslyDelivered[0].Result != "" {
+		t.Fatalf("previously_delivered must omit the stale result payload: %+v", resp.PreviouslyDelivered)
+	}
+
+	close(slow.release)
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"any","task_ids":["`+fastID+`","`+slowID+`"]}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSubagentWaitResponse(t, result)
+	if !resp.WaitComplete || len(resp.Finished) != 1 || resp.Finished[0].TaskID != slowID {
+		t.Fatalf("third any-wait = %s, want slow task result", result.Content)
+	}
+	if resp.Finished[0].Result != "blocked child done" {
+		t.Fatalf("third any-wait finished = %+v, want slow task payload", resp.Finished)
+	}
+	if len(resp.PreviouslyDelivered) != 1 || resp.PreviouslyDelivered[0].TaskID != fastID || resp.PreviouslyDelivered[0].Result != "" {
+		t.Fatalf("third any-wait previously_delivered = %+v, want payload-free fast task", resp.PreviouslyDelivered)
+	}
+	if registry.HasPendingFinalJoinTasks() {
+		t.Fatal("all results should be marked delivered")
+	}
+}
+
+func TestSubagentWaitNoTasksInvalidInputAndUndelivered(t *testing.T) {
+	model := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done fast"}}}},
+		},
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	spawnTool := &subagentTool{registry: registry, defaultAgent: "worker"}
+	waitTool := &subagentWaitTool{registry: registry}
+
+	result, err := waitTool.Execute(context.Background(), json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeSubagentWaitResponse(t, result)
+	if result.IsError || !resp.WaitComplete || !strings.Contains(resp.Note, "no active sub-agent tasks") {
+		t.Fatalf("empty registry wait = %s", result.Content)
+	}
+
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"task_ids":["nope"]}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "not found") {
+		t.Fatalf("unknown task id = %+v, want error", result)
+	}
+
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{"wait_for":"bogus"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "invalid wait_for") {
+		t.Fatalf("invalid wait_for = %+v, want error", result)
+	}
+
+	// A task that finished before the wait call: its undelivered result is
+	// returned immediately even though nothing is active anymore.
+	taskID := spawnBackgroundSubagentTask(t, spawnTool, `{"message":"do it","mode":"background"}`)
+	if _, err := registry.WaitForTask(context.Background(), taskID, 2000); err != nil {
+		t.Fatal(err)
+	}
+	result, err = waitTool.Execute(context.Background(), json.RawMessage(`{}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeSubagentWaitResponse(t, result)
+	if len(resp.Finished) != 1 || resp.Finished[0].TaskID != taskID || resp.Finished[0].Result != "done fast" {
+		t.Fatalf("undelivered result wait = %s", result.Content)
+	}
+	if registry.HasPendingFinalJoinTasks() {
+		t.Fatal("returned result should be marked delivered")
+	}
+}

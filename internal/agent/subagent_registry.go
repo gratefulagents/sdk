@@ -1215,6 +1215,97 @@ func (r *SubAgentRegistry) tasksByID(taskIDs []string) ([]SubAgentTask, bool, er
 	return tasks, done, nil
 }
 
+// PendingResultTaskIDs returns ids of tasks the parent has not fully consumed
+// yet: still-active tasks plus terminal tasks whose result has not been
+// delivered, in spawn order. This is the default watch set for subagent_wait.
+func (r *SubAgentRegistry) PendingResultTaskIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.order))
+	for _, id := range r.order {
+		entry, ok := r.tasks[id]
+		if !ok {
+			continue
+		}
+		if !entry.task.IsTerminal() || !entry.resultDelivered {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// awaitState snapshots the requested tasks and reports whether an AwaitTasks
+// wait condition is satisfied. waitAny=false requires every task to be
+// terminal; waitAny=true is also satisfied as soon as any requested task has a
+// terminal result that has not yet been delivered to the parent.
+func (r *SubAgentRegistry) awaitState(taskIDs []string, waitAny bool) ([]SubAgentTask, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tasks := make([]SubAgentTask, 0, len(taskIDs))
+	allTerminal := true
+	anyUndeliveredTerminal := false
+	for _, taskID := range taskIDs {
+		entry, ok := r.tasks[taskID]
+		if !ok {
+			return nil, false, fmt.Errorf("task %q not found", taskID)
+		}
+		task := subAgentTaskSnapshot(entry)
+		tasks = append(tasks, task)
+		if !task.IsTerminal() {
+			allTerminal = false
+			continue
+		}
+		if !entry.resultDelivered {
+			anyUndeliveredTerminal = true
+		}
+	}
+	met := allTerminal || (waitAny && anyUndeliveredTerminal)
+	return tasks, met, nil
+}
+
+// AwaitTasks blocks until the requested tasks satisfy the wait condition:
+// waitAny=false waits for every task to reach a terminal status, waitAny=true
+// returns as soon as any requested task has an undelivered terminal result (or
+// everything is terminal). It wakes on task state changes rather than polling,
+// emits periodic progress heartbeats while blocked so host UIs stay fresh, and
+// on timeout returns the current snapshots together with the context error.
+func (r *SubAgentRegistry) AwaitTasks(ctx context.Context, taskIDs []string, waitAny bool, timeoutMS int64) ([]SubAgentTask, error) {
+	taskIDs = uniqueNonEmptyStrings(taskIDs)
+	if len(taskIDs) == 0 {
+		return nil, nil
+	}
+	waitCtx, cancel := waitContext(ctx, timeoutMS)
+	defer cancel()
+
+	heartbeat := time.NewTicker(managedSubAgentStatusHeartbeat)
+	defer heartbeat.Stop()
+	heartbeatEmitted := false
+
+	for {
+		ch := r.changeChan()
+		tasks, met, err := r.awaitState(taskIDs, waitAny)
+		if err != nil {
+			return nil, err
+		}
+		if met {
+			return tasks, nil
+		}
+		if !heartbeatEmitted {
+			r.EmitActiveTaskStatuses("parent_wait")
+			heartbeatEmitted = true
+		}
+
+		select {
+		case <-ch:
+		case <-heartbeat.C:
+			r.EmitActiveTaskStatuses("parent_wait")
+		case <-waitCtx.Done():
+			tasks, _, _ := r.awaitState(taskIDs, waitAny)
+			return tasks, waitCtx.Err()
+		}
+	}
+}
+
 // WaitForUndeliveredResults blocks until all currently active managed sub-agent
 // tasks finish, then returns terminal results that have not already been
 // delivered to the parent through CollectResult, FinalJoinSnapshot, or this
@@ -1326,18 +1417,29 @@ func (r *SubAgentRegistry) undeliveredResultState(markDelivered bool) ([]SubAgen
 
 // CollectResult returns the result of a completed task.
 func (r *SubAgentRegistry) CollectResult(taskID string) (*SubAgentTask, error) {
+	task, _, err := r.CollectResultIfUndelivered(taskID)
+	return task, err
+}
+
+// CollectResultIfUndelivered returns the result of a completed task and marks
+// it delivered, reporting whether this call performed the first delivery.
+// firstDelivery=false means the parent already received this result earlier
+// (via CollectResult, FinalJoinSnapshot, WaitForUndeliveredResults, or a
+// previous wait) and callers should avoid repeating the payload.
+func (r *SubAgentRegistry) CollectResultIfUndelivered(taskID string) (*SubAgentTask, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok := r.tasks[taskID]
 	if !ok {
-		return nil, fmt.Errorf("task %q not found", taskID)
+		return nil, false, fmt.Errorf("task %q not found", taskID)
 	}
 	if !entry.task.IsTerminal() {
-		return nil, fmt.Errorf("task %q is still %s", taskID, entry.task.Status)
+		return nil, false, fmt.Errorf("task %q is still %s", taskID, entry.task.Status)
 	}
+	firstDelivery := !entry.resultDelivered
 	entry.resultDelivered = true
 	task := subAgentTaskSnapshot(entry)
-	return &task, nil
+	return &task, firstDelivery, nil
 }
 
 // Cancel cancels a running task.

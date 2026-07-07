@@ -925,6 +925,7 @@ func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {
 		}
 	}
 	add(features.Task, "subagent")
+	add(features.Task, "subagent_wait")
 	add(features.Status, "subagent_status")
 	add(features.Control, "subagent_control")
 	return names
