@@ -21,8 +21,19 @@ func (e *AgentError) Error() string {
 func (e *AgentError) Unwrap() error { return e.Cause }
 
 // MaxTurnsExceeded is returned when Runner.Run exceeds the configured max turns.
+//
+// PartialResult, when non-nil, carries the run state accumulated before the
+// budget ran out: every generated item (NewItems), the replay-safe
+// post-fold conversation history (FinalHistory), raw responses, and usage.
+// Runner.Run also returns the same partial result alongside this error
+// (io.Reader-style partial-result semantics) so hosts can persist the
+// conversation and continue it in a follow-up run instead of losing all
+// accumulated context.
 type MaxTurnsExceeded struct {
 	MaxTurns int
+	// PartialResult is the run state accumulated before the cap was hit.
+	// FinalOutput is unset — the run never produced a final answer.
+	PartialResult *RunResult
 }
 
 func (e *MaxTurnsExceeded) Error() string {

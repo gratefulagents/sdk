@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -141,11 +143,23 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 			outcome.Status = subAgentStatusCancelled
 		}
 		outcome.ErrMsg = fmt.Sprintf("agent %q %s: %v", spec.Agent.Name, outcome.Status, err)
-		// Runner.Run returns a nil result on error, so recover the partial
-		// usage the child tracker observed (its own LLM calls plus anything
-		// forwarded from nested subagents) for outcome accounting and the
-		// completion event/span. Run-level totals are unaffected either way:
-		// per-call forwarding already recorded this usage on the parent.
+		// A budget-exhausted child hands back its accumulated run state
+		// (partial result attached to the error): surface its last assistant
+		// message so the parent receives the findings gathered so far
+		// instead of a bare failure.
+		var budgetErr *MaxTurnsExceeded
+		if errors.As(err, &budgetErr) {
+			if tail := partialProgressTail(budgetErr.PartialResult); tail != "" {
+				outcome.ErrMsg += "\nPartial progress before the budget ran out:\n" + TruncateMiddle(tail, 1600)
+			}
+		}
+		// Runner.Run returns a nil result on most errors (max-turns hands
+		// back a partial result, but without provider-reported totals), so
+		// recover the partial usage the child tracker observed (its own LLM
+		// calls plus anything forwarded from nested subagents) for outcome
+		// accounting and the completion event/span. Run-level totals are
+		// unaffected either way: per-call forwarding already recorded this
+		// usage on the parent.
 		if childTracker != nil {
 			snap := childTracker.Snapshot()
 			outcome.CostUSD = snap.CostUsd
@@ -216,4 +230,25 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 		spec.EventStream.EmitSubagentCompleted(spec.TaskID, outcome.Status, outcome.FinalText, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, int32(outcome.NumTurns), "", outcome.FinalText)
 	}
 	return outcome
+}
+
+// partialProgressTail extracts the last assistant message text from a
+// partial run result so a budget-exhausted child still reports what it
+// learned before the cap instead of returning a bare failure.
+func partialProgressTail(result *RunResult) string {
+	if result == nil {
+		return ""
+	}
+	for i := len(result.NewItems) - 1; i >= 0; i-- {
+		item := result.NewItems[i]
+		if item.Type != RunItemMessage || item.Message == nil {
+			continue
+		}
+		text := strings.TrimSpace(item.Message.Text)
+		if text == "" || strings.HasPrefix(text, "[SYSTEM]") {
+			continue
+		}
+		return text
+	}
+	return ""
 }
