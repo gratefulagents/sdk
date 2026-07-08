@@ -10,6 +10,12 @@ import (
 const (
 	defaultOutputReserveTokens = 16384
 	requestSafetyBufferTokens  = 8192
+	// compactionItemTokenEstimateCap bounds the token estimate for a provider
+	// compaction item. Encrypted blobs are opaque ciphertext whose byte size
+	// has no linear relationship to their replay token cost; counting them at
+	// chars/4 makes the post-compaction estimate exceed the compaction trigger
+	// permanently (self-sustaining re-compaction loop).
+	compactionItemTokenEstimateCap = 20000
 )
 
 // MaybeCompactRunItems reduces history size while preserving the original task
@@ -62,6 +68,12 @@ func planRunItemsCompaction(items []RunItem, cfg CompactionConfig) (CompactionPl
 	}
 
 	protectedPrefix := selectInitialUserMessageIndices(items, cfg.PreserveInitialUserMessages)
+	// Provider compaction items are the ONLY copy of the provider-compacted
+	// history: an encrypted blob cannot be summarized into text, so the local
+	// planner must never remove one (a digest like "compaction item" would
+	// silently delete all older context). Applies to every local-compaction
+	// entry point, including the forced overflow-recovery pass.
+	protectedPrefix = append(protectedPrefix, providerCompactionItemIndices(items)...)
 	maxRecent := minInt(cfg.PreserveRecentItems, len(items))
 	if maxRecent < 1 {
 		maxRecent = minInt(len(items), 1)
@@ -191,7 +203,14 @@ func estimateRunItemsTokens(items []RunItem) int {
 			}
 		case RunItemCompaction:
 			if item.Compaction != nil {
-				total += estimateStringTokens(item.Compaction.EncryptedContent) + 8
+				// Provider compaction blobs are encrypted+encoded bytes, not
+				// text: chars/4 wildly overestimates their real prompt cost
+				// (blobs run 100KB-10MB while representing a bounded compacted
+				// window). Cap the estimate so one compaction cannot keep the
+				// total above the trigger forever and re-fire every turn.
+				// Underestimation is safe here: the provider enforces the real
+				// window (context_management + forced compaction on overflow).
+				total += minInt(estimateStringTokens(item.Compaction.EncryptedContent), compactionItemTokenEstimateCap) + 8
 			}
 		case RunItemHandoffCall:
 			if item.HandoffCall != nil {
@@ -261,6 +280,19 @@ func selectInitialUserMessageIndices(items []RunItem, limit int) []int {
 		indices = append(indices, idx)
 		if len(indices) >= limit {
 			break
+		}
+	}
+	return indices
+}
+
+// providerCompactionItemIndices returns the indices of provider compaction
+// items carrying an encrypted blob. See planRunItemsCompaction: these are
+// always protected from local compaction.
+func providerCompactionItemIndices(items []RunItem) []int {
+	var indices []int
+	for idx, item := range items {
+		if item.Type == RunItemCompaction && item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+			indices = append(indices, idx)
 		}
 	}
 	return indices

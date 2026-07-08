@@ -403,6 +403,12 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 			}
 		case agentsdk.RunItemCompaction:
 			if item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+				// Skip blobs produced by a different provider: they are not
+				// decryptable here and would 400 the whole request (see the
+				// mirrored guard in the anthropic provider).
+				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin == "anthropic" {
+					continue
+				}
 				compaction := internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy)
 				compaction.Content = item.Compaction.Content
 				msgs = append(msgs, internalanthropic.Message{
