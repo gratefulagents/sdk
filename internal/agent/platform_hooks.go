@@ -21,6 +21,13 @@ type PlatformHooks struct {
 	// Protected by mu since tools execute in parallel goroutines.
 	mu        sync.Mutex
 	toolStart map[string]time.Time
+	// llmAttemptID is the id of the most recent model call attempt (the
+	// generation span UUID also carried by llm_attempt events). OnLLMEnd
+	// stamps it onto final assistant_thinking events so consumers can match
+	// them to the assistant_thinking_delta chunk stream of the same call.
+	// Guarded by mu; each hooks instance observes sequential model calls
+	// (sub-agent runs get their own PlatformHooks).
+	llmAttemptID string
 }
 
 // NewPlatformHooks creates a PlatformHooks bridging to the given tracker and event stream.
@@ -98,6 +105,21 @@ func extractToolInputSummary(toolName string, input json.RawMessage) string {
 	}
 }
 
+// setLLMAttemptID records the id of the model call attempt about to start so
+// OnLLMEnd can link the response's reasoning items to that attempt's
+// assistant_thinking_delta stream.
+func (h *PlatformHooks) setLLMAttemptID(id string) {
+	h.mu.Lock()
+	h.llmAttemptID = id
+	h.mu.Unlock()
+}
+
+func (h *PlatformHooks) currentLLMAttemptID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.llmAttemptID
+}
+
 func (h *PlatformHooks) OnLLMStart(_ *RunContext, _ *Agent) {
 	// No-op: the model call start isn't separately tracked in our activity log.
 }
@@ -125,7 +147,12 @@ func (h *PlatformHooks) OnLLMEnd(_ *RunContext, agent *Agent, response *ModelRes
 			if item.Reasoning != nil && item.Reasoning.Text != "" {
 				h.Tracker.RecordAssistantThinking(item.Reasoning.Text)
 				if h.EventStream != nil {
-					h.EventStream.EmitThinking(item.Reasoning.Text, agent.Name)
+					h.EventStream.Emit(ContentEvent{
+						Type:      "assistant_thinking",
+						Message:   item.Reasoning.Text,
+						AgentName: agent.Name,
+						ToolUseID: h.currentLLMAttemptID(),
+					})
 				}
 			}
 		}
