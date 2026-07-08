@@ -357,10 +357,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	consecutiveToolErrorTurns := 0
 	toolErrorEscalated := false
 	// estimateCalibration corrects the token estimator against the actual
-	// input tokens reported by provider usage. The estimator historically
-	// undercounts (~25% on Claude histories), which delays compaction past
-	// the real context limit; dividing thresholds by this ratio makes the
-	// trigger fire at true window pressure. Only upward corrections apply.
+	// input tokens reported by provider usage (provider-normalized, see
+	// usageContextTokens). Undercounting (~25% on Claude histories) delays
+	// compaction past the real context limit; overcounting (encrypted
+	// reasoning/compaction blobs estimated as text) fires it at a fraction
+	// of the window. Dividing thresholds by this ratio makes the trigger
+	// fire at true window pressure in both directions.
 	estimateCalibration := 1.0
 	// stopGateBlocks counts consecutive StopGate blocks; the gate is bypassed
 	// once the cap is hit so a broken gate cannot loop forever.
@@ -551,7 +553,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// auto-compact far below the model's actual window (up to 2.5x early),
 		// causing chronic server-side over-compaction.
 		providerCompactionCfg := compactionCfg
-		if compactionCfg.Enabled && estimateCalibration > 1.0 {
+		if compactionCfg.Enabled && estimateCalibration != 1.0 {
 			normalized := compactionCfg.normalized()
 			compactionCfg.TriggerTokens = maxInt(1, int(float64(normalized.TriggerTokens)/estimateCalibration))
 			compactionCfg.TargetTokens = maxInt(1, int(float64(normalized.TargetTokens)/estimateCalibration))
@@ -1013,12 +1015,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		allResponses = append(allResponses, *resp)
 
 		// Calibrate the token estimator against the actual context consumed
-		// (prompt + cache read + cache creation tokens) for this request.
-		if actual := resp.Usage.InputTokens + resp.Usage.CacheReadTokens + resp.Usage.CacheCreateTokens; actual > 0 {
+		// for this request (provider-normalized: OpenAI-style input_tokens
+		// already include cached tokens; Anthropic-style cache fields are
+		// additive). The correction applies in BOTH directions: the estimator
+		// undercounts some histories (~25% on Claude) and overcounts others
+		// (encrypted reasoning/compaction blobs are counted as text but not
+		// billed as such), so a one-sided clamp let overcounting histories
+		// compact at half the real window.
+		if actual := usageContextTokens(activeModel, resp.Usage); actual > 0 {
 			if sentEstimate := estimateRunItemsTokens(requestInput) + requestOverheadTokens; sentEstimate > 0 {
 				ratio := float64(actual) / float64(sentEstimate)
 				blended := 0.5*estimateCalibration + 0.5*ratio
-				estimateCalibration = math.Max(1.0, math.Min(2.5, blended))
+				estimateCalibration = math.Max(0.5, math.Min(2.5, blended))
 			}
 		}
 

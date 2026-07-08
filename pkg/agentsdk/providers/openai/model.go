@@ -140,6 +140,13 @@ func (m *OpenAIModel) SupportsContextCompaction() bool {
 	return m != nil && m.client != nil && m.client.SupportsResponseCompaction()
 }
 
+// UsageInputIncludesCacheTokens reports OpenAI wire usage semantics:
+// usage.input_tokens already includes input_tokens_details.cached_tokens
+// (cached tokens are a subset, not an additive field). Applies to the OpenAI
+// API, the ChatGPT Codex backend, and OpenAI-compatible gateways served by
+// this model type.
+func (m *OpenAIModel) UsageInputIncludesCacheTokens() bool { return true }
+
 func (m *OpenAIModel) GetResponse(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.ModelResponse, error) {
 	if m == nil || m.client == nil {
 		return nil, errors.New("openai model is not configured")

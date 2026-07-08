@@ -509,3 +509,121 @@ func TestCarryForwardTailUsesTargetTokenBudget(t *testing.T) {
 		t.Fatalf("min tail = %d calls / %d outputs, want 2/2 (PreserveRecentItems=4)", callsMin, outputs)
 	}
 }
+
+// usageSemanticsCompactorModel lets tests pick the provider usage semantics
+// the calibration must normalize against.
+type usageSemanticsCompactorModel struct {
+	mockCompactorModel
+	inclusive bool
+}
+
+func (m *usageSemanticsCompactorModel) UsageInputIncludesCacheTokens() bool { return m.inclusive }
+
+func TestUsageContextTokensNormalizesProviderSemantics(t *testing.T) {
+	usage := Usage{InputTokens: 1000, CacheReadTokens: 900, CacheCreateTokens: 50}
+	inclusive := &usageSemanticsCompactorModel{inclusive: true}
+	if got := usageContextTokens(inclusive, usage); got != 1000 {
+		t.Fatalf("inclusive semantics = %d, want 1000 (cached tokens are a subset of input)", got)
+	}
+	additive := &mockCompactorModel{}
+	if got := usageContextTokens(additive, usage); got != 1950 {
+		t.Fatalf("additive semantics = %d, want 1950 (cache fields add to input)", got)
+	}
+}
+
+// OpenAI-style usage reports input_tokens INCLUSIVE of cached tokens. Summing
+// the cache fields on top (the old calibration formula) double-counted almost
+// the whole prompt on warm requests, inflated estimateCalibration, and made
+// compaction fire at ~half the model's real window (observed on the Codex
+// backend: trigger 244.8K effectively firing at 125K real tokens).
+func TestCalibrationDoesNotDoubleCountInclusiveCacheUsage(t *testing.T) {
+	bigText := strings.Repeat("word ", 80_000) // ~100K estimated tokens
+	model := &usageSemanticsCompactorModel{
+		inclusive: true,
+		mockCompactorModel: mockCompactorModel{
+			mockModel: mockModel{
+				responses: []*ModelResponse{
+					{
+						Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call1", Name: "echo", Input: json.RawMessage(`"hi"`)}}},
+						// Warm request: nearly the whole prompt is cached.
+						// input already includes the cached tokens.
+						Usage: Usage{InputTokens: 130_000, CacheReadTokens: 125_000},
+					},
+					{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+				},
+			},
+		},
+	}
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return strings.Repeat("out ", 2_000), nil
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	_, err := runner.Run(context.Background(), &Agent{Name: "test", Tools: []Tool{echoTool}}, []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: bigText}},
+	}, RunConfig{
+		MaxTurns: 5,
+		// Estimate ≈125K (items ~100K + ~25K request overhead) stays under
+		// the 145K trigger. The old double-count made actual≈255K vs
+		// estimate≈125K → calibration ≈1.5 → effective trigger ≈95K →
+		// spurious provider compaction on the next turn.
+		CompactionConfig: CompactionConfig{Enabled: true, TriggerTokens: 145_000, TargetTokens: 70_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.compactCalls != 0 {
+		t.Fatalf("compactCalls = %d, want 0 (calibration must not double-count cached tokens)", model.compactCalls)
+	}
+}
+
+// The estimator can also OVERCOUNT (encrypted reasoning/compaction blobs are
+// estimated as text but not billed as such). Calibration must correct
+// downward too — a one-sided clamp at 1.0 kept the trigger at the inflated
+// estimate scale and compacted at a fraction of the real window.
+func TestCalibrationCorrectsOvercountingEstimatorDownward(t *testing.T) {
+	bigText := strings.Repeat("word ", 80_000) // ~100K estimated tokens
+	model := &usageSemanticsCompactorModel{
+		inclusive: true,
+		mockCompactorModel: mockCompactorModel{
+			mockModel: mockModel{
+				responses: []*ModelResponse{
+					{
+						Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call1", Name: "echo", Input: json.RawMessage(`"hi"`)}}},
+						// Provider reports ~half the estimator's guess.
+						Usage: Usage{InputTokens: 65_000},
+					},
+					{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+				},
+			},
+		},
+	}
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return strings.Repeat("out ", 2_000), nil
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	_, err := runner.Run(context.Background(), &Agent{Name: "test", Tools: []Tool{echoTool}}, []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: bigText}},
+	}, RunConfig{
+		MaxTurns: 5,
+		// Turn-2 raw estimate (≈127K after the tool output) crosses this
+		// trigger, but the provider says the real prompt is only ~65K —
+		// half the window pressure. Downward calibration (ratio≈0.52 →
+		// blended≈0.76) lifts the effective trigger to ≈166K: no compaction.
+		// The old one-sided clamp kept calibration at 1.0 and compacted.
+		CompactionConfig: CompactionConfig{Enabled: true, TriggerTokens: 126_000, TargetTokens: 63_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.compactCalls != 0 {
+		t.Fatalf("compactCalls = %d, want 0 (downward calibration must lift the trigger)", model.compactCalls)
+	}
+}

@@ -18,6 +18,7 @@ type ContentEvent = agent.ContentEvent
 type ContextCompactor = agent.ContextCompactor
 type EventStream = agent.EventStream
 type EventWriter = agent.EventStream
+type UsageCacheSemantics = agent.UsageCacheSemantics
 type FunctionTool = agent.FunctionTool
 type FunctionSpanData = agent.FunctionSpanData
 type GenerationSpanData = agent.GenerationSpanData

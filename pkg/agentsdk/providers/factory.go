@@ -462,6 +462,17 @@ func (m *copilotModel) Provider() string {
 	return DefaultProviderCopilot
 }
 
+// UsageInputIncludesCacheTokens forwards the wrapped model's usage semantics:
+// the interface assertion cannot tunnel through the embedded interface value,
+// so without this the Copilot OpenAI-shaped routes would silently fall back
+// to Anthropic-style (additive) cache accounting.
+func (m *copilotModel) UsageInputIncludesCacheTokens() bool {
+	if semantics, ok := m.Model.(agentsdk.UsageCacheSemantics); ok {
+		return semantics.UsageInputIncludesCacheTokens()
+	}
+	return false
+}
+
 func normalizeCopilotModelName(name string) string {
 	if prefix, bare := agentsdk.ParseModelPrefix(name); strings.EqualFold(strings.TrimSpace(prefix), DefaultProviderCopilot) {
 		return strings.TrimSpace(bare)
