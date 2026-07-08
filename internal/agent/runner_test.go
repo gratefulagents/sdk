@@ -784,7 +784,7 @@ func TestRunnerMaxTurnsExceeded(t *testing.T) {
 	runner := NewRunnerWithModel(model)
 	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
 
-	_, err := runner.Run(context.Background(), agent, nil, RunConfig{MaxTurns: 3})
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{MaxTurns: 3})
 	if err == nil {
 		t.Fatal("expected MaxTurnsExceeded error")
 	}
@@ -794,6 +794,104 @@ func TestRunnerMaxTurnsExceeded(t *testing.T) {
 	}
 	if maxTurns.MaxTurns != 3 {
 		t.Errorf("expected max turns 3, got %d", maxTurns.MaxTurns)
+	}
+	// Partial-result contract: the accumulated conversation survives the cap
+	// so hosts can persist and continue it.
+	if result == nil {
+		t.Fatal("expected a partial result alongside MaxTurnsExceeded")
+	}
+	if maxTurns.PartialResult != result {
+		t.Error("MaxTurnsExceeded.PartialResult should be the returned partial result")
+	}
+	if len(result.NewItems) == 0 {
+		t.Error("partial result should carry the generated items")
+	}
+	if len(result.FinalHistory) == 0 {
+		t.Error("partial result should carry the replay-safe conversation history")
+	}
+	// Every tool call in the history must have a paired output (replay-safe).
+	calls, outputs := 0, 0
+	for _, item := range result.FinalHistory {
+		switch item.Type {
+		case RunItemToolCall:
+			calls++
+		case RunItemToolOutput:
+			outputs++
+		}
+	}
+	if calls == 0 || calls != outputs {
+		t.Errorf("partial history should pair tool calls with outputs, got %d calls / %d outputs", calls, outputs)
+	}
+	// MaxTurns=3 is below the warning floor: no wrap-up warning expected.
+	for _, item := range result.NewItems {
+		if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "Turn budget warning") {
+			t.Error("tiny budgets must not receive the budget warning")
+		}
+	}
+}
+
+func TestRunnerBudgetWarningInjectedNearCap(t *testing.T) {
+	model := &mockModel{
+		responses: make([]*ModelResponse, 20),
+	}
+	for i := range model.responses {
+		model.responses[i] = &ModelResponse{
+			Items: []RunItem{
+				{Type: RunItemToolCall, ToolCall: &ToolCallData{
+					ID: fmt.Sprintf("call-%d", i), Name: "echo", Input: json.RawMessage(`"loop"`),
+				}},
+			},
+		}
+	}
+
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return "ok", nil
+		},
+	}
+
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
+
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{MaxTurns: 10})
+	var maxTurns *MaxTurnsExceeded
+	if !errors.As(err, &maxTurns) {
+		t.Fatalf("expected MaxTurnsExceeded, got %T: %v", err, err)
+	}
+	if result == nil {
+		t.Fatal("expected a partial result alongside MaxTurnsExceeded")
+	}
+	countWarnings := func(items []RunItem) int {
+		n := 0
+		for _, item := range items {
+			if item.Type == RunItemMessage && item.Message != nil && strings.Contains(item.Message.Text, "Turn budget warning") {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countWarnings(result.NewItems); got != 1 {
+		t.Errorf("expected exactly one budget warning in NewItems, got %d", got)
+	}
+	if got := countWarnings(result.FinalHistory); got != 1 {
+		t.Errorf("expected the budget warning in FinalHistory (model-visible), got %d", got)
+	}
+}
+
+func TestBudgetWarnTurns(t *testing.T) {
+	cases := []struct{ maxTurns, want int }{
+		{8, 2},
+		{10, 2},
+		{50, 5},
+		{100, 10},
+		{500, 10},
+	}
+	for _, tc := range cases {
+		if got := budgetWarnTurns(tc.maxTurns); got != tc.want {
+			t.Errorf("budgetWarnTurns(%d) = %d, want %d", tc.maxTurns, got, tc.want)
+		}
 	}
 }
 
