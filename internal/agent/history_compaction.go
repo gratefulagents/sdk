@@ -277,6 +277,13 @@ func selectInitialUserMessageIndices(items []RunItem, limit int) []int {
 		if text == "" || strings.HasPrefix(text, "[SYSTEM]") || strings.HasPrefix(text, "[PHASE TRANSITION") {
 			continue
 		}
+		// Carry-forward messages are injected runtime state, not the user's
+		// task framing: treating one as an "initial user message" would
+		// re-insert a STALE copy after every re-compaction (contradicting the
+		// fresh carry-forward appended at the end) and waste a preserve slot.
+		if strings.HasPrefix(text, compactionCarryForwardPrefix) {
+			continue
+		}
 		indices = append(indices, idx)
 		if len(indices) >= limit {
 			break

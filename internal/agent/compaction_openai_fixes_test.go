@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -216,7 +217,11 @@ func TestApplyCompactionCarryForwardPreservesInitialUserMessages(t *testing.T) {
 			PreserveRecentItems:         4,
 			PreserveInitialUserMessages: 2,
 		},
-	})
+	}, CompactionConfig{
+		Enabled:                     true,
+		PreserveRecentItems:         4,
+		PreserveInitialUserMessages: 2,
+	}, 0)
 
 	if len(got) == 0 || got[0].Type != RunItemCompaction {
 		t.Fatalf("first item = %+v, want compaction blob", got)
@@ -363,5 +368,144 @@ func TestStampCompactionItemOrigin(t *testing.T) {
 	}
 	if got := items[1].Compaction.CreatedBy; got != "openai" {
 		t.Fatalf("pre-set CreatedBy overwritten: %q", got)
+	}
+}
+
+// Reasoning items in the preserved tail must survive provider compaction:
+// runItemDedupeKey previously returned "" for RunItemReasoning, so
+// appendMissingRecentRunItems silently dropped every reasoning item — on the
+// Codex backend that discards the model's encrypted working memory and leaves
+// function_calls without their paired rs_ items (run chat-gf-all-aqvafl).
+func TestCarryForwardPreservesReasoningItemsInTail(t *testing.T) {
+	agentRef := &Agent{Name: "assistant"}
+	previous := []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the task"}},
+	}
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("call_%d", i)
+		previous = append(previous,
+			RunItem{Type: RunItemReasoning, Agent: agentRef, Reasoning: &ReasoningData{ID: fmt.Sprintf("rs_%d", i), EncryptedContent: "enc-" + id}},
+			RunItem{Type: RunItemToolCall, Agent: agentRef, ToolCall: &ToolCallData{ID: id, Name: "read_file", Input: json.RawMessage(`{}`)}},
+			RunItem{Type: RunItemToolOutput, ToolOutput: &ToolOutputData{CallID: id, Content: "file content"}},
+		)
+	}
+	compacted := []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the task"}},
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: "blob"}},
+	}
+	got, _ := applyCompactionCarryForward(context.Background(), compacted, previous, RunConfig{
+		CompactionConfig: CompactionConfig{Enabled: true, PreserveRecentItems: 6, PreserveInitialUserMessages: 1},
+	}, CompactionConfig{Enabled: true, PreserveRecentItems: 6, PreserveInitialUserMessages: 1}, 0)
+
+	var reasoning, calls int
+	for _, item := range got {
+		switch item.Type {
+		case RunItemReasoning:
+			reasoning++
+		case RunItemToolCall:
+			calls++
+		}
+	}
+	if reasoning == 0 {
+		t.Fatalf("post-compaction input lost all reasoning items: %+v", got)
+	}
+	if calls == 0 {
+		t.Fatalf("post-compaction input lost the recent tool calls")
+	}
+}
+
+// A stale carry-forward message from an earlier compaction must not be
+// re-inserted as an "initial user message" on the next compaction: the fresh
+// carry-forward appended at the end is the only copy allowed to survive.
+func TestCarryForwardNotDuplicatedAcrossCompactions(t *testing.T) {
+	previous := []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the task"}},
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: "old-blob"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "[COMPACTION CARRY-FORWARD]\nstale runtime state from the previous compaction"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "later plain user message"}},
+	}
+	compacted := []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the task"}},
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_2", EncryptedContent: "new-blob"}},
+	}
+	got, carryForward := applyCompactionCarryForward(context.Background(), compacted, previous, RunConfig{
+		CompactionConfig:    CompactionConfig{Enabled: true, PreserveRecentItems: 2, PreserveInitialUserMessages: 2},
+		WorkingStateContext: "fresh runtime state",
+	}, CompactionConfig{Enabled: true, PreserveRecentItems: 2, PreserveInitialUserMessages: 2}, 0)
+	if !strings.Contains(carryForward, "fresh runtime state") {
+		t.Fatalf("carry-forward = %q, want fresh runtime state", carryForward)
+	}
+	var carryForwards, stale int
+	for _, item := range got {
+		if isCompactionCarryForwardItem(item) {
+			carryForwards++
+			if strings.Contains(item.Message.Text, "stale runtime state") {
+				stale++
+			}
+		}
+	}
+	if stale != 0 {
+		t.Fatalf("stale carry-forward re-inserted after re-compaction: %+v", got)
+	}
+	if carryForwards != 1 {
+		t.Fatalf("carry-forward count = %d, want exactly 1 (the fresh one)", carryForwards)
+	}
+}
+
+// The preserved tail extends beyond PreserveRecentItems while it fits the
+// compaction target: a provider blob compresses the whole history into a few
+// KB, and refilling only ~3 tool exchanges left the post-compaction window
+// nearly empty while the agent lost its recent working state and restarted
+// discovery (run chat-gf-all-aqvafl re-ran greps/reads it had already done).
+func TestCarryForwardTailUsesTargetTokenBudget(t *testing.T) {
+	agentRef := &Agent{Name: "assistant"}
+	previous := []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the task"}},
+	}
+	const turns = 30
+	for i := 0; i < turns; i++ {
+		id := fmt.Sprintf("call_%d", i)
+		previous = append(previous,
+			RunItem{Type: RunItemToolCall, Agent: agentRef, ToolCall: &ToolCallData{ID: id, Name: "read_file", Input: json.RawMessage(`{}`)}},
+			RunItem{Type: RunItemToolOutput, ToolOutput: &ToolOutputData{CallID: id, Content: strings.Repeat("x", 4000)}}, // ~1000 tokens each
+		)
+	}
+	compacted := []RunItem{
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: "blob"}},
+	}
+	cfg := RunConfig{CompactionConfig: CompactionConfig{
+		Enabled: true, TriggerTokens: 60_000, TargetTokens: 20_000,
+		PreserveRecentItems: 4, PreserveInitialUserMessages: 1,
+	}}
+
+	// Large remaining budget: the tail should reach well past 4 items.
+	got, _ := applyCompactionCarryForward(context.Background(), compacted, previous, cfg, cfg.CompactionConfig, 0)
+	var outputs int
+	for _, item := range got {
+		if item.Type == RunItemToolOutput {
+			outputs++
+		}
+	}
+	if outputs <= 4 {
+		t.Fatalf("budgeted tail outputs = %d, want > PreserveRecentItems/2 pairs", outputs)
+	}
+	if outputs == turns {
+		t.Fatalf("tail unexpectedly kept the whole history; budget not applied")
+	}
+
+	// Overhead consuming the whole target: fall back to the minimum item count.
+	gotMin, _ := applyCompactionCarryForward(context.Background(), compacted, previous, cfg, cfg.CompactionConfig, 60_000)
+	outputs = 0
+	var callsMin int
+	for _, item := range gotMin {
+		switch item.Type {
+		case RunItemToolOutput:
+			outputs++
+		case RunItemToolCall:
+			callsMin++
+		}
+	}
+	if outputs != 2 || callsMin != 2 {
+		t.Fatalf("min tail = %d calls / %d outputs, want 2/2 (PreserveRecentItems=4)", callsMin, outputs)
 	}
 }

@@ -573,7 +573,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			compactCancel()
 			if ok {
 				var carryForward string
-				currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
+				currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
 				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 					return nil, guardErr
 				}
@@ -598,7 +598,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						}
 					}
 					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
+					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
 					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 						return nil, guardErr
 					}
@@ -808,7 +808,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				forcedCompactCancel()
 				if ok {
 					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
+					currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
 					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 						return nil, guardErr
 					}
@@ -842,7 +842,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						}
 					}
 					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
+					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
 					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 						return nil, guardErr
 					}
@@ -1036,7 +1036,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			before := requestSnapshot.TotalTokenEstimate
 			var carryForward string
-			pruned, carryForward = applyCompactionCarryForward(ctx, pruned, items, cfg)
+			pruned, carryForward = applyCompactionCarryForward(ctx, pruned, items, cfg, compactionCfg, requestOverheadTokens)
 			after := estimateRunItemsTokens(pruned) + requestOverheadTokens
 			if cfg.CompactionRecorder != nil {
 				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(responseCompactionSummary, carryForward))
@@ -1205,7 +1205,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			nextInput = recordAndPruneResponseCompaction(nextInput)
 			if compacted, before, after, ok, reason := MaybeCompactHandoffInput(nextInput, cfg.HandoffHistory); ok {
 				var carryForward string
-				nextInput, carryForward = applyCompactionCarryForward(ctx, compacted, nextInput, cfg)
+				nextInput, carryForward = applyCompactionCarryForward(ctx, compacted, nextInput, cfg, compactionCfg, requestOverheadTokens)
 				after = estimateRunItemsTokens(nextInput)
 				if cfg.CompactionRecorder != nil {
 					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(compacted), carryForward))
@@ -2349,7 +2349,7 @@ func providerCompactionSummaryFromItems(items []RunItem) (string, bool) {
 	return summarizeProviderCompactionOutput("", compacted), true
 }
 
-func applyCompactionCarryForward(ctx context.Context, compacted, previous []RunItem, cfg RunConfig) ([]RunItem, string) {
+func applyCompactionCarryForward(ctx context.Context, compacted, previous []RunItem, cfg RunConfig, compactionCfg CompactionConfig, requestOverheadTokens int) ([]RunItem, string) {
 	carryForward := buildCompactionCarryForward(ctx, cfg)
 	out := make([]RunItem, 0, len(compacted)+1)
 	for _, item := range compacted {
@@ -2365,9 +2365,19 @@ func applyCompactionCarryForward(ctx context.Context, compacted, previous []RunI
 		// survives in plaintext — if the blob is ever dropped, undecryptable,
 		// or under-summarized, the agent must still know what it was asked to
 		// do instead of restarting cold.
-		normalizedCfg := cfg.CompactionConfig.normalized()
+		normalizedCfg := compactionCfg.normalized()
 		out = insertMissingInitialUserMessages(out, previous, normalizedCfg.PreserveInitialUserMessages)
-		out = appendMissingRecentRunItems(out, previous, normalizedCfg.PreserveRecentItems)
+		// Preserve as much verbatim recent history as the compaction target
+		// allows, not just a fixed item count: a provider blob replaces the
+		// history with a few-KB opaque summary, so a count-based tail (12
+		// items ≈ 3 tool exchanges once reasoning items are included) left the
+		// post-compaction window ~90% empty while the agent lost its recent
+		// working state and restarted discovery.
+		if requestOverheadTokens < 0 {
+			requestOverheadTokens = 0
+		}
+		tailBudget := normalizedCfg.TargetTokens - requestOverheadTokens - estimateRunItemsTokens(out)
+		out = appendMissingRecentRunItems(out, previous, normalizedCfg.PreserveRecentItems, tailBudget)
 	}
 	out = repairToolPairsForModelInput(out, previous)
 	if carryForward == "" {
@@ -2484,15 +2494,44 @@ func hasLocalCompactionSummary(items []RunItem) bool {
 	return false
 }
 
-func appendMissingRecentRunItems(items, previous []RunItem, limit int) []RunItem {
-	if limit <= 0 || len(previous) == 0 {
+// appendMissingRecentRunItems re-appends the tail of the pre-compaction
+// history that isn't already present. The window always covers at least
+// `minItems` items and extends further back while the (estimated) token total
+// stays within `budgetTokens`, so the post-compaction request actually uses
+// the target-token headroom for verbatim recent context instead of leaving it
+// empty. A budgetTokens <= 0 degrades to the fixed minItems window.
+func appendMissingRecentRunItems(items, previous []RunItem, minItems, budgetTokens int) []RunItem {
+	if minItems <= 0 && budgetTokens <= 0 {
 		return items
 	}
-	start := maxInt(0, len(previous)-limit)
+	if len(previous) == 0 {
+		return items
+	}
 	minPairIdx := 0
+	floor := 0
 	if latest := latestProviderCompactionIndex(previous); latest >= 0 {
-		start = maxInt(start, latest+1)
+		floor = latest + 1
 		minPairIdx = latest + 1
+	}
+	// Walk backward from the end, accumulating estimated tokens. Include an
+	// item while the count guarantee is unmet or it still fits the budget.
+	start := len(previous)
+	count := 0
+	tokens := 0
+	for idx := len(previous) - 1; idx >= floor; idx-- {
+		if isCompactionCarryForwardItem(previous[idx]) {
+			continue
+		}
+		cost := estimateRunItemsTokens(previous[idx : idx+1])
+		if count >= minItems && tokens+cost > budgetTokens {
+			break
+		}
+		start = idx
+		count++
+		tokens += cost
+	}
+	if start >= len(previous) {
+		return items
 	}
 	protected := make(map[int]struct{}, len(previous)-start)
 	for idx := start; idx < len(previous); idx++ {
@@ -2668,6 +2707,11 @@ func runItemDedupeKey(item RunItem) string {
 			return ""
 		}
 		return fmt.Sprintf("compaction:%s:%s", item.Compaction.ID, item.Compaction.EncryptedContent)
+	case RunItemReasoning:
+		if item.Reasoning == nil {
+			return ""
+		}
+		return fmt.Sprintf("reasoning:%s:%s:%s:%s", item.Reasoning.ID, item.Reasoning.Text, item.Reasoning.EncryptedContent, item.Reasoning.RedactedData)
 	default:
 		return ""
 	}

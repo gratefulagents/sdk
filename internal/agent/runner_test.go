@@ -1948,7 +1948,7 @@ func TestApplyCompactionCarryForwardAppendsCurrentState(t *testing.T) {
 		CompactionCarryForward: func(context.Context) string {
 			return "Live AgentRun state: mode=deep step=reviewing\n\n## Durable Working State\nLatest assistant summary: implementation already landed"
 		},
-	})
+	}, CompactionConfig{}, 0)
 
 	if carryForward == "" {
 		t.Fatal("expected carry-forward text")
@@ -1985,7 +1985,10 @@ func TestApplyCompactionCarryForwardPreservesRecentProviderTail(t *testing.T) {
 			Enabled:             true,
 			PreserveRecentItems: 3,
 		},
-	})
+	}, CompactionConfig{
+		Enabled:             true,
+		PreserveRecentItems: 3,
+	}, 0)
 
 	hasLintOutput := false
 	for _, item := range got {
@@ -2012,7 +2015,7 @@ func TestApplyCompactionCarryForwardPreservesRecentToolPairs(t *testing.T) {
 
 	got, _ := applyCompactionCarryForward(context.Background(), compacted, previous, RunConfig{
 		CompactionConfig: CompactionConfig{PreserveRecentItems: 1},
-	})
+	}, CompactionConfig{PreserveRecentItems: 1}, 0)
 
 	callIdx, outputIdx := toolPairPositions(got, "call_1")
 	if callIdx < 0 || outputIdx < 0 {
@@ -2036,7 +2039,7 @@ func TestApplyCompactionCarryForwardRepairsProviderOrphanToolOutput(t *testing.T
 
 	got, _ := applyCompactionCarryForward(context.Background(), compacted, previous, RunConfig{
 		CompactionConfig: CompactionConfig{PreserveRecentItems: 0},
-	})
+	}, CompactionConfig{PreserveRecentItems: 0}, 0)
 
 	callIdx, outputIdx := toolPairPositions(got, "call_1")
 	if callIdx < 0 || outputIdx < 0 {
