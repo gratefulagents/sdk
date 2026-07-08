@@ -581,8 +581,10 @@ func authModeForOpenAIProvider(spec ProviderSpec) sdkopenai.AuthMode {
 	// Anthropic OAuth run that can live-switch providers mid-run) must keep
 	// the OpenAI leg in OAuth mode; otherwise a mid-run switch to an OpenAI
 	// model fails with "OpenAI API key is required" even though usable OAuth
-	// credentials are mounted.
-	if spec.OpenAIAuthSession != nil || strings.TrimSpace(spec.OpenAIOAuthPath) != "" {
+	// credentials are mounted. Only genuine OAuth material qualifies: an
+	// API-key/custom session must not push the leg onto the Codex OAuth
+	// backend.
+	if (spec.OpenAIAuthSession != nil && spec.OpenAIAuthSession.IsOAuth()) || strings.TrimSpace(spec.OpenAIOAuthPath) != "" {
 		return authMode
 	}
 	return sdkopenai.NormalizeAuthMode("")

@@ -10,6 +10,11 @@ import (
 )
 
 func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
+	oauthSession, err := sdkopenai.NewOAuthAuthSessionFromSecretData(
+		[]byte(`{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh","account_id":"acct"}}`), "")
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromSecretData() error = %v", err)
+	}
 	cases := []struct {
 		name string
 		spec ProviderSpec
@@ -34,6 +39,16 @@ func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
 			name: "oauth aimed at anthropic default stays oauth with mounted openai material",
 			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json"},
 			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "oauth aimed at anthropic default stays oauth with oauth session",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIAuthSession: oauthSession},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "oauth aimed at anthropic default does not leak with non-oauth session",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIAuthSession: sdkopenai.NewAPIKeyAuthSession("sk-test")},
+			want: sdkopenai.AuthModeAPIKey,
 		},
 		{
 			name: "api-key mode passes through",
