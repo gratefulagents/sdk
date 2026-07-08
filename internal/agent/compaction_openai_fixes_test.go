@@ -46,52 +46,149 @@ func TestEstimateRunItemsTokensCapsCompactionBlob(t *testing.T) {
 }
 
 // Once a provider compaction item anchors the history, only plaintext growth
-// after it may re-trigger provider compaction. The blob itself (however large
-// its estimate) must not cause a compaction storm.
-func TestProviderCompactionNotRetriggeredByBlobEstimate(t *testing.T) {
-	model := &mockCompactorModel{}
+// after it may re-trigger the pre-request compaction pass. The blob itself
+// (however large its estimate) must not cause a compaction storm.
+func TestShouldDeferCompactionForBlobGrowth(t *testing.T) {
 	blob := strings.Repeat("x", 500_000)
-	req := ModelRequest{
-		Model: "gpt-test",
-		Input: []RunItem{
-			{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: blob}},
-			{Type: RunItemMessage, Message: &MessageOutput{Text: "small new user message"}},
+	cfg := CompactionConfig{Enabled: true, TriggerTokens: 1000, TargetTokens: 500}
+	items := []RunItem{
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: blob}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "small new user message"}},
+	}
+	if !shouldDeferCompactionForBlobGrowth(items, cfg, 0) {
+		t.Fatal("expected defer while post-blob growth is below the trigger")
+	}
+	grown := append(append([]RunItem(nil), items...), RunItem{
+		Type: RunItemMessage, Message: &MessageOutput{Text: strings.Repeat("growth ", 2000)},
+	})
+	if shouldDeferCompactionForBlobGrowth(grown, cfg, 0) {
+		t.Fatal("expected no defer once post-blob growth crosses the trigger")
+	}
+	noBlob := []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: strings.Repeat("growth ", 2000)}}}
+	if shouldDeferCompactionForBlobGrowth(noBlob, cfg, 0) {
+		t.Fatal("expected no defer without a provider compaction item")
+	}
+}
+
+// In the deferred steady state the runner must skip BOTH provider and local
+// compaction: the provider blob stays in the request untouched and no local
+// summary replaces it (a textual digest of an opaque blob preserves nothing).
+func TestRunnerDefersAllCompactionInBlobSteadyState(t *testing.T) {
+	blob := strings.Repeat("x", 500_000)
+	model := &mockCompactorModel{
+		mockModel: mockModel{
+			responses: []*ModelResponse{
+				{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+			},
 		},
 	}
-	cfg := CompactionConfig{Enabled: true, TriggerTokens: 1000, TargetTokens: 500}
-
-	_, _, _, ok, err := compactRunItemsWithModelAPI(context.Background(), model, req, 0, cfg, false)
+	runner := NewRunnerWithModel(model)
+	_, err := runner.Run(context.Background(), &Agent{Name: "test"}, []RunItem{
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: blob, CreatedBy: "mock"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "small follow-up"}},
+	}, RunConfig{
+		// Trigger sits above the fixed request overhead (~24.6K: output
+		// reserve + safety buffer) but below overhead + capped blob estimate,
+		// so pre-fix this would have re-compacted; post-fix it defers.
+		CompactionConfig: CompactionConfig{Enabled: true, TriggerTokens: 30_000, TargetTokens: 15_000},
+	})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if ok || model.compactCalls != 0 {
-		t.Fatalf("compaction fired on blob estimate alone (ok=%v calls=%d), want skip", ok, model.compactCalls)
+	if model.compactCalls != 0 {
+		t.Fatalf("provider compact calls = %d, want 0 (deferred)", model.compactCalls)
 	}
+	if len(model.requests) != 1 {
+		t.Fatalf("model requests = %d, want 1", len(model.requests))
+	}
+	var blobSurvived bool
+	for _, item := range model.requests[0].Input {
+		if item.Type == RunItemCompaction && item.Compaction != nil && item.Compaction.EncryptedContent == blob {
+			blobSurvived = true
+		}
+		if item.Type == RunItemMessage && item.Agent != nil && item.Agent.Name == "context-summary" {
+			t.Fatalf("local compaction summary replaced the provider blob: %+v", item)
+		}
+	}
+	if !blobSurvived {
+		t.Fatalf("provider compaction blob missing from request input: %+v", model.requests[0].Input)
+	}
+}
 
-	// Genuine post-compaction growth above the trigger still compacts.
-	model.compactResults = []*CompactionResult{{
-		Items: []RunItem{{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_2", EncryptedContent: "fresh-blob"}}},
-	}}
-	req.Input = append(req.Input, RunItem{Type: RunItemMessage, Message: &MessageOutput{Text: strings.Repeat("growth ", 2000)}})
-	_, _, _, ok, err = compactRunItemsWithModelAPI(context.Background(), model, req, 0, cfg, false)
+// Real post-blob growth above the trigger still compacts via the provider.
+func TestRunnerRecompactsOnRealPostBlobGrowth(t *testing.T) {
+	blob := strings.Repeat("x", 500_000)
+	model := &mockCompactorModel{
+		mockModel: mockModel{
+			responses: []*ModelResponse{
+				{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
+			},
+		},
+		compactResults: []*CompactionResult{{
+			Items: []RunItem{{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_2", EncryptedContent: "fresh-blob"}}},
+		}},
+	}
+	runner := NewRunnerWithModel(model)
+	_, err := runner.Run(context.Background(), &Agent{Name: "test"}, []RunItem{
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: blob, CreatedBy: "mock"}},
+		// ~8.7K tokens of post-blob plaintext + ~24.6K request overhead
+		// crosses the 30K trigger on growth alone.
+		{Type: RunItemMessage, Message: &MessageOutput{Text: strings.Repeat("growth ", 5000)}},
+	}, RunConfig{
+		CompactionConfig: CompactionConfig{Enabled: true, TriggerTokens: 30_000, TargetTokens: 15_000},
+	})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if !ok || model.compactCalls != 1 {
-		t.Fatalf("compaction did not fire on real growth (ok=%v calls=%d)", ok, model.compactCalls)
+	if model.compactCalls != 1 {
+		t.Fatalf("provider compact calls = %d, want 1", model.compactCalls)
 	}
+}
 
-	// force=true (context-overflow recovery) bypasses the growth guard.
-	model.compactResults = []*CompactionResult{{
-		Items: []RunItem{{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_3", EncryptedContent: "forced-blob"}}},
-	}}
-	req.Input = req.Input[:2]
-	_, _, _, ok, err = compactRunItemsWithModelAPI(context.Background(), model, req, 0, cfg, true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// The local planner must never remove a provider compaction item: it is the
+// only copy of the provider-compacted history. Covers the provider-error
+// fallback and the forced overflow-recovery pass (trigger=1).
+func TestLocalCompactionProtectsProviderBlob(t *testing.T) {
+	items := []RunItem{
+		{Type: RunItemCompaction, Compaction: &CompactionData{ID: "cmp_1", EncryptedContent: "encrypted-blob"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the user task"}},
 	}
-	if !ok || model.compactCalls != 2 {
-		t.Fatalf("forced compaction skipped (ok=%v calls=%d)", ok, model.compactCalls)
+	for i := 0; i < 40; i++ {
+		items = append(items, RunItem{
+			Type:  RunItemMessage,
+			Agent: &Agent{Name: "assistant"},
+			Message: &MessageOutput{
+				Text: strings.Repeat("assistant progress notes ", 40),
+			},
+		})
+	}
+	for _, trigger := range []int{1, 100} {
+		cfg := CompactionConfig{
+			Enabled:                     true,
+			TriggerTokens:               trigger,
+			TargetTokens:                maxInt(trigger/2, 1),
+			PreserveRecentItems:         2,
+			PreserveInitialUserMessages: 1,
+			SummaryBulletLimit:          4,
+		}
+		plan, _, ok, reason := planRunItemsCompaction(items, cfg)
+		if !ok {
+			t.Fatalf("trigger=%d: planRunItemsCompaction not ok: %s", trigger, reason)
+		}
+		var blobKept bool
+		for _, item := range plan.Items {
+			if item.Type == RunItemCompaction && item.Compaction != nil && item.Compaction.EncryptedContent == "encrypted-blob" {
+				blobKept = true
+			}
+		}
+		if !blobKept {
+			t.Fatalf("trigger=%d: local compaction removed the provider blob: %+v", trigger, plan.Items)
+		}
+		for _, removed := range plan.Removed {
+			if removed.Type == RunItemCompaction {
+				t.Fatalf("trigger=%d: provider blob listed in removed items", trigger)
+			}
+		}
 	}
 }
 

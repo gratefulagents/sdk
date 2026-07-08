@@ -552,57 +552,66 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 
 		requestOverheadTokens := estimateModelRequestOverheadTokens(instructions, tools, settings)
-		compactRequest := ModelRequest{
-			Model:        modelName,
-			Instructions: instructions,
-			Input:        currentInput,
-			Tools:        tools,
-			Settings:     settings,
-			OutputSchema: currentAgent.OutputType,
-		}
-		compactCtx, compactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
-		compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
-		compactCancel()
-		if ok {
-			var carryForward string
-			currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
-			if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-				return nil, guardErr
+		// Post-provider-compaction steady state: while the plaintext that
+		// accumulated after the newest provider compaction blob stays below
+		// the trigger, skip BOTH provider and local compaction this turn.
+		// Neither can help — the blob's (capped) estimate is what keeps the
+		// total above the trigger, re-compacting it buys nothing, and the
+		// local planner must not run either: falling through to it would
+		// spend an LLM-summary call per turn on negligible growth.
+		if !compactionCfg.Enabled || !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
+			compactRequest := ModelRequest{
+				Model:        modelName,
+				Instructions: instructions,
+				Input:        currentInput,
+				Tools:        tools,
+				Settings:     settings,
+				OutputSchema: currentAgent.OutputType,
 			}
-			after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
-			runCtx.Usage.Add(compactResult.Usage)
-			recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
-			if cfg.CompactionRecorder != nil {
-				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
-			}
-		} else {
-			if compactErr != nil {
-				log.Printf("[runner] WARN: provider compaction failed; falling back to local compaction: %v", compactErr)
-			}
-			if plan, before, ok, reason := PlanRunItemsCompactionForRequest(currentInput, compactionCfg, requestOverheadTokens); ok {
-				compactedItems := plan.Items
-				if compactionCfg.UseLLMSummary {
-					rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
-					runCtx.Usage.Add(usage)
-					recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
-					if llmOK {
-						compactedItems = rebuilt
-					}
-				}
+			compactCtx, compactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+			compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
+			compactCancel()
+			if ok {
 				var carryForward string
-				currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
+				currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg)
 				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
 					return nil, guardErr
 				}
-				after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
+				after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
+				runCtx.Usage.Add(compactResult.Usage)
+				recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
 				if cfg.CompactionRecorder != nil {
-					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
+					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
 				}
-			} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
+			} else {
 				if compactErr != nil {
-					reason = fmt.Sprintf("provider-compaction-failed: %v; local-compaction: %s", compactErr, reason)
+					log.Printf("[runner] WARN: provider compaction failed; falling back to local compaction: %v", compactErr)
 				}
-				cfg.CompactionFailureReporter("run", reason, before, after)
+				if plan, before, ok, reason := PlanRunItemsCompactionForRequest(currentInput, compactionCfg, requestOverheadTokens); ok {
+					compactedItems := plan.Items
+					if compactionCfg.UseLLMSummary {
+						rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
+						runCtx.Usage.Add(usage)
+						recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
+						if llmOK {
+							compactedItems = rebuilt
+						}
+					}
+					var carryForward string
+					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg)
+					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
+						return nil, guardErr
+					}
+					after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
+					if cfg.CompactionRecorder != nil {
+						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
+					}
+				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
+					if compactErr != nil {
+						reason = fmt.Sprintf("provider-compaction-failed: %v; local-compaction: %s", compactErr, reason)
+					}
+					cfg.CompactionFailureReporter("run", reason, before, after)
+				}
 			}
 		}
 
@@ -2267,19 +2276,6 @@ func compactRunItemsWithModelAPI(ctx context.Context, model Model, req ModelRequ
 	if !force && before <= cfg.TriggerTokens {
 		return nil, before, before, false, nil
 	}
-	// Re-compaction hysteresis: once a provider compaction item anchors the
-	// history, only the plaintext conversation that accumulated AFTER it can
-	// justify another compaction. The blob's own (estimated) size must not
-	// re-trigger — its true cost is provider-side and re-compacting it buys
-	// nothing while shredding another window of recent context every turn.
-	if !force {
-		if latest := latestProviderCompactionIndex(req.Input); latest >= 0 {
-			growth := estimateRunItemsTokens(req.Input[latest+1:]) + requestOverheadTokens
-			if growth <= cfg.TriggerTokens {
-				return nil, before, before, false, nil
-			}
-		}
-	}
 	compactor, ok := model.(ContextCompactor)
 	if !ok || !compactor.SupportsContextCompaction() {
 		return nil, before, before, false, nil
@@ -2294,6 +2290,27 @@ func compactRunItemsWithModelAPI(ctx context.Context, model Model, req ModelRequ
 	stampCompactionItemOrigin(result.Items, model)
 	after := estimateRunItemsTokens(result.Items) + requestOverheadTokens
 	return result, before, after, true, nil
+}
+
+// shouldDeferCompactionForBlobGrowth reports whether the pre-request
+// compaction pass (provider AND local) should be skipped entirely this turn:
+// once a provider compaction item anchors the history, only the plaintext
+// conversation that accumulated AFTER it can justify another compaction. The
+// blob's own (estimated) size must not re-trigger — its true cost is
+// provider-side, re-compacting it buys nothing, and letting the local planner
+// run instead would burn an LLM-summary call per turn while risking the blob
+// itself (the only copy of the provider-compacted history) being summarized
+// away. The forced overflow-recovery path bypasses this deliberately.
+func shouldDeferCompactionForBlobGrowth(items []RunItem, cfg CompactionConfig, requestOverheadTokens int) bool {
+	latest := latestProviderCompactionIndex(items)
+	if latest < 0 {
+		return false
+	}
+	if requestOverheadTokens < 0 {
+		requestOverheadTokens = 0
+	}
+	growth := estimateRunItemsTokens(items[latest+1:]) + requestOverheadTokens
+	return growth <= cfg.normalized().TriggerTokens
 }
 
 // stampCompactionItemOrigin records the producing provider on compaction items

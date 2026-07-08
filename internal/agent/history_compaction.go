@@ -68,6 +68,12 @@ func planRunItemsCompaction(items []RunItem, cfg CompactionConfig) (CompactionPl
 	}
 
 	protectedPrefix := selectInitialUserMessageIndices(items, cfg.PreserveInitialUserMessages)
+	// Provider compaction items are the ONLY copy of the provider-compacted
+	// history: an encrypted blob cannot be summarized into text, so the local
+	// planner must never remove one (a digest like "compaction item" would
+	// silently delete all older context). Applies to every local-compaction
+	// entry point, including the forced overflow-recovery pass.
+	protectedPrefix = append(protectedPrefix, providerCompactionItemIndices(items)...)
 	maxRecent := minInt(cfg.PreserveRecentItems, len(items))
 	if maxRecent < 1 {
 		maxRecent = minInt(len(items), 1)
@@ -274,6 +280,19 @@ func selectInitialUserMessageIndices(items []RunItem, limit int) []int {
 		indices = append(indices, idx)
 		if len(indices) >= limit {
 			break
+		}
+	}
+	return indices
+}
+
+// providerCompactionItemIndices returns the indices of provider compaction
+// items carrying an encrypted blob. See planRunItemsCompaction: these are
+// always protected from local compaction.
+func providerCompactionItemIndices(items []RunItem) []int {
+	var indices []int
+	for idx, item := range items {
+		if item.Type == RunItemCompaction && item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+			indices = append(indices, idx)
 		}
 	}
 	return indices
