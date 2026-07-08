@@ -431,6 +431,72 @@ func TestNewProviderFromConfigMultiToleratesUnusableSecondaryOpenAIOAuth(t *test
 	}
 }
 
+// TestNewProviderFromConfigMultiExplicitProviderAuthModesMixAuthFlavors pins
+// per-leg auth via ProviderAuthModes: an api-key run (top-level auth mode
+// unset) with Anthropic OAuth material mounted must run the Anthropic leg in
+// OAuth mode when the caller says so — the top-level AuthMode scoping alone
+// would leave it in api-key mode and send the OAuth token as x-api-key.
+func TestNewProviderFromConfigMultiExplicitProviderAuthModesMixAuthFlavors(t *testing.T) {
+	dir := t.TempDir()
+	anthropicAuthPath := filepath.Join(dir, "anthropic-auth.json")
+	if err := os.WriteFile(anthropicAuthPath, []byte(`{"access_token":"anthropic-oauth-token"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(anthropic auth.json) error = %v", err)
+	}
+
+	var gotAuth, gotAPIKey, gotBeta string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_test",
+			"type":"message",
+			"role":"assistant",
+			"content":[{"type":"text","text":"ok"}],
+			"model":"claude-sonnet-4-5",
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":1,"output_tokens":1}
+		}`))
+	}))
+	defer srv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:           "multi",
+		DefaultProvider:    "openai",
+		Model:              "openai/gpt-5.5",
+		AnthropicOAuthPath: anthropicAuthPath,
+		ProviderAuthModes:  map[string]string{"anthropic": "oauth"},
+		ProviderAPIKeys:    map[string]string{"openai": "sk-test", "anthropic": "anthropic-oauth-token"},
+		ProviderBaseURLs:   map[string]string{"anthropic": srv.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("anthropic/claude-sonnet-4-5")
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Model: "claude-sonnet-4-5",
+		Input: []agentsdk.RunItem{{
+			Type:    agentsdk.RunItemMessage,
+			Message: &agentsdk.MessageOutput{Text: "hello"},
+		}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if gotAuth != "Bearer anthropic-oauth-token" {
+		t.Fatalf("Authorization = %q, want Bearer anthropic-oauth-token", gotAuth)
+	}
+	if gotAPIKey != "" {
+		t.Fatalf("x-api-key = %q, want empty", gotAPIKey)
+	}
+	if !strings.Contains(gotBeta, "oauth-2025-04-20") {
+		t.Fatalf("anthropic-beta = %q, want oauth-2025-04-20", gotBeta)
+	}
+}
+
 func TestNewProviderFromConfigMultiUsesConfiguredDefaultProvider(t *testing.T) {
 	provider, err := NewProviderFromConfig(ProviderSpec{
 		Provider:        "multi",

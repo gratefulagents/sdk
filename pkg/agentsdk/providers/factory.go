@@ -42,6 +42,13 @@ type ProviderSpec struct {
 	ProviderAPIKeys    map[string]string
 	ProviderBaseURLs   map[string]string
 	ProviderAPIModes   map[string]string
+	// ProviderAuthModes optionally pins the auth mode ("oauth" or "api-key")
+	// per canonical provider leg, taking precedence over the top-level
+	// AuthMode scoping and mounted-material inference. This lets one registry
+	// mix auth flavors — e.g. an API-key default provider with an OAuth
+	// secondary leg — so callers can live-switch between providers without
+	// rebuilding the registry. Missing entries keep the inferred behavior.
+	ProviderAuthModes map[string]string
 	// ModelFallbacks is an ordered list of fallback model identifiers sent as
 	// the OpenRouter "models" array so the provider retries the next model when
 	// one is unavailable. It is only forwarded to OpenRouter; other
@@ -546,6 +553,11 @@ func anthropicProviderConfig(spec ProviderSpec) sdkanthropic.ProviderConfig {
 }
 
 func authModeForAnthropicProvider(spec ProviderSpec) string {
+	// An explicit per-provider auth mode always wins: it lets a registry mix
+	// auth flavors across legs (e.g. api-key default + OAuth anthropic).
+	if explicit := lookupProviderValue(spec.ProviderAuthModes, DefaultProviderAnthropic); explicit != "" {
+		return strings.ToLower(explicit)
+	}
 	authMode := strings.ToLower(strings.TrimSpace(spec.AuthMode))
 	if authMode != "oauth" {
 		return authMode
@@ -569,6 +581,11 @@ func authModeForAnthropicProvider(spec ProviderSpec) string {
 // whose OAuth setting targets another default provider would push the
 // always-registered OpenAI leg onto the Codex OAuth backend.
 func authModeForOpenAIProvider(spec ProviderSpec) sdkopenai.AuthMode {
+	// An explicit per-provider auth mode always wins: it lets a registry mix
+	// auth flavors across legs (e.g. OAuth default + api-key openai).
+	if explicit := lookupProviderValue(spec.ProviderAuthModes, DefaultProviderOpenAI); explicit != "" {
+		return sdkopenai.NormalizeAuthMode(explicit)
+	}
 	authMode := sdkopenai.NormalizeAuthMode(spec.AuthMode)
 	if authMode != sdkopenai.AuthModeOAuth {
 		return authMode
