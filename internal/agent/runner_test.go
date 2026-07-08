@@ -895,6 +895,130 @@ func TestBudgetWarnTurns(t *testing.T) {
 	}
 }
 
+// assertReplaySafePartial checks the partial-result contract shared by all
+// early-exit paths: accumulated items survive and the history pairs every
+// tool call with an output.
+func assertReplaySafePartial(t *testing.T, result *RunResult, err error) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %T: %v", err, err)
+	}
+	if result == nil {
+		t.Fatal("expected a partial result alongside the cancellation error")
+	}
+	if len(result.NewItems) == 0 {
+		t.Error("partial result should carry the generated items")
+	}
+	if len(result.FinalHistory) == 0 {
+		t.Error("partial result should carry the replay-safe conversation history")
+	}
+	calls, outputs := 0, 0
+	for _, item := range result.FinalHistory {
+		switch item.Type {
+		case RunItemToolCall:
+			calls++
+		case RunItemToolOutput:
+			outputs++
+		}
+	}
+	if calls == 0 || calls != outputs {
+		t.Errorf("partial history should pair tool calls with outputs, got %d calls / %d outputs", calls, outputs)
+	}
+}
+
+// Cancellation between turns (host pause/shutdown while tools run) must hand
+// back the accumulated conversation, exactly like the max-turns path, so the
+// host can persist it and resume the session without amnesia.
+func TestRunnerContextCancelledPreservesPartialResult(t *testing.T) {
+	model := &mockModel{responses: make([]*ModelResponse, 10)}
+	for i := range model.responses {
+		model.responses[i] = &ModelResponse{
+			Items: []RunItem{
+				{Type: RunItemToolCall, ToolCall: &ToolCallData{
+					ID: fmt.Sprintf("call-%d", i), Name: "echo", Input: json.RawMessage(`"loop"`),
+				}},
+			},
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	toolCalls := 0
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			toolCalls++
+			if toolCalls == 2 {
+				cancel() // SIGTERM lands mid-run: the host cancels the run context.
+			}
+			return "ok", nil
+		},
+	}
+
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
+
+	result, err := runner.Run(ctx, agent, nil, RunConfig{MaxTurns: 50})
+	assertReplaySafePartial(t, result, err)
+	var maxTurns *MaxTurnsExceeded
+	if errors.As(err, &maxTurns) {
+		t.Fatalf("cancellation must not be reported as MaxTurnsExceeded: %v", err)
+	}
+}
+
+// cancellingModel simulates a host shutdown landing while a model call is in
+// flight: at cancelAtCall it cancels the run context and fails with its error.
+type cancellingModel struct {
+	mockModel
+	cancelAtCall int
+	cancel       context.CancelFunc
+}
+
+func (m *cancellingModel) GetResponse(ctx context.Context, req ModelRequest) (*ModelResponse, error) {
+	if m.mockModel.callIdx == m.cancelAtCall {
+		m.cancel()
+		return nil, context.Canceled
+	}
+	return m.mockModel.GetResponse(ctx, req)
+}
+
+// Cancellation mid model call (the common shape of a pod SIGTERM) must also
+// preserve the turns completed before it.
+func TestRunnerCancelledModelCallPreservesPartialResult(t *testing.T) {
+	inner := mockModel{responses: make([]*ModelResponse, 10)}
+	for i := range inner.responses {
+		inner.responses[i] = &ModelResponse{
+			Items: []RunItem{
+				{Type: RunItemToolCall, ToolCall: &ToolCallData{
+					ID: fmt.Sprintf("call-%d", i), Name: "echo", Input: json.RawMessage(`"loop"`),
+				}},
+			},
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	model := &cancellingModel{mockModel: inner, cancelAtCall: 2, cancel: cancel}
+
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return "ok", nil
+		},
+	}
+
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
+
+	result, err := runner.Run(ctx, agent, nil, RunConfig{MaxTurns: 50})
+	assertReplaySafePartial(t, result, err)
+	// Two full turns completed before the cancelled third model call.
+	if got := len(result.RawResponses); got != 2 {
+		t.Errorf("expected 2 raw responses accumulated before cancellation, got %d", got)
+	}
+}
+
 type accessAdaptingTool struct {
 	executed bool
 }
