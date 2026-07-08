@@ -10,6 +10,12 @@ import (
 const (
 	defaultOutputReserveTokens = 16384
 	requestSafetyBufferTokens  = 8192
+	// compactionItemTokenEstimateCap bounds the token estimate for a provider
+	// compaction item. Encrypted blobs are opaque ciphertext whose byte size
+	// has no linear relationship to their replay token cost; counting them at
+	// chars/4 makes the post-compaction estimate exceed the compaction trigger
+	// permanently (self-sustaining re-compaction loop).
+	compactionItemTokenEstimateCap = 20000
 )
 
 // MaybeCompactRunItems reduces history size while preserving the original task
@@ -191,7 +197,14 @@ func estimateRunItemsTokens(items []RunItem) int {
 			}
 		case RunItemCompaction:
 			if item.Compaction != nil {
-				total += estimateStringTokens(item.Compaction.EncryptedContent) + 8
+				// Provider compaction blobs are encrypted+encoded bytes, not
+				// text: chars/4 wildly overestimates their real prompt cost
+				// (blobs run 100KB-10MB while representing a bounded compacted
+				// window). Cap the estimate so one compaction cannot keep the
+				// total above the trigger forever and re-fire every turn.
+				// Underestimation is safe here: the provider enforces the real
+				// window (context_management + forced compaction on overflow).
+				total += minInt(estimateStringTokens(item.Compaction.EncryptedContent), compactionItemTokenEstimateCap) + 8
 			}
 		case RunItemHandoffCall:
 			if item.HandoffCall != nil {

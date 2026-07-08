@@ -538,6 +538,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				compactionCfg.TargetTokens = target
 			}
 		}
+		// providerCompactionCfg keeps the UNCALIBRATED thresholds for the
+		// provider-facing context_management compact_threshold: the provider
+		// compares that value against REAL token counts, so dividing it by the
+		// local estimator calibration (below) would tell the provider to
+		// auto-compact far below the model's actual window (up to 2.5x early),
+		// causing chronic server-side over-compaction.
+		providerCompactionCfg := compactionCfg
 		if compactionCfg.Enabled && estimateCalibration > 1.0 {
 			normalized := compactionCfg.normalized()
 			compactionCfg.TriggerTokens = maxInt(1, int(float64(normalized.TriggerTokens)/estimateCalibration))
@@ -656,7 +663,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			Tools:               tools,
 			Settings:            settings,
 			OutputSchema:        currentAgent.OutputType,
-			CompactionThreshold: modelCompactionThreshold(activeModel, compactionCfg),
+			CompactionThreshold: modelCompactionThreshold(activeModel, providerCompactionCfg),
 		}
 		requestSnapshot := BuildLLMRequestSnapshot(currentAgent.Name, modelRequest)
 		genData := &GenerationSpanData{
@@ -757,6 +764,25 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				ev := attemptFailureEvent(attemptEvent("failed"), genData)
 				emitLLMAttemptEvent(cfg.Hooks, ev)
 				return nil, err
+			}
+
+			// Provider rejected encrypted context items (compaction blobs /
+			// encrypted reasoning are bound to the producing provider, backend
+			// and model; they go stale on model switches, cross-provider
+			// fallback, or long-lived session resume). Strip the undecryptable
+			// items and retry instead of bricking the session: the preserved
+			// plaintext (initial user messages, recent items, carry-forward)
+			// keeps the run on task.
+			if isEncryptedContentError(err) {
+				if stripped, removed := stripUndecryptableEncryptedItems(currentInput); removed > 0 {
+					log.Printf("[runner] WARN: provider rejected encrypted context items; stripped %d and retrying: %v", removed, err)
+					currentInput = stripped
+					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
+					ev.RetryPlanned = true
+					emitLLMAttemptEvent(cfg.Hooks, ev)
+					exportGenSpan()
+					continue
+				}
 			}
 
 			if isContextLengthExceededError(err) {
@@ -986,6 +1012,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		for i := range newItems {
 			newItems[i].Agent = currentAgent
 		}
+		stampCompactionItemOrigin(newItems, activeModel)
 		allItems = append(allItems, newItems...)
 		emitRunItems(ctx, streamEvents, newItems)
 		responseCompactionSummary, responseHasCompaction := providerCompactionSummaryFromItems(newItems)
@@ -2240,6 +2267,19 @@ func compactRunItemsWithModelAPI(ctx context.Context, model Model, req ModelRequ
 	if !force && before <= cfg.TriggerTokens {
 		return nil, before, before, false, nil
 	}
+	// Re-compaction hysteresis: once a provider compaction item anchors the
+	// history, only the plaintext conversation that accumulated AFTER it can
+	// justify another compaction. The blob's own (estimated) size must not
+	// re-trigger — its true cost is provider-side and re-compacting it buys
+	// nothing while shredding another window of recent context every turn.
+	if !force {
+		if latest := latestProviderCompactionIndex(req.Input); latest >= 0 {
+			growth := estimateRunItemsTokens(req.Input[latest+1:]) + requestOverheadTokens
+			if growth <= cfg.TriggerTokens {
+				return nil, before, before, false, nil
+			}
+		}
+	}
 	compactor, ok := model.(ContextCompactor)
 	if !ok || !compactor.SupportsContextCompaction() {
 		return nil, before, before, false, nil
@@ -2251,8 +2291,32 @@ func compactRunItemsWithModelAPI(ctx context.Context, model Model, req ModelRequ
 	if result == nil || len(result.Items) == 0 {
 		return nil, before, before, false, errors.New("provider returned empty compaction output")
 	}
+	stampCompactionItemOrigin(result.Items, model)
 	after := estimateRunItemsTokens(result.Items) + requestOverheadTokens
 	return result, before, after, true, nil
+}
+
+// stampCompactionItemOrigin records the producing provider on compaction items
+// that arrive without a created_by marker. Encrypted compaction blobs are only
+// decryptable by the provider (and backend) that produced them; the origin
+// stamp lets request builders skip known-foreign blobs instead of sending
+// undecryptable payloads after a cross-provider model fallback or switch.
+func stampCompactionItemOrigin(items []RunItem, model Model) {
+	if model == nil {
+		return
+	}
+	provider := strings.TrimSpace(model.Provider())
+	if provider == "" {
+		return
+	}
+	for i := range items {
+		if items[i].Type != RunItemCompaction || items[i].Compaction == nil {
+			continue
+		}
+		if strings.TrimSpace(items[i].Compaction.CreatedBy) == "" {
+			items[i].Compaction.CreatedBy = provider
+		}
+	}
 }
 
 func providerCompactionSummaryFromItems(items []RunItem) (string, bool) {
@@ -2278,7 +2342,15 @@ func applyCompactionCarryForward(ctx context.Context, compacted, previous []RunI
 		out = append(out, item)
 	}
 	if !hasLocalCompactionSummary(out) {
-		out = appendMissingRecentRunItems(out, previous, cfg.CompactionConfig.normalized().PreserveRecentItems)
+		// Provider compaction (no local summary): the provider's output is
+		// typically just an opaque encrypted blob. Mirror the local path's
+		// PreserveInitialUserMessages guarantee so the original task prompt
+		// survives in plaintext — if the blob is ever dropped, undecryptable,
+		// or under-summarized, the agent must still know what it was asked to
+		// do instead of restarting cold.
+		normalizedCfg := cfg.CompactionConfig.normalized()
+		out = insertMissingInitialUserMessages(out, previous, normalizedCfg.PreserveInitialUserMessages)
+		out = appendMissingRecentRunItems(out, previous, normalizedCfg.PreserveRecentItems)
 	}
 	out = repairToolPairsForModelInput(out, previous)
 	if carryForward == "" {
@@ -2291,6 +2363,48 @@ func applyCompactionCarryForward(ctx context.Context, compacted, previous []RunI
 		},
 	})
 	return out, carryForward
+}
+
+// insertMissingInitialUserMessages re-inserts the first `limit` plain user
+// messages from the pre-compaction history (the original task framing) right
+// after the newest provider compaction item, unless they already survived.
+// They are placed after the blob — not before it — so subsequent
+// prune-before-latest-compaction passes cannot delete them again.
+func insertMissingInitialUserMessages(items, previous []RunItem, limit int) []RunItem {
+	if limit <= 0 || len(previous) == 0 {
+		return items
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if key := runItemDedupeKey(item); key != "" {
+			seen[key] = struct{}{}
+		}
+	}
+	var initial []RunItem
+	for _, idx := range selectInitialUserMessageIndices(previous, limit) {
+		item := previous[idx]
+		key := runItemDedupeKey(item)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		initial = append(initial, item)
+	}
+	if len(initial) == 0 {
+		return items
+	}
+	insertAt := 0
+	if latest := latestProviderCompactionIndex(items); latest >= 0 {
+		insertAt = latest + 1
+	}
+	out := make([]RunItem, 0, len(items)+len(initial))
+	out = append(out, items[:insertAt]...)
+	out = append(out, initial...)
+	out = append(out, items[insertAt:]...)
+	return out
 }
 
 // guardCompactionCarryForward re-runs the agent's input guardrails on a
@@ -2609,6 +2723,62 @@ func isContextLengthExceededError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "context_length_exceeded") ||
 		strings.Contains(msg, "exceeds the context window")
+}
+
+// isEncryptedContentError detects provider rejections of encrypted context
+// items (compaction blobs, encrypted reasoning). OpenAI reports these as 400s
+// with code "invalid_encrypted_content" and messages like "The encrypted
+// content ... could not be verified. Reason: Encrypted content could not be
+// decrypted or parsed."
+func isEncryptedContentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "invalid_encrypted_content") {
+		return true
+	}
+	if !strings.Contains(msg, "encrypted content") && !strings.Contains(msg, "encrypted_content") {
+		return false
+	}
+	return strings.Contains(msg, "could not be decrypted") ||
+		strings.Contains(msg, "could not be verified") ||
+		strings.Contains(msg, "could not be parsed") ||
+		strings.Contains(msg, "decrypted or parsed") ||
+		// Oversized blob rejections (server caps encrypted_content at 10MiB);
+		// the request can never succeed while the blob stays in the input.
+		strings.Contains(msg, "string too long")
+}
+
+// stripUndecryptableEncryptedItems removes provider-encrypted payloads the
+// active model rejected: compaction items with encrypted blobs are dropped
+// outright, and reasoning items lose their encrypted content (the whole item
+// is dropped when nothing readable remains). Items are cloned before
+// modification — history slices share the underlying data pointers.
+func stripUndecryptableEncryptedItems(items []RunItem) ([]RunItem, int) {
+	out := make([]RunItem, 0, len(items))
+	removed := 0
+	for _, item := range items {
+		switch item.Type {
+		case RunItemCompaction:
+			if item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+				removed++
+				continue
+			}
+		case RunItemReasoning:
+			if item.Reasoning != nil && strings.TrimSpace(item.Reasoning.EncryptedContent) != "" {
+				removed++
+				if strings.TrimSpace(item.Reasoning.Text) == "" && strings.TrimSpace(item.Reasoning.RedactedData) == "" {
+					continue
+				}
+				reasoning := *item.Reasoning
+				reasoning.EncryptedContent = ""
+				item.Reasoning = &reasoning
+			}
+		}
+		out = append(out, item)
+	}
+	return out, removed
 }
 
 // fireAgentHook safely calls an AgentHooks callback if hooks is non-nil.

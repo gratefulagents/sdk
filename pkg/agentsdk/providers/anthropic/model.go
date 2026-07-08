@@ -530,6 +530,14 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 			}
 		case agentsdk.RunItemCompaction:
 			if item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+				// Encrypted compaction blobs are decryptable only by the
+				// provider that produced them. After a cross-provider model
+				// fallback/switch, forwarding e.g. an OpenAI blob to the
+				// Anthropic API yields a hard 400; skip known-foreign blobs
+				// and rely on the preserved plaintext context instead.
+				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin != "" && origin != "anthropic" {
+					continue
+				}
 				block := internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy)
 				block.Content = item.Compaction.Content
 				msgs = append(msgs, internalanthropic.Message{

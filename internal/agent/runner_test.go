@@ -1886,8 +1886,10 @@ func TestRunnerPrunesBeforeProviderCompactionItem(t *testing.T) {
 	}
 	var compactionEvents int
 	runner := NewRunnerWithModel(model)
+	assistant := &Agent{Name: "assistant"}
 	_, err := runner.Run(context.Background(), &Agent{Name: "test", Tools: []Tool{echoTool}}, []RunItem{
-		{Type: RunItemMessage, Message: &MessageOutput{Text: "old context should be pruned"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the user task"}},
+		{Type: RunItemMessage, Agent: assistant, Message: &MessageOutput{Text: "old context should be pruned"}},
 	}, RunConfig{
 		CompactionRecorder: func(_, _ int, summary string) {
 			compactionEvents++
@@ -1907,7 +1909,12 @@ func TestRunnerPrunesBeforeProviderCompactionItem(t *testing.T) {
 	}
 	second := model.requests[1].Input
 	if got := Items.ExtractText(second); strings.Contains(got, "old context should be pruned") {
-		t.Fatalf("second request text = %q, did not expect old context", got)
+		t.Fatalf("second request text = %q, did not expect old assistant context", got)
+	}
+	// The initial user task is re-inserted after the blob so the agent keeps
+	// its assignment even though the plaintext history was compacted away.
+	if got := Items.ExtractText(second); !strings.Contains(got, "the user task") {
+		t.Fatalf("second request text = %q, want the initial user task preserved", got)
 	}
 	if len(second) == 0 || second[0].Type != RunItemCompaction {
 		t.Fatalf("second request first item = %+v, want compaction", second)

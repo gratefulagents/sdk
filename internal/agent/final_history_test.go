@@ -221,9 +221,11 @@ func TestFinalHistoryPrunedByProviderCompactionInFinalResponse(t *testing.T) {
 	}}
 	runner := NewRunnerWithModel(model)
 	agentDef := &Agent{Name: "test"}
+	assistant := &Agent{Name: "assistant"}
 	input := []RunItem{
-		{Type: RunItemMessage, Message: &MessageOutput{Text: "old context that was compacted away"}},
-		{Type: RunItemMessage, Message: &MessageOutput{Text: "more old context"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "the user task"}},
+		{Type: RunItemMessage, Agent: assistant, Message: &MessageOutput{Text: "old context that was compacted away"}},
+		{Type: RunItemMessage, Agent: assistant, Message: &MessageOutput{Text: "more old context"}},
 	}
 
 	result, err := runner.Run(context.Background(), agentDef, input, RunConfig{})
@@ -231,14 +233,24 @@ func TestFinalHistoryPrunedByProviderCompactionInFinalResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	// FinalHistory must reflect the provider compaction carried by the final
-	// response: it starts at the compaction item and drops everything before.
+	// response: it starts at the compaction item and drops the pre-compaction
+	// assistant transcript. The initial user task is deliberately re-inserted
+	// after the blob (PreserveInitialUserMessages parity with local
+	// compaction) so it must survive.
 	if len(result.FinalHistory) == 0 || result.FinalHistory[0].Type != RunItemCompaction {
 		t.Fatalf("expected FinalHistory to start with the provider compaction item, got %+v", result.FinalHistory)
 	}
+	var taskSurvived bool
 	for _, item := range result.FinalHistory {
 		if item.Message != nil && strings.Contains(item.Message.Text, "old context") {
 			t.Errorf("expected pre-compaction history to be pruned from FinalHistory, found %q", item.Message.Text)
 		}
+		if item.Message != nil && item.Agent == nil && item.Message.Text == "the user task" {
+			taskSurvived = true
+		}
+	}
+	if !taskSurvived {
+		t.Errorf("expected the initial user task to survive provider compaction, got %+v", result.FinalHistory)
 	}
 	last := result.FinalHistory[len(result.FinalHistory)-1]
 	if last.Message == nil || last.Message.Text != "final answer" {
