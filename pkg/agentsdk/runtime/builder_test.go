@@ -35,6 +35,7 @@ func TestProviderSpecCarriesExplicitMultiProviderConfig(t *testing.T) {
 		ProviderAPIKeys:          map[string]string{"anthropic": "sk-ant-test"},
 		ProviderBaseURLs:         map[string]string{"gemini": "https://gemini.example.test/v1"},
 		ProviderAPIModes:         map[string]string{"gemini": "chat-completions"},
+		ProviderAuthModes:        map[string]string{"anthropic": "oauth"},
 		Routes: []sdkproviders.ProviderRoute{
 			{Prefix: "anthropic-oauth", Provider: "anthropic", AuthMode: "oauth", APIKey: "anthropic-oauth-token"},
 		},
@@ -50,6 +51,9 @@ func TestProviderSpecCarriesExplicitMultiProviderConfig(t *testing.T) {
 	}
 	if spec.ProviderBaseURLs["gemini"] != "https://gemini.example.test/v1" {
 		t.Fatalf("ProviderBaseURLs = %#v", spec.ProviderBaseURLs)
+	}
+	if spec.ProviderAuthModes["anthropic"] != "oauth" {
+		t.Fatalf("ProviderAuthModes = %#v", spec.ProviderAuthModes)
 	}
 	if len(spec.Routes) != 1 || spec.Routes[0].Prefix != "anthropic-oauth" || spec.Routes[0].AuthMode != "oauth" {
 		t.Fatalf("Routes = %#v", spec.Routes)

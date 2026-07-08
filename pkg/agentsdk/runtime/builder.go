@@ -51,6 +51,12 @@ type Config struct {
 	ProviderAPIKeys    map[string]string
 	ProviderBaseURLs   map[string]string
 	ProviderAPIModes   map[string]string
+	// ProviderAuthModes optionally pins the auth mode ("oauth" or "api-key")
+	// per canonical provider leg, taking precedence over the top-level
+	// AuthMode scoping. Lets one registry mix auth flavors (e.g. an API-key
+	// default provider with an OAuth secondary leg) for live provider
+	// switches. Missing entries keep the inferred behavior.
+	ProviderAuthModes map[string]string
 	// Routes declares named provider instances registered under arbitrary
 	// routing prefixes, letting the same base provider be exposed under
 	// multiple prefixes with independent auth (e.g. "anthropic" via API key and
@@ -384,6 +390,7 @@ func ProviderSpec(cfg Config) sdkproviders.ProviderSpec {
 		ProviderAPIKeys:          cloneStringMap(cfg.ProviderAPIKeys),
 		ProviderBaseURLs:         cloneStringMap(cfg.ProviderBaseURLs),
 		ProviderAPIModes:         cloneStringMap(cfg.ProviderAPIModes),
+		ProviderAuthModes:        cloneStringMap(cfg.ProviderAuthModes),
 		ModelFallbacks:           append([]string(nil), cfg.ModelFallbacks...),
 		Routes:                   append([]sdkproviders.ProviderRoute(nil), cfg.Routes...),
 	}

@@ -10,6 +10,11 @@ import (
 )
 
 func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
+	oauthSession, err := sdkopenai.NewOAuthAuthSessionFromSecretData(
+		[]byte(`{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh","account_id":"acct"}}`), "")
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromSecretData() error = %v", err)
+	}
 	cases := []struct {
 		name string
 		spec ProviderSpec
@@ -31,6 +36,31 @@ func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
 			want: sdkopenai.AuthModeAPIKey,
 		},
 		{
+			name: "oauth aimed at anthropic default stays oauth with mounted openai material",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json"},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "oauth aimed at anthropic default stays oauth with oauth session",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIAuthSession: oauthSession},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
+			name: "oauth aimed at anthropic default does not leak with non-oauth session",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIAuthSession: sdkopenai.NewAPIKeyAuthSession("sk-test")},
+			want: sdkopenai.AuthModeAPIKey,
+		},
+		{
+			name: "explicit per-provider api-key beats top-level oauth and mounted material",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json", ProviderAuthModes: map[string]string{"openai": "api-key"}},
+			want: sdkopenai.AuthModeAPIKey,
+		},
+		{
+			name: "explicit per-provider oauth wins without top-level oauth",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "openai", ProviderAuthModes: map[string]string{"openai": "oauth"}},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
 			name: "api-key mode passes through",
 			spec: ProviderSpec{Provider: "multi", DefaultProvider: "openai", AuthMode: ""},
 			want: sdkopenai.AuthModeAPIKey,
@@ -42,6 +72,20 @@ func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
 				t.Fatalf("authModeForOpenAIProvider(%+v) = %q, want %q", tc.spec, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAuthModeForAnthropicProviderExplicitOverride(t *testing.T) {
+	// Explicit api-key pins the leg even when the top-level mode is oauth for
+	// the anthropic default.
+	spec := ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", ProviderAuthModes: map[string]string{"anthropic": "api-key"}}
+	if got := authModeForAnthropicProvider(spec); got != "api-key" {
+		t.Fatalf("authModeForAnthropicProvider() = %q, want api-key", got)
+	}
+	// Explicit oauth pins the leg on a run without a top-level oauth mode.
+	spec = ProviderSpec{Provider: "multi", DefaultProvider: "openai", ProviderAuthModes: map[string]string{"anthropic": "oauth"}}
+	if got := authModeForAnthropicProvider(spec); got != "oauth" {
+		t.Fatalf("authModeForAnthropicProvider() = %q, want oauth", got)
 	}
 }
 
