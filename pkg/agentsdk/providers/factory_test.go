@@ -291,6 +291,146 @@ func TestNewProviderFromConfigMultiUsesAnthropicOAuthWhenDefaultProvider(t *test
 	}
 }
 
+// TestNewProviderFromConfigMultiOpenAIOAuthLiveSwitchFromAnthropicDefault
+// reproduces the mid-run provider switch bug: a run that starts on Anthropic
+// OAuth with OpenAI OAuth material additionally mounted (for live switches)
+// must be able to resolve OpenAI models. The regression built the OpenAI leg
+// in api-key mode with no key, so GetModel("openai/...") failed with
+// "OpenAI API key is required" despite usable mounted OAuth credentials.
+func TestNewProviderFromConfigMultiOpenAIOAuthLiveSwitchFromAnthropicDefault(t *testing.T) {
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	accountIDPath := filepath.Join(dir, "account-id")
+	if err := os.WriteFile(authPath, []byte(`{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh"},"last_refresh":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(auth.json) error = %v", err)
+	}
+	if err := os.WriteFile(accountIDPath, []byte("acct-from-path\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(account-id) error = %v", err)
+	}
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:                 "multi",
+		DefaultProvider:          "anthropic",
+		Model:                    "anthropic/claude-sonnet-4-5",
+		AuthMode:                 "oauth",
+		OpenAIOAuthPath:          authPath,
+		OpenAIOAuthAccountIDPath: accountIDPath,
+		ProviderAPIKeys:          map[string]string{"anthropic": "anthropic-oauth-token"},
+		ProviderBaseURLs:         map[string]string{"openai": DefaultCodexBackendBaseURL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("openai/gpt-5.5")
+	if err != nil {
+		t.Fatalf("GetModel(openai/gpt-5.5) error = %v", err)
+	}
+	if got := model.Provider(); got != "openai" {
+		t.Fatalf("Provider() = %q, want openai", got)
+	}
+}
+
+// TestNewProviderFromConfigMultiUsesAnthropicOAuthWhenMountedButNotDefault is
+// the mirrored live-switch direction: an OpenAI OAuth run with Anthropic OAuth
+// material additionally mounted must authenticate the Anthropic leg with the
+// OAuth bearer flow — not send the OAuth access token as an x-api-key header,
+// which the API rejects.
+func TestNewProviderFromConfigMultiUsesAnthropicOAuthWhenMountedButNotDefault(t *testing.T) {
+	dir := t.TempDir()
+	openAIAuthPath := filepath.Join(dir, "openai-auth.json")
+	anthropicAuthPath := filepath.Join(dir, "anthropic-auth.json")
+	if err := os.WriteFile(openAIAuthPath, []byte(`{"tokens":{"access_token":"oauth-access","refresh_token":"oauth-refresh","account_id":"acct"},"last_refresh":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(openai auth.json) error = %v", err)
+	}
+	if err := os.WriteFile(anthropicAuthPath, []byte(`{"access_token":"anthropic-oauth-token"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(anthropic auth.json) error = %v", err)
+	}
+
+	var gotAuth, gotAPIKey, gotBeta string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotBeta = r.Header.Get("anthropic-beta")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_test",
+			"type":"message",
+			"role":"assistant",
+			"content":[{"type":"text","text":"ok"}],
+			"model":"claude-sonnet-4-5",
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":1,"output_tokens":1}
+		}`))
+	}))
+	defer srv.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:           "multi",
+		DefaultProvider:    "openai",
+		Model:              "openai/gpt-5.5",
+		AuthMode:           "oauth",
+		OpenAIOAuthPath:    openAIAuthPath,
+		AnthropicOAuthPath: anthropicAuthPath,
+		ProviderAPIKeys:    map[string]string{"anthropic": "anthropic-oauth-token"},
+		ProviderBaseURLs:   map[string]string{"anthropic": srv.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("anthropic/claude-sonnet-4-5")
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+	if _, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Model: "claude-sonnet-4-5",
+		Input: []agentsdk.RunItem{{
+			Type:    agentsdk.RunItemMessage,
+			Message: &agentsdk.MessageOutput{Text: "hello"},
+		}},
+	}); err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if gotAuth != "Bearer anthropic-oauth-token" {
+		t.Fatalf("Authorization = %q, want Bearer anthropic-oauth-token", gotAuth)
+	}
+	if gotAPIKey != "" {
+		t.Fatalf("x-api-key = %q, want empty", gotAPIKey)
+	}
+	if !strings.Contains(gotBeta, "oauth-2025-04-20") {
+		t.Fatalf("anthropic-beta = %q, want oauth-2025-04-20", gotBeta)
+	}
+}
+
+// TestNewProviderFromConfigMultiToleratesUnusableSecondaryOpenAIOAuth ensures
+// broken OpenAI OAuth material mounted for live switches cannot take down a
+// run whose default provider is healthy: the registry still builds, the
+// default leg works, and only an actual switch to OpenAI reports the cause.
+func TestNewProviderFromConfigMultiToleratesUnusableSecondaryOpenAIOAuth(t *testing.T) {
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(authPath, []byte("not-json"), 0o600); err != nil {
+		t.Fatalf("WriteFile(auth.json) error = %v", err)
+	}
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider:        "multi",
+		DefaultProvider: "anthropic",
+		Model:           "anthropic/claude-sonnet-4-5",
+		AuthMode:        "oauth",
+		OpenAIOAuthPath: authPath,
+		ProviderAPIKeys: map[string]string{"anthropic": "anthropic-oauth-token"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderFromConfig() error = %v, want success (broken secondary leg must not fail the build)", err)
+	}
+	if _, err := provider.GetModel("anthropic/claude-sonnet-4-5"); err != nil {
+		t.Fatalf("GetModel(anthropic) error = %v", err)
+	}
+	if _, err := provider.GetModel("openai/gpt-5.5"); err == nil || !strings.Contains(err.Error(), "OAuth") {
+		t.Fatalf("GetModel(openai) error = %v, want OAuth load failure", err)
+	}
+}
+
 func TestNewProviderFromConfigMultiUsesConfiguredDefaultProvider(t *testing.T) {
 	provider, err := NewProviderFromConfig(ProviderSpec{
 		Provider:        "multi",

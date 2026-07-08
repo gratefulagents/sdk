@@ -31,6 +31,11 @@ func TestAuthModeForOpenAIProviderScopesOAuthToOpenAI(t *testing.T) {
 			want: sdkopenai.AuthModeAPIKey,
 		},
 		{
+			name: "oauth aimed at anthropic default stays oauth with mounted openai material",
+			spec: ProviderSpec{Provider: "multi", DefaultProvider: "anthropic", AuthMode: "oauth", OpenAIOAuthPath: "/var/run/oauth/openai/auth.json"},
+			want: sdkopenai.AuthModeOAuth,
+		},
+		{
 			name: "api-key mode passes through",
 			spec: ProviderSpec{Provider: "multi", DefaultProvider: "openai", AuthMode: ""},
 			want: sdkopenai.AuthModeAPIKey,

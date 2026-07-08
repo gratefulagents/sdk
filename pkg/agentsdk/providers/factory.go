@@ -181,7 +181,15 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 
 	openAIProvider, err := newOpenAIProviderFromSpec(spec)
 	if err != nil {
-		return nil, err
+		// The default provider's credentials must be usable at startup; a
+		// broken secondary OpenAI leg (e.g. unusable OAuth material mounted
+		// for mid-run live switches) must not take down the whole registry.
+		// Defer the error to GetModel so switching to an OpenAI model reports
+		// the real cause.
+		if defaultProvider == DefaultProviderOpenAI {
+			return nil, err
+		}
+		openAIProvider = unavailableProvider{err: err}
 	}
 	mp.Register(DefaultProviderOpenAI, openAIProvider)
 	mp.Register(DefaultProviderAnthropic, sdkanthropic.NewProviderWithConfig(anthropicProviderConfig(spec)))
@@ -194,6 +202,15 @@ func newMultiProviderFromSpec(spec ProviderSpec) (agentsdk.ModelProvider, error)
 	}
 	return mp, nil
 }
+
+// unavailableProvider is registered in place of a provider whose credentials
+// failed to load at registry-build time. It preserves the original failure and
+// reports it when a model from that provider is actually requested.
+type unavailableProvider struct{ err error }
+
+func (p unavailableProvider) GetModel(string) (agentsdk.Model, error) { return nil, p.err }
+
+func (p unavailableProvider) Close() error { return nil }
 
 // registerProviderRoutes builds and registers each named route on the
 // MultiProvider. Routes are applied after the canonical providers, so a route
@@ -338,8 +355,8 @@ func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
 		BaseURL: copilotAnthropicBaseURL(baseURL),
 		// The per-request header hook overwrites Authorization with the current
 		// token; the static bearer only satisfies the client's credential check.
-		BearerToken:      firstNonEmpty(initialToken, "copilot-placeholder"),
-		RequestHeaders:   anthropicHeaders,
+		BearerToken:    firstNonEmpty(initialToken, "copilot-placeholder"),
+		RequestHeaders: anthropicHeaders,
 		// Effort-first shim: Claude 4.6+/fable/5.x take thinking.type=adaptive +
 		// output_config.effort here (they 400 on enabled), while the 4.5-and-older
 		// family still resolves to enabled + budget_tokens per model — the shim
@@ -537,6 +554,13 @@ func authModeForAnthropicProvider(spec ProviderSpec) string {
 	if provider == DefaultProviderAnthropic || defaultProviderForSpec(spec) == DefaultProviderAnthropic {
 		return authMode
 	}
+	// Anthropic OAuth material mounted alongside another OAuth default (e.g.
+	// an OpenAI OAuth run that can live-switch providers mid-run) must keep
+	// the Anthropic leg in OAuth mode: its credential is an OAuth access
+	// token, which the API rejects when sent as an x-api-key header.
+	if strings.TrimSpace(spec.AnthropicOAuthPath) != "" {
+		return authMode
+	}
 	return ""
 }
 
@@ -551,6 +575,14 @@ func authModeForOpenAIProvider(spec ProviderSpec) sdkopenai.AuthMode {
 	}
 	provider := normalizeProviderName(spec.Provider)
 	if provider == DefaultProviderOpenAI || defaultProviderForSpec(spec) == DefaultProviderOpenAI {
+		return authMode
+	}
+	// OpenAI OAuth material mounted alongside another OAuth default (e.g. an
+	// Anthropic OAuth run that can live-switch providers mid-run) must keep
+	// the OpenAI leg in OAuth mode; otherwise a mid-run switch to an OpenAI
+	// model fails with "OpenAI API key is required" even though usable OAuth
+	// credentials are mounted.
+	if spec.OpenAIAuthSession != nil || strings.TrimSpace(spec.OpenAIOAuthPath) != "" {
 		return authMode
 	}
 	return sdkopenai.NormalizeAuthMode("")
