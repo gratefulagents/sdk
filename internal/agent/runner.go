@@ -188,13 +188,14 @@ func (r *Runner) CalculateCost(usage Usage) float64 {
 // It runs the agent loop: LLM call → process response → tools/handoff/final → repeat.
 //
 // Partial results: when the run ends early with the conversation still
-// intact — the turn budget runs out (MaxTurnsExceeded) or the context is
-// cancelled mid-run (host pause/shutdown, run deadline) — Run returns the
-// accumulated run state alongside the non-nil error (io.Reader-style
-// partial-result semantics). FinalHistory on that partial result is the
-// replay-safe post-fold transcript of every completed turn, so hosts can
-// persist it and continue the session in a follow-up run instead of losing
-// the accumulated context.
+// intact — the turn budget runs out (MaxTurnsExceeded), the context is
+// cancelled mid-run (host pause/shutdown, run deadline), or the turn fails
+// after at least one completed turn (model/API error past retries and
+// fallbacks, guardrail trip) — Run returns the accumulated run state
+// alongside the non-nil error (io.Reader-style partial-result semantics).
+// FinalHistory on that partial result is the replay-safe post-fold
+// transcript of every completed turn, so hosts can persist it and continue
+// the session in a follow-up run instead of losing the accumulated context.
 func (r *Runner) Run(ctx context.Context, agent *Agent, input []RunItem, cfg RunConfig) (*RunResult, error) {
 	if r == nil {
 		return nil, fmt.Errorf("runner is nil")
@@ -380,18 +381,23 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 	}
 
-	// Cancellation of the run context (host shutdown: pod deletion on
-	// pause/wake, SIGTERM, run deadline) must not discard the conversation
-	// accumulated so far — the exact failure the max-turns branch below
-	// already guards against. The turn loop surfaces cancellation from many
-	// return sites (top-of-loop check, model call, retry waits, sub-agent
-	// joins), so a single deferred hook hands the accumulated run state back
-	// alongside the error for all of them: hosts can persist the transcript
-	// and continue the session in a follow-up run instead of losing it.
-	// currentInput is the post-fold history of every completed turn —
-	// replay-safe, no unpaired tool_use.
+	// A run that ends early with the conversation still intact — context
+	// cancellation (host shutdown: pod deletion on pause/wake, SIGTERM, run
+	// deadline), a model/API failure after retries and fallbacks, or a
+	// guardrail trip — must not discard the conversation accumulated so far:
+	// the exact failure the max-turns branch below already guards against.
+	// The turn loop surfaces these errors from many return sites (top-of-loop
+	// check, model call, retry waits, sub-agent joins), so a single deferred
+	// hook hands the accumulated run state back alongside the error for all
+	// of them: hosts can persist the transcript and continue the session in a
+	// follow-up run instead of losing it. currentInput is the post-fold
+	// history of every completed turn — replay-safe, no unpaired tool_use.
+	// Errors raised before anything accumulated keep the nil result.
 	defer func() {
-		if err == nil || result != nil || ctx.Err() == nil {
+		if err == nil || result != nil {
+			return
+		}
+		if ctx.Err() == nil && len(allItems) == 0 {
 			return
 		}
 		result = &RunResult{

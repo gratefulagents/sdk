@@ -414,6 +414,90 @@ func TestSubagentStatusDetailsActivityAndGraph(t *testing.T) {
 	}
 }
 
+// detail=results is the recovery path for results the parent no longer has in
+// context (compaction, lost turns): it must return the full payload of
+// finished tasks even after they were already delivered, and it must mark
+// first-time deliveries so the final join does not re-inject them.
+func TestSubagentStatusResultsRefetchesDeliveredResults(t *testing.T) {
+	model := &subagentToolMockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "research findings: 42 sources"}}}},
+		},
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+
+	taskID, err := registry.SpawnAsync(context.Background(), "worker", "research the ecosystem", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.WaitForTask(context.Background(), taskID, 5000); err != nil {
+		t.Fatal(err)
+	}
+	// First delivery consumes the undelivered flag (the wait tool path).
+	if _, err := registry.CollectResult(taskID); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &subagentStatusTool{registry: registry}
+	for i := 0; i < 2; i++ { // re-readable any number of times
+		result, err := tool.Execute(context.Background(), json.RawMessage(`{"detail":"results"}`), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.IsError {
+			t.Fatalf("results error: %s", result.Content)
+		}
+		if !strings.Contains(result.Content, "research findings: 42 sources") {
+			t.Fatalf("read %d did not return the full result payload: %s", i+1, result.Content)
+		}
+		if !strings.Contains(result.Content, taskID) || !strings.Contains(result.Content, `"status": "completed"`) {
+			t.Fatalf("read %d content = %s", i+1, result.Content)
+		}
+	}
+	// Consuming via detail=results counts as delivery: nothing left to join.
+	if pending := registry.PendingResultTaskIDs(); len(pending) != 0 {
+		t.Fatalf("pending results after detail=results read: %v", pending)
+	}
+}
+
+// detail=results on a still-running task lists it as still_active instead of
+// failing, so the parent can immediately follow up with subagent_wait.
+func TestSubagentStatusResultsListsActiveTasks(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	taskID, err := registry.SpawnAsync(context.Background(), "worker", "long job", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-model.started
+
+	tool := &subagentStatusTool{registry: registry}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"detail":"results"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("results error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `"still_active"`) || !strings.Contains(result.Content, taskID) {
+		t.Fatalf("content = %s", result.Content)
+	}
+
+	close(model.release)
+	if _, err := registry.WaitForTask(context.Background(), taskID, 5000); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSubagentControlMessageAndCancel(t *testing.T) {
 	model := &blockingSubagentToolModel{
 		started: make(chan struct{}),
@@ -760,6 +844,11 @@ func TestSubagentWaitForAnyDeliversEachResultOnce(t *testing.T) {
 	}
 	if resp.PreviouslyDelivered[0].Result != "" {
 		t.Fatalf("previously_delivered must omit the stale result payload: %+v", resp.PreviouslyDelivered)
+	}
+	// The omission must advertise the recovery path for parents that lost the
+	// original delivery to context compaction.
+	if !strings.Contains(resp.Note, `subagent_status detail="results"`) {
+		t.Fatalf("note = %q, want re-fetch hint", resp.Note)
 	}
 
 	close(slow.release)

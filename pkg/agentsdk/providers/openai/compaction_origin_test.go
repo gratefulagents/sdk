@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
@@ -38,5 +39,39 @@ func TestItemsToAnthropicMessagesSkipsAnthropicCompactionBlobs(t *testing.T) {
 		if enc == "anthropic-blob" {
 			t.Fatalf("foreign Anthropic blob was forwarded to OpenAI: %v", kept)
 		}
+	}
+}
+
+// Anthropic compaction blocks carry a plaintext summary alongside the
+// encrypted blob; after a switch to OpenAI that summary must survive as an
+// assistant text message instead of vanishing with the skipped blob.
+func TestItemsToAnthropicMessagesDownConvertsAnthropicBlobSummary(t *testing.T) {
+	items := []agentsdk.RunItem{
+		{Type: agentsdk.RunItemCompaction, Compaction: &agentsdk.CompactionData{
+			ID: "cmp_anthropic", EncryptedContent: "anthropic-blob", CreatedBy: "anthropic",
+			Content: "user asked for X; agent finished steps A and B",
+		}},
+		{Type: agentsdk.RunItemCompaction, Compaction: &agentsdk.CompactionData{
+			ID: "cmp_anthropic_opaque", EncryptedContent: "anthropic-blob-2", CreatedBy: "anthropic",
+		}},
+	}
+	msgs := itemsToAnthropicMessages(items)
+
+	var texts []string
+	for _, msg := range msgs {
+		for _, block := range msg.Content {
+			switch block.Type {
+			case "compaction":
+				t.Fatalf("foreign blob forwarded: %+v", block)
+			case "text":
+				texts = append(texts, block.Text)
+			}
+		}
+	}
+	if len(texts) != 1 {
+		t.Fatalf("got %d text blocks (%v), want 1 down-converted summary (opaque blob has nothing to keep)", len(texts), texts)
+	}
+	if !strings.Contains(texts[0], "steps A and B") || !strings.Contains(texts[0], "[CONTEXT SUMMARY") {
+		t.Fatalf("down-converted summary = %q", texts[0])
 	}
 }

@@ -76,6 +76,13 @@ func NewCompactionBlock(id, encryptedContent, createdBy string) ContentBlock {
 	return ContentBlock{Type: "compaction", ID: id, EncryptedContent: encryptedContent, CreatedBy: createdBy}
 }
 
+// ForeignCompactionSummaryHeader prefixes the plaintext assistant message a
+// request builder substitutes for an encrypted compaction blob produced by a
+// different provider (undecryptable here, and the only remnant of the history
+// pruned behind it). Shared by the anthropic and openai providers so the
+// down-converted marker is identical across a provider switch.
+const ForeignCompactionSummaryHeader = "[CONTEXT SUMMARY carried over from an earlier context compaction by a different model provider]\n"
+
 // NewToolUseBlock creates a tool_use content block.
 func NewToolUseBlock(id, name string, input json.RawMessage) ContentBlock {
 	return ContentBlock{Type: "tool_use", ID: id, Name: name, Input: input}

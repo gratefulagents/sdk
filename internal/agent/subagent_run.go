@@ -143,15 +143,18 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 			outcome.Status = subAgentStatusCancelled
 		}
 		outcome.ErrMsg = fmt.Sprintf("agent %q %s: %v", spec.Agent.Name, outcome.Status, err)
-		// A budget-exhausted child hands back its accumulated run state
-		// (partial result attached to the error): surface its last assistant
-		// message so the parent receives the findings gathered so far
-		// instead of a bare failure.
+		// Partial-result semantics: a budget-exhausted child attaches its
+		// accumulated run state to the error, while cancellations and
+		// model/API failures hand it back as the result. Surface the child's
+		// last assistant message either way so the parent receives the
+		// findings gathered so far instead of a bare failure.
+		partial := result
 		var budgetErr *MaxTurnsExceeded
-		if errors.As(err, &budgetErr) {
-			if tail := partialProgressTail(budgetErr.PartialResult); tail != "" {
-				outcome.ErrMsg += "\nPartial progress before the budget ran out:\n" + TruncateMiddle(tail, 1600)
-			}
+		if errors.As(err, &budgetErr) && budgetErr.PartialResult != nil {
+			partial = budgetErr.PartialResult
+		}
+		if tail := partialProgressTail(partial); tail != "" {
+			outcome.ErrMsg += "\nPartial progress before the run ended:\n" + TruncateMiddle(tail, 1600)
 		}
 		// Runner.Run returns a nil result on most errors (max-turns hands
 		// back a partial result, but without provider-reported totals), so

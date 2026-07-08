@@ -967,6 +967,65 @@ func TestRunnerContextCancelledPreservesPartialResult(t *testing.T) {
 	}
 }
 
+// A model/API failure after completed turns (retries and fallbacks already
+// exhausted) must hand back the accumulated conversation exactly like the
+// cancellation and max-turns paths: the host persists it and the session
+// retries with context instead of amnesia.
+func TestRunnerModelFailurePreservesPartialResult(t *testing.T) {
+	model := &mockModel{
+		responses: []*ModelResponse{
+			{Items: []RunItem{
+				{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call-1", Name: "echo", Input: json.RawMessage(`"x"`)}},
+			}},
+		},
+		errors: []error{nil, errors.New("model call exceeded per-attempt timeout")},
+	}
+	echoTool := &FunctionTool{
+		ToolName: "echo", ToolDescription: "echo",
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Fn: func(_ context.Context, _ json.RawMessage) (string, error) {
+			return "tool finding", nil
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{echoTool}}
+
+	result, err := runner.Run(context.Background(), agent, []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "go"}}}, RunConfig{MaxTurns: 10})
+	if err == nil {
+		t.Fatal("expected the model failure to surface as an error")
+	}
+	if result == nil {
+		t.Fatal("expected a partial result alongside the model failure")
+	}
+	calls, outputs := 0, 0
+	for _, item := range result.FinalHistory {
+		switch item.Type {
+		case RunItemToolCall:
+			calls++
+		case RunItemToolOutput:
+			outputs++
+		}
+	}
+	if calls != 1 || outputs != 1 {
+		t.Errorf("partial history should pair the completed turn's tool call with its output, got %d/%d", calls, outputs)
+	}
+}
+
+// A failure before anything accumulated must keep the nil result: there is
+// no partial state worth handing back for the very first model call.
+func TestRunnerImmediateModelFailureReturnsNilResult(t *testing.T) {
+	model := &mockModel{errors: []error{errors.New("boom")}}
+	runner := NewRunnerWithModel(model)
+
+	result, err := runner.Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{MaxTurns: 5})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if result != nil {
+		t.Fatalf("expected nil result when nothing accumulated, got %+v", result)
+	}
+}
+
 // cancellingModel simulates a host shutdown landing while a model call is in
 // flight: at cancelAtCall it cancels the run context and fails with its error.
 type cancellingModel struct {

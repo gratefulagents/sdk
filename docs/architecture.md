@@ -88,7 +88,9 @@ One execution engine, one model-facing spawn tool.
   - `subagent` — spawn one task (`message`) or a keyed DAG (`tasks` with
     `depends_on`); `mode:"sync"` (default) returns results in the same call,
     `mode:"background"` returns task ids immediately.
-  - `subagent_status` — `detail:"summary" | "activity" | "graph"` introspection.
+  - `subagent_status` — `detail:"summary" | "activity" | "results" | "graph"`
+    introspection; `results` re-returns full result/error payloads of finished
+    tasks at any time (the recovery path after context compaction).
   - `subagent_wait` — event-driven blocking join on background tasks
     (`wait_for:"all" | "any"`, optional `timeout_ms`); replaces sleep/poll loops.
   - `subagent_control` — `action:"message"` (steering) or `action:"cancel"`.

@@ -403,10 +403,20 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 			}
 		case agentsdk.RunItemCompaction:
 			if item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
-				// Skip blobs produced by a different provider: they are not
-				// decryptable here and would 400 the whole request (see the
-				// mirrored guard in the anthropic provider).
+				// Blobs produced by a different provider are not decryptable
+				// here and would 400 the whole request (see the mirrored
+				// guard in the anthropic provider). The blob is the only
+				// remnant of the history pruned behind it, so down-convert it
+				// to a plaintext assistant summary when the producing
+				// provider supplied one instead of silently severing the
+				// conversation.
 				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin == "anthropic" {
+					if summary := strings.TrimSpace(item.Compaction.Content); summary != "" {
+						msgs = append(msgs, internalanthropic.Message{
+							Role:    internalanthropic.RoleAssistant,
+							Content: []internalanthropic.ContentBlock{internalanthropic.NewTextBlock(internalanthropic.ForeignCompactionSummaryHeader + summary)},
+						})
+					}
 					continue
 				}
 				compaction := internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy)

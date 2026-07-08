@@ -619,7 +619,7 @@ type subagentStatusTool struct {
 
 func (t *subagentStatusTool) Name() string { return "subagent_status" }
 func (t *subagentStatusTool) Description() string {
-	return "Inspect sub-agent tasks. detail=summary (default) returns per-task status and counts; detail=activity adds files read/written and recent tool calls; detail=graph returns the dependency DAG as nodes and edges."
+	return "Inspect sub-agent tasks. detail=summary (default) returns per-task status and counts; detail=activity adds files read/written and recent tool calls; detail=results returns the full result/error text of finished tasks — use it to re-read results you no longer have (e.g. after context compaction); detail=graph returns the dependency DAG as nodes and edges."
 }
 func (t *subagentStatusTool) IsReadOnly() bool { return true }
 func (t *subagentStatusTool) InputSchema() json.RawMessage {
@@ -633,8 +633,8 @@ func (t *subagentStatusTool) InputSchema() json.RawMessage {
 			},
 			"detail": {
 				"type": "string",
-				"enum": ["summary", "activity", "graph"],
-				"description": "summary (default): status snapshot. activity: per-task tool/file activity — use for evidence before steering. graph: dependency DAG."
+				"enum": ["summary", "activity", "results", "graph"],
+				"description": "summary (default): status snapshot. activity: per-task tool/file activity — use for evidence before steering. results: full result/error text of finished tasks, re-readable at any time (survives context compaction). graph: dependency DAG."
 			}
 		}
 	}`)
@@ -663,10 +663,12 @@ func (t *subagentStatusTool) Execute(_ context.Context, input json.RawMessage, _
 		return ToolResult{Content: string(resp)}, nil
 	case "activity":
 		return t.executeActivity(params.TaskIDs)
+	case "results":
+		return t.executeResults(params.TaskIDs)
 	case "graph":
 		return t.executeGraph()
 	default:
-		return ToolResult{Content: fmt.Sprintf("invalid detail %q: use \"summary\", \"activity\", or \"graph\"", params.Detail), IsError: true}, nil
+		return ToolResult{Content: fmt.Sprintf("invalid detail %q: use \"summary\", \"activity\", \"results\", or \"graph\"", params.Detail), IsError: true}, nil
 	}
 }
 
@@ -704,6 +706,70 @@ func (t *subagentStatusTool) executeActivity(taskIDs []string) (ToolResult, erro
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	return ToolResult{Content: string(b)}, nil
+}
+
+// executeResults returns the full result/error payloads of terminal tasks.
+// Unlike subagent_wait, it never withholds already-delivered results: it is
+// the recovery path when earlier deliveries were lost to context compaction
+// or never made it into durable context. Tasks it returns are marked
+// delivered so the automatic final join does not re-inject them.
+func (t *subagentStatusTool) executeResults(taskIDs []string) (ToolResult, error) {
+	ids := uniqueNonEmptyTaskIDs(taskIDs)
+	if len(ids) == 0 {
+		for _, task := range t.registry.ListTasks() {
+			ids = append(ids, task.ID)
+		}
+	}
+	type taskResult struct {
+		TaskID   string `json:"task_id"`
+		Agent    string `json:"agent"`
+		Status   string `json:"status"`
+		Duration string `json:"duration,omitempty"`
+		Task     string `json:"task,omitempty"`
+		Result   string `json:"result,omitempty"`
+		Error    string `json:"error,omitempty"`
+	}
+	out := make([]taskResult, 0, len(ids))
+	var stillActive []string
+	for _, taskID := range ids {
+		task, err := t.registry.GetStatus(taskID)
+		if err != nil {
+			return ToolResult{Content: err.Error(), IsError: true}, nil
+		}
+		if !task.IsTerminal() {
+			stillActive = append(stillActive, task.ID)
+			continue
+		}
+		if delivered, _, err := t.registry.CollectResultIfUndelivered(task.ID); err == nil && delivered != nil {
+			task = delivered
+		}
+		out = append(out, taskResult{
+			TaskID:   task.ID,
+			Agent:    task.AgentName,
+			Status:   string(task.Status),
+			Duration: subagentTaskDurationString(task),
+			Task:     Truncate(task.Message, 300),
+			Result:   task.Result,
+			Error:    task.Error,
+		})
+	}
+	resp, _ := json.MarshalIndent(struct {
+		Results     []taskResult `json:"results"`
+		StillActive []string     `json:"still_active,omitempty"`
+		Note        string       `json:"note,omitempty"`
+	}{
+		Results:     out,
+		StillActive: stillActive,
+		Note:        noteWhen(len(stillActive) > 0, "tasks in still_active have no result yet — use subagent_wait to wait for them"),
+	}, "", "  ")
+	return ToolResult{Content: string(resp)}, nil
+}
+
+func noteWhen(cond bool, note string) string {
+	if cond {
+		return note
+	}
+	return ""
 }
 
 func (t *subagentStatusTool) executeGraph() (ToolResult, error) {
@@ -786,7 +852,8 @@ type subagentWaitResponse struct {
 	Finished     []joinedTaskJSON `json:"finished,omitempty"`
 	// PreviouslyDelivered lists watched tasks that were already terminal with
 	// results delivered before this call. Their result payloads are omitted so
-	// stale output is never re-delivered as if it were new.
+	// stale output is never re-delivered as if it were new; re-read them at
+	// any time with subagent_status detail="results".
 	PreviouslyDelivered []joinedTaskJSON       `json:"previously_delivered,omitempty"`
 	StillActive         []subagentProgressTask `json:"still_active,omitempty"`
 	Note                string                 `json:"note,omitempty"`
@@ -862,9 +929,14 @@ func (t *subagentWaitTool) Execute(ctx context.Context, input json.RawMessage, _
 		}
 		response.StillActive = append(response.StillActive, subagentProgressTaskFromTask(&task))
 	}
-	if timedOut {
-		response.Note = fmt.Sprintf("timed out after %dms; %d task(s) still active — call subagent_wait again to keep waiting", params.TimeoutMS, len(response.StillActive))
+	var notes []string
+	if len(response.PreviouslyDelivered) > 0 {
+		notes = append(notes, "previously_delivered results were already returned earlier and are omitted here — re-read them any time with subagent_status detail=\"results\"")
 	}
+	if timedOut {
+		notes = append(notes, fmt.Sprintf("timed out after %dms; %d task(s) still active — call subagent_wait again to keep waiting", params.TimeoutMS, len(response.StillActive)))
+	}
+	response.Note = strings.Join(notes, ". ")
 	resp, _ := json.MarshalIndent(response, "", "  ")
 	return ToolResult{Content: string(resp)}, nil
 }

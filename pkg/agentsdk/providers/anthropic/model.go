@@ -533,9 +533,18 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 				// Encrypted compaction blobs are decryptable only by the
 				// provider that produced them. After a cross-provider model
 				// fallback/switch, forwarding e.g. an OpenAI blob to the
-				// Anthropic API yields a hard 400; skip known-foreign blobs
-				// and rely on the preserved plaintext context instead.
+				// Anthropic API yields a hard 400. The blob is the only
+				// remnant of the history pruned behind it, so down-convert
+				// known-foreign blobs to a plaintext assistant summary when
+				// the producing provider supplied one instead of silently
+				// severing the conversation.
 				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin != "" && origin != "anthropic" {
+					if summary := strings.TrimSpace(item.Compaction.Content); summary != "" {
+						msgs = append(msgs, internalanthropic.Message{
+							Role:    internalanthropic.RoleAssistant,
+							Content: []internalanthropic.ContentBlock{internalanthropic.NewTextBlock(internalanthropic.ForeignCompactionSummaryHeader + summary)},
+						})
+					}
 					continue
 				}
 				block := internalanthropic.NewCompactionBlock(item.Compaction.ID, item.Compaction.EncryptedContent, item.Compaction.CreatedBy)

@@ -167,8 +167,8 @@ func TestCompactionUsageReachesTracker(t *testing.T) {
 
 // A subagent that fails mid-run must still contribute everything it consumed
 // before failing: to the run totals (via live forwarding) and to its own
-// completion outcome/event (recovered from the child tracker, since
-// Runner.Run returns a nil result on error).
+// completion outcome/event (recovered from the child tracker, since partial
+// results carry no provider-reported totals).
 func TestRunSubAgentOnceFailureKeepsPartialUsage(t *testing.T) {
 	echoTool := &FunctionTool{
 		ToolName:        "echo",
