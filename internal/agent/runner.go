@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gratefulagents/sdk/internal/modeldelta"
 )
 
 const finalSummaryTurnDirective = `<final_turn>
@@ -669,8 +671,24 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// derived from the run context, so real cancellation still propagates.
 		llmStartedAt := time.Now()
 		callCtx, callCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+		// Surface reasoning text live while the (blocking) model call is in
+		// flight: transports that stream internally feed a coalescing emitter
+		// which writes assistant_thinking_delta events keyed by attemptID.
+		// The streamed-run path already forwards reasoning deltas through its
+		// own event channel, so the sink is only installed for blocking runs.
+		var thinkingDeltas *thinkingDeltaEmitter
+		if platformHooks := findPlatformHooks(cfg.Hooks); platformHooks != nil {
+			platformHooks.setLLMAttemptID(attemptID)
+			if streamEvents == nil && platformHooks.EventStream != nil {
+				thinkingDeltas = newThinkingDeltaEmitter(platformHooks.EventStream, attemptID, currentAgent.Name)
+				callCtx = modeldelta.WithReasoningSink(callCtx, thinkingDeltas.Chunk)
+			}
+		}
 		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents)
 		callCancel()
+		if thinkingDeltas != nil {
+			thinkingDeltas.Flush()
+		}
 		// A per-attempt timeout (our derived deadline fired while the parent
 		// run context is still alive) is a transient provider hang, not a user
 		// cancellation: let it flow through the normal retry/fallback path

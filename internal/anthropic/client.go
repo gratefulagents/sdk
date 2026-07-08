@@ -18,6 +18,8 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 	"github.com/google/uuid"
+
+	"github.com/gratefulagents/sdk/internal/modeldelta"
 )
 
 const (
@@ -251,12 +253,23 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 		// Beta.Messages.New refuses requests whose max_tokens could exceed the
 		// 10-minute non-streaming limit. Streaming has no such cap, and the
 		// SDK's own accumulator reassembles the identical final message.
+		sink := modeldelta.ReasoningSinkFromContext(ctx)
 		stream := c.sdk.Beta.Messages.NewStreaming(ctx, params, betas...)
 		defer stream.Close()
 		var acc sdk.BetaMessage
 		for stream.Next() {
-			if err := acc.Accumulate(stream.Current()); err != nil {
+			event := stream.Current()
+			if err := acc.Accumulate(event); err != nil {
 				return err
+			}
+			// Surface reasoning text live to any installed sink while the
+			// blocking call keeps accumulating the full response.
+			if sink != nil && event.Type == "content_block_delta" {
+				if delta := event.AsContentBlockDelta().Delta; delta.Type == "thinking_delta" {
+					if text := delta.AsThinkingDelta().Thinking; text != "" {
+						sink(text)
+					}
+				}
 			}
 		}
 		if err := stream.Err(); err != nil {

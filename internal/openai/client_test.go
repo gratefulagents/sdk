@@ -1232,7 +1232,7 @@ func TestDrainStreamRejectsEmptyResponse(t *testing.T) {
 			},
 		},
 		{Type: anthropic.EventMessageStop},
-	}})
+	}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "without output content") {
 		t.Fatalf("error = %v, want without output content", err)
 	}
@@ -1277,7 +1277,7 @@ func TestDrainStreamPreservesInputTokensWhenDeltaOmitsThem(t *testing.T) {
 			Usage: &anthropic.Usage{OutputTokens: 7},
 		},
 		{Type: anthropic.EventMessageStop},
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatalf("drainStreamToResponse() error = %v", err)
 	}
@@ -1404,5 +1404,67 @@ func TestCreateMessageNonCopilotChatUsesBufferedPath(t *testing.T) {
 	}
 	if len(resp.Content) != 1 || resp.Content[0].Text != "hi" {
 		t.Fatalf("response content = %+v, want single text block 'hi'", resp.Content)
+	}
+}
+
+func TestDrainStreamFeedsReasoningSink(t *testing.T) {
+	var chunks []string
+	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+		{
+			Type: anthropic.EventMessageStart,
+			Message: &anthropic.CreateMessageResponse{
+				ID:    "resp_think",
+				Model: "gpt-5.5",
+				Role:  anthropic.RoleAssistant,
+			},
+		},
+		{
+			Type:         anthropic.EventContentBlockStart,
+			Index:        0,
+			ContentBlock: &anthropic.ContentBlock{Type: "thinking"},
+		},
+		{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: 0,
+			Delta: &anthropic.DeltaBlock{Type: "thinking_delta", Thinking: "step one, "},
+		},
+		{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: 0,
+			Delta: &anthropic.DeltaBlock{Type: "thinking_delta", Text: "step two"},
+		},
+		{
+			Type:         anthropic.EventContentBlockStart,
+			Index:        1,
+			ContentBlock: &anthropic.ContentBlock{Type: "text"},
+		},
+		{
+			Type:  anthropic.EventContentBlockDelta,
+			Index: 1,
+			Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: "answer"},
+		},
+		{
+			Type: anthropic.EventMessageDelta,
+			Delta: &anthropic.DeltaBlock{
+				Type:       "message_delta",
+				StopReason: string(anthropic.StopReasonEndTurn),
+			},
+		},
+		{Type: anthropic.EventMessageStop},
+	}}, func(text string) { chunks = append(chunks, text) })
+	if err != nil {
+		t.Fatalf("drainStreamToResponse() error = %v", err)
+	}
+	if got := strings.Join(chunks, ""); got != "step one, step two" {
+		t.Fatalf("sink received %q, want reasoning text in stream order", got)
+	}
+	var thinking string
+	for _, b := range resp.Content {
+		if b.Type == "thinking" {
+			thinking = b.Thinking
+		}
+	}
+	if thinking != "step one, step two" {
+		t.Fatalf("assembled thinking = %q, want full text", thinking)
 	}
 }

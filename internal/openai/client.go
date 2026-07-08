@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gratefulagents/sdk/internal/anthropic"
+	"github.com/gratefulagents/sdk/internal/modeldelta"
 	sdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
@@ -832,7 +833,7 @@ func (c *Client) createViaResponses(ctx context.Context, params responses.Respon
 	reader := &ResponsesStreamReader{stream: stream}
 	defer reader.Close()
 
-	return drainStreamToResponse(reader)
+	return drainStreamToResponse(reader, modeldelta.ReasoningSinkFromContext(ctx))
 }
 
 func (c *Client) CompactConversation(ctx context.Context, req anthropic.CreateMessageRequest) (*CompactConversationResponse, error) {
@@ -924,7 +925,7 @@ func (c *Client) createViaChatCompletions(ctx context.Context, req anthropic.Cre
 			return nil, err
 		}
 		defer stream.Close()
-		return drainStreamToResponse(stream)
+		return drainStreamToResponse(stream, modeldelta.ReasoningSinkFromContext(ctx))
 	}
 
 	raw, err := c.doChatRequest(ctx, body)
@@ -1655,7 +1656,8 @@ func responseOutputString(output responses.ResponseOutputItemUnionOutput) string
 // reassembles them into a CreateMessageResponse. This is used by
 // createViaResponses so that the non-streaming CreateMessage path still
 // goes through SSE — the Codex backend only delivers output via streaming.
-func drainStreamToResponse(stream messageStream) (*anthropic.CreateMessageResponse, error) {
+// A non-nil sink receives reasoning text chunks live as they stream in.
+func drainStreamToResponse(stream messageStream, sink modeldelta.ReasoningSink) (*anthropic.CreateMessageResponse, error) {
 	resp := &anthropic.CreateMessageResponse{
 		Type: "message",
 		Role: anthropic.RoleAssistant,
@@ -1719,8 +1721,14 @@ func drainStreamToResponse(stream messageStream) (*anthropic.CreateMessageRespon
 				case "thinking_delta":
 					if ev.Delta.Thinking != "" {
 						b.thinkingBuf.WriteString(ev.Delta.Thinking)
+						if sink != nil {
+							sink(ev.Delta.Thinking)
+						}
 					} else {
 						b.thinkingBuf.WriteString(ev.Delta.Text)
+						if sink != nil && ev.Delta.Text != "" {
+							sink(ev.Delta.Text)
+						}
 					}
 				case "reasoning_encrypted_content":
 					b.encryptedContent = ev.Delta.EncryptedContent

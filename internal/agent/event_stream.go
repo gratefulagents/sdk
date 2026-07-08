@@ -363,6 +363,19 @@ func (es *EventStream) EmitThinking(thinking string, agentName ...string) {
 	es.Emit(ev)
 }
 
+// EmitThinkingDelta emits an incremental assistant reasoning chunk streamed
+// while a model call is still in flight. ToolUseID carries the llm attempt id
+// so consumers can stitch chunks into one reasoning block and supersede them
+// with the final assistant_thinking event bearing the same id.
+func (es *EventStream) EmitThinkingDelta(chunk, agentName, attemptID string) {
+	es.Emit(ContentEvent{
+		Type:      "assistant_thinking_delta",
+		Message:   chunk,
+		AgentName: agentName,
+		ToolUseID: attemptID,
+	})
+}
+
 // EmitToolStart emits a tool invocation event with optional raw input.
 func (es *EventStream) EmitToolStart(toolName, toolUseID, parentCallID, inputSummary, agentName, inputRaw string) {
 	es.Emit(ContentEvent{
