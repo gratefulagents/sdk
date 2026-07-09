@@ -257,14 +257,6 @@ type RunConfig struct {
 	// (Terminus 2 double-confirm pattern).
 	RequireCompletionConfirmation bool
 
-	// PlanRecitation, when set, is invoked before every model request and its
-	// non-empty return value is appended as the final input message of that
-	// request only — it is never persisted to run history. Reciting the
-	// current plan/goals at the context tail keeps them in the model's
-	// high-attention window (the todo.md recitation pattern) while leaving
-	// the cache-stable instruction prefix and append-only history untouched.
-	PlanRecitation func(ctx context.Context) string
-
 	// ConsecutiveToolErrorLimit escalates when this many consecutive tool
 	// turns produce only errors: the runner injects a corrective note telling
 	// the model to change approach or report the blocker (the 12-factor

@@ -658,20 +658,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			taskID = parentCallID
 		}
 
-		// Plan recitation: append a transient plan/goals message as the last
-		// input item of this request only. It is regenerated each turn and
-		// never persisted to history, so the append-only conversation and
-		// cache-stable prefix are preserved while goals stay in the model's
-		// high-attention window.
+		// The request input is exactly the accumulated conversation: plan
+		// state, when a host tracks one, lives in durable history like any
+		// other context (per-request transient re-injection was removed — it
+		// made the model re-orient and re-narrate every turn).
 		requestInput := currentInput
-		if cfg.PlanRecitation != nil {
-			if recitation := strings.TrimSpace(cfg.PlanRecitation(ctx)); recitation != "" {
-				requestInput = append(append([]RunItem(nil), currentInput...), RunItem{
-					Type:    RunItemMessage,
-					Message: &MessageOutput{Text: "<current_plan>\n" + recitation + "\n</current_plan>"},
-				})
-			}
-		}
 
 		modelRequest := ModelRequest{
 			Model:               modelName,
