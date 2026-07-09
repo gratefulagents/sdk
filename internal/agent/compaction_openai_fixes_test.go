@@ -627,3 +627,69 @@ func TestCalibrationCorrectsOvercountingEstimatorDownward(t *testing.T) {
 		t.Fatalf("compactCalls = %d, want 0 (downward calibration must lift the trigger)", model.compactCalls)
 	}
 }
+
+// hookCapturingContextTokens records the ContextTokens stamped on responses
+// observed via OnLLMEnd — the value host context gauges must consume.
+type hookCapturingContextTokens struct {
+	NoOpRunHooks
+	seen []int64
+}
+
+func (h *hookCapturingContextTokens) OnLLMEnd(_ *RunContext, _ *Agent, resp *ModelResponse) {
+	if resp != nil {
+		h.seen = append(h.seen, resp.ContextTokens)
+	}
+}
+
+// The response handed to OnLLMEnd carries the provider-normalized context
+// size: on OpenAI-style providers (input inclusive of cached tokens) hosts
+// summing usage fields read ~2x on warm requests — the platform gauge showed
+// 91% while real usage was 46% (run chat-gf-all-xa9h7s).
+func TestOnLLMEndReceivesNormalizedContextTokens(t *testing.T) {
+	hooks := &hookCapturingContextTokens{}
+	inclusive := &usageSemanticsCompactorModel{
+		inclusive: true,
+		mockCompactorModel: mockCompactorModel{
+			mockModel: mockModel{
+				responses: []*ModelResponse{
+					{
+						Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}},
+						// Warm OpenAI-style request: cached tokens are a
+						// subset of input, not additive.
+						Usage: Usage{InputTokens: 114_000, CacheReadTokens: 110_000},
+					},
+				},
+			},
+		},
+	}
+	runner := NewRunnerWithModel(inclusive)
+	if _, err := runner.Run(context.Background(), &Agent{Name: "main"}, []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "task"}},
+	}, RunConfig{MaxTurns: 3, Hooks: hooks}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hooks.seen) != 1 || hooks.seen[0] != 114_000 {
+		t.Fatalf("OnLLMEnd ContextTokens = %v, want [114000] (not 224000 double-counted)", hooks.seen)
+	}
+
+	hooks = &hookCapturingContextTokens{}
+	additive := &mockCompactorModel{
+		mockModel: mockModel{
+			responses: []*ModelResponse{
+				{
+					Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}},
+					Usage: Usage{InputTokens: 4_000, CacheReadTokens: 110_000},
+				},
+			},
+		},
+	}
+	runner = NewRunnerWithModel(additive)
+	if _, err := runner.Run(context.Background(), &Agent{Name: "main"}, []RunItem{
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "task"}},
+	}, RunConfig{MaxTurns: 3, Hooks: hooks}); err != nil {
+		t.Fatal(err)
+	}
+	if len(hooks.seen) != 1 || hooks.seen[0] != 114_000 {
+		t.Fatalf("OnLLMEnd ContextTokens (additive) = %v, want [114000] (input+cache)", hooks.seen)
+	}
+}

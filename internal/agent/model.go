@@ -70,6 +70,12 @@ type ModelResponse struct {
 	Raw       any     // provider-specific raw response for debugging
 	CostUSD   float64 // estimated cost in USD (set by runner after model returns)
 	CostKnown bool    // whether cost estimate is considered reliable
+	// ContextTokens is the provider-normalized prompt-side size of this
+	// request (set by the runner, see usageContextTokens): the true context
+	// pressure regardless of whether the provider reports cache tokens as a
+	// subset of input (OpenAI-style) or additive to it (Anthropic-style).
+	// Hosts must use this for window gauges instead of summing usage fields.
+	ContextTokens int64
 }
 
 // CompactionResult is the provider-native compacted context window.

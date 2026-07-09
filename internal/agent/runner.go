@@ -1008,6 +1008,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		ev.AttemptLatencyMs = genData.LatencyMS
 		emitLLMAttemptEvent(cfg.Hooks, ev)
 
+		// Stamp the provider-normalized context size before hooks observe the
+		// response: host gauges summing usage fields double-count the cached
+		// prompt on OpenAI-style providers (input_tokens already include
+		// cached tokens), reading ~2x real window pressure on warm requests.
+		resp.ContextTokens = usageContextTokens(activeModel, resp.Usage)
+
 		fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnLLMEnd(runCtx, currentAgent, resp) })
 
 		// Track usage.
@@ -1022,7 +1028,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// (encrypted reasoning/compaction blobs are counted as text but not
 		// billed as such), so a one-sided clamp let overcounting histories
 		// compact at half the real window.
-		if actual := usageContextTokens(activeModel, resp.Usage); actual > 0 {
+		if actual := resp.ContextTokens; actual > 0 {
 			if sentEstimate := estimateRunItemsTokens(requestInput) + requestOverheadTokens; sentEstimate > 0 {
 				ratio := float64(actual) / float64(sentEstimate)
 				blended := 0.5*estimateCalibration + 0.5*ratio
