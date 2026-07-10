@@ -1059,8 +1059,7 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 		params.ParallelToolCalls = sdk.Bool(true)
 	}
 
-	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-		reasoning := sharedReasoningFromBudget(req.Thinking.BudgetTokens)
+	if reasoning, ok := sharedReasoning(req.ReasoningEffort, req.Thinking); ok {
 		// Request a reasoning summary so models that withhold raw reasoning
 		// (gpt-5, o-series, codex) still surface human-readable reasoning text via
 		// response.reasoning_summary_text events. Effort "minimal" yields no
@@ -1174,8 +1173,8 @@ func toCompactParams(req anthropic.CreateMessageRequest, includeCodexExtras bool
 			extras["tools"] = tools
 			extras["parallel_tool_calls"] = true
 		}
-		if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-			extras["reasoning"] = sharedReasoningFromBudget(req.Thinking.BudgetTokens)
+		if reasoning, ok := sharedReasoning(req.ReasoningEffort, req.Thinking); ok {
+			extras["reasoning"] = reasoning
 		}
 		if verbosity := normalizeTextVerbosity(req.TextVerbosity); verbosity != "" {
 			extras["text"] = responses.ResponseTextConfigParam{
@@ -1283,6 +1282,22 @@ func outputSchemaMap(schema *anthropic.OutputSchema) (map[string]any, error) {
 		schemaMap = map[string]any{"type": "object"}
 	}
 	return schemaMap, nil
+}
+
+func sharedReasoning(effort string, thinking *anthropic.ThinkingConfig) (shared.ReasoningParam, bool) {
+	if effort = strings.ToLower(strings.TrimSpace(effort)); effort != "" {
+		// The Responses path historically represents explicit none with a tiny
+		// thinking budget, which maps to minimal. Preserve that compatibility
+		// while allowing newer model efforts such as GPT-5.6 max to pass through.
+		if effort == "none" {
+			effort = "minimal"
+		}
+		return shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}, true
+	}
+	if thinking == nil || thinking.BudgetTokens <= 0 {
+		return shared.ReasoningParam{}, false
+	}
+	return sharedReasoningFromBudget(thinking.BudgetTokens), true
 }
 
 func sharedReasoningFromBudget(budget int) shared.ReasoningParam {

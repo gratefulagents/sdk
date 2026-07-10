@@ -441,13 +441,12 @@ func markLastCacheableBlock(blocks []internalanthropic.ContentBlock, cc *interna
 // API output_config.effort value. Returns "" when no effort is requested
 // (including "none"), so callers can decide whether to fall back to a default.
 //
-// The host reasoning ladder tops out at "xhigh" ("extra reasoning for hardest
-// tasks"). Anthropic's output_config.effort scale is low/medium/high/xhigh/max,
-// but the supported subset is model-specific: e.g. claude-sonnet-4.6 accepts
-// only [low medium high max] and rejects "xhigh" with HTTP 400. We therefore map
-// the host's top tier to Anthropic's "max", which is the canonical maximum
-// effort and is supported across Claude models, instead of the model-specific
-// "xhigh". This keeps the OpenAI path (which does support "xhigh") unchanged.
+// Anthropic's output_config.effort scale is low/medium/high/xhigh/max, but the
+// supported subset is model-specific: e.g. claude-sonnet-4.6 accepts only
+// [low medium high max] and rejects "xhigh" with HTTP 400. We therefore map the
+// host's xhigh tier to Anthropic's canonical "max" effort. A first-class host
+// max selection also remains max. The OpenAI path preserves xhigh and max as
+// distinct efforts.
 func mapReasoningEffortToAnthropic(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "minimal", "low":

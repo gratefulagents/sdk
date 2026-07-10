@@ -14,6 +14,7 @@ const (
 	ReasoningMedium ModeReasoningLevel = "medium"
 	ReasoningHigh   ModeReasoningLevel = "high"
 	ReasoningXHigh  ModeReasoningLevel = "xhigh"
+	ReasoningMax    ModeReasoningLevel = "max"
 )
 
 // ModeTextVerbosity is an SDK-native text verbosity label.
@@ -155,6 +156,10 @@ func ModeReasoningSettings(level any) ModelSettings {
 	case ReasoningXHigh:
 		// Keep the Anthropic budget capped while preserving OpenAI xhigh effort.
 		return ModelSettings{ThinkingBudget: 12288, ReasoningEffort: "xhigh"}
+	case ReasoningMax:
+		// Max is a distinct OpenAI effort above xhigh. Legacy budget-based
+		// providers use the same safe cap as xhigh.
+		return ModelSettings{ThinkingBudget: 12288, ReasoningEffort: "max"}
 	default:
 		return ModelSettings{}
 	}
@@ -193,6 +198,8 @@ func normalizeModeReasoningLevel(level any) ModeReasoningLevel {
 		return ReasoningHigh
 	case string(ReasoningXHigh):
 		return ReasoningXHigh
+	case string(ReasoningMax):
+		return ReasoningMax
 	default:
 		return ""
 	}
