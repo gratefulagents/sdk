@@ -30,7 +30,7 @@ const (
 	openAIBetaResponsesExperimental = "responses=experimental"
 	oauthRefreshInterval            = 8 * 24 * time.Hour
 
-	DefaultCodexClientVersion = "0.125.0"
+	DefaultCodexClientVersion = "0.144.1"
 	DefaultOAuthClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
 	DefaultOAuthIssuer        = "https://auth.openai.com"
 	DefaultOAuthTokenEndpoint = "https://auth.openai.com/oauth/token"

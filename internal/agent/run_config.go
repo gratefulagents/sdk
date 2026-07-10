@@ -105,6 +105,11 @@ func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) 
 		strings.Contains(m, "lite"),
 		strings.Contains(m, "flash"):
 		return 110000, 60000
+	// GPT-5.6 on the ChatGPT Codex backend advertises 372K context. The OpenAI
+	// API can expose larger windows; provider metadata or models.dev overrides
+	// this conservative static fallback when available.
+	case strings.HasPrefix(m, "gpt-5.6"):
+		return 334800, 186000
 	// GPT-5.x / codex (non-spark) on Copilot/OpenAI are ~400K context (not the
 	// ~1M once assumed): trigger ~360K (90%), target ~200K (50%). Providers
 	// that genuinely expose ~1M are corrected upward by provider metadata.

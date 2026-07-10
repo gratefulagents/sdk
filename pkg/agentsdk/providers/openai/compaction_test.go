@@ -19,6 +19,23 @@ func TestCompactionDefaultsFromModelMetadataUsesCodexLimit(t *testing.T) {
 	}
 }
 
+func TestCompactionDefaultsFromModelMetadataUsesCodexGPT56Limit(t *testing.T) {
+	trigger, target, ok := CompactionDefaultsFromModelMetadata(ModelMetadata{
+		ID:               "gpt-5.6-sol",
+		ContextWindow:    372000,
+		MaxContextWindow: 372000,
+	})
+	if !ok {
+		t.Fatal("expected metadata to produce compaction defaults")
+	}
+	if trigger != 334800 {
+		t.Fatalf("trigger = %d, want 334800", trigger)
+	}
+	if target != 186000 {
+		t.Fatalf("target = %d, want 186000", target)
+	}
+}
+
 func TestCompactionDefaultsFromModelMetadataClampsConfiguredLimit(t *testing.T) {
 	trigger, target, ok := CompactionDefaultsFromModelMetadata(ModelMetadata{
 		ID:                    "gpt-test",

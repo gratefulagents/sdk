@@ -32,7 +32,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const liveOpenAIModel = "gpt-5.5"
+const liveOpenAIModel = sdkopenai.DefaultChatModel
 
 type integrationDecision struct {
 	Answer string `json:"answer"`

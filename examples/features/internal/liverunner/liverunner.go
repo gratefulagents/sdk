@@ -23,7 +23,7 @@
 // liveanthropic, and liveopenrouter packages.
 //
 // In "multi" mode the returned model name is prefixed (e.g.
-// "openai/gpt-5.5"), so it routes via agentsdk.MultiProvider's prefix
+// "openai/gpt-5.6-sol"), so it routes via agentsdk.MultiProvider's prefix
 // parsing — the same MultiProvider construct the SDK exposes to users.
 package liverunner
 

@@ -102,6 +102,18 @@ func TestCalculateCost(t *testing.T) {
 			wantCost: 0.75,
 		},
 		{
+			name:     "gpt-5.6-terra input",
+			model:    "gpt-5.6-terra",
+			usage:    anthropic.Usage{InputTokens: 1_000_000},
+			wantCost: 2.5,
+		},
+		{
+			name:     "gpt-5.6-luna output",
+			model:    "gpt-5.6-luna",
+			usage:    anthropic.Usage{OutputTokens: 1_000_000},
+			wantCost: 6.0,
+		},
+		{
 			name:     "gpt-5.5 output",
 			model:    "gpt-5.5",
 			usage:    anthropic.Usage{OutputTokens: 1_000_000},
@@ -149,7 +161,14 @@ func TestEstimateCost(t *testing.T) {
 		},
 		{
 			name:      "openai provider prefix stripped",
-			model:     "openai/gpt-5.5",
+			model:     "openai/gpt-5.6-terra",
+			usage:     anthropic.Usage{OutputTokens: 1_000_000},
+			wantCost:  15.0,
+			wantKnown: true,
+		},
+		{
+			name:      "gpt-5.6 alias uses sol pricing",
+			model:     "gpt-5.6",
 			usage:     anthropic.Usage{OutputTokens: 1_000_000},
 			wantCost:  30.0,
 			wantKnown: true,
@@ -162,13 +181,13 @@ func TestEstimateCost(t *testing.T) {
 			wantKnown: false,
 		},
 		{
-			name:  "cached input uses cached price",
-			model: "gpt-5.5",
+			name:  "gpt-5.6-luna cached input uses cached price",
+			model: "gpt-5.6-luna",
 			usage: anthropic.Usage{
 				InputTokens:          1_000_000,
 				CacheReadInputTokens: 800_000,
 			},
-			wantCost:  1.4,
+			wantCost:  0.28,
 			wantKnown: true,
 		},
 		{

@@ -14,7 +14,7 @@ type ModelPricing struct {
 }
 
 // modelPricing holds OpenAI standard-tier list prices in USD per 1M tokens,
-// verified against https://developers.openai.com/api/docs/pricing (2026-06).
+// verified against https://developers.openai.com/api/docs/pricing (2026-07).
 // CachedInputPerMillion is the prompt-cache read rate; OutputPerMillion already
 // covers reasoning tokens (OpenAI includes them in output_tokens). Batch, Flex,
 // and Priority tiers are not modeled. Keep in sync when OpenAI updates pricing.
@@ -98,6 +98,21 @@ var modelPricing = map[string]ModelPricing{
 		CachedInputPerMillion: 0.02,
 		OutputPerMillion:      1.25,
 	},
+	"gpt-5.6-sol": {
+		InputPerMillion:       5.0,
+		CachedInputPerMillion: 0.50,
+		OutputPerMillion:      30.0,
+	},
+	"gpt-5.6-terra": {
+		InputPerMillion:       2.5,
+		CachedInputPerMillion: 0.25,
+		OutputPerMillion:      15.0,
+	},
+	"gpt-5.6-luna": {
+		InputPerMillion:       1.0,
+		CachedInputPerMillion: 0.10,
+		OutputPerMillion:      6.0,
+	},
 	"gpt-5.5": {
 		InputPerMillion:       5.0,
 		CachedInputPerMillion: 0.50,
@@ -132,6 +147,9 @@ func normalizePricingModel(model string) string {
 	}
 	if model == "gpt-4" {
 		return "gpt-4.1"
+	}
+	if model == "gpt-5.6" {
+		return "gpt-5.6-sol"
 	}
 	return model
 }

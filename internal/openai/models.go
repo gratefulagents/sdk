@@ -9,7 +9,7 @@ const (
 	// DefaultChatModel/DefaultChatMiniModel are the default OpenAI-compatible
 	// runtime models used when callers omit an explicit model selection.
 	// These defaults should be Responses-compatible.
-	DefaultChatModel     = "gpt-5.5"
+	DefaultChatModel     = "gpt-5.6-sol"
 	DefaultChatMiniModel = "gpt-5.3-codex-spark"
 
 	chatCompletionsExampleModel     = "gpt-4.1"

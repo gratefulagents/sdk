@@ -34,7 +34,7 @@ func TestContextCompactionExample(t *testing.T) {
 		t.Fatalf("summary missing: %q", summary)
 	}
 
-	trigger, target := agentsdk.CompactionDefaultsForModel("gpt-5.5")
+	trigger, target := agentsdk.CompactionDefaultsForModel("gpt-5.6-sol")
 	if trigger <= target {
 		t.Fatalf("defaults should trigger above target: trigger=%d target=%d", trigger, target)
 	}

@@ -20,6 +20,7 @@ const sampleCatalog = `{
   "openai": {
     "models": {
       "gpt-5.3-codex-spark": {"limit": {"context": 128000, "output": 32000}},
+      "gpt-5.6-sol": {"limit": {"context": 1050000, "output": 128000}},
       "gpt-5.4": {"limit": {"context": 1050000, "output": 128000}}
     }
   },
@@ -65,6 +66,9 @@ func TestLookupProviderAliasesAndPrefixes(t *testing.T) {
 	if _, ok := r.Lookup(ctx, "openai-oauth", "gpt-5.3-codex-spark"); ok {
 		t.Fatal("openai-oauth must not resolve via models.dev")
 	}
+	if _, ok := r.Lookup(ctx, "openai-oauth", "gpt-5.6-sol"); ok {
+		t.Fatal("openai-oauth gpt-5.6 must not resolve via models.dev")
+	}
 	// Dated snapshot resolves via suffix tolerance.
 	limits, ok = r.Lookup(ctx, "anthropic-oauth", "claude-fable-5-20270101")
 	if !ok || limits.ContextTokens != 1000000 {
@@ -101,6 +105,10 @@ func TestCompactionResolverFuncUsesModelPrefixAsProvider(t *testing.T) {
 	trigger, _, ok = resolve(context.Background(), "openai/gpt-5.4")
 	if !ok || trigger != 945000 {
 		t.Fatalf("openai gpt-5.4 trigger = %d ok=%v, want 945000", trigger, ok)
+	}
+	trigger, _, ok = resolve(context.Background(), "openai/gpt-5.6-sol")
+	if !ok || trigger != 945000 {
+		t.Fatalf("openai gpt-5.6 trigger = %d ok=%v, want 945000", trigger, ok)
 	}
 }
 

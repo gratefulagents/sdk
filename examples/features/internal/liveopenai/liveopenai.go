@@ -11,7 +11,7 @@
 //	OPENAI_OAUTH_ACCOUNT_ID       optional account ID to bind
 //	OPENAI_OAUTH_ACCOUNT_ID_PATH  optional path containing the account ID
 //	OPENAI_BASE_URL               override Codex backend base URL
-//	OPENAI_LIVE_MODEL             model name (defaults to gpt-5.5)
+//	OPENAI_LIVE_MODEL             model name (defaults to sdkopenai.DefaultChatModel)
 //	GRATEFUL_LIVE_TESTS=skip      skip live tests without touching provider
 //	                              credentials or network
 //	GRATEFUL_LIVE_TESTS=required  fail when required credentials are missing
@@ -29,7 +29,7 @@ import (
 )
 
 // DefaultModel is the model name used when OPENAI_LIVE_MODEL is unset.
-const DefaultModel = "gpt-5.5"
+const DefaultModel = sdkopenai.DefaultChatModel
 
 // Runner returns a Runner backed by the OpenAI OAuth provider plus the model
 // name to use. Tests should pass the model name into Agent.Model and

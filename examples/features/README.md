@@ -2,7 +2,7 @@
 
 These examples show focused usage of individual SDK features. They are intentionally smaller than the SDK-wide integration suite. Some packages are deterministic and offline; many packages run live provider calls through `examples/features/internal/liverunner` when credentials are present, so the same examples can exercise real provider adapters.
 
-For the SDK-wide live OpenAI OAuth integration suite using `gpt-5.5`, run:
+For the SDK-wide live OpenAI OAuth integration suite using `gpt-5.6-sol` by default, run:
 
 ```sh
 OPENAI_OAUTH_AUTH_JSON_PATH=$HOME/.codex/auth.json go test ./test/integration/openai_oauth -count=1 -v

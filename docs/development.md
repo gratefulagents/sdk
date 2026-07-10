@@ -65,7 +65,7 @@ Notes:
 
 - `GRATEFUL_LIVE_PROVIDER=multi` builds a real `agentsdk.MultiProvider`,
   registers every provider whose credentials are present, and runs the
-  default-prefix model (e.g. `openai/gpt-5.5`). This is the same
+  default-prefix model (e.g. `openai/gpt-5.6-sol`). This is the same
   `MultiProvider` callers use in production — the test suite is just a
   client of it.
 - A handful of provider tests in `examples/features/providers/` pin

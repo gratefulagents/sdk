@@ -1,6 +1,6 @@
 # OpenAI OAuth SDK Integration Tests
 
-This package is the SDK-wide live integration suite. It uses OpenAI OAuth only, runs `gpt-5.5`, and skips when OAuth credentials are not available or `GRATEFUL_LIVE_TESTS=skip` is set. It does not use API-key auth and does not provide credential-free live fallbacks.
+This package is the SDK-wide live integration suite. It uses OpenAI OAuth only, runs `gpt-5.6-sol` by default, and skips when OAuth credentials are not available or `GRATEFUL_LIVE_TESTS=skip` is set. It does not use API-key auth and does not provide credential-free live fallbacks.
 
 Run it:
 
@@ -15,7 +15,7 @@ If `OPENAI_OAUTH_AUTH_JSON_PATH` is unset, the tests look for `$HOME/.codex/auth
 | Feature | Primary entry points | Correctness and security coverage |
 | --- | --- | --- |
 | Agent runtime | `agentsdk.Agent`, `Runner`, `RunConfig`, `RunResult` | Live turn loop, tool-call lifecycle, final output, usage/raw responses, max turns, last-agent state, and result item shape. |
-| OpenAI OAuth provider | `openai.ProviderConfig`, `AuthModeOAuth`, OAuth auth sessions | Builds providers from auth JSON, runs `gpt-5.5`, streams responses, estimates cost, and uses provider-native Responses compaction. |
+| OpenAI OAuth provider | `openai.ProviderConfig`, `AuthModeOAuth`, OAuth auth sessions | Builds providers from auth JSON, runs `gpt-5.6-sol` by default, streams responses, estimates cost, and uses provider-native Responses compaction. |
 | Model abstraction | `Model`, `ModelProvider`, `ModelRequest`, `ModelResponse`, `ModelStream` | Exercises both runner-level and low-level model calls with streaming and response item assertions. |
 | Structured output | `OutputSchema`, `NewOutputSchema` | Sends strict JSON schema to the live model and verifies parsed typed Go output. |
 | Function tools | `Tool`, `FunctionTool`, `WrapWithPolicy` | Verifies model-visible tool schemas, execution, tool output items, and approval-gated interruption without executing protected mutation. |
@@ -24,7 +24,7 @@ If `OPENAI_OAUTH_AUTH_JSON_PATH` is unset, the tests look for `$HOME/.codex/auth
 | Runtime builder | `runtime.NewBuilder` | Builds a runnable OAuth bundle from config and verifies the resulting agent/runner can complete a live run. |
 | Chat loop | `ChatLoop`, `SessionStore`, working state | Loads host messages, persists run items, and verifies conversation/working-state helper logic. |
 | Handoffs | `NewHandoff`, `Agent.Handoffs` | Forces a live triage agent to transfer to a target agent and verifies target output and last-agent state. |
-| Sub-agents | `Agent.AsTool`, `NewSubAgentScheduler`, `BuildSubAgentTaskTools` | Exercises synchronous sub-agent-as-tool and async spawn/wait/activity/collect task tools against live `gpt-5.5` workers. |
+| Sub-agents | `Agent.AsTool`, `NewSubAgentScheduler`, `BuildSubAgentTaskTools` | Exercises synchronous sub-agent-as-tool and async spawn/wait/activity/collect task tools against live `gpt-5.6-sol` workers by default. |
 | Modes and routing | `mode.TemplateSpec`, routing helpers, phase gates | Verifies phase tool access, role routing, completion/reset decisions, RBAC denial, plan gates, and git-clean gates. |
 | Specialists | `RoleCatalog`, `BuildSpecialistsFromCatalog` | Converts role specs into agent specialists with expected names/access metadata. |
 | Policy | `RuntimePolicy`, `ToolPolicy`, `PermissionMode` | Confirms default policy normalization, read-only filtering, shell command blocking, and approval-gated mutation. |
