@@ -70,6 +70,11 @@ type ModelResponse struct {
 	Raw       any     // provider-specific raw response for debugging
 	CostUSD   float64 // estimated cost in USD (set by runner after model returns)
 	CostKnown bool    // whether cost estimate is considered reliable
+	// EndTurn carries an explicit provider decision about whether this response
+	// ends the current user turn. nil means the provider omitted the signal and
+	// the runner falls back to its normal response classification; false requests
+	// another model step even when the response contains text but no tool call.
+	EndTurn *bool
 	// ContextTokens is the provider-normalized prompt-side size of this
 	// request (set by the runner, see usageContextTokens): the true context
 	// pressure regardless of whether the provider reports cache tokens as a
@@ -105,11 +110,11 @@ func NewModelStream(events <-chan ModelStreamEvent, done chan *ModelResponse) *M
 type ModelStreamEventType int
 
 const (
-	ModelStreamDelta    ModelStreamEventType = iota // partial text/tool content
-	ModelStreamItemDone                             // complete item ready
-	ModelStreamComplete                             // stream finished
-	ModelStreamError                                // terminal stream error
-	ModelStreamReasoningDelta                       // partial reasoning/thinking content
+	ModelStreamDelta          ModelStreamEventType = iota // partial text/tool content
+	ModelStreamItemDone                                   // complete item ready
+	ModelStreamComplete                                   // stream finished
+	ModelStreamError                                      // terminal stream error
+	ModelStreamReasoningDelta                             // partial reasoning/thinking content
 )
 
 // ModelStreamEvent is a single event from a streaming model call.

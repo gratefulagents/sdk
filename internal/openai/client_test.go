@@ -80,6 +80,40 @@ func TestToAnthropicResponse_ReconstructsToolCalls(t *testing.T) {
 	}
 }
 
+func TestToAnthropicResponsePreservesOptionalEndTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want *bool
+	}{
+		{name: "explicit false", raw: `{"id":"resp_continue","model":"gpt-5.6","status":"completed","end_turn":false,"output":[{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"continuing"}]}]}`, want: boolPtr(false)},
+		{name: "explicit true", raw: `{"id":"resp_done","model":"gpt-5.6","status":"completed","end_turn":true,"output":[{"type":"message","phase":"final_answer","content":[{"type":"output_text","text":"done"}]}]}`, want: boolPtr(true)},
+		{name: "omitted", raw: `{"id":"resp_legacy","model":"gpt-5.6","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"legacy"}]}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var wire responses.Response
+			if err := wire.UnmarshalJSON([]byte(tc.raw)); err != nil {
+				t.Fatal(err)
+			}
+			got, err := toAnthropicResponseFromResponses(&wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == nil {
+				if got.EndTurn != nil {
+					t.Fatalf("EndTurn = %v, want nil", *got.EndTurn)
+				}
+				return
+			}
+			if got.EndTurn == nil || *got.EndTurn != *tc.want {
+				t.Fatalf("EndTurn = %v, want %v", got.EndTurn, *tc.want)
+			}
+		})
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
+
 func TestToAnthropicResponseRejectsEmptyOutput(t *testing.T) {
 	_, err := toAnthropicResponseFromResponses(&responses.Response{
 		ID:     "resp_empty",
@@ -1025,6 +1059,23 @@ func TestResponsesStreamReader_TranslatesTextEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamReaderPreservesEndTurnFalse(t *testing.T) {
+	reader := &ResponsesStreamReader{}
+	var completed responses.ResponseStreamEventUnion
+	if err := completed.UnmarshalJSON([]byte(`{"type":"response.completed","response":{"id":"resp_continue","model":"gpt-5.6","status":"completed","end_turn":false,"output":[{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"continuing"}]}]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	reader.translateEvent(completed)
+
+	if len(reader.buf) != 2 || reader.buf[0].Delta == nil {
+		t.Fatalf("events = %+v, want message delta and stop", reader.buf)
+	}
+	endTurn := reader.buf[0].Delta.EndTurn
+	if endTurn == nil || *endTurn {
+		t.Fatalf("EndTurn = %v, want explicit false", endTurn)
+	}
+}
+
 func TestResponsesStreamReader_PreservesMessagePhase(t *testing.T) {
 	reader := &ResponsesStreamReader{}
 
@@ -1283,6 +1334,31 @@ func TestDrainStreamPreservesInputTokensWhenDeltaOmitsThem(t *testing.T) {
 	}
 	if resp.Usage.InputTokens != 123 || resp.Usage.OutputTokens != 7 {
 		t.Fatalf("usage = %+v, want input=123 output=7", resp.Usage)
+	}
+}
+
+func TestDrainStreamPreservesEndTurnFalse(t *testing.T) {
+	keepGoing := false
+	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+		{
+			Type: anthropic.EventMessageStart,
+			Message: &anthropic.CreateMessageResponse{
+				ID:    "resp_continue",
+				Model: "gpt-5.6",
+				Role:  anthropic.RoleAssistant,
+			},
+		},
+		{Type: anthropic.EventContentBlockStart, Index: 0, ContentBlock: &anthropic.ContentBlock{Type: "text", Phase: "commentary"}},
+		{Type: anthropic.EventContentBlockDelta, Index: 0, Delta: &anthropic.DeltaBlock{Type: "text_delta", Text: "continuing"}},
+		{Type: anthropic.EventContentBlockStop, Index: 0},
+		{Type: anthropic.EventMessageDelta, Delta: &anthropic.DeltaBlock{Type: "message_delta", StopReason: string(anthropic.StopReasonEndTurn), EndTurn: &keepGoing}},
+		{Type: anthropic.EventMessageStop},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.EndTurn == nil || *resp.EndTurn {
+		t.Fatalf("EndTurn = %v, want explicit false", resp.EndTurn)
 	}
 }
 

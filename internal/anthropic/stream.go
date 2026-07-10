@@ -98,8 +98,14 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 		}
 
 	case EventMessageDelta:
-		if event.Delta != nil && event.Delta.StopReason != "" {
-			a.resp.StopReason = StopReason(event.Delta.StopReason)
+		if event.Delta != nil {
+			if event.Delta.StopReason != "" {
+				a.resp.StopReason = StopReason(event.Delta.StopReason)
+			}
+			if event.Delta.EndTurn != nil {
+				endTurn := *event.Delta.EndTurn
+				a.resp.EndTurn = &endTurn
+			}
 		}
 		// message_delta usage is authoritative when present, but some backends
 		// (and shims) only populate output_tokens there. Never let a zero field

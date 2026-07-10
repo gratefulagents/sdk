@@ -24,6 +24,7 @@ type LLMRequestSnapshot struct {
 type LLMResponseSnapshot struct {
 	Items          []LLMRunItemSnapshot `json:"items,omitempty"`
 	Usage          Usage                `json:"usage,omitempty"`
+	EndTurn        *bool                `json:"end_turn,omitempty"`
 	Texts          []string             `json:"texts,omitempty"`
 	Reasoning      []LLMReasoning       `json:"reasoning,omitempty"`
 	ReasoningTexts []string             `json:"reasoning_texts,omitempty"`
@@ -39,6 +40,7 @@ type LLMRunItemSnapshot struct {
 	Type          string             `json:"type"`
 	AgentName     string             `json:"agent_name,omitempty"`
 	MessageText   string             `json:"message_text,omitempty"`
+	MessagePhase  string             `json:"message_phase,omitempty"`
 	ToolCall      *LLMToolCall       `json:"tool_call,omitempty"`
 	ToolOutput    *ToolOutputData    `json:"tool_output,omitempty"`
 	HandoffCall   *HandoffCallData   `json:"handoff_call,omitempty"`
@@ -127,8 +129,9 @@ func BuildLLMResponseSnapshot(resp *ModelResponse) *LLMResponseSnapshot {
 		return nil
 	}
 	snap := &LLMResponseSnapshot{
-		Items: SnapshotRunItems(resp.Items),
-		Usage: resp.Usage,
+		Items:   SnapshotRunItems(resp.Items),
+		Usage:   resp.Usage,
+		EndTurn: resp.EndTurn,
 	}
 	for _, item := range resp.Items {
 		switch item.Type {
@@ -198,6 +201,7 @@ func SnapshotRunItems(items []RunItem) []LLMRunItemSnapshot {
 		case RunItemMessage:
 			if item.Message != nil {
 				snap.MessageText = item.Message.Text
+				snap.MessagePhase = item.Message.Phase
 			}
 		case RunItemToolCall:
 			if item.ToolCall != nil {

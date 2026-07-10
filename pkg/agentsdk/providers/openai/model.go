@@ -362,7 +362,9 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 				}
 				var blocks []internalanthropic.ContentBlock
 				if item.Message.Text != "" {
-					blocks = append(blocks, internalanthropic.NewTextBlock(item.Message.Text))
+					block := internalanthropic.NewTextBlock(item.Message.Text)
+					block.Phase = item.Message.Phase
+					blocks = append(blocks, block)
 				}
 				for _, img := range item.Message.Images {
 					if img.Data == "" {
@@ -444,8 +446,11 @@ func convertAnthropicResponse(resp *internalanthropic.CreateMessageResponse) *ag
 		switch block.Type {
 		case "text":
 			items = append(items, agentsdk.RunItem{
-				Type:    agentsdk.RunItemMessage,
-				Message: &agentsdk.MessageOutput{Text: block.Text},
+				Type: agentsdk.RunItemMessage,
+				Message: &agentsdk.MessageOutput{
+					Text:  block.Text,
+					Phase: block.Phase,
+				},
 			})
 		case "tool_use":
 			items = append(items, agentsdk.RunItem{
@@ -497,7 +502,8 @@ func convertAnthropicResponse(resp *internalanthropic.CreateMessageResponse) *ag
 			CacheReadTokens:   resp.Usage.CacheReadInputTokens,
 			CacheCreateTokens: resp.Usage.CacheCreationInputTokens,
 		},
-		Raw: resp,
+		Raw:     resp,
+		EndTurn: resp.EndTurn,
 	}
 }
 
@@ -534,9 +540,12 @@ func anthropicMessagesToRunItems(messages []internalanthropic.Message) []agentsd
 			switch block.Type {
 			case "text":
 				items = append(items, agentsdk.RunItem{
-					Type:    agentsdk.RunItemMessage,
-					Agent:   agent,
-					Message: &agentsdk.MessageOutput{Text: block.Text},
+					Type:  agentsdk.RunItemMessage,
+					Agent: agent,
+					Message: &agentsdk.MessageOutput{
+						Text:  block.Text,
+						Phase: block.Phase,
+					},
 				})
 			case "tool_use":
 				items = append(items, agentsdk.RunItem{
