@@ -34,6 +34,10 @@ type RunItem struct {
 // MessageOutput holds text content from the model.
 type MessageOutput struct {
 	Text string `json:"text"`
+	// Phase preserves provider message intent when available (for example,
+	// OpenAI Responses "commentary" versus "final_answer"). Providers that do
+	// not expose phases leave it empty.
+	Phase string `json:"phase,omitempty"`
 	// Images carries inbound image attachments for multimodal user messages.
 	// Outbound model messages leave this empty.
 	Images []ImageAttachment `json:"images,omitempty"`

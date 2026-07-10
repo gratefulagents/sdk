@@ -299,6 +299,9 @@ type CreateMessageResponse struct {
 	Model      string         `json:"model"`
 	StopReason StopReason     `json:"stop_reason"`
 	Usage      Usage          `json:"usage"`
+	// EndTurn preserves the optional OpenAI Responses backend signal while this
+	// provider-neutral shim translates through Anthropic-shaped events.
+	EndTurn *bool `json:"end_turn,omitempty"`
 }
 
 // StreamEventType identifies the type of a streaming SSE event.
@@ -346,6 +349,7 @@ type DeltaBlock struct {
 	Content          string `json:"content,omitempty"` // compaction_delta summary content
 	EncryptedContent string `json:"encrypted_content,omitempty"`
 	StopReason       string `json:"stop_reason,omitempty"`
+	EndTurn          *bool  `json:"end_turn,omitempty"`
 	Usage            *Usage `json:"usage,omitempty"`
 }
 

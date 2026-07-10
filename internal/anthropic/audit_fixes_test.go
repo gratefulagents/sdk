@@ -43,6 +43,20 @@ func TestStreamAssemblerKeepsInputTokensWhenMessageDeltaOmitsThem(t *testing.T) 
 	}
 }
 
+func TestStreamAssemblerPreservesEndTurnFalse(t *testing.T) {
+	keepGoing := false
+	a := NewStreamAssembler()
+	a.Add(StreamEvent{
+		Type:  EventMessageDelta,
+		Delta: &DeltaBlock{Type: "message_delta", StopReason: "end_turn", EndTurn: &keepGoing},
+	})
+
+	resp := a.Response()
+	if resp.EndTurn == nil || *resp.EndTurn {
+		t.Fatalf("EndTurn = %v, want explicit false", resp.EndTurn)
+	}
+}
+
 func TestStreamAssemblerAssemblesCompactionBlocks(t *testing.T) {
 	a := NewStreamAssembler()
 	a.Add(StreamEvent{Type: EventMessageStart, Message: &CreateMessageResponse{ID: "msg_1"}})

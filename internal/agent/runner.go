@@ -1061,6 +1061,19 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
+			// OpenAI's Codex backend can explicitly request another sampling step
+			// with end_turn=false even when this response contains commentary text
+			// and no tool call. Preserve that protocol decision instead of treating
+			// every text-only response as a final answer. Providers that omit the
+			// signal (EndTurn == nil) keep the existing classification fallback.
+			if resp.EndTurn != nil && !*resp.EndTurn {
+				pendingCompletion = false
+				stopGateBlocks = 0
+				currentInput = append(currentInput, newItems...)
+				currentInput = recordAndPruneResponseCompaction(currentInput)
+				continue
+			}
+
 			joinItems, joinErr := collectSubAgentFinalJoinItems(ctx, tools)
 			if joinErr != nil {
 				return nil, joinErr

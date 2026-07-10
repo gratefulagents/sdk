@@ -58,6 +58,7 @@ func TestBuildLLMRequestSnapshotCapturesModelEnvelope(t *testing.T) {
 }
 
 func TestBuildLLMResponseSnapshotCapturesReasoningAndRaw(t *testing.T) {
+	keepGoing := false
 	resp := &ModelResponse{
 		Items: []RunItem{
 			{Type: RunItemReasoning, Reasoning: &ReasoningData{
@@ -67,9 +68,10 @@ func TestBuildLLMResponseSnapshotCapturesReasoningAndRaw(t *testing.T) {
 				EncryptedContent: "encrypted_1",
 			}},
 			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call_1", Name: "Read", Input: json.RawMessage(`{"path":"README.md"}`)}},
-			{Type: RunItemMessage, Message: &MessageOutput{Text: "final answer"}},
+			{Type: RunItemMessage, Message: &MessageOutput{Text: "final answer", Phase: "commentary"}},
 		},
-		Usage: Usage{InputTokens: 10, OutputTokens: 5},
+		Usage:   Usage{InputTokens: 10, OutputTokens: 5},
+		EndTurn: &keepGoing,
 		Raw: map[string]any{
 			"id":     "resp_1",
 			"output": []any{"raw content"},
@@ -92,6 +94,12 @@ func TestBuildLLMResponseSnapshotCapturesReasoningAndRaw(t *testing.T) {
 	}
 	if len(snap.Texts) != 1 || snap.Texts[0] != "final answer" {
 		t.Fatalf("texts = %+v", snap.Texts)
+	}
+	if snap.EndTurn == nil || *snap.EndTurn {
+		t.Fatalf("EndTurn = %v, want explicit false", snap.EndTurn)
+	}
+	if got := snap.Items[2].MessagePhase; got != "commentary" {
+		t.Fatalf("message phase = %q, want commentary", got)
 	}
 	if len(snap.ToolCalls) != 1 || snap.ToolCalls[0].Name != "Read" {
 		t.Fatalf("tool calls = %+v", snap.ToolCalls)

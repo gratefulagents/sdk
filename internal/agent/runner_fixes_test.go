@@ -9,6 +9,45 @@ import (
 	"time"
 )
 
+// --- Provider-directed turn continuation -----------------------------------
+
+func TestRunnerExplicitEndTurnFalseContinuesSampling(t *testing.T) {
+	keepGoing := false
+	model := &mockModel{responses: []*ModelResponse{
+		{
+			Items: []RunItem{{
+				Type:    RunItemMessage,
+				Message: &MessageOutput{Text: "I’m running the final checks now.", Phase: "commentary"},
+			}},
+			EndTurn: &keepGoing,
+		},
+		{
+			Items: []RunItem{{
+				Type:    RunItemMessage,
+				Message: &MessageOutput{Text: "All checks passed.", Phase: "final_answer"},
+			}},
+		},
+	}}
+	runner := NewRunnerWithModel(model)
+
+	result, err := runner.Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{MaxTurns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.FinalText(); got != "All checks passed." {
+		t.Fatalf("FinalText() = %q, want final response from follow-up sampling", got)
+	}
+	if model.callIdx != 2 {
+		t.Fatalf("model calls = %d, want 2 after end_turn=false", model.callIdx)
+	}
+	if len(model.requests[1].Input) != 1 || model.requests[1].Input[0].Message == nil {
+		t.Fatalf("follow-up input = %+v, want prior commentary message", model.requests[1].Input)
+	}
+	if got := model.requests[1].Input[0].Message.Phase; got != "commentary" {
+		t.Fatalf("follow-up message phase = %q, want commentary", got)
+	}
+}
+
 // --- RetryPolicy: failures on later turns must still be retried -------------
 
 // Regression test: llmAttempt accumulates across the whole run, but the retry

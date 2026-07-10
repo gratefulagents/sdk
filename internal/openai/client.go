@@ -314,6 +314,27 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// responseEndTurn extracts the optional ChatGPT Codex backend end_turn field
+// from the response's retained raw JSON. The public OpenAI Responses schema does
+// not currently expose this extension as a typed field, so preserving the raw
+// presence is necessary to distinguish an omitted signal from explicit false.
+func responseEndTurn(resp *responses.Response) *bool {
+	if resp == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(resp.RawJSON())
+	if raw == "" {
+		return nil
+	}
+	var envelope struct {
+		EndTurn *bool `json:"end_turn"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return nil
+	}
+	return envelope.EndTurn
+}
+
 // StreamReader replays synthetic Anthropic-style events derived from Responses output.
 type StreamReader struct {
 	events []anthropic.StreamEvent
@@ -684,6 +705,7 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 			Delta: &anthropic.DeltaBlock{
 				Type:       "message_delta",
 				StopReason: string(stopReason),
+				EndTurn:    responseEndTurn(&evt.Response),
 			},
 			Usage: &anthropic.Usage{
 				InputTokens:          evt.Response.Usage.InputTokens,
@@ -1440,10 +1462,11 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 	}
 
 	out := &anthropic.CreateMessageResponse{
-		ID:    resp.ID,
-		Type:  "message",
-		Role:  anthropic.RoleAssistant,
-		Model: string(resp.Model),
+		ID:      resp.ID,
+		Type:    "message",
+		Role:    anthropic.RoleAssistant,
+		Model:   string(resp.Model),
+		EndTurn: responseEndTurn(resp),
 		Usage: anthropic.Usage{
 			InputTokens:          resp.Usage.InputTokens,
 			OutputTokens:         resp.Usage.OutputTokens,
@@ -1740,6 +1763,10 @@ func drainStreamToResponse(stream messageStream, sink modeldelta.ReasoningSink) 
 		case anthropic.EventMessageDelta:
 			if ev.Delta != nil {
 				resp.StopReason = anthropic.StopReason(ev.Delta.StopReason)
+				if ev.Delta.EndTurn != nil {
+					endTurn := *ev.Delta.EndTurn
+					resp.EndTurn = &endTurn
+				}
 			}
 			if ev.Usage != nil {
 				if ev.Usage.InputTokens != 0 || resp.Usage.InputTokens == 0 {
