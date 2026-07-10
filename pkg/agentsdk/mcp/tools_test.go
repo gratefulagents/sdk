@@ -221,6 +221,57 @@ func TestFormatCallToolResultRejectsSymlinkBlobDirectoryEscape(t *testing.T) {
 	}
 }
 
+func TestCreateExclusiveBeneathRejectsExistingTarget(t *testing.T) {
+	workDir := t.TempDir()
+	if err := mkdirAllBeneath(workDir, filepath.Join(".mcp", "blobs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rel := filepath.Join(".mcp", "blobs", "generated.bin")
+	path := filepath.Join(workDir, rel)
+	if err := os.WriteFile(path, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := createExclusiveBeneath(workDir, rel, []byte("replacement"), 0o600); err == nil {
+		t.Fatal("createExclusiveBeneath() succeeded for existing target")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "existing" {
+		t.Fatalf("target = %q, want unchanged", got)
+	}
+}
+
+func TestCreateExclusiveBeneathRejectsSymlinkTarget(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	outside := filepath.Join(root, "outside.bin")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mkdirAllBeneath(workDir, filepath.Join(".mcp", "blobs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rel := filepath.Join(".mcp", "blobs", "generated.bin")
+	if err := os.Symlink(outside, filepath.Join(workDir, rel)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := createExclusiveBeneath(workDir, rel, []byte("replacement"), 0o600); err == nil {
+		t.Fatal("createExclusiveBeneath() succeeded for symlink target")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "outside" {
+		t.Fatalf("outside target = %q, want unchanged", got)
+	}
+}
+
 func TestTrustedMCPReadOnlyRequiresServerOptIn(t *testing.T) {
 	t.Parallel()
 

@@ -380,6 +380,13 @@ func (t *BashStartTool) Execute(ctx context.Context, input json.RawMessage, work
 	if mode == "" {
 		mode = policy.PermissionModeDangerFullAccess
 	}
+	var executor sandbox.Executor
+	if t.Manager != nil {
+		executor = t.Manager.executor
+	}
+	if blocked, reason := (&BashTool{Executor: executor}).commandBlocked(mode, in.Command); blocked {
+		return agentsdk.ToolResult{Content: reason, IsError: true}, nil
+	}
 	id, err := t.Manager.start(ctx, in, workDir, mode)
 	if err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error: %v", err), IsError: true}, nil

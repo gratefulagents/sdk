@@ -174,36 +174,20 @@ func saveMCPConfig(path string, cfg *mcp.Config) error {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
 	data = append(data, '\n')
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".mcp.json.tmp-*")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
+	perm := os.FileMode(0o600)
+	f, err := pathutil.OpenInWorkspace(filepath.Dir(path), filepath.Base(path), os.O_RDONLY, 0)
+	if err == nil {
+		info, statErr := f.Stat()
+		_ = f.Close()
+		if statErr != nil {
+			return fmt.Errorf("stat config: %w", statErr)
 		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("writing temp file: %w", err)
+		perm = info.Mode().Perm() & 0o600
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("open config: %w", err)
 	}
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temp file: %w", err)
+	if err := pathutil.AtomicWriteFileInWorkspace(filepath.Dir(path), filepath.Base(path), data, perm); err != nil {
+		return fmt.Errorf("saving config: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename temp file: %w", err)
-	}
-	cleanup = false
 	return nil
 }

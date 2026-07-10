@@ -220,11 +220,19 @@ func TestResponseFailedErrorRetryClassification(t *testing.T) {
 }
 
 func TestSanitizeLogBodyRedactsSecrets(t *testing.T) {
-	body := `{"access_token":"access-secret","refresh_token":"refresh-secret","message":"Bearer sk-testsecret"}`
-	got := sanitizeLogBody(body)
-	for _, secret := range []string{"access-secret", "refresh-secret", "sk-testsecret"} {
-		if strings.Contains(got, secret) {
-			t.Fatalf("sanitizeLogBody leaked %q in %q", secret, got)
+	bodies := []string{
+		`{"diagnostic":"invalid request","access_token":"access-secret","password_hint":"password-secret","nested":{"authorization":"Bearer bearer-secret","cookie_value":"cookie-secret","public_key":"key-secret"},"message":"failed for sk-testsecret"}`,
+		`invalid request: refresh_token=refresh-plain client_secret: client-plain authorization=Basic basic-plain cookie="cookie-plain"`,
+	}
+	for _, body := range bodies {
+		got := sanitizeLogBody(body)
+		for _, secret := range []string{"access-secret", "password-secret", "bearer-secret", "cookie-secret", "key-secret", "sk-testsecret", "refresh-plain", "client-plain", "basic-plain", "cookie-plain"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("sanitizeLogBody leaked %q in %q", secret, got)
+			}
+		}
+		if !strings.Contains(got, "invalid request") {
+			t.Fatalf("sanitizeLogBody removed diagnostic from %q", got)
 		}
 	}
 }

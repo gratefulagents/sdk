@@ -152,6 +152,25 @@ func TestReadFileToolRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+func TestReadFileToolRejectsHardlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, filepath.Join(workDir, "alias.txt")); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	_, err := (&ReadFileTool{}).Execute(context.Background(), json.RawMessage(`{"path":"alias.txt"}`), workDir)
+	if err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Fatalf("Execute() error = %v, want hardlink refusal", err)
+	}
+}
+
 func TestListFilesToolReturnsErrorOnInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	_, err := (&ListFilesTool{}).Execute(context.Background(), json.RawMessage(`{not-json`), dir)

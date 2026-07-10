@@ -116,7 +116,7 @@ func (t *ReadFileTool) Execute(_ context.Context, input json.RawMessage, workDir
 	if err != nil {
 		return agentsdk.ToolResult{}, err
 	}
-	data, truncated, err := readFileNoFollowBounded(path, params.StartLine, params.EndLine)
+	data, truncated, err := readFileNoFollowBounded(workDir, path, params.StartLine, params.EndLine)
 	if err != nil {
 		return agentsdk.ToolResult{}, err
 	}
@@ -254,7 +254,7 @@ func (t *GrepTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if err != nil {
 		return agentsdk.ToolResult{}, err
 	}
-	out, err := grepWalk(root, base, re, params.Glob, limit)
+	out, err := grepWalk(workDir, root, base, re, params.Glob, limit)
 	if err != nil {
 		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
@@ -289,8 +289,8 @@ func workspaceRoot(workDir string) (string, error) {
 	return pathutil.ResolveWorkspace(workDir, ".")
 }
 
-func readFileNoFollowBounded(path string, startLine, endLine int) ([]byte, bool, error) {
-	f, err := pathutil.OpenFileNoFollow(path, os.O_RDONLY, 0)
+func readFileNoFollowBounded(workDir, path string, startLine, endLine int) ([]byte, bool, error) {
+	f, err := pathutil.OpenInWorkspace(workDir, path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, false, err
 	}
@@ -302,6 +302,9 @@ func readFileNoFollowBounded(path string, startLine, endLine int) ([]byte, bool,
 	}
 	if !info.Mode().IsRegular() {
 		return nil, false, fmt.Errorf("%s is not a regular file", path)
+	}
+	if err := pathutil.RequireSingleLink(info); err != nil {
+		return nil, false, fmt.Errorf("refusing workspace read of %s: %w", path, err)
 	}
 
 	if startLine <= 0 && endLine <= 0 {
@@ -436,7 +439,7 @@ func doubleStarMatch(pattern, name string) bool {
 	return re.MatchString(name)
 }
 
-func grepWalk(root, base string, re *regexp.Regexp, glob string, limit int) (string, error) {
+func grepWalk(workDir, root, base string, re *regexp.Regexp, glob string, limit int) (string, error) {
 	var b strings.Builder
 	count := 0
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -458,12 +461,12 @@ func grepWalk(root, base string, re *regexp.Regexp, glob string, limit int) (str
 				return nil
 			}
 		}
-		f, err := pathutil.OpenFileNoFollow(path, os.O_RDONLY, 0)
+		f, err := pathutil.OpenInWorkspace(workDir, path, os.O_RDONLY, 0)
 		if err != nil {
 			return nil
 		}
 		info, err := f.Stat()
-		if err != nil || !info.Mode().IsRegular() {
+		if err != nil || !info.Mode().IsRegular() || pathutil.RequireSingleLink(info) != nil {
 			_ = f.Close()
 			return nil
 		}

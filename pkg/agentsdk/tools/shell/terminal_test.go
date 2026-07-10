@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 )
 
@@ -81,6 +82,16 @@ func TestTerminalToolInteractiveSession(t *testing.T) {
 	snap = execTerminal(t, tool, workDir, `{"op":"kill","session_id":"`+sid+`"}`)
 	if snap.Status != "exited" {
 		t.Fatalf("expected exited after kill, got %s", snap.Status)
+	}
+}
+
+func TestTerminalToolRejectsRestrictedModes(t *testing.T) {
+	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
+		tool := &TerminalTool{Manager: NewTerminalManager(sandbox.Default()), Mode: mode}
+		res, err := tool.Execute(context.Background(), json.RawMessage(`{"op":"list"}`), t.TempDir())
+		if err != nil || !res.IsError || !strings.Contains(res.Content, "danger-full-access") {
+			t.Fatalf("mode %s result = %+v err=%v, want runtime refusal", mode, res, err)
+		}
 	}
 }
 

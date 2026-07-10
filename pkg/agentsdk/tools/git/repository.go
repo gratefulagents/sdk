@@ -59,7 +59,7 @@ func WithAttachRepositoryStoreDir(path string) AttachRepositoryOption {
 func (t *AttachRepositoryTool) Name() string { return "attach_repository" }
 
 func (t *AttachRepositoryTool) Description() string {
-	return "Clone a git repository into this SDK workspace's repository list. Repositories are cloned under repos/<alias> by default and can be used with file/search tools or passed to create_pull_request via repo_path."
+	return "Clone a credential-free GitHub repository over HTTPS into this SDK workspace's repository list. Accepts owner/repo, github.com/owner/repo, or https://github.com/owner/repo forms. Repositories are cloned under repos/<alias> by default."
 }
 
 func (t *AttachRepositoryTool) InputSchema() json.RawMessage {
@@ -68,7 +68,7 @@ func (t *AttachRepositoryTool) InputSchema() json.RawMessage {
 		"properties": {
 			"repository": {
 				"type": "string",
-				"description": "Repository to clone. Accepts a git URL, GitHub URL, github.com/owner/repo, or owner/repo shorthand."
+				"description": "Credential-free GitHub repository. Accepts owner/repo, github.com/owner/repo, or https://github.com/owner/repo[.git]."
 			},
 			"repo": {
 				"type": "string",
@@ -201,11 +201,11 @@ func (t *AttachRepositoryTool) runner() CommandRunner {
 }
 
 func cloneRepository(ctx context.Context, runner CommandRunner, workDir, repoURL, dest, baseBranch string) (string, error) {
-	args := []string{"clone"}
+	args := []string{"-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "clone"}
 	if strings.TrimSpace(baseBranch) != "" {
 		args = append(args, "--branch", strings.TrimSpace(baseBranch))
 	}
-	args = append(args, repoURL, dest)
+	args = append(args, "--", repoURL, dest)
 	return runner.RunGit(ctx, workDir, args...)
 }
 
@@ -242,39 +242,9 @@ func attachedRepositoryResult(workspaceRoot, dest, status, repoURL, baseBranch, 
 }
 
 func sameRepositoryURL(a, b string) bool {
-	return canonicalRepositoryURL(a) == canonicalRepositoryURL(b)
-}
-
-func canonicalRepositoryURL(raw string) string {
-	repo := strings.TrimSpace(raw)
-	repo = strings.TrimSuffix(strings.TrimRight(repo, "/"), ".git")
-	if repo == "" {
-		return ""
-	}
-
-	if strings.HasPrefix(repo, "git@") {
-		repo = strings.TrimPrefix(repo, "git@")
-		if host, path, ok := strings.Cut(repo, ":"); ok {
-			return strings.ToLower(host) + "/" + strings.TrimPrefix(path, "/")
-		}
-	}
-
-	if strings.HasPrefix(repo, "ssh://git@") {
-		repo = strings.TrimPrefix(repo, "ssh://git@")
-		if host, path, ok := strings.Cut(repo, "/"); ok {
-			return strings.ToLower(host) + "/" + strings.TrimPrefix(path, "/")
-		}
-	}
-
-	parsed, err := url.Parse(repo)
-	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		return strings.ToLower(parsed.Host) + "/" + strings.TrimPrefix(parsed.Path, "/")
-	}
-
-	if strings.HasPrefix(repo, "github.com/") {
-		return "github.com/" + strings.TrimPrefix(repo, "github.com/")
-	}
-	return repo
+	canonicalA, _, errA := normalizeRepositoryInput(a)
+	canonicalB, _, errB := normalizeRepositoryInput(b)
+	return errA == nil && errB == nil && canonicalA == canonicalB
 }
 
 func resolveRepositoryWorkDir(workDir, repoPath string) (string, error) {
@@ -341,39 +311,46 @@ func normalizeRepositoryInput(raw string) (repoURL, repoName string, err error) 
 	if repo == "" {
 		return "", "", fmt.Errorf("repository is required")
 	}
-	if strings.ContainsAny(repo, " \t\r\n") {
-		return "", "", fmt.Errorf("repository must not contain whitespace")
+	if strings.ContainsAny(repo, " \t\r\n") || strings.HasPrefix(repo, "-") {
+		return "", "", fmt.Errorf("repository must be a GitHub owner/repository name or credential-free HTTPS github.com URL")
 	}
-
-	if strings.HasPrefix(repo, "github.com/") {
+	if strings.HasPrefix(strings.ToLower(repo), "github.com/") {
 		repo = "https://" + repo
 	} else if isGitHubOwnerRepoShorthand(repo) {
 		repo = "https://github.com/" + repo
 	}
-	name := repositoryNameFromURL(repo)
-	if name == "" {
-		return "", "", fmt.Errorf("could not derive repository name from %q", raw)
+
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Host != parsed.Hostname() || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" {
+		return "", "", fmt.Errorf("repository must be a credential-free HTTPS github.com owner/repository URL")
 	}
-	if strings.HasPrefix(repo, "https://github.com/") && !strings.HasSuffix(repo, ".git") {
-		repo += ".git"
+	path := strings.TrimPrefix(parsed.Path, "/")
+	if strings.HasSuffix(path, ".git") {
+		path = strings.TrimSuffix(path, ".git")
 	}
-	return repo, name, nil
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || !validGitHubRepositoryPart(parts[0]) || !validGitHubRepositoryPart(parts[1]) {
+		return "", "", fmt.Errorf("repository must identify exactly one GitHub owner/repository")
+	}
+	return "https://github.com/" + parts[0] + "/" + parts[1] + ".git", parts[1], nil
 }
 
 func isGitHubOwnerRepoShorthand(repo string) bool {
-	if strings.Count(repo, "/") != 1 || strings.Contains(repo, "://") || strings.HasPrefix(repo, "/") {
-		return false
-	}
 	parts := strings.Split(repo, "/")
-	return parts[0] != "" && parts[1] != "" && !strings.Contains(parts[0], ".")
+	return len(parts) == 2 && validGitHubRepositoryPart(parts[0]) && validGitHubRepositoryPart(strings.TrimSuffix(parts[1], ".git"))
 }
 
-func repositoryNameFromURL(repo string) string {
-	trimmed := strings.TrimSuffix(strings.TrimRight(repo, "/"), ".git")
-	if idx := strings.LastIndexAny(trimmed, "/:"); idx >= 0 {
-		trimmed = trimmed[idx+1:]
+func validGitHubRepositoryPart(part string) bool {
+	if part == "" || part == "." || part == ".." || strings.HasPrefix(part, "-") {
+		return false
 	}
-	return strings.TrimSpace(trimmed)
+	for _, r := range part {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func sanitizeRepositoryAlias(raw string) string {

@@ -18,20 +18,16 @@ import (
 )
 
 const (
-	SandboxModeEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX"
-	SandboxPathEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH"
-	SandboxPathPrependEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_PREPEND"
-	SandboxPathAppendEnv  = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_APPEND"
-	// SandboxExtraReadOnlyPathsEnv is accepted for compatibility but is a
-	// no-op: the sandbox exposes the whole host filesystem read-only.
+	SandboxModeEnv               = "GRATEFULAGENTS_COMMAND_SANDBOX"
+	SandboxPathEnv               = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH"
+	SandboxPathPrependEnv        = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_PREPEND"
+	SandboxPathAppendEnv         = "GRATEFULAGENTS_COMMAND_SANDBOX_PATH_APPEND"
 	SandboxExtraReadOnlyPathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RO_PATHS"
 	SandboxExtraWritablePathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RW_PATHS"
 	SandboxExtraEnvEnv           = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_ENV"
-	// SandboxAllowUnsafeReadOnlyLocalEnv opts a host into running read-only
-	// commands through the advisory LocalExecutor when the enforcing subprocess
-	// sandbox is unavailable on this platform (e.g. macOS/Windows dev hosts,
-	// where bubblewrap does not exist). It is a developer convenience, not a
-	// security boundary, so it defaults off and must be set explicitly.
+	// SandboxAllowUnsafeReadOnlyLocalEnv is retained for configuration parsing
+	// compatibility. Restricted modes no longer honor it: they always require an
+	// enforcing subprocess sandbox.
 	SandboxAllowUnsafeReadOnlyLocalEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_ALLOW_UNSAFE_READONLY_LOCAL"
 
 	sandboxModeAuto     = "auto"
@@ -69,19 +65,16 @@ type Config struct {
 	WorkspaceRoot       string
 	// Path fully replaces the inherited PATH when set. PathPrepend/PathAppend
 	// adjust the inherited (or configured) PATH instead.
-	Path        string
-	PathPrepend []string
-	PathAppend  []string
-	// ExtraReadOnlyPaths is retained for configuration compatibility but is a
-	// no-op: the sandbox now exposes the entire host filesystem read-only, so
-	// there is nothing extra to mount.
+	Path               string
+	PathPrepend        []string
+	PathAppend         []string
 	ExtraReadOnlyPaths []string
 	ExtraWritablePaths []string
 	ExtraEnv           map[string]string
 	GOROOT             string
-	// AllowUnsafeReadOnlyLocal lets a host explicitly skip the enforcing
-	// subprocess sandbox for read-only requests when Mode is disabled. This is
-	// a compatibility escape hatch, not a security boundary.
+	// AllowUnsafeReadOnlyLocal is retained for configuration compatibility but
+	// is not honored by executors; restricted modes always fail closed without
+	// OS-enforced containment.
 	AllowUnsafeReadOnlyLocal bool
 }
 
@@ -125,6 +118,15 @@ type Request struct {
 	PermissionMode policy.PermissionMode
 	Timeout        time.Duration
 	Env            map[string]string
+	// AllowNetwork keeps the host network namespace for a restricted request.
+	// Restricted sandboxes otherwise unshare networking, leaving only loopback;
+	// danger-full-access retains the host network by definition. Hosts should set
+	// this only for tools with an explicit egress policy.
+	AllowNetwork bool
+	// WritablePaths grants request-scoped writable mounts outside the workspace.
+	// Only trusted tool implementations may populate this field; read-only
+	// requests always ignore it.
+	WritablePaths []string
 }
 
 // Result is the combined stdout/stderr result of a command run.
@@ -195,17 +197,12 @@ func (e defaultExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, err
 	case sandboxModeRequired:
 		return BubblewrapExecutor{Config: config}.Build(ctx, req)
 	case sandboxModeAuto:
-		if config.RunningInKubernetes || policy.NormalizePermissionMode(string(req.PermissionMode)) == policy.PermissionModeReadOnly {
-			// Read-only and in-cluster workloads need the enforcing subprocess
-			// sandbox. When it is unavailable on this platform (no bubblewrap —
-			// e.g. macOS/Windows dev hosts) and the host explicitly opted into
-			// advisory local execution, fall back to LocalExecutor so commands
-			// can still run. Otherwise fail closed via the BubblewrapExecutor,
-			// which returns a descriptive "requires linux" error.
-			if subprocessSandboxAvailable() || !config.AllowUnsafeReadOnlyLocal {
-				return BubblewrapExecutor{Config: config}.Build(ctx, req)
-			}
-			return LocalExecutor{Config: config}.Build(ctx, req)
+		permissionMode := policy.NormalizePermissionMode(string(req.PermissionMode))
+		if permissionMode != policy.PermissionModeDangerFullAccess || config.RunningInKubernetes {
+			// Every restricted mode requires OS-enforced containment. Bubblewrap
+			// unavailability fails closed; local execution cannot safely enforce a
+			// filesystem permission boundary.
+			return BubblewrapExecutor{Config: config}.Build(ctx, req)
 		}
 		return LocalExecutor{Config: config}.Build(ctx, req)
 	default:
@@ -236,7 +233,7 @@ func (e defaultExecutor) EnforcesFilesystem(mode policy.PermissionMode) bool {
 			return false
 		}
 		return config.RunningInKubernetes ||
-			policy.NormalizePermissionMode(string(mode)) == policy.PermissionModeReadOnly
+			policy.NormalizePermissionMode(string(mode)) != policy.PermissionModeDangerFullAccess
 	}
 }
 
@@ -342,8 +339,9 @@ func (e LocalExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, error
 	if err := validateRequest(req); err != nil {
 		return nil, err
 	}
-	if policy.NormalizePermissionMode(string(req.PermissionMode)) == policy.PermissionModeReadOnly && !e.Config.AllowUnsafeReadOnlyLocal {
-		return nil, errors.New("LocalExecutor cannot enforce read-only permission mode; subprocess sandbox required")
+	mode := policy.NormalizePermissionMode(string(req.PermissionMode))
+	if mode == policy.PermissionModeWorkspaceWrite || mode == policy.PermissionModeReadOnly {
+		return nil, errors.New("LocalExecutor cannot enforce restricted permission modes; subprocess sandbox required")
 	}
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = req.WorkDir
@@ -414,12 +412,10 @@ func BubblewrapArgs(req Request) ([]string, error) {
 // BubblewrapArgsWithConfig returns the bwrap argument vector using explicit
 // sandbox configuration.
 //
-// Filesystem model (codex-style): the entire host filesystem is visible
-// read-only via `--ro-bind / /`, /proc is either freshly mounted for the new
-// pid namespace or masked when the host forbids procfs mounts (so
-// /proc/<pid>/environ of host processes is unreachable either way), and a
-// minimal /dev is mounted. Writes are enabled only for the workspace root,
-// /tmp, and explicitly configured extra writable paths.
+// Filesystem model: a fresh root exposes only runtime/toolchain paths,
+// explicitly configured read-only paths, the workspace, a private /proc and
+// /dev, and ephemeral /tmp. Writes are enabled only for the trusted workspace
+// root and explicitly configured writable paths.
 func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 	if err := validateRequest(req); err != nil {
 		return nil, err
@@ -430,12 +426,18 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("absolute workdir: %w", err)
 	}
-	workspaceRoot, err := workspaceRootFor(workDir, config.WorkspaceRoot)
-	if err != nil {
-		return nil, err
-	}
 	mode := policy.NormalizePermissionMode(string(req.PermissionMode))
 	readOnly := mode == policy.PermissionModeReadOnly
+	if (readOnly || mode == policy.PermissionModeWorkspaceWrite) && config.WorkspaceRoot == "" {
+		return nil, errors.New("restricted sandbox requires a trusted workspace root")
+	}
+	workspaceRoot := resolveExistingPrefix(workDir)
+	if config.WorkspaceRoot != "" {
+		workspaceRoot, err = workspaceRootFor(workDir, config.WorkspaceRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	args := []string{
 		"--die-with-parent",
@@ -444,18 +446,20 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		"--unshare-ipc",
 		"--unshare-uts",
 		"--unshare-cgroup-try",
+	}
+	if mode != policy.PermissionModeDangerFullAccess && !req.AllowNetwork {
+		args = append(args, "--unshare-net")
+	}
+	args = append(args,
 		"--uid", fmt.Sprintf("%d", os.Getuid()),
 		"--gid", fmt.Sprintf("%d", os.Getgid()),
 		"--clearenv",
-	}
+	)
 	for _, pair := range bwrapProcessEnv(req.Env, config) {
 		key, val, _ := strings.Cut(pair, "=")
 		args = append(args, "--setenv", key, val)
 	}
 
-	args = append(args,
-		"--ro-bind", "/", "/",
-	)
 	if procfsMountUsable() {
 		// Fresh pid-namespaced /proc: host process environments are
 		// unreachable and tools that need /proc/self work.
@@ -469,25 +473,21 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 	}
 	args = append(args,
 		"--dev", "/dev",
+		"--tmpfs", "/tmp",
+		"--dir", "/tmp/home",
 	)
-	if readOnly {
-		// Ephemeral scratch: read-only commands get a writable /tmp that
-		// vanishes when the command exits.
-		args = append(args, "--tmpfs", "/tmp")
-	} else {
-		// Real /tmp so caches and tooling installed under HOME=/tmp/home
-		// persist across commands.
-		args = append(args, "--bind", "/tmp", "/tmp")
-	}
-	args = append(args, "--dir", "/tmp/home")
 
-	for _, path := range existingPaths(sandboxWritablePaths(workspaceRoot, config)) {
-		args = append(args, "--bind", path, path)
+	for _, path := range sandboxReadOnlyPaths(config) {
+		args = append(args, "--ro-bind", path, path)
+	}
+	if !readOnly {
+		writableConfig := config
+		writableConfig.ExtraWritablePaths = append(append([]string(nil), config.ExtraWritablePaths...), req.WritablePaths...)
+		for _, path := range existingPaths(sandboxWritablePaths(workspaceRoot, writableConfig)) {
+			args = append(args, "--bind", path, path)
+		}
 	}
 
-	// The workspace mount is emitted even though `--ro-bind / /` already covers
-	// reads: it re-exposes workspaces that live under /tmp (shadowed by the
-	// mounts above) and enables writes outside read-only mode.
 	if readOnly {
 		args = append(args, "--ro-bind", workspaceRoot, workspaceRoot)
 	} else {
@@ -739,6 +739,38 @@ func existingPaths(paths []string) []string {
 	for _, path := range paths {
 		if pathExists(path) {
 			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func sandboxReadOnlyPaths(config Config) []string {
+	paths := []string{
+		"/usr", "/bin", "/sbin", "/lib", "/lib64", "/nix/store",
+		"/etc/ssl", "/etc/pki", "/etc/ca-certificates",
+		"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
+		"/etc/passwd", "/etc/group", "/etc/localtime", "/etc/ld.so.cache",
+	}
+	if config.GOROOT != "" {
+		paths = append(paths, config.GOROOT)
+	}
+	paths = append(paths, config.ExtraReadOnlyPaths...)
+
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		clean := cleanAbsolutePath(path)
+		if clean == "" || clean == string(os.PathSeparator) || !pathExists(clean) {
+			continue
+		}
+		covered := false
+		for _, existing := range out {
+			if clean == existing || isPathWithin(clean, existing) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, clean)
 		}
 	}
 	return out

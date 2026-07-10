@@ -353,6 +353,13 @@ func (t *TerminalTool) NeedsApproval() bool { return false }
 func (t *TerminalTool) TimeoutSeconds() int { return 0 }
 
 func (t *TerminalTool) Execute(ctx context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
+	mode := t.Mode
+	if mode == "" {
+		mode = policy.PermissionModeDangerFullAccess
+	}
+	if policy.NormalizePermissionMode(string(mode)) != policy.PermissionModeDangerFullAccess {
+		return agentsdk.ToolResult{Content: "Terminal requires danger-full-access mode", IsError: true}, nil
+	}
 	var in terminalInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Invalid input: %v", err), IsError: true}, nil

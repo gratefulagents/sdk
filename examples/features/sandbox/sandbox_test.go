@@ -14,7 +14,7 @@ func TestSandboxLocalExecutorExample(t *testing.T) {
 	result, err := sandbox.LocalExecutor{}.Run(context.Background(), sandbox.Request{
 		Argv:           []string{"sh", "-c", "printf hello"},
 		WorkDir:        t.TempDir(),
-		PermissionMode: policy.PermissionModeWorkspaceWrite,
+		PermissionMode: policy.PermissionModeDangerFullAccess,
 		Timeout:        5 * time.Second,
 	})
 	if err != nil {

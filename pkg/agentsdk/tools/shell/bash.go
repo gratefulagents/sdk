@@ -339,10 +339,8 @@ func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (b
 }
 
 // IsCommandBlockedForMode is the public entry point for the Bash tools'
-// destructive-command guard. It tokenizes the command (resolving quoting,
-// escapes, $IFS, and ANSI-C $'...' decoding) before applying the per-mode
-// policy, so naive evasions like \rm, "rm", $'\x2drf', ${IFS}, command
-// substitution, and `bash -c "..."` are normalized first.
+// command guard. Restricted modes reject dynamic shell syntax that cannot be
+// authorized statically, then apply destructive and remote-side-effect policy.
 //
 // NOTE on policy boundaries: this tool-layer denylist is defense in depth for
 // hosts running commands without an enforcing OS sandbox. When the bubblewrap
@@ -357,14 +355,15 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnforced bool) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
 
+	if readOnly || workspaceWrite {
+		if reason := restrictedShellSyntaxReason(command); reason != "" {
+			return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, reason)
+		}
+	}
+
 	// Universal destructive-command checks (apply when not danger-full-access
 	// and no OS sandbox enforces the filesystem boundary).
 	if (readOnly || workspaceWrite) && !fsEnforced {
-		// classifyDestructive recurses into command substitutions ($()/backticks),
-		// and the git policy below scans inside them too, so a substitution grants
-		// no capability its inner command would not already have at top level.
-		// We therefore allow command substitution itself (e.g. wc -l $(find ...)),
-		// relying on those recursive checks plus the sandbox for enforcement.
 		if blocked, reason := classifyDestructive(command); blocked {
 			return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, reason)
 		}
@@ -403,6 +402,92 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 
 // IsPushToProtectedBranch detects git push commands that target main or
 // master, including via shell wrappers and command substitution.
+func restrictedShellSyntaxReason(command string) string {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && !inSingle {
+			escaped = true
+			continue
+		}
+		if c == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if c == '"' {
+			inDouble = !inDouble
+			continue
+		}
+		if c == '`' {
+			return "backtick substitution cannot be authorized statically"
+		}
+		if c == '$' && i+1 < len(command) {
+			next := command[i+1]
+			if next == '\'' {
+				return "ANSI-C shell quoting cannot be authorized statically"
+			}
+			if next == '(' || next == '{' || next == '_' || next >= 'A' && next <= 'Z' || next >= 'a' && next <= 'z' || next >= '0' && next <= '9' || strings.ContainsRune("@*#?$!-", rune(next)) {
+				return "shell substitution cannot be authorized statically"
+			}
+		}
+		if !inDouble && i+1 < len(command) && (c == '<' || c == '>') && command[i+1] == '(' {
+			return "process substitution cannot be authorized statically"
+		}
+		if !inDouble && c == '<' && i+1 < len(command) && command[i+1] == '<' {
+			return "heredocs and here-strings cannot be authorized statically"
+		}
+	}
+
+	for _, pl := range parseStatements(tokenize(command)) {
+		for _, cmd := range pl.commands {
+			if reason := restrictedAssignmentReason(cmd.argv); reason != "" {
+				return reason
+			}
+			argv := stripPrefixWrappers(cmd.argv)
+			if len(argv) == 0 {
+				continue
+			}
+			if strings.ToLower(basename(argv[0])) == "builtin" {
+				argv = argv[1:]
+				if len(argv) == 0 {
+					continue
+				}
+			}
+			head := strings.ToLower(basename(argv[0]))
+			switch head {
+			case "eval", "source", ".", "alias":
+				return head + " cannot be authorized statically"
+			case "function":
+				return "function definitions cannot be authorized statically"
+			}
+			if strings.HasSuffix(argv[0], "()") {
+				return "function definitions cannot be authorized statically"
+			}
+		}
+	}
+	return ""
+}
+
+func restrictedAssignmentReason(argv []string) string {
+	for _, word := range argv {
+		if !isShellAssignmentWord(word) {
+			continue
+		}
+		name, _, _ := strings.Cut(word, "=")
+		return fmt.Sprintf("shell assignment %s cannot be authorized statically", name)
+	}
+	return ""
+}
+
 func IsPushToProtectedBranch(cmd string) bool {
 	for _, argv := range gitInvocations(cmd) {
 		if pushTargetsProtectedBranch(argv) {

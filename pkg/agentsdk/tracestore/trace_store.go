@@ -3,7 +3,6 @@ package tracestore
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -80,17 +79,18 @@ type TraceStore interface {
 //	  tool_calls.jsonl
 //	  ...
 type FilesystemTraceStore struct {
-	root string
-	mu   sync.Mutex
+	root   string
+	rootFD int
+	mu     sync.Mutex
 }
 
 // NewFilesystemTraceStore creates a store rooted at the given directory.
 func NewFilesystemTraceStore(root string) (*FilesystemTraceStore, error) {
-	tracesDir := filepath.Join(root, "traces")
-	if err := os.MkdirAll(tracesDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create traces dir: %w", err)
+	canonicalRoot, rootFD, err := initializeFilesystemRoot(root)
+	if err != nil {
+		return nil, err
 	}
-	return &FilesystemTraceStore{root: root}, nil
+	return &FilesystemTraceStore{root: canonicalRoot, rootFD: rootFD}, nil
 }
 
 func (s *FilesystemTraceStore) tracesDir() string {
@@ -106,64 +106,57 @@ func (s *FilesystemTraceStore) runDir(runID string) (string, error) {
 }
 
 func (s *FilesystemTraceStore) CreateRunDir(runID string, metadata RunMetadata) (string, error) {
-	dir, err := s.runDir(runID)
-	if err != nil {
+	if _, err := s.runDir(runID); err != nil {
 		return "", err
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create run dir: %w", err)
 	}
 	metaBytes, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal metadata: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), metaBytes, 0o600); err != nil {
-		return "", fmt.Errorf("write metadata: %w", err)
+	if err := s.createRunDir(runID, metaBytes); err != nil {
+		return "", err
 	}
-	return dir, nil
+	verifiedDir, err := s.RunDir(runID)
+	if err != nil {
+		return "", err
+	}
+	return verifiedDir, nil
 }
 
 func (s *FilesystemTraceStore) AppendTrace(runID string, category string, data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	dir, err := s.runDir(runID)
-	if err != nil {
+	if _, err := s.runDir(runID); err != nil {
 		return err
 	}
 	safeCategory, err := safeTraceName("trace category", category)
 	if err != nil {
 		return err
 	}
-	filePath := filepath.Join(dir, safeCategory+".jsonl")
-	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", category, err)
-	}
-	defer f.Close()
-
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		data = append(data, '\n')
 	}
-	_, err = f.Write(data)
-	return err
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
+	return s.appendTrace(runID, safeCategory+".jsonl", data)
 }
 
 func (s *FilesystemTraceStore) WriteFile(runID string, relPath string, data []byte) error {
-	dir, err := s.runDir(runID)
-	if err != nil {
+	if _, err := s.runDir(runID); err != nil {
 		return err
 	}
 	safeRelPath, err := safeTraceRelPath(relPath)
 	if err != nil {
 		return err
 	}
-	full := filepath.Join(dir, safeRelPath)
-	parentDir := filepath.Dir(full)
-	if err := os.MkdirAll(parentDir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", parentDir, err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
 	}
-	return os.WriteFile(full, data, 0o600)
+	return s.writeFile(runID, safeRelPath, data)
 }
 
 func (s *FilesystemTraceStore) WriteScore(runID string, score Score) error {
@@ -175,37 +168,12 @@ func (s *FilesystemTraceStore) WriteScore(runID string, score Score) error {
 }
 
 func (s *FilesystemTraceStore) ListRuns(filter RunFilter) ([]RunMetadata, error) {
-	entries, err := os.ReadDir(s.tracesDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read traces dir: %w", err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
 	}
-
-	var runs []RunMetadata
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		metaPath := filepath.Join(s.tracesDir(), entry.Name(), "metadata.json")
-		data, err := os.ReadFile(metaPath)
-		if err != nil {
-			continue
-		}
-		var meta RunMetadata
-		if err := json.Unmarshal(data, &meta); err != nil {
-			continue
-		}
-		if filter.CandidateID != "" && meta.CandidateID != filter.CandidateID {
-			continue
-		}
-		if !filter.Since.IsZero() && meta.StartedAt.Before(filter.Since) {
-			continue
-		}
-		runs = append(runs, meta)
-	}
-	return runs, nil
+	return s.listRuns(filter)
 }
 
 func (s *FilesystemTraceStore) RunDir(runID string) (string, error) {
@@ -213,10 +181,38 @@ func (s *FilesystemTraceStore) RunDir(runID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(dir); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return "", err
+	}
+	if err := s.verifyRunDir(runID, dir); err != nil {
 		return "", fmt.Errorf("run dir %s: %w", runID, err)
 	}
 	return dir, nil
+}
+
+// Close releases the descriptor pinning the trusted trace root. It is safe to
+// call more than once; subsequent store operations fail closed.
+func (s *FilesystemTraceStore) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rootFD < 0 {
+		return nil
+	}
+	err := closeFilesystemRoot(s.rootFD)
+	s.rootFD = -1
+	return err
+}
+
+func (s *FilesystemTraceStore) ensureOpen() error {
+	if s == nil || s.rootFD < 0 {
+		return fmt.Errorf("filesystem trace store is closed")
+	}
+	return nil
 }
 
 // UpdateMetadataFinishedAt updates the FinishedAt field in metadata.json.
@@ -233,18 +229,18 @@ func (s *FilesystemTraceStore) UpdateMetadataMode(runID string, mode string) err
 	})
 }
 
-// updateMetadata reads, mutates, and writes back metadata.json atomically.
 func (s *FilesystemTraceStore) updateMetadata(runID string, mutate func(*RunMetadata)) error {
-	dir, err := s.runDir(runID)
-	if err != nil {
+	if _, err := s.runDir(runID); err != nil {
 		return err
 	}
-	metaPath := filepath.Join(dir, "metadata.json")
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
 
-	data, err := os.ReadFile(metaPath)
+	data, err := s.readMetadata(runID)
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
 	}
@@ -257,7 +253,7 @@ func (s *FilesystemTraceStore) updateMetadata(runID string, mutate func(*RunMeta
 	if err != nil {
 		return fmt.Errorf("marshal metadata: %w", err)
 	}
-	return os.WriteFile(metaPath, updated, 0o600)
+	return s.writeMetadata(runID, updated)
 }
 
 func safeTraceName(kind, value string) (string, error) {
@@ -265,7 +261,7 @@ func safeTraceName(kind, value string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("%s is required", kind)
 	}
-	if filepath.IsAbs(trimmed) || strings.ContainsAny(trimmed, `/\`) {
+	if filepath.IsAbs(trimmed) || strings.ContainsAny(trimmed, `/\\`) {
 		return "", fmt.Errorf("%s %q must be a single path segment", kind, value)
 	}
 	clean := filepath.Clean(trimmed)
@@ -280,14 +276,14 @@ func safeTraceRelPath(value string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("trace file path is required")
 	}
-	if filepath.IsAbs(trimmed) {
+	if filepath.IsAbs(trimmed) || strings.Contains(trimmed, `\`) {
 		return "", fmt.Errorf("trace file path %q must be relative", value)
 	}
 	clean := filepath.Clean(trimmed)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("trace file path %q escapes the run directory", value)
 	}
-	for _, part := range strings.FieldsFunc(clean, func(r rune) bool { return r == '/' || r == '\\' }) {
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
 		if part == "" || part == "." || part == ".." {
 			return "", fmt.Errorf("trace file path %q contains an unsafe path segment", value)
 		}

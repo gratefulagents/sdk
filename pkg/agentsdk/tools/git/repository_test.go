@@ -44,7 +44,7 @@ func TestAttachRepositoryClonesIntoWorkspaceRepoList(t *testing.T) {
 		t.Fatalf("workspace root unexpectedly became a git repo")
 	}
 
-	wantClonePrefix := "clone --branch main https://github.com/acme/helm-charts.git"
+	wantClonePrefix := "-c protocol.allow=never -c protocol.https.allow=always clone --branch main -- https://github.com/acme/helm-charts.git"
 	if !strings.HasPrefix(runner.gitCalls[0], wantClonePrefix) || runner.gitCalls[1] != "checkout -B agent-run-123" {
 		t.Fatalf("git calls = %#v, want clone prefix %q then checkout", runner.gitCalls, wantClonePrefix)
 	}
@@ -118,7 +118,7 @@ func TestAttachRepositoryReusesDuplicateAliasForSameRepository(t *testing.T) {
 	}
 	cloneCalls := 0
 	for _, call := range runner.gitCalls {
-		if strings.HasPrefix(call, "clone ") {
+		if strings.Contains(call, " clone ") {
 			cloneCalls++
 		}
 	}
@@ -144,6 +144,24 @@ func TestAttachRepositoryRejectsDuplicateAliasWithDifferentRepository(t *testing
 	}
 }
 
+func TestAttachRepositoryRejectsExistingRepositoryWithUnsafeOrigin(t *testing.T) {
+	workDir := t.TempDir()
+	dest := filepath.Join(workDir, "repos", "same")
+	if err := os.MkdirAll(filepath.Join(dest, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, ".git", "config"), []byte("[remote \"origin\"]\n\turl = git@github.com:acme/repo.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewAttachRepositoryTool(&fakeRunner{gitFn: cloneFakeRepo}).Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo","alias":"same"}`), workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "with origin") {
+		t.Fatalf("result = %+v, want unsafe existing origin rejection", result)
+	}
+}
+
 func TestAttachRepositoryRejectsDuplicateAliasThatIsNotGitRepository(t *testing.T) {
 	workDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(workDir, "repos", "same"), 0o755); err != nil {
@@ -159,7 +177,7 @@ func TestAttachRepositoryRejectsDuplicateAliasThatIsNotGitRepository(t *testing.
 	}
 }
 
-func TestSameRepositoryURLMatchesCommonGitHubForms(t *testing.T) {
+func TestSameRepositoryURLRequiresTrustedHTTPSOrigins(t *testing.T) {
 	tests := []struct {
 		name string
 		a    string
@@ -167,16 +185,16 @@ func TestSameRepositoryURLMatchesCommonGitHubForms(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "https and ssh",
+			name: "equivalent trusted HTTPS",
 			a:    "https://github.com/acme/repo.git",
-			b:    "git@github.com:acme/repo.git",
+			b:    "https://github.com/acme/repo",
 			want: true,
 		},
 		{
-			name: "https and ssh url",
+			name: "SSH origin rejected",
 			a:    "https://github.com/acme/repo",
-			b:    "ssh://git@github.com/acme/repo.git",
-			want: true,
+			b:    "git@github.com:acme/repo.git",
+			want: false,
 		},
 		{
 			name: "different repo",
@@ -189,6 +207,21 @@ func TestSameRepositoryURLMatchesCommonGitHubForms(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := sameRepositoryURL(tt.a, tt.b); got != tt.want {
 				t.Fatalf("sameRepositoryURL(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeRepositoryInputRejectsUnsafeTransportsAndAuthorities(t *testing.T) {
+	for _, input := range []string{
+		"../repo", "-uploader", "git@github.com:acme/repo.git", "ssh://git@github.com/acme/repo.git",
+		"git://github.com/acme/repo", "file:///tmp/repo", "ext::helper", "https://user@github.com/acme/repo",
+		"https://github.com:443/acme/repo", "https://github.com/acme/repo?q=1", "https://github.com/acme/repo#frag",
+		"https://github.com.evil.test/acme/repo", "https://github.com/acme/repo/extra",
+	} {
+		t.Run(input, func(t *testing.T) {
+			if _, _, err := normalizeRepositoryInput(input); err == nil {
+				t.Fatalf("normalizeRepositoryInput(%q) accepted unsafe repository", input)
 			}
 		})
 	}
@@ -221,7 +254,11 @@ func cloneFakeRepo(_ context.Context, workDir string, args ...string) (string, e
 	if len(args) == 0 {
 		return "", nil
 	}
-	switch args[0] {
+	command := args[0]
+	if len(args) > 4 && args[0] == "-c" && args[4] == "clone" {
+		command = "clone"
+	}
+	switch command {
 	case "clone":
 		repoURL := args[len(args)-2]
 		dest := args[len(args)-1]

@@ -1,4 +1,4 @@
-//go:build !aix && !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
+//go:build !linux
 
 package mcp
 
@@ -7,11 +7,10 @@ import (
 	"os"
 )
 
-func openFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink", path)
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	return os.OpenFile(path, flag, perm)
+func mkdirAllBeneath(workDir, relPath string, perm os.FileMode) error {
+	return fmt.Errorf("secure blob persistence is unsupported on this platform")
+}
+
+func createExclusiveBeneath(workDir, relPath string, data []byte, perm os.FileMode) error {
+	return fmt.Errorf("secure blob persistence is unsupported on this platform")
 }

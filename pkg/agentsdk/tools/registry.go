@@ -133,6 +133,12 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	for _, opt := range opts {
 		opt(r)
 	}
+	config := sandbox.ConfigFromEnv()
+	if r.commandSandboxConfig != nil {
+		config = *r.commandSandboxConfig
+	}
+	config.WorkspaceRoot = workDir
+	r.commandSandboxConfig = &config
 
 	var allTools []agentsdk.Tool
 	if r.permissionMode == policy.PermissionModeWorkspaceWrite {
@@ -180,7 +186,7 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 		r.Register(&shell.BashPollTool{Manager: manager})
 		r.Register(&shell.BashKillTool{Manager: manager})
 	}
-	if r.interactiveTerminal && r.permissionMode.AllowsWriteTools() {
+	if r.interactiveTerminal && r.permissionMode == policy.PermissionModeDangerFullAccess {
 		manager := shell.NewTerminalManager(r.bashExecutor())
 		r.terminalManager = manager
 		r.Register(&shell.TerminalTool{Manager: manager, Mode: r.permissionMode})
@@ -188,8 +194,11 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	if r.thinkTool {
 		r.Register(&signal.ThinkTool{})
 	}
-	if r.browser {
-		r.Register(&browser.Tool{AllowPrivateNetworkURLs: r.allowPrivateNetworkURLs})
+	// Chromium cannot bind public-only URL validation to redirects, DNS, and
+	// subresources. Register Browser only behind the explicit unrestricted
+	// networking opt-in; WebFetch remains the destination-confined default.
+	if r.browser && r.allowPrivateNetworkURLs {
+		r.Register(&browser.Tool{AllowPrivateNetworkURLs: true, Executor: r.bashExecutor()})
 	}
 	if r.visionTool != nil {
 		r.visionTool.AllowPrivateNetworkURLs = r.allowPrivateNetworkURLs
