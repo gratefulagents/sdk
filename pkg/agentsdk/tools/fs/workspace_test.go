@@ -301,6 +301,129 @@ func TestWorkspaceEditToolAcceptsSymlinkedWorkspaceRoot(t *testing.T) {
 	}
 }
 
+func TestWorkspaceWriteFileToolReplacesHardlinkWithoutChangingOutsideAlias(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.txt")
+	inside := filepath.Join(workDir, "inside.txt")
+	if err := os.WriteFile(outside, []byte("before"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, inside); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+
+	result, err := (&WorkspaceWriteFileTool{}).Execute(context.Background(), mustJSON(t, map[string]string{
+		"file_path": "inside.txt",
+		"content":   "after",
+	}), workDir)
+	if err != nil || result.IsError {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	outsideData, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(outsideData) != "before" {
+		t.Fatalf("outside alias = %q, want before", outsideData)
+	}
+}
+
+func TestWorkspaceWriteFileToolPreservesExistingMode(t *testing.T) {
+	workDir := t.TempDir()
+	path := filepath.Join(workDir, "private.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&WorkspaceWriteFileTool{}).Execute(context.Background(), mustJSON(t, map[string]string{
+		"file_path": "private.txt",
+		"content":   "after",
+	}), workDir)
+	if err != nil || result.IsError {
+		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("mode = %o, want 600", got)
+	}
+}
+
+func TestWorkspaceEditToolRejectsHardlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.txt")
+	inside := filepath.Join(workDir, "inside.txt")
+	if err := os.WriteFile(outside, []byte("before"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, inside); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+
+	result, err := (&WorkspaceEditTool{}).Execute(context.Background(), mustJSON(t, map[string]string{
+		"file_path":  "inside.txt",
+		"old_string": "before",
+		"new_string": "after",
+	}), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "hard link") {
+		t.Fatalf("Execute() = %#v, want hardlink refusal", result)
+	}
+	outsideData, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(outsideData) != "before" {
+		t.Fatalf("outside alias = %q, want before", outsideData)
+	}
+	insideData, err := os.ReadFile(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(insideData) != "before" {
+		t.Fatalf("inside alias = %q, want unchanged", insideData)
+	}
+}
+
+func TestWorkspaceWriteFileToolRejectsSymlinkParentDuringCreation(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(workDir, "parent")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	result, err := (&WorkspaceWriteFileTool{}).Execute(context.Background(), mustJSON(t, map[string]string{
+		"file_path": filepath.Join("parent", "nested", "file.txt"),
+		"content":   "outside",
+	}), workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatalf("Execute() = %#v, want error", result)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "nested")); !os.IsNotExist(err) {
+		t.Fatalf("outside nested stat = %v, want not exist", err)
+	}
+}
+
 func mustJSON(t *testing.T, value any) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)

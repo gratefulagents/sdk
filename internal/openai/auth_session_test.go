@@ -145,6 +145,26 @@ func TestNewOAuthAuthSessionFromConfigLeavesRefreshEnabledByDefault(t *testing.T
 	}
 }
 
+func TestOAuthAuthSessionClonesRefreshClientAndBlocksRedirects(t *testing.T) {
+	caller := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return nil }}
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSON:      []byte(`{"tokens":{"access_token":"access","refresh_token":"refresh","account_id":"acct"}}`),
+		RefreshClient: caller,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.oauth.httpClient == caller {
+		t.Fatal("session retained caller client instead of a clone")
+	}
+	if caller.CheckRedirect == nil {
+		t.Fatal("caller redirect policy was mutated")
+	}
+	if err := session.oauth.httpClient.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("CheckRedirect error = %v, want ErrUseLastResponse", err)
+	}
+}
+
 func TestDisableRefreshDisablesOAuthRefresh(t *testing.T) {
 	dir := t.TempDir()
 	authPath := dir + "/auth.json"

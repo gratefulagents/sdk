@@ -38,29 +38,15 @@ func (t *WorkspaceWriteFileTool) Execute(ctx context.Context, input json.RawMess
 	if in.FilePath == "" {
 		return agentsdk.ToolResult{Content: "file_path is required", IsError: true}, nil
 	}
-	// Validate workspace membership and reject symlink components up front so we
-	// can return a friendly error with the canonical path. The actual write goes
-	// through OpenInWorkspace, which on Linux uses openat2(2) with
-	// RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS to atomically reject any path that
-	// escapes the workspace — closing the canonicalize-then-open TOCTOU window.
 	canonical, err := pathutil.ResolveWorkspace(workDir, in.FilePath)
 	if err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error resolving file path: %v", err), IsError: true}, nil
 	}
-	dir := filepath.Dir(canonical)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Error creating directory %s: %v", dir, err), IsError: true}, nil
+	if err := pathutil.MkdirAllInWorkspace(workDir, filepath.Dir(canonical), 0o755); err != nil {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("Error creating parent directory: %v", err), IsError: true}, nil
 	}
-	f, err := pathutil.OpenInWorkspace(workDir, canonical, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
+	if err := pathutil.AtomicWriteFilePreservingModeInWorkspace(workDir, canonical, []byte(in.Content), 0o644); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
-	}
-	if _, err := f.Write([]byte(in.Content)); err != nil {
-		_ = f.Close()
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
-	}
-	if err := f.Close(); err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Error closing file: %v", err), IsError: true}, nil
 	}
 	return agentsdk.ToolResult{Content: fmt.Sprintf("Successfully wrote %d bytes to %s", len(in.Content), canonical)}, nil
 }

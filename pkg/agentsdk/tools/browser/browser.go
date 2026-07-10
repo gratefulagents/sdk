@@ -129,6 +129,12 @@ func (t *Tool) Execute(ctx context.Context, raw json.RawMessage, workDir string)
 	if in.URL == "" {
 		return agentsdk.ToolResult{Content: "url is required", IsError: true}, nil
 	}
+	if !t.AllowPrivateNetworkURLs {
+		return agentsdk.ToolResult{
+			Content: "Browser public-only networking cannot safely contain redirects, DNS changes, or page subresources. Use WebFetch, or explicitly set AllowPrivateNetworkURLs=true to allow unrestricted/private browser networking.",
+			IsError: true,
+		}, nil
+	}
 	parsedURL, err := web.ValidateHTTPURL(ctx, in.URL, web.URLSecurityOptions{
 		AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs,
 	})
@@ -205,19 +211,15 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to resolve output path: %v", err), IsError: true}, nil
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o700); err != nil {
+	if err := pathutil.MkdirAllInWorkspace(workDir, filepath.Dir(outPath), 0o700); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create output directory: %v", err), IsError: true}, nil
 	}
-	tmpFile, err := os.CreateTemp(filepath.Dir(outPath), ".screenshot-*.png")
+	tmpDir, err := os.MkdirTemp("", "agentsdk-browser-*")
 	if err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create temporary screenshot file: %v", err), IsError: true}, nil
+		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create private screenshot directory: %v", err), IsError: true}, nil
 	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to close temporary screenshot file: %v", err), IsError: true}, nil
-	}
-	defer os.Remove(tmpPath)
+	defer os.RemoveAll(tmpDir)
+	tmpPath := filepath.Join(tmpDir, "screenshot.png")
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -238,6 +240,8 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
 		Timeout:        30 * time.Second,
+		AllowNetwork:   true,
+		WritablePaths:  []string{tmpDir},
 	})
 	if err != nil || execResult.ExitCode != 0 || execResult.TimedOut {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Screenshot failed: %v\n%s", err, execResult.Output), IsError: true}, nil
@@ -246,7 +250,7 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 	if err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to read temporary screenshot file: %v", err), IsError: true}, nil
 	}
-	if err := pathutil.WriteFileNoFollow(outPath, data, 0o600); err != nil {
+	if err := pathutil.AtomicWriteFilePreservingModeInWorkspace(workDir, outPath, data, 0o600); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to save screenshot: %v", err), IsError: true}, nil
 	}
 
@@ -277,6 +281,7 @@ func (t *Tool) navigate(ctx context.Context, chromeBin string, in input, workDir
 		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeReadOnly,
 		Timeout:        30 * time.Second,
+		AllowNetwork:   true,
 	})
 	if err != nil || execResult.ExitCode != 0 || execResult.TimedOut {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Navigation failed: %v\n%s", err, execResult.Output), IsError: true}, nil
@@ -308,6 +313,7 @@ func (t *Tool) getText(ctx context.Context, chromeBin string, in input, workDir 
 		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeReadOnly,
 		Timeout:        30 * time.Second,
+		AllowNetwork:   true,
 	})
 	if err != nil || execResult.ExitCode != 0 || execResult.TimedOut {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to get page text: %v\n%s", err, execResult.Output), IsError: true}, nil

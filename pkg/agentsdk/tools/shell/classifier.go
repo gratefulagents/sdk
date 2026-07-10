@@ -361,11 +361,17 @@ var wrapperOperandOpts = map[string]map[string]bool{
 	"setsid":  {},
 }
 
-// stripPrefixWrappers removes leading transparent wrappers (sudo, doas,
-// command, exec, env, nice, nohup, ionice, stdbuf, timeout, setsid) so that
-// the underlying program is what gets classified. Returns the remaining argv.
+// stripPrefixWrappers removes leading shell assignments and transparent
+// wrappers (sudo, doas, command, exec, env, nice, nohup, ionice, stdbuf,
+// timeout, setsid) so that the underlying program is what gets classified.
+// Assignment stripping runs again after each wrapper because both forms are
+// valid shell syntax: FOO=bar env git ... and env FOO=bar git ....
 func stripPrefixWrappers(argv []string) []string {
 	for len(argv) > 0 {
+		argv = stripLeadingShellAssignments(argv)
+		if len(argv) == 0 {
+			return nil
+		}
 		head := basename(argv[0])
 		operandOpts, isWrapper := wrapperOperandOpts[head]
 		if !isWrapper {
@@ -416,6 +422,34 @@ func stripPrefixWrappers(argv []string) []string {
 		argv = argv[i:]
 	}
 	return argv
+}
+
+func stripLeadingShellAssignments(argv []string) []string {
+	for len(argv) > 0 && isShellAssignmentWord(argv[0]) {
+		argv = argv[1:]
+	}
+	return argv
+}
+
+func isShellAssignmentWord(word string) bool {
+	name, _, ok := strings.Cut(word, "=")
+	if !ok || name == "" || !isShellNameStart(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !isShellNameContinue(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isShellNameStart(c byte) bool {
+	return c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+}
+
+func isShellNameContinue(c byte) bool {
+	return isShellNameStart(c) || c >= '0' && c <= '9'
 }
 
 func isShellInterpreter(arg string) bool {

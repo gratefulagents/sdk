@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -226,6 +227,13 @@ func IsTerminalRefreshError(err error) bool {
 		strings.Contains(msg, "status 401")
 }
 
+var oauthLogSecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(bearer\s+)[^\s"']+`),
+	regexp.MustCompile(`(?i)(["']?(?:authorization|proxy-authorization)["']?\s*[:=]\s*(?:basic\s+|bearer\s+)?)[^\s"',;&]+`),
+	regexp.MustCompile(`(?i)(["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|session[_-]?token|password|set-cookie|cookie)["']?\s*[:=]\s*["']?)[^\s"',;&]+`),
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]+`),
+}
+
 // SanitizeLogBody redacts token-like and secret-like JSON fields before logging
 // provider OAuth error bodies.
 func SanitizeLogBody(body string) string {
@@ -239,6 +247,9 @@ func SanitizeLogBody(body string) string {
 			body = string(sanitized)
 		}
 	}
+	for _, pattern := range oauthLogSecretPatterns {
+		body = pattern.ReplaceAllString(body, "${1}[redacted]")
+	}
 	if len(body) > 2048 {
 		return body[:2048] + "..."
 	}
@@ -251,7 +262,7 @@ func sanitizeJSONValue(value any) any {
 		out := make(map[string]any, len(v))
 		for key, child := range v {
 			lower := strings.ToLower(key)
-			if strings.Contains(lower, "token") || strings.Contains(lower, "secret") {
+			if strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "auth") || strings.Contains(lower, "cookie") || strings.Contains(lower, "key") {
 				out[key] = "[redacted]"
 				continue
 			}
@@ -270,10 +281,13 @@ func sanitizeJSONValue(value any) any {
 }
 
 func refreshHTTPClient(cfg RefreshConfig) *http.Client {
-	if cfg.HTTPClient != nil {
-		return cfg.HTTPClient
+	base := cfg.HTTPClient
+	if base == nil {
+		base = &http.Client{Timeout: 20 * time.Second}
 	}
-	return &http.Client{Timeout: 20 * time.Second}
+	client := *base
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &client
 }
 
 func refreshNow(cfg RefreshConfig) time.Time {

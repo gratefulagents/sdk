@@ -161,7 +161,7 @@ func TestLocalExecutorUsesSafeEnv(t *testing.T) {
 	result, err := LocalExecutor{}.Run(context.Background(), Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "printf '%s' \"${DATABASE_URL:-unset}\""},
 		WorkDir:        t.TempDir(),
-		PermissionMode: policy.PermissionModeWorkspaceWrite,
+		PermissionMode: policy.PermissionModeDangerFullAccess,
 		Timeout:        time.Second,
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestExecutorRunCapsOutputWithoutTerminatingProcess(t *testing.T) {
 	result, err := LocalExecutor{}.Run(context.Background(), Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", fmt.Sprintf(`i=0; while [ "$i" -lt 20000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; echo done > %s; echo SENTINEL_DONE`, strconv.Quote(sentinel))},
 		WorkDir:        workDir,
-		PermissionMode: policy.PermissionModeWorkspaceWrite,
+		PermissionMode: policy.PermissionModeDangerFullAccess,
 		Timeout:        5 * time.Second,
 	})
 	if err != nil {
@@ -214,7 +214,8 @@ func TestBubblewrapArgsReadOnlyWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgSequence(t, args, "--ro-bind", "/", "/")
+	assertArgAbsent(t, args, "--ro-bind", "/", "/")
+	assertArgSequence(t, args, "--unshare-net")
 	assertArgSequence(t, args, "--proc", "/proc")
 	assertArgAbsent(t, args, "--tmpfs", "/proc")
 	assertArgSequence(t, args, "--dev", "/dev")
@@ -231,6 +232,62 @@ func TestBubblewrapArgsReadOnlyWorkspace(t *testing.T) {
 	assertArgSequence(t, args, "--", "bash", "--noprofile", "--norc", "-c", "pwd")
 }
 
+func TestBubblewrapArgsDangerFullAccessKeepsHostNetwork(t *testing.T) {
+	workDir := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workDir,
+		PermissionMode: policy.PermissionModeDangerFullAccess,
+	}, Config{WorkspaceRoot: workDir})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgAbsent(t, args, "--unshare-net")
+}
+
+func TestBubblewrapArgsExplicitNetworkOptInKeepsHostNetwork(t *testing.T) {
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        "/workspace/repo",
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+		AllowNetwork:   true,
+	}, Config{WorkspaceRoot: "/workspace"})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgAbsent(t, args, "--unshare-net")
+}
+
+func TestBubblewrapArgsIncludesRequestScopedWritablePath(t *testing.T) {
+	workspace := t.TempDir()
+	scratch := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+		WritablePaths:  []string{scratch},
+	}, Config{WorkspaceRoot: workspace})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgSequence(t, args, "--bind", resolveExistingPrefix(scratch), resolveExistingPrefix(scratch))
+}
+
+func TestBubblewrapArgsReadOnlyIgnoresRequestScopedWritablePath(t *testing.T) {
+	workspace := t.TempDir()
+	scratch := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeReadOnly,
+		WritablePaths:  []string{scratch},
+	}, Config{WorkspaceRoot: workspace})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgAbsent(t, args, "--bind", resolveExistingPrefix(scratch), resolveExistingPrefix(scratch))
+}
+
 func TestBubblewrapArgsWorkspaceWriteWorkspace(t *testing.T) {
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "printf hi > file"},
@@ -240,12 +297,11 @@ func TestBubblewrapArgsWorkspaceWriteWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgSequence(t, args, "--ro-bind", "/", "/")
+	assertArgAbsent(t, args, "--ro-bind", "/", "/")
 	assertArgSequence(t, args, "--bind", "/workspace", "/workspace")
 	assertArgAbsent(t, args, "--ro-bind", "/workspace", "/workspace")
-	// Real /tmp persists caches and installed tooling across commands.
-	assertArgSequence(t, args, "--bind", "/tmp", "/tmp")
-	assertArgAbsent(t, args, "--tmpfs", "/tmp")
+	assertArgSequence(t, args, "--tmpfs", "/tmp")
+	assertArgAbsent(t, args, "--bind", "/tmp", "/tmp")
 }
 
 func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
@@ -266,8 +322,8 @@ func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
 	assertArgAbsent(t, args, "--proc", "/proc")
 }
 
-func TestBubblewrapArgsExposeWholeFilesystemWithoutExtraMounts(t *testing.T) {
-	toolchain := t.TempDir()
+func TestBubblewrapArgsExposeConfiguredReadOnlyPaths(t *testing.T) {
+	toolchain := resolveExistingPrefix(t.TempDir())
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "true"},
 		WorkDir:        "/workspace/repo",
@@ -279,12 +335,60 @@ func TestBubblewrapArgsExposeWholeFilesystemWithoutExtraMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	// The whole filesystem is already visible read-only; per-path read-only
-	// mounts must not be emitted.
-	assertArgSequence(t, args, "--ro-bind", "/", "/")
-	assertArgAbsent(t, args, "--ro-bind", toolchain, toolchain)
+	assertArgAbsent(t, args, "--ro-bind", "/", "/")
+	assertArgSequence(t, args, "--ro-bind", toolchain, toolchain)
 	assertArgAbsent(t, args, "--ro-bind", "/opt/tooling", "/opt/tooling")
-	assertArgAbsent(t, args, "--ro-bind", "/home/worker", "/home/worker")
+	assertArgSequence(t, args, "--ro-bind", "/home/worker", "/home/worker")
+}
+
+func TestBubblewrapArgsReadOnlyIgnoresConfiguredWritablePaths(t *testing.T) {
+	workspace := t.TempDir()
+	scratch := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeReadOnly,
+	}, Config{WorkspaceRoot: workspace, ExtraWritablePaths: []string{scratch}})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgAbsent(t, args, "--bind", resolveExistingPrefix(scratch), resolveExistingPrefix(scratch))
+	assertArgSequence(t, args, "--ro-bind", resolveExistingPrefix(workspace), resolveExistingPrefix(workspace))
+}
+
+func TestBubblewrapArgsReadOnlyRejectsWorkDirOutsideTrustedRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	_, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        outside,
+		PermissionMode: policy.PermissionModeReadOnly,
+	}, Config{WorkspaceRoot: root})
+	if err == nil || !strings.Contains(err.Error(), "outside configured workspace root") {
+		t.Fatalf("BubblewrapArgs() error = %v, want outside-root refusal", err)
+	}
+}
+
+func TestBubblewrapArgsReadOnlyRequiresTrustedRoot(t *testing.T) {
+	_, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	}, Config{})
+	if err == nil || !strings.Contains(err.Error(), "trusted workspace root") {
+		t.Fatalf("BubblewrapArgs() error = %v, want trusted workspace root refusal", err)
+	}
+}
+
+func TestBubblewrapArgsWorkspaceWriteRequiresTrustedRoot(t *testing.T) {
+	_, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{})
+	if err == nil || !strings.Contains(err.Error(), "trusted workspace root") {
+		t.Fatalf("BubblewrapArgs() error = %v, want trusted workspace root refusal", err)
+	}
 }
 
 func TestBubblewrapArgsIncludesConfiguredWritableScratchPaths(t *testing.T) {
@@ -344,8 +448,8 @@ func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
 	if got := ExecutorEnforcesFilesystem(Default(), policy.PermissionModeReadOnly); got != wantEnforcing {
 		t.Fatalf("auto read-only enforcement = %v, want %v", got, wantEnforcing)
 	}
-	if ExecutorEnforcesFilesystem(Default(), policy.PermissionModeWorkspaceWrite) {
-		t.Fatal("auto workspace-write outside kubernetes must not report enforcement")
+	if got := ExecutorEnforcesFilesystem(Default(), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("auto workspace-write enforcement = %v, want %v", got, wantEnforcing)
 	}
 	if ExecutorEnforcesFilesystem(LocalExecutor{}, policy.PermissionModeWorkspaceWrite) {
 		t.Fatal("LocalExecutor must not report enforcement")
@@ -353,9 +457,10 @@ func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
 }
 
 func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {
-	_, err := DefaultWithConfig(Config{RunningInKubernetes: true}).Build(context.Background(), Request{
+	workDir := t.TempDir()
+	_, err := DefaultWithConfig(Config{RunningInKubernetes: true, WorkspaceRoot: workDir}).Build(context.Background(), Request{
 		Argv:           []string{"true"},
-		WorkDir:        t.TempDir(),
+		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
 	})
 	if err == nil && runtimeHasBubblewrap() {
@@ -370,9 +475,10 @@ func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {
 }
 
 func TestDefaultExecutorRequiresSandboxForReadOnlyAuto(t *testing.T) {
-	_, err := Default().Build(context.Background(), Request{
+	workDir := t.TempDir()
+	_, err := DefaultWithConfig(Config{WorkspaceRoot: workDir}).Build(context.Background(), Request{
 		Argv:           []string{"true"},
-		WorkDir:        t.TempDir(),
+		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeReadOnly,
 	})
 	if err == nil {
@@ -383,6 +489,17 @@ func TestDefaultExecutorRequiresSandboxForReadOnlyAuto(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "subprocess sandbox") {
 		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
+	}
+}
+
+func TestLocalExecutorRejectsWorkspaceWrite(t *testing.T) {
+	_, err := LocalExecutor{}.Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	})
+	if err == nil || !strings.Contains(err.Error(), "restricted") {
+		t.Fatalf("LocalExecutor.Build(WorkspaceWrite) error = %v, want refusal", err)
 	}
 }
 
@@ -411,34 +528,14 @@ func TestDefaultExecutorDisabledModeRejectsReadOnly(t *testing.T) {
 	}
 }
 
-func TestDefaultExecutorDisabledModeCanExplicitlySkipReadOnlySandbox(t *testing.T) {
-	cmd, err := DefaultWithConfig(Config{Mode: "disabled", AllowUnsafeReadOnlyLocal: true}).Build(context.Background(), Request{
+func TestDefaultExecutorDisabledModeUnsafeOptInStillRejectsReadOnly(t *testing.T) {
+	_, err := DefaultWithConfig(Config{Mode: "disabled", AllowUnsafeReadOnlyLocal: true}).Build(context.Background(), Request{
 		Argv:           []string{"true"},
 		WorkDir:        t.TempDir(),
 		PermissionMode: policy.PermissionModeReadOnly,
 	})
-	if err != nil {
-		t.Fatalf("Build() error = %v, want explicit local compatibility executor", err)
-	}
-	if cmd == nil {
-		t.Fatal("Build() command = nil")
-	}
-}
-
-func TestDefaultExecutorAutoModeReadOnlyFallsBackToLocalWhenOptedIn(t *testing.T) {
-	if subprocessSandboxAvailable() {
-		t.Skip("enforcing sandbox available on this platform; the fallback path is for non-linux dev hosts")
-	}
-	cmd, err := DefaultWithConfig(Config{Mode: "auto", AllowUnsafeReadOnlyLocal: true}).Build(context.Background(), Request{
-		Argv:           []string{"true"},
-		WorkDir:        t.TempDir(),
-		PermissionMode: policy.PermissionModeReadOnly,
-	})
-	if err != nil {
-		t.Fatalf("Build() error = %v, want LocalExecutor fallback for read-only on non-linux", err)
-	}
-	if cmd == nil {
-		t.Fatal("Build() command = nil")
+	if err == nil {
+		t.Fatal("unsafe compatibility flag bypassed restricted-mode containment")
 	}
 }
 
@@ -452,7 +549,7 @@ func TestDefaultExecutorAutoModeReadOnlyFailsClosedWithoutOptIn(t *testing.T) {
 		PermissionMode: policy.PermissionModeReadOnly,
 	})
 	if err == nil {
-		t.Fatal("Build() error = nil; read-only must fail closed without AllowUnsafeReadOnlyLocal")
+		t.Fatal("Build() error = nil; read-only must fail closed without an enforcing sandbox")
 	}
 	if !strings.Contains(err.Error(), "subprocess sandbox") {
 		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
@@ -470,23 +567,14 @@ func TestConfigFromEnvParsesAllowUnsafeReadOnlyLocal(t *testing.T) {
 	}
 }
 
-func TestBubblewrapArgsWorkDirEscapesConfiguredRootViaDotDot(t *testing.T) {
-	// /workspace/../etc cleans to /etc — escape attempt. Even though /workspace
-	// is the configured root, the resolved workdir is outside it; the executor
-	// must not return an arg vector that exposes /etc as the workspace root.
-	args, err := BubblewrapArgsWithConfig(Request{
+func TestBubblewrapArgsWorkspaceWriteRejectsWorkDirOutsideTrustedRoot(t *testing.T) {
+	_, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"true"},
 		WorkDir:        "/workspace/../etc",
-		PermissionMode: policy.PermissionModeReadOnly,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
 	}, Config{WorkspaceRoot: "/workspace"})
-	if err != nil {
-		// preferred outcome: refusal
-		return
-	}
-	for i := 0; i+2 < len(args); i++ {
-		if (args[i] == "--ro-bind" || args[i] == "--bind") && args[i+1] == "/etc" && args[i+2] == "/etc" {
-			t.Fatalf("workspace root resolved to /etc; escape from /workspace not detected: %v", args)
-		}
+	if err == nil || !strings.Contains(err.Error(), "outside configured workspace root") {
+		t.Fatalf("BubblewrapArgs() error = %v, want outside-root refusal", err)
 	}
 }
 
@@ -497,18 +585,13 @@ func TestWorkspaceRootForRejectsSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	args, err := BubblewrapArgsWithConfig(Request{
+	_, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"true"},
 		WorkDir:        link,
-		PermissionMode: policy.PermissionModeReadOnly,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
 	}, Config{WorkspaceRoot: root})
-	if err != nil {
-		return
-	}
-	for i := 0; i+2 < len(args); i++ {
-		if (args[i] == "--ro-bind" || args[i] == "--bind") && args[i+1] == outside {
-			t.Fatalf("symlink escape allowed: workspace root resolved to %q outside configured root %q", outside, root)
-		}
+	if err == nil || !strings.Contains(err.Error(), "outside configured workspace root") {
+		t.Fatalf("BubblewrapArgs() error = %v, want symlink escape refusal", err)
 	}
 }
 

@@ -112,6 +112,31 @@ func OpenFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error)
 	return openFileNoFollow(path, flag, perm)
 }
 
+// MkdirAllInWorkspace recursively creates a directory beneath workDir without
+// traversing symlinks.
+func MkdirAllInWorkspace(workDir, relPath string, perm os.FileMode) error {
+	return mkdirAllInWorkspace(workDir, relPath, perm)
+}
+
+// AtomicWriteFileInWorkspace writes a new same-directory inode and atomically
+// replaces relPath, leaving any hardlink aliases to the old inode unchanged.
+func AtomicWriteFileInWorkspace(workDir, relPath string, data []byte, perm os.FileMode) error {
+	return atomicWriteFileInWorkspace(workDir, relPath, data, perm)
+}
+
+// AtomicWriteFilePreservingModeInWorkspace atomically replaces relPath while
+// preserving the permission bits of an existing regular destination. New
+// files use perm.
+func AtomicWriteFilePreservingModeInWorkspace(workDir, relPath string, data []byte, perm os.FileMode) error {
+	return atomicWriteFilePreservingModeInWorkspace(workDir, relPath, data, perm)
+}
+
+// CreateExclusiveFileInWorkspace creates relPath beneath workDir and refuses
+// to overwrite any existing directory entry.
+func CreateExclusiveFileInWorkspace(workDir, relPath string, data []byte, perm os.FileMode) error {
+	return createExclusiveFileInWorkspace(workDir, relPath, data, perm)
+}
+
 // OpenInWorkspace opens a file located beneath workDir without exposing a
 // canonicalize-then-open TOCTOU window.
 //
@@ -120,14 +145,8 @@ func OpenFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error)
 // intermediate) and any path that escapes the workspace, eliminating the
 // race between resolution and open.
 //
-// On macOS and other non-Linux platforms openat2 is unavailable; the function
-// falls back to ResolveWorkspace + OpenFileNoFollow. That fallback fully
-// canonicalizes the path through EvalSymlinks before opening and rejects a
-// symlink in the final component via O_NOFOLLOW, but a determined attacker
-// who can swap a parent directory between resolve and open could still cause
-// the open to follow a different path than was validated. This residual TOCTOU
-// risk is documented and accepted on those platforms; callers on Linux get
-// stronger guarantees automatically.
+// Non-Linux platforms fail closed because this package does not provide an
+// equivalent descriptor-relative containment primitive there.
 func OpenInWorkspace(workDir, relPath string, flag int, perm os.FileMode) (*os.File, error) {
 	if strings.TrimSpace(workDir) == "" {
 		return nil, fmt.Errorf("workspace root is required")

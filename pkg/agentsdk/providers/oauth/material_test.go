@@ -153,10 +153,15 @@ func TestCopilotAPIBaseURLFromToken(t *testing.T) {
 	cases := map[string]string{
 		"":           "",
 		"token-only": "",
-		"proxy-ep=proxy.individual.githubcopilot.com":         "https://api.individual.githubcopilot.com",
-		"tid=1; proxy-ep=proxy.individual.githubcopilot.com;": "https://api.individual.githubcopilot.com",
-		"proxy-ep=https://proxy.business.githubcopilot.com":   "https://api.business.githubcopilot.com",
-		"proxy-ep=api.individual.githubcopilot.com":           "https://api.individual.githubcopilot.com",
+		"proxy-ep=proxy.individual.githubcopilot.com":           "https://api.individual.githubcopilot.com",
+		"tid=1; proxy-ep=proxy.individual.githubcopilot.com;":   "https://api.individual.githubcopilot.com",
+		"proxy-ep=https://proxy.business.githubcopilot.com":     "https://api.business.githubcopilot.com",
+		"proxy-ep=api.individual.githubcopilot.com":             "https://api.individual.githubcopilot.com",
+		"proxy-ep=proxy.enterprise.githubcopilot.com":           "https://api.enterprise.githubcopilot.com",
+		"proxy-ep=http://proxy.individual.githubcopilot.com":    "",
+		"proxy-ep=proxy.individual.githubcopilot.com.evil.test": "",
+		"proxy-ep=proxy.individual.githubcopilot.com:443":       "",
+		"proxy-ep=https://proxy.individual.githubcopilot.com/x": "",
 	}
 	for token, want := range cases {
 		if got := CopilotAPIBaseURLFromToken(token); got != want {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 )
@@ -39,8 +40,26 @@ func TestNewRegistryWithoutWebTools(t *testing.T) {
 	}
 }
 
+func TestRegistryBrowserUsesTrustedSandboxExecutor(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithBrowserTools(), WithPrivateNetworkURLs(true))
+	tool, ok := r.Get("Browser").(*browser.Tool)
+	if !ok {
+		t.Fatalf("Browser tool = %T, want *browser.Tool", r.Get("Browser"))
+	}
+	if tool.Executor == nil {
+		t.Fatal("Browser executor = nil")
+	}
+}
+
+func TestRegistryDoesNotRegisterUnconfinedBrowserByDefault(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithBrowserTools())
+	if tool := r.Get("Browser"); tool != nil {
+		t.Fatalf("Browser tool = %T, want nil without explicit private-network opt-in", tool)
+	}
+}
+
 func TestRegistryAdaptsBrowserForReadOnlyMode(t *testing.T) {
-	r := NewRegistry(t.TempDir(), WithReadOnlyTools(), WithBrowserTools())
+	r := NewRegistry(t.TempDir(), WithReadOnlyTools(), WithBrowserTools(), WithPrivateNetworkURLs(true))
 	tool := r.Get("Browser")
 	if tool == nil {
 		t.Fatalf("read-only registry missing Browser; names=%v", r.Names())
@@ -70,8 +89,27 @@ func TestNewRegistryReadOnly(t *testing.T) {
 	}
 }
 
+func TestNewRegistryAlwaysWiresTrustedWorkspaceSandboxConfig(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+	if r.commandSandboxConfig == nil {
+		t.Fatal("command sandbox config = nil")
+	}
+	if r.commandSandboxConfig.WorkspaceRoot != dir {
+		t.Fatalf("WorkspaceRoot = %q, want %q", r.commandSandboxConfig.WorkspaceRoot, dir)
+	}
+	bash := r.Get("Bash").(*shell.WorkspaceWriteBashTool)
+	if bash.Executor == nil {
+		t.Fatal("default workspace-write Bash executor = nil")
+	}
+}
+
 func TestNewRegistryWiresCommandSandboxConfigIntoBashTools(t *testing.T) {
-	r := NewRegistry(t.TempDir(), WithCommandSandboxConfig(sandbox.Config{Mode: "disabled"}))
+	dir := t.TempDir()
+	r := NewRegistry(dir, WithCommandSandboxConfig(sandbox.Config{Mode: "disabled", WorkspaceRoot: "/untrusted"}))
+	if r.commandSandboxConfig.WorkspaceRoot != dir {
+		t.Fatalf("WorkspaceRoot = %q, want trusted registry workdir %q", r.commandSandboxConfig.WorkspaceRoot, dir)
+	}
 	bash, ok := r.Get("Bash").(*shell.WorkspaceWriteBashTool)
 	if !ok {
 		t.Fatalf("Bash tool = %T, want *shell.WorkspaceWriteBashTool", r.Get("Bash"))
@@ -121,6 +159,19 @@ func TestNewRegistryDangerFullAccess(t *testing.T) {
 	}
 }
 
+func TestInteractiveTerminalRequiresDangerFullAccess(t *testing.T) {
+	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
+		r := NewRegistry(t.TempDir(), WithPermissionMode(mode), WithInteractiveTerminal())
+		if r.Get("Terminal") != nil {
+			t.Fatalf("%s registry unexpectedly registered Terminal", mode)
+		}
+	}
+	r := NewRegistry(t.TempDir(), WithPermissionMode(policy.PermissionModeDangerFullAccess), WithInteractiveTerminal())
+	if r.Get("Terminal") == nil {
+		t.Fatal("danger-full-access registry missing Terminal")
+	}
+}
+
 func TestNewRegistryAsyncShellTools(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithAsyncShellTools())
 	want := []string{"BashKill", "BashPoll", "BashStart"}
@@ -135,7 +186,7 @@ func TestNewRegistryAsyncShellTools(t *testing.T) {
 }
 
 func TestAsyncShellStartPollAndKill(t *testing.T) {
-	r := NewRegistry(t.TempDir(), WithAsyncShellTools())
+	r := NewRegistry(t.TempDir(), WithPermissionMode(policy.PermissionModeDangerFullAccess), WithAsyncShellTools())
 	start := r.Get("BashStart")
 	poll := r.Get("BashPoll")
 	kill := r.Get("BashKill")
@@ -174,8 +225,19 @@ func TestAsyncShellStartPollAndKill(t *testing.T) {
 	}
 }
 
-func TestAsyncShellPollCanWait(t *testing.T) {
+func TestBashStartUsesRestrictedBashPolicy(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithAsyncShellTools())
+	res, err := r.Get("BashStart").Execute(context.Background(), json.RawMessage(`{"command":"echo $HOME"}`), r.WorkDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Content, "cannot be authorized statically") {
+		t.Fatalf("BashStart result = %+v, want restricted policy refusal", res)
+	}
+}
+
+func TestAsyncShellPollCanWait(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithPermissionMode(policy.PermissionModeDangerFullAccess), WithAsyncShellTools())
 	start := r.Get("BashStart")
 	poll := r.Get("BashPoll")
 

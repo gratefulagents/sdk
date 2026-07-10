@@ -83,6 +83,63 @@ func TestSkillInstallSeedsAllowEnvFromRequiresEnvVars(t *testing.T) {
 	}
 }
 
+func TestSkillInstallCreatesPrivateConfigAndDoesNotWidenExistingMode(t *testing.T) {
+	registry := mustNewSkillRegistry(t)
+	dir := t.TempDir()
+	installer := NewInstaller(registry)
+	if err := installer.Install(dir, "search-exa"); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	path := filepath.Join(dir, ".mcp.json")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("new config mode = %o, want 600", info.Mode().Perm())
+	}
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := installer.Install(dir, "search-duckduckgo"); err != nil {
+		t.Fatalf("second Install() error = %v", err)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o400 {
+		t.Fatalf("updated config mode = %o, want 400", info.Mode().Perm())
+	}
+}
+
+func TestSkillInstallReplacesHardlinkWithoutChangingOutsideAlias(t *testing.T) {
+	registry := mustNewSkillRegistry(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "workspace")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.json")
+	original := []byte(`{"mcpServers":{}}`)
+	if err := os.WriteFile(outside, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, filepath.Join(dir, ".mcp.json")); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	if err := NewInstaller(registry).Install(dir, "search-exa"); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("outside alias = %q, want unchanged", got)
+	}
+}
+
 func TestSkillInstallPreservesExistingHardening(t *testing.T) {
 	registry := mustNewSkillRegistry(t)
 	dir := t.TempDir()

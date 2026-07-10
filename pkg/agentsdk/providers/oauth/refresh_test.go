@@ -54,6 +54,21 @@ func TestRefreshOpenAIAuthJSON(t *testing.T) {
 	}
 }
 
+func TestRefreshHTTPClientBlocksRedirectsWithoutMutatingCaller(t *testing.T) {
+	callerRedirect := func(*http.Request, []*http.Request) error { return nil }
+	caller := &http.Client{CheckRedirect: callerRedirect}
+	client := refreshHTTPClient(RefreshConfig{HTTPClient: caller})
+	if client == caller {
+		t.Fatal("refreshHTTPClient returned caller client")
+	}
+	if caller.CheckRedirect == nil {
+		t.Fatal("refreshHTTPClient mutated caller redirect policy")
+	}
+	if err := client.CheckRedirect(nil, nil); err != http.ErrUseLastResponse {
+		t.Fatalf("CheckRedirect error = %v, want ErrUseLastResponse", err)
+	}
+}
+
 func TestRefreshAnthropicTokens(t *testing.T) {
 	now := time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC)
 	cfg := RefreshConfig{
@@ -199,6 +214,24 @@ func TestRefreshCopilotTokenRedactsErrorBody(t *testing.T) {
 	}
 	if !IsTerminalRefreshError(err) {
 		t.Fatalf("IsTerminalRefreshError(%v) = false, want true", err)
+	}
+}
+
+func TestSanitizeLogBodyRedactsSensitiveKeysAndPlaintextTokens(t *testing.T) {
+	bodies := []string{
+		`{"diagnostic":"invalid grant","password_hint":"pw","authorization":"Bearer bearer-secret","cookie_value":"session","public_key":"key-value","message":"failed for sk-plaintext"}`,
+		`invalid grant: refresh_token=refresh-plain client_secret: client-plain authorization=Basic basic-plain cookie="cookie-plain"`,
+	}
+	for _, body := range bodies {
+		got := SanitizeLogBody(body)
+		for _, secret := range []string{"pw", "bearer-secret", "session", "key-value", "sk-plaintext", "refresh-plain", "client-plain", "basic-plain", "cookie-plain"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("SanitizeLogBody leaked %q in %q", secret, got)
+			}
+		}
+		if !strings.Contains(got, "invalid grant") {
+			t.Fatalf("SanitizeLogBody removed diagnostic: %q", got)
+		}
 	}
 }
 

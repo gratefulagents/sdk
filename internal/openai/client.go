@@ -40,7 +40,9 @@ const (
 )
 
 var logSecretRedactors = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._\-]+`),
+	regexp.MustCompile(`(?i)(bearer\s+)[^\s"']+`),
+	regexp.MustCompile(`(?i)(["']?(?:authorization|proxy-authorization)["']?\s*[:=]\s*(?:basic\s+|bearer\s+)?)[^\s"',;&]+`),
+	regexp.MustCompile(`(?i)(["']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|session[_-]?token|password|set-cookie|cookie)["']?\s*[:=]\s*["']?)[^\s"',;&]+`),
 	regexp.MustCompile(`(?i)("(?:access_token|refresh_token|id_token|api_key|authorization)"\s*:\s*")[^"]+(")`),
 	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]+`),
 }
@@ -2071,7 +2073,14 @@ func responsesCompactURLForBase(baseURL string) string {
 }
 
 func sanitizeLogBody(body string) string {
-	trimmed := strings.Join(strings.Fields(strings.TrimSpace(body)), " ")
+	trimmed := strings.TrimSpace(body)
+	var parsed any
+	if json.Unmarshal([]byte(trimmed), &parsed) == nil {
+		if sanitized, err := json.Marshal(sanitizeLogJSONValue(parsed)); err == nil {
+			trimmed = string(sanitized)
+		}
+	}
+	trimmed = strings.Join(strings.Fields(trimmed), " ")
 	for _, redactor := range logSecretRedactors {
 		trimmed = redactor.ReplaceAllString(trimmed, "${1}[REDACTED]${2}")
 	}
@@ -2079,6 +2088,30 @@ func sanitizeLogBody(body string) string {
 		return trimmed[:500] + "...(truncated)"
 	}
 	return trimmed
+}
+
+func sanitizeLogJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			lower := strings.ToLower(key)
+			if strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "auth") || strings.Contains(lower, "cookie") || strings.Contains(lower, "key") {
+				out[key] = "[REDACTED]"
+			} else {
+				out[key] = sanitizeLogJSONValue(child)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = sanitizeLogJSONValue(child)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 type chatCompletionRequest struct {

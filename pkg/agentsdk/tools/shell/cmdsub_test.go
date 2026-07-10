@@ -6,33 +6,34 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 )
 
-// TestSafeCommandSubstitutionAllowed verifies that command substitution used to
-// compute arguments for non-destructive programs is permitted. The recursive
-// destructive/git checks already inspect the substitution body, and the
-// substitution cannot turn a benign program destructive, so blocking these was
-// a false positive that broke common read-only workflows.
-func TestSafeCommandSubstitutionAllowed(t *testing.T) {
-	allowed := []string{
+func TestDynamicShellSyntaxBlockedInRestrictedModes(t *testing.T) {
+	commands := []string{
 		`wc -l $(find . -name '*.go')`,
-		"cat $(rg -l foo)",
-		"echo $(git rev-parse HEAD)",
-		"head -n 5 $(ls -t | head -1)",
-		"grep TODO $(git ls-files)",
+		"cat `rg -l foo`",
+		"printf '%s' \"$HOME\"",
 		"diff <(sort a) <(sort b)",
+		"cat <<< data",
+		"cat <<EOF\ndata\nEOF",
+		"eval 'git status'",
+		"source script.sh",
+		"alias x=ls",
+		"function x { true; }",
+		"x() { true; }",
 	}
 	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
-		for _, cmd := range allowed {
-			if blocked, reason := IsCommandBlockedForMode(mode, cmd); blocked {
-				t.Errorf("IsCommandBlockedForMode(%s, %q) = blocked %q; want allowed (safe command substitution)", mode, cmd, reason)
+		for _, cmd := range commands {
+			if blocked, _ := IsCommandBlockedForMode(mode, cmd); !blocked {
+				t.Errorf("IsCommandBlockedForMode(%s, %q) = allowed; want dynamic syntax blocked", mode, cmd)
 			}
+		}
+	}
+	for _, cmd := range commands {
+		if blocked, reason := IsCommandBlockedForMode(policy.PermissionModeDangerFullAccess, cmd); blocked {
+			t.Errorf("danger-full-access blocked %q: %s", cmd, reason)
 		}
 	}
 }
 
-// TestCommandSubstitutionEvasionsBlocked ensures the relaxation did not reopen
-// the flag/target-injection hole: substitution feeding a statically-checked
-// destructive head (rm, chmod, dd, tee, mkfs, shell) stays blocked, and a
-// destructive command inside the substitution is still caught by recursion.
 func TestCommandSubstitutionEvasionsBlocked(t *testing.T) {
 	blockedCmds := []string{
 		"rm $(echo -rf) /",

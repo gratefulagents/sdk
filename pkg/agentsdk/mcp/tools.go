@@ -410,11 +410,10 @@ func persistBinaryBlob(workDir, serverName, sourceName, mimeType string, data []
 		return "", fmt.Errorf("binary content is %d bytes; max allowed is %d bytes", len(data), maxMCPBlobBytes)
 	}
 	relDir := filepath.Join(".mcp", "blobs")
-	dir, err := resolveWorkspaceOutputDir(workDir, relDir)
-	if err != nil {
+	if _, err := resolveWorkspaceOutputDir(workDir, relDir); err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllBeneath(workDir, relDir, 0o700); err != nil {
 		return "", fmt.Errorf("create blob dir: %w", err)
 	}
 
@@ -429,22 +428,10 @@ func persistBinaryBlob(workDir, serverName, sourceName, mimeType string, data []
 		return "", err
 	}
 
-	if err := writeFileNoFollow(path, data, 0o600); err != nil {
+	if err := createExclusiveBeneath(workDir, filepath.Join(relDir, filename), data, 0o600); err != nil {
 		return "", fmt.Errorf("write blob: %w", err)
 	}
 	return path, nil
-}
-
-func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
-	f, err := openFileNoFollow(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 func resolveWorkspaceOutputDir(workDir, relDir string) (string, error) {

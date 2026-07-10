@@ -65,6 +65,24 @@ func TestCommandBlockedForModeHandlesGitPushSpacing(t *testing.T) {
 	}
 }
 
+func TestCommandBlockedForModeRejectsLeadingAssignments(t *testing.T) {
+	t.Parallel()
+
+	for _, cmd := range []string{
+		"X=1 git push origin main",
+		"X=1 Y=2 gh pr merge 123",
+		"X=1 env Y=2 git push origin master",
+		"X=1 command gh issue create --title t",
+		"BASH_ENV=./payload bash -c true",
+		"GIT_CONFIG_COUNT=1 git status",
+	} {
+		blocked, _ := IsCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, cmd)
+		if !blocked {
+			t.Fatalf("IsCommandBlockedForMode(workspace-write, %q) = allowed; want block", cmd)
+		}
+	}
+}
+
 func TestCommandBlockedForModeBlocksGHCLI(t *testing.T) {
 	t.Parallel()
 
@@ -87,8 +105,13 @@ func TestCommandBlockedForModeBlocksGHCLI(t *testing.T) {
 	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
 		for _, cmd := range blockedCommands {
 			blocked, reason := IsCommandBlockedForMode(mode, cmd)
-			if !blocked || !strings.Contains(reason, "gh CLI is not allowed") {
-				t.Fatalf("IsCommandBlockedForMode(%v, %q) = %v, %q; want gh CLI block", mode, cmd, blocked, reason)
+			if !blocked {
+				t.Fatalf("IsCommandBlockedForMode(%v, %q) = false, %q; want block", mode, cmd, reason)
+			}
+			// Dynamic constructs fail earlier at the stricter static-authorization
+			// boundary; direct invocations must report the gh policy.
+			if !strings.Contains(cmd, "$(") && !strings.HasPrefix(cmd, "eval ") && !strings.Contains(cmd, "=") && !strings.Contains(reason, "gh CLI is not allowed") {
+				t.Fatalf("IsCommandBlockedForMode(%v, %q) reason = %q; want gh CLI block", mode, cmd, reason)
 			}
 		}
 	}
@@ -138,6 +161,14 @@ func TestCommandBlockedForModeHandlesRootRemoveVariants(t *testing.T) {
 		if !blocked || !strings.Contains(reason, "recursive removal") {
 			t.Fatalf("IsCommandBlockedForMode(%q) = %v, %q; want root removal block", cmd, blocked, reason)
 		}
+	}
+}
+
+func TestCommandBlockedRejectsDynamicSyntaxWhenSandboxEnforces(t *testing.T) {
+	t.Parallel()
+
+	if blocked, _ := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "echo $HOME", true); !blocked {
+		t.Fatal("dynamic shell syntax must remain blocked under an enforcing sandbox")
 	}
 }
 

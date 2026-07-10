@@ -15,8 +15,7 @@ import (
 
 // openInWorkspace opens a file beneath workDir using openat2 with
 // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS, eliminating any canonicalize-then-open
-// TOCTOU window. Falls back to the portable canonicalize-then-open path when
-// the kernel does not support openat2 (returns ENOSYS).
+// TOCTOU window.
 func openInWorkspace(workDir, relPath string, flag int, perm os.FileMode) (*os.File, error) {
 	baseAbs, err := filepath.Abs(workDir)
 	if err != nil {
@@ -58,9 +57,7 @@ func openInWorkspace(workDir, relPath string, flag int, perm os.FileMode) (*os.F
 	fd, err := unix.Openat2(dirfd, rel, how)
 	if err != nil {
 		if errors.Is(err, syscall.ENOSYS) {
-			// Kernel < 5.6: fall back to canonicalize-then-open. The fallback
-			// keeps the documented residual TOCTOU risk for those kernels.
-			return openInWorkspaceFallback(workDir, relPath, flag, perm)
+			return nil, fmt.Errorf("secure workspace opens require openat2: %w", err)
 		}
 		if errors.Is(err, unix.EXDEV) || errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("path %s escapes workspace or contains symlink: %w", relPath, err)
@@ -68,14 +65,6 @@ func openInWorkspace(workDir, relPath string, flag int, perm os.FileMode) (*os.F
 		return nil, err
 	}
 	return os.NewFile(uintptr(fd), filepath.Join(base, rel)), nil
-}
-
-func openInWorkspaceFallback(workDir, relPath string, flag int, perm os.FileMode) (*os.File, error) {
-	resolved, err := ResolveWorkspace(workDir, relPath)
-	if err != nil {
-		return nil, err
-	}
-	return OpenFileNoFollow(resolved, flag, perm)
 }
 
 func syscallMode(perm os.FileMode) uint32 {

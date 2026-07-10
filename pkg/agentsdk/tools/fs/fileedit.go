@@ -66,6 +66,10 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 		_ = rf.Close()
 		return agentsdk.ToolResult{Content: fmt.Sprintf("%s is not a regular file", canonical), IsError: true}, nil
 	}
+	if err := pathutil.RequireSingleLink(info); err != nil {
+		_ = rf.Close()
+		return agentsdk.ToolResult{Content: fmt.Sprintf("refusing workspace edit of %s: %v", canonical, err), IsError: true}, nil
+	}
 	if info.Size() > maxEditableFileBytes {
 		_ = rf.Close()
 		return agentsdk.ToolResult{Content: fmt.Sprintf("file is too large to edit (%d bytes, max %d)", info.Size(), maxEditableFileBytes), IsError: true}, nil
@@ -84,16 +88,8 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 	if errMsg != "" {
 		return agentsdk.ToolResult{Content: errMsg, IsError: true}, nil
 	}
-	wf, err := pathutil.OpenInWorkspace(workDir, canonical, os.O_WRONLY|os.O_TRUNC, origMode)
-	if err != nil {
+	if err := pathutil.AtomicWriteFileInWorkspace(workDir, canonical, []byte(newContent), origMode); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
-	}
-	if _, err := wf.Write([]byte(newContent)); err != nil {
-		_ = wf.Close()
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Error writing file: %v", err), IsError: true}, nil
-	}
-	if err := wf.Close(); err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Error closing file: %v", err), IsError: true}, nil
 	}
 	return agentsdk.ToolResult{Content: editSuccessMessage(canonical, count, in.ReplaceAll, diff)}, nil
 }

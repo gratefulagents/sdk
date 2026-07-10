@@ -960,9 +960,13 @@ func TestSDKSecurityRegressionCoverage(t *testing.T) {
 		}
 
 		readOnlyRegistry := sdktools.NewRegistry(workDir, sdktools.WithReadOnlyTools(), sdktools.WithBrowserTools())
-		readOnlyBrowser := readOnlyRegistry.Get("Browser")
+		if browser := readOnlyRegistry.Get("Browser"); browser != nil {
+			t.Fatalf("public-only registry exposed unconfined Browser: %#v", browser)
+		}
+		unrestrictedBrowserRegistry := sdktools.NewRegistry(workDir, sdktools.WithReadOnlyTools(), sdktools.WithBrowserTools(), sdktools.WithPrivateNetworkURLs(true))
+		readOnlyBrowser := unrestrictedBrowserRegistry.Get("Browser")
 		if readOnlyBrowser == nil {
-			t.Fatalf("read-only registry missing Browser; names=%v", readOnlyRegistry.Names())
+			t.Fatalf("explicit unrestricted registry missing Browser; names=%v", unrestrictedBrowserRegistry.Names())
 		}
 		if !readOnlyBrowser.IsReadOnly() || strings.Contains(string(readOnlyBrowser.InputSchema()), "screenshot") {
 			t.Fatalf("read-only Browser = %#v schema=%s", readOnlyBrowser, readOnlyBrowser.InputSchema())

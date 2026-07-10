@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -260,16 +261,24 @@ func CopilotAPIBaseURLFromToken(token string) string {
 		if !ok || !strings.EqualFold(strings.TrimSpace(key), "proxy-ep") {
 			continue
 		}
-		host := strings.TrimSpace(value)
-		host = strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://")
-		host = strings.Trim(host, "/")
-		if host == "" {
+		raw := strings.TrimSpace(value)
+		if !strings.Contains(raw, "://") {
+			raw = "https://" + raw
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Host != parsed.Hostname() || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return ""
 		}
-		if strings.HasPrefix(strings.ToLower(host), "proxy.") {
-			host = "api." + host[len("proxy."):]
+		host := strings.ToLower(parsed.Hostname())
+		if strings.HasPrefix(host, "proxy.") {
+			host = "api." + strings.TrimPrefix(host, "proxy.")
 		}
-		return "https://" + host
+		switch host {
+		case "api.individual.githubcopilot.com", "api.business.githubcopilot.com", "api.enterprise.githubcopilot.com":
+			return "https://" + host
+		default:
+			return ""
+		}
 	}
 	return ""
 }

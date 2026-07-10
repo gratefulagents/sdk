@@ -170,6 +170,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("create trace store: %w", err)
 		}
+		defer traceStore.Close()
 		traceWriter = tracestore.NewTraceWriter(traceStore)
 	}
 

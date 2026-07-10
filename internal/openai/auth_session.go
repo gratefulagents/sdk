@@ -203,6 +203,8 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
+	refreshClient := *httpClient
+	refreshClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	clientID := strings.TrimSpace(cfg.ClientID)
 	if clientID == "" {
 		clientID = DefaultOAuthClientID
@@ -215,7 +217,7 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 	return &OpenAIAuthSession{
 		mode: AuthModeOAuth,
 		oauth: &oauthSessionState{
-			httpClient:    httpClient,
+			httpClient:    &refreshClient,
 			clientID:      clientID,
 			tokenEndpoint: tokenEndpoint,
 			clientVersion: strings.TrimSpace(cfg.ClientVersion),
@@ -765,7 +767,7 @@ func logCodexErrorBody(req *http.Request, resp *http.Response, session *OpenAIAu
 	if err != nil {
 		return
 	}
-	log.Printf("[openai] codex error: status=%d url=%s body=%s", resp.StatusCode, req.URL.Path, strings.TrimSpace(string(body)))
+	log.Printf("[openai] codex error: status=%d url=%s body=%s", resp.StatusCode, req.URL.Path, sanitizeLogBody(string(body)))
 }
 
 // ChatGPT's Codex compact endpoint can return JSON without a JSON content type.
@@ -878,7 +880,7 @@ func collectSSEToJSON(resp *http.Response) (*http.Response, error) {
 						}
 						// Log error events for diagnostics.
 						if evt.Type == "error" {
-							log.Printf("[openai] SSE error event: %s", string(data))
+							log.Printf("[openai] SSE error event: %s", sanitizeLogBody(string(data)))
 						}
 					}
 				}
