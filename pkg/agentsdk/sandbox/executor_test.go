@@ -324,21 +324,21 @@ func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
 
 func TestBubblewrapArgsExposeConfiguredReadOnlyPaths(t *testing.T) {
 	toolchain := resolveExistingPrefix(t.TempDir())
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "true"},
 		WorkDir:        "/workspace/repo",
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
 	}, Config{
 		WorkspaceRoot:      "/workspace",
-		ExtraReadOnlyPaths: []string{toolchain, "/opt/tooling", "/home/worker"},
+		ExtraReadOnlyPaths: []string{toolchain, missing},
 	})
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
 	assertArgAbsent(t, args, "--ro-bind", "/", "/")
 	assertArgSequence(t, args, "--ro-bind", toolchain, toolchain)
-	assertArgAbsent(t, args, "--ro-bind", "/opt/tooling", "/opt/tooling")
-	assertArgSequence(t, args, "--ro-bind", "/home/worker", "/home/worker")
+	assertArgAbsent(t, args, "--ro-bind", missing, missing)
 }
 
 func TestBubblewrapArgsReadOnlyIgnoresConfiguredWritablePaths(t *testing.T) {
