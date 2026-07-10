@@ -31,7 +31,7 @@ type CreateMessageRequest struct {
 	OutputEffort string `json:"-"`
 
 	// OpenRouter chat-completions shim only: reasoning effort label
-	// ("none", "minimal", "low", "medium", "high", "xhigh"). "none" disables
+	// ("none", "minimal", "low", "medium", "high", "xhigh", "max"). "none" disables
 	// reasoning entirely. Empty leaves the provider/model default. Carried into
 	// the chat body's "reasoning" field; ignored on the native Anthropic path.
 	ReasoningEffort string `json:"-"`

@@ -930,6 +930,27 @@ func TestAnalyzeImagePostsGPT55ImageInput(t *testing.T) {
 	}
 }
 
+func TestToResponseParams_PreservesExplicitReasoningEffort(t *testing.T) {
+	for _, effort := range []string{"high", "xhigh", "max"} {
+		t.Run(effort, func(t *testing.T) {
+			req := anthropic.CreateMessageRequest{
+				Model:           "gpt-5.6-sol",
+				Messages:        []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+				Thinking:        &anthropic.ThinkingConfig{BudgetTokens: 12288},
+				ReasoningEffort: effort,
+			}
+
+			params, err := toResponseParams(req)
+			if err != nil {
+				t.Fatalf("toResponseParams() error = %v", err)
+			}
+			if got := string(params.Reasoning.Effort); got != effort {
+				t.Fatalf("Reasoning effort = %q, want %q", got, effort)
+			}
+		})
+	}
+}
+
 func TestToResponseParams_IncludesReasoningWhenThinkingEnabled(t *testing.T) {
 	req := anthropic.CreateMessageRequest{
 		Model:         "gpt-5.4",
@@ -987,13 +1008,33 @@ func TestToCompactParams_OmitsReasoningSummary(t *testing.T) {
 	if !strings.Contains(string(raw), "\"effort\"") {
 		t.Fatalf("compaction request should still carry reasoning.effort: %s", raw)
 	}
-	// budget 16000 -> "xhigh". OpenAI accepts xhigh (not "max", which is the
-	// Anthropic vocabulary), so the effort is passed through unchanged.
+	// A budget-only request still infers xhigh. Max is selected only when the
+	// caller explicitly requests it.
 	if !strings.Contains(string(raw), "xhigh") {
-		t.Fatalf("compaction effort should be xhigh (OpenAI vocab, no remap): %s", raw)
+		t.Fatalf("budget-inferred compaction effort should be xhigh: %s", raw)
 	}
 	if strings.Contains(string(raw), "\"max\"") {
-		t.Fatalf("compaction effort must not be 'max' (Anthropic-only vocabulary): %s", raw)
+		t.Fatalf("budget-inferred compaction effort must not become max: %s", raw)
+	}
+}
+
+func TestToCompactParams_PreservesExplicitMaxReasoning(t *testing.T) {
+	req := anthropic.CreateMessageRequest{
+		Model:           "gpt-5.6-sol",
+		Messages:        []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+		Thinking:        &anthropic.ThinkingConfig{BudgetTokens: 12288},
+		ReasoningEffort: "max",
+	}
+	params, err := toCompactParams(req, true)
+	if err != nil {
+		t.Fatalf("toCompactParams() error = %v", err)
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"effort":"max"`) {
+		t.Fatalf("explicit max compaction effort not preserved: %s", raw)
 	}
 }
 

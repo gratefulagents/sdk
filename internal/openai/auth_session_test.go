@@ -551,28 +551,30 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 	})
 
 	t.Run("passes reasoning effort through unchanged for chatgpt backend", func(t *testing.T) {
-		// OpenAI models accept [none minimal low medium high xhigh]. "max" is the
-		// Anthropic/Claude vocabulary and is never sent here, so no remap is done.
-		for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh"} {
+		// GPT-5.6 adds max as a distinct tier above xhigh. The normalizer must
+		// preserve every selected effort; model-specific validation is upstream.
+		for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
 			req := makeReq("chatgpt.com", "/backend-api/codex/responses",
 				`{"model":"gpt-5.4-mini","reasoning":{"effort":"`+effort+`"}}`)
 			maybeNormalizeCodexResponsesBody(req, oauthSession)
 			body := readBody(req)
 			reasoning, _ := body["reasoning"].(map[string]any)
 			if reasoning == nil || reasoning["effort"] != effort {
-				t.Errorf("effort %q -> %v, want unchanged (OpenAI accepts xhigh, not max)", effort, reasoning["effort"])
+				t.Errorf("effort %q -> %v, want unchanged", effort, reasoning["effort"])
 			}
 		}
 	})
 
 	t.Run("does not remap reasoning effort for standard api", func(t *testing.T) {
-		req := makeReq("api.openai.com", "/v1/responses",
-			`{"model":"gpt-5.4","reasoning":{"effort":"xhigh"}}`)
-		maybeNormalizeCodexResponsesBody(req, oauthSession)
-		body := readBody(req)
-		reasoning, _ := body["reasoning"].(map[string]any)
-		if reasoning == nil || reasoning["effort"] != "xhigh" {
-			t.Errorf("standard API must keep effort=xhigh, got %v", body["reasoning"])
+		for _, effort := range []string{"xhigh", "max"} {
+			req := makeReq("api.openai.com", "/v1/responses",
+				`{"model":"gpt-5.6-sol","reasoning":{"effort":"`+effort+`"}}`)
+			maybeNormalizeCodexResponsesBody(req, oauthSession)
+			body := readBody(req)
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil || reasoning["effort"] != effort {
+				t.Errorf("standard API must keep effort=%s, got %v", effort, body["reasoning"])
+			}
 		}
 	})
 

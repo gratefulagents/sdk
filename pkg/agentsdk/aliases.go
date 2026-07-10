@@ -183,6 +183,7 @@ const (
 	ReasoningMedium = agent.ReasoningMedium
 	ReasoningHigh   = agent.ReasoningHigh
 	ReasoningXHigh  = agent.ReasoningXHigh
+	ReasoningMax    = agent.ReasoningMax
 
 	TextVerbosityLow    = agent.TextVerbosityLow
 	TextVerbosityMedium = agent.TextVerbosityMedium

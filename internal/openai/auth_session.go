@@ -693,9 +693,7 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 	// so the client receives the encrypted reasoning to round-trip on the next
 	// turn; stripping it makes Codex reject the request. opencode and codex-cli
 	// both send it. reasoning.effort and reasoning.summary are passed through
-	// untouched: OpenAI models accept [none minimal low medium high xhigh] (the
-	// values the SDK produces). "max" is the Anthropic/Claude vocabulary and is
-	// never sent on this path.
+	// untouched. GPT-5.6 accepts max as a distinct tier above xhigh.
 	if _, ok := body["store"]; !ok {
 		body["store"] = false
 	}

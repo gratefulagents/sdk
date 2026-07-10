@@ -8,7 +8,7 @@ type ModelSettings struct {
 	ToolChoice        string   `json:"tool_choice,omitempty"` // "auto", "none", "required", or specific tool name
 	ParallelToolCalls *bool    `json:"parallel_tool_calls,omitempty"`
 	ThinkingBudget    int      `json:"thinking_budget,omitempty"`
-	ReasoningEffort   string   `json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh"
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"` // "minimal", "low", "medium", "high", "xhigh", "max"
 	TextVerbosity     string   `json:"text_verbosity,omitempty"`   // "low", "medium", "high"
 	StopSequences     []string `json:"stop_sequences,omitempty"`
 }

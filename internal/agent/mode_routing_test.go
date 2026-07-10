@@ -14,6 +14,7 @@ func TestModeReasoningSettings(t *testing.T) {
 		{name: "medium", level: ReasoningMedium, wantBudget: 4096, wantEffort: "medium"},
 		{name: "high", level: ReasoningHigh, wantBudget: 8192, wantEffort: "high"},
 		{name: "xhigh", level: ReasoningXHigh, wantBudget: 12288, wantEffort: "xhigh"},
+		{name: "max", level: ReasoningMax, wantBudget: 12288, wantEffort: "max"},
 	}
 
 	for _, tt := range tests {

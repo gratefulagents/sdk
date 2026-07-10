@@ -17,6 +17,8 @@ func TestToChatRequestEmitsReasoningEffort(t *testing.T) {
 		{name: "none disables reasoning", effort: "none", want: `"reasoning":{"effort":"none"}`},
 		{name: "low", effort: "low", want: `"reasoning":{"effort":"low"}`},
 		{name: "high", effort: "high", want: `"reasoning":{"effort":"high"}`},
+		{name: "xhigh", effort: "xhigh", want: `"reasoning":{"effort":"xhigh"}`},
+		{name: "max", effort: "max", want: `"reasoning":{"effort":"max"}`},
 		{name: "empty omits field", effort: "", want: ""},
 		{name: "whitespace omits field", effort: "   ", want: ""},
 	}
