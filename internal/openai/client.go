@@ -30,8 +30,9 @@ const (
 	defaultBaseURL       = "https://api.openai.com/v1"
 	defaultMaxConcurrent = 2
 	maxRetries           = 3
-	maxRetryAfterSeconds = 5 * 60
-	apiModeResponses     = "responses"
+	maxRetryAfterSeconds   = 5 * 60
+	defaultHTTPCallTimeout = 5 * time.Minute
+	apiModeResponses       = "responses"
 	apiModeChat          = "chat-completions"
 	// maxProviderResponseBytes caps the response body size we read from the
 	// provider. A misbehaving or hostile endpoint cannot exhaust memory by
@@ -148,7 +149,7 @@ func NewClientWithAuthSession(session *OpenAIAuthSession, opts ...Option) *Clien
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMaxConcurrent
 	}
-	httpClient := newAuthHTTPClient(cfg.authSession, 10*time.Minute)
+	httpClient := newAuthHTTPClient(cfg.authSession, defaultHTTPCallTimeout)
 
 	sdkClient := sdk.NewClient(
 		option.WithAPIKey(cfg.authSession.sdkAPIKey()),

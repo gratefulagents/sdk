@@ -7,10 +7,10 @@ import (
 )
 
 // DefaultModelCallTimeout bounds a single model generation attempt when
-// RunConfig.ModelCallTimeout is 0. It is generous enough for slow,
-// high-reasoning generations over large contexts, but finite so a hung
-// provider connection can never freeze a run indefinitely.
-const DefaultModelCallTimeout = 10 * time.Minute
+// RunConfig.ModelCallTimeout is 0. Five minutes matches Codex CLI's default
+// stream inactivity budget while remaining finite so a hung provider
+// connection cannot freeze a run indefinitely.
+const DefaultModelCallTimeout = 5 * time.Minute
 
 // effectiveModelCallTimeout resolves the per-attempt model-call timeout:
 // 0 uses DefaultModelCallTimeout; a negative value disables the timeout.
