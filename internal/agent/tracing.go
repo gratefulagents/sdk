@@ -101,6 +101,8 @@ type GenerationSpanData struct {
 	CompletionTokens             int64
 	CacheReadTokens              int64
 	CacheCreateTokens            int64
+	InputTokensIncludeCache      bool
+	InputTokensIncludeCacheKnown bool
 	TotalTokens                  int64
 	CostUSD                      float64
 	CostKnown                    bool
@@ -170,24 +172,26 @@ func (SessionSpanData) spanData() {}
 
 // SubagentSpanData records data about a subagent lifecycle.
 type SubagentSpanData struct {
-	TaskID       string
-	Type         string // role name or type
-	Description  string
-	Model        string
-	Status       string // initializing, running, completed, failed
-	CostUSD      float64
-	NumTurns     int
-	TotalTokens  int64
-	InputTokens  int64
-	OutputTokens int64
-	ToolCount    int32
-	DurationMS   int64
-	StopReason   string
-	Isolation    string
-	Prompt       string
-	ResultText   string
-	FilesRead    []string // files the subagent read
-	FilesWritten []string // files the subagent modified
+	TaskID            string
+	Type              string // role name or type
+	Description       string
+	Model             string
+	Status            string // initializing, running, completed, failed
+	CostUSD           float64
+	NumTurns          int
+	TotalTokens       int64
+	InputTokens       int64
+	OutputTokens      int64
+	CacheReadTokens   int64
+	CacheCreateTokens int64
+	ToolCount         int32
+	DurationMS        int64
+	StopReason        string
+	Isolation         string
+	Prompt            string
+	ResultText        string
+	FilesRead         []string // files the subagent read
+	FilesWritten      []string // files the subagent modified
 }
 
 func (SubagentSpanData) spanData() {}

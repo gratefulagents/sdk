@@ -538,7 +538,7 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 
 	t.Run("strips api-only params but keeps include for chatgpt backend", func(t *testing.T) {
 		req := makeReq("chatgpt.com", "/backend-api/codex/responses",
-			`{"model":"gpt-5.4","truncation":"auto","prompt_cache_retention":"24h","include":["reasoning.encrypted_content"]}`)
+			`{"model":"gpt-5.4","truncation":"auto","prompt_cache_retention":"24h","prompt_cache_key":"parent-run-123","include":["reasoning.encrypted_content"]}`)
 		maybeNormalizeCodexResponsesBody(req, oauthSession)
 		body := readBody(req)
 		for _, key := range []string{"truncation", "prompt_cache_retention"} {
@@ -551,6 +551,9 @@ func TestMaybeNormalizeCodexResponsesBody(t *testing.T) {
 		inc, ok := body["include"].([]any)
 		if !ok || len(inc) != 1 || inc[0] != "reasoning.encrypted_content" {
 			t.Errorf("include must be preserved for Codex, got %v", body["include"])
+		}
+		if body["prompt_cache_key"] != "parent-run-123" {
+			t.Errorf("prompt_cache_key must be preserved for Codex, got %v", body["prompt_cache_key"])
 		}
 	})
 

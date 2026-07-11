@@ -3,6 +3,8 @@ package openai
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,13 +29,13 @@ import (
 )
 
 const (
-	defaultBaseURL       = "https://api.openai.com/v1"
-	defaultMaxConcurrent = 2
-	maxRetries           = 3
+	defaultBaseURL         = "https://api.openai.com/v1"
+	defaultMaxConcurrent   = 2
+	maxRetries             = 3
 	maxRetryAfterSeconds   = 5 * 60
 	defaultHTTPCallTimeout = 5 * time.Minute
 	apiModeResponses       = "responses"
-	apiModeChat          = "chat-completions"
+	apiModeChat            = "chat-completions"
 	// maxProviderResponseBytes caps the response body size we read from the
 	// provider. A misbehaving or hostile endpoint cannot exhaust memory by
 	// streaming an unbounded body in response to a single API call.
@@ -711,9 +713,10 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 				EndTurn:    responseEndTurn(&evt.Response),
 			},
 			Usage: &anthropic.Usage{
-				InputTokens:          evt.Response.Usage.InputTokens,
-				OutputTokens:         evt.Response.Usage.OutputTokens,
-				CacheReadInputTokens: evt.Response.Usage.InputTokensDetails.CachedTokens,
+				InputTokens:              evt.Response.Usage.InputTokens,
+				OutputTokens:             evt.Response.Usage.OutputTokens,
+				CacheReadInputTokens:     evt.Response.Usage.InputTokensDetails.CachedTokens,
+				CacheCreationInputTokens: responseCacheWriteTokens(evt.Response.Usage.InputTokensDetails),
 			},
 		})
 		r.emit(anthropic.StreamEvent{Type: anthropic.EventMessageStop})
@@ -723,6 +726,7 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 }
 
 func (c *Client) CreateMessage(ctx context.Context, req anthropic.CreateMessageRequest) (*anthropic.CreateMessageResponse, error) {
+	req.PromptCacheKey = c.scopedPromptCacheKey(req.PromptCacheKey)
 	responseParams, err := toResponseParams(req)
 	if err != nil {
 		return nil, err
@@ -780,6 +784,24 @@ func (c *Client) shouldUseResponsesFirst(model string) bool {
 	return c.apiMode != apiModeChat
 }
 
+// scopedPromptCacheKey binds a run-level cache identity to both the provider
+// endpoint and the authenticated account. This preserves stable affinity for
+// one tenant while preventing caller-controlled keys from colliding across
+// credentials or provider fallbacks. Sessions without a stable credential
+// identity omit explicit cache affinity rather than sharing an unsafe key.
+func (c *Client) scopedPromptCacheKey(logical string) string {
+	logical = strings.TrimSpace(logical)
+	if c == nil || logical == "" || c.authSession == nil {
+		return ""
+	}
+	credentialScope := c.authSession.promptCacheCredentialScope()
+	if credentialScope == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("v1\x00" + c.baseURL + "\x00" + credentialScope + "\x00" + logical))
+	return hex.EncodeToString(sum[:])
+}
+
 func (c *Client) SupportsResponseCompaction() bool {
 	if c == nil || c.apiMode != apiModeResponses {
 		return false
@@ -809,6 +831,7 @@ func (c *Client) CreateMessageStream(ctx context.Context, req anthropic.CreateMe
 			return &StreamReader{events: responseToEvents(resp)}, nil
 		}
 
+		req.PromptCacheKey = c.scopedPromptCacheKey(req.PromptCacheKey)
 		responseParams, err := toResponseParams(req)
 		if err != nil {
 			return nil, err
@@ -866,6 +889,7 @@ func (c *Client) CompactConversation(ctx context.Context, req anthropic.CreateMe
 		return nil, fmt.Errorf("responses compaction unsupported for api_mode=%s base_url=%s", c.apiMode, c.baseURL)
 	}
 	useCodexCompact := c.shouldUseCodexBackendCompact()
+	req.PromptCacheKey = c.scopedPromptCacheKey(req.PromptCacheKey)
 	params, err := toCompactParams(req, useCodexCompact)
 	if err != nil {
 		return nil, err
@@ -1091,6 +1115,10 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 
 	// Auto-truncate input to fit context window instead of returning 400.
 	params.Truncation = responses.ResponseNewParamsTruncation("auto")
+
+	if req.PromptCacheKey != "" {
+		params.PromptCacheKey = sdk.String(req.PromptCacheKey)
+	}
 
 	// Extended prompt cache retention for better cache hit rates.
 	params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention("24h")
@@ -1477,6 +1505,16 @@ func normalizeTextVerbosity(verbosity string) string {
 	}
 }
 
+func responseCacheWriteTokens(details interface{ RawJSON() string }) int64 {
+	var raw struct {
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	}
+	if json.Unmarshal([]byte(details.RawJSON()), &raw) != nil {
+		return 0
+	}
+	return raw.CacheWriteTokens
+}
+
 func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.CreateMessageResponse, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("responses api returned nil response")
@@ -1492,9 +1530,10 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 		Model:   string(resp.Model),
 		EndTurn: responseEndTurn(resp),
 		Usage: anthropic.Usage{
-			InputTokens:          resp.Usage.InputTokens,
-			OutputTokens:         resp.Usage.OutputTokens,
-			CacheReadInputTokens: resp.Usage.InputTokensDetails.CachedTokens,
+			InputTokens:              resp.Usage.InputTokens,
+			OutputTokens:             resp.Usage.OutputTokens,
+			CacheReadInputTokens:     resp.Usage.InputTokensDetails.CachedTokens,
+			CacheCreationInputTokens: responseCacheWriteTokens(resp.Usage.InputTokensDetails),
 		},
 	}
 
@@ -1611,9 +1650,10 @@ func compactedResponseToConversation(resp *responses.CompactedResponse) *Compact
 	}
 	out.ID = resp.ID
 	out.Usage = anthropic.Usage{
-		InputTokens:          resp.Usage.InputTokens,
-		OutputTokens:         resp.Usage.OutputTokens,
-		CacheReadInputTokens: resp.Usage.InputTokensDetails.CachedTokens,
+		InputTokens:              resp.Usage.InputTokens,
+		OutputTokens:             resp.Usage.OutputTokens,
+		CacheReadInputTokens:     resp.Usage.InputTokensDetails.CachedTokens,
+		CacheCreationInputTokens: responseCacheWriteTokens(resp.Usage.InputTokensDetails),
 	}
 	out.Raw = resp
 

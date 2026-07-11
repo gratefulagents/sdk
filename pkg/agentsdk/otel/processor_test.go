@@ -8,33 +8,44 @@ import (
 
 func TestMapSpanData_Generation(t *testing.T) {
 	s := agent.NewSpan("gen", "", agent.GenerationSpanData{
-		RequestedModel:    "openai/gpt-4",
-		ResolvedModel:     "gpt-4",
-		ModelProvider:     "openai",
-		ModelCanonical:    "gpt-4",
-		AttemptNumber:     2,
-		Scope:             "subagent",
-		TaskID:            "task-1",
-		UsageAvailable:    true,
-		PromptTokens:      100,
-		CompletionTokens:  50,
-		CacheReadTokens:   10,
-		CacheCreateTokens: 5,
-		TotalTokens:       150,
-		CostUSD:           0.0123,
-		CostKnown:         true,
-		Success:           true,
-		FallbackScheduled: true,
-		FallbackFromModel: "openai/gpt-4",
-		FallbackToModel:   "anthropic/claude-sonnet-4-6",
-		FallbackReason:    "rate_limit",
+		RequestedModel:               "openai/gpt-4",
+		ResolvedModel:                "gpt-4",
+		ModelProvider:                "openai",
+		ModelCanonical:               "gpt-4",
+		AttemptNumber:                2,
+		Scope:                        "subagent",
+		TaskID:                       "task-1",
+		UsageAvailable:               true,
+		PromptTokens:                 100,
+		CompletionTokens:             50,
+		CacheReadTokens:              10,
+		CacheCreateTokens:            5,
+		InputTokensIncludeCache:      true,
+		InputTokensIncludeCacheKnown: true,
+		TotalTokens:                  150,
+		CostUSD:                      0.0123,
+		CostKnown:                    true,
+		Success:                      true,
+		FallbackScheduled:            true,
+		FallbackFromModel:            "openai/gpt-4",
+		FallbackToModel:              "anthropic/claude-sonnet-4-6",
+		FallbackReason:               "rate_limit",
 	})
 	name, attrs := mapSpanData(s)
 	if name != "llm.generation" {
 		t.Errorf("expected llm.generation, got %s", name)
 	}
-	if len(attrs) != 33 {
-		t.Errorf("expected 33 attrs, got %d", len(attrs))
+	if len(attrs) != 35 {
+		t.Errorf("expected 35 attrs, got %d", len(attrs))
+	}
+	got := map[string]bool{}
+	for _, attr := range attrs {
+		if attr.Key == "gen.input_tokens_include_cache" || attr.Key == "gen.input_tokens_include_cache_known" {
+			got[string(attr.Key)] = attr.Value.AsBool()
+		}
+	}
+	if !got["gen.input_tokens_include_cache"] || !got["gen.input_tokens_include_cache_known"] {
+		t.Fatalf("cache semantics attrs = %v", got)
 	}
 }
 
@@ -110,13 +121,23 @@ func TestMapSpanData_Subagent(t *testing.T) {
 	s := agent.NewSpan("subagent", "", agent.SubagentSpanData{
 		TaskID: "t1", Type: "executor", Description: "Build it",
 		Model: "gpt-4", Status: "completed", CostUSD: 0.02,
+		CacheReadTokens: 1200, CacheCreateTokens: 300,
 	})
 	name, attrs := mapSpanData(s)
 	if name != "subagent.executor" {
 		t.Errorf("expected subagent.executor, got %s", name)
 	}
-	if len(attrs) != 13 {
-		t.Errorf("expected 13 attrs, got %d", len(attrs))
+	if len(attrs) != 15 {
+		t.Errorf("expected 15 attrs, got %d", len(attrs))
+	}
+	got := map[string]int64{}
+	for _, attr := range attrs {
+		if attr.Key == "subagent.cache_read_tokens" || attr.Key == "subagent.cache_creation_tokens" {
+			got[string(attr.Key)] = attr.Value.AsInt64()
+		}
+	}
+	if got["subagent.cache_read_tokens"] != 1200 || got["subagent.cache_creation_tokens"] != 300 {
+		t.Fatalf("subagent cache attrs = %v, want read=1200 create=300", got)
 	}
 }
 

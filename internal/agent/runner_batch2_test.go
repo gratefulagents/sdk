@@ -146,8 +146,8 @@ func TestRunnerCapsModelFacingToolOutput(t *testing.T) {
 	if !strings.Contains(toolOutput, "elided") {
 		t.Fatalf("expected elision marker in capped output: %q", toolOutput[:80])
 	}
-	if !strings.HasSuffix(toolOutput, "TAIL-MARKER") {
-		t.Fatalf("middle truncation should preserve the tail")
+	if !strings.Contains(toolOutput, "TAIL-MARKER") {
+		t.Fatalf("middle truncation should preserve the tail before the spill hint")
 	}
 
 	// Negative value disables the cap.

@@ -81,6 +81,28 @@ func TestAddSpanDataGenerationUsesCurrentFields(t *testing.T) {
 	}
 }
 
+func TestAddSpanDataSubagentIncludesCacheUsage(t *testing.T) {
+	tw := &TraceWriter{}
+	entry := map[string]any{}
+
+	tw.addSpanData(entry, agent.SubagentSpanData{
+		TaskID:            "task-cache",
+		Type:              "explore",
+		Status:            "completed",
+		InputTokens:       100,
+		OutputTokens:      20,
+		CacheReadTokens:   80,
+		CacheCreateTokens: 10,
+	})
+
+	if got := entry["cache_read_tokens"]; got != int64(80) {
+		t.Fatalf("cache_read_tokens = %v, want 80", got)
+	}
+	if got := entry["cache_creation_tokens"]; got != int64(10) {
+		t.Fatalf("cache_creation_tokens = %v, want 10", got)
+	}
+}
+
 func TestAddSpanDataSessionHandlesValueSpanData(t *testing.T) {
 	tw := &TraceWriter{}
 	entry := map[string]any{}

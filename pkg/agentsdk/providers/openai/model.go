@@ -290,7 +290,8 @@ func (m *OpenAIModel) buildRequest(req agentsdk.ModelRequest) internalanthropic.
 	}
 
 	apiReq := internalanthropic.CreateMessageRequest{
-		Model: model,
+		Model:          model,
+		PromptCacheKey: req.PromptCacheKey,
 	}
 	if req.OutputSchema != nil {
 		apiReq.OutputSchema = &internalanthropic.OutputSchema{

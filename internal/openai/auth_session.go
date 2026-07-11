@@ -3,7 +3,9 @@ package openai
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -468,6 +470,32 @@ func (s *OpenAIAuthSession) sdkAPIKey() string {
 		return "oauth-placeholder"
 	}
 	return strings.TrimSpace(s.apiKey)
+}
+
+// promptCacheCredentialScope returns a stable, non-secret credential identity
+// used to isolate provider prompt-cache keys. Empty means the session has no
+// trustworthy stable credential scope and explicit cache affinity must be
+// omitted rather than shared across tenants.
+func (s *OpenAIAuthSession) promptCacheCredentialScope() string {
+	if s == nil {
+		return ""
+	}
+	var material string
+	switch {
+	case s.custom != nil:
+		material = strings.TrimSpace(s.custom.sdkAPIKey)
+	case s.mode == AuthModeOAuth && s.oauth != nil:
+		s.oauth.mu.Lock()
+		material = strings.TrimSpace(s.oauth.accountID)
+		s.oauth.mu.Unlock()
+	case s.mode == AuthModeAPIKey:
+		material = strings.TrimSpace(s.apiKey)
+	}
+	if material == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(string(s.mode) + "\x00" + material))
+	return hex.EncodeToString(sum[:])
 }
 
 func shouldRefreshOAuthAccessToken(accessToken string, lastRefresh time.Time, now time.Time) bool {

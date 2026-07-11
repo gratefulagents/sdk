@@ -201,6 +201,14 @@ type RunConfig struct {
 	ModelSettings    ModelSettings // override agent's model settings
 	ModelOverride    string        // override agent's model name
 	FallbackModels   []string      // ordered cross-provider fallback models for failed model calls
+	// PromptCacheKey is the logical identity grouped into a provider prompt cache.
+	// The runner hashes it with PromptCacheNamespace before sending it to a provider.
+	PromptCacheKey string
+	// PromptCacheNamespace deliberately shares logical prompt cache keys across
+	// separate runs. Empty scopes keys to the shared trace ID; callers should set
+	// the same non-secret value only when cross-run cache reuse is intended.
+	PromptCacheNamespace string
+	toolOutputSpillDir   string
 	// TracingDisabled suppresses the spans the runner itself emits
 	// (generation, function, handoff, trace lifecycle) for this run. It does
 	// NOT affect spans emitted by a ProgressTracker wired via
@@ -343,11 +351,10 @@ const DefaultMaxTurns = 100
 const DefaultSubAgentMaxTurns = 50
 
 // DefaultMaxToolOutputBytes caps model-facing tool output when
-// RunConfig.MaxToolOutputBytes is 0. 64 KB (~16K tokens) bounds the context
-// cost of a single pathological tool call while staying generous enough for
-// file reads and command output (codex-cli truncates exec output at ~10K
-// tokens at history-record time for the same reason).
-const DefaultMaxToolOutputBytes = 64 * 1024
+// RunConfig.MaxToolOutputBytes is 0. 16 KB bounds the context cost of a
+// single pathological tool call while preserving enough head and tail output
+// for the model to diagnose failures.
+const DefaultMaxToolOutputBytes = 16 * 1024
 
 // DefaultConsecutiveToolErrorLimit is the consecutive all-error tool-turn
 // threshold that triggers a corrective escalation note.

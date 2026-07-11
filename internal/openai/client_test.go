@@ -895,11 +895,41 @@ func TestToAnthropicResponse_HandlesBuiltInToolCalls(t *testing.T) {
 	}
 }
 
+func TestScopedPromptCacheKeySeparatesCredentialsAndProviders(t *testing.T) {
+	clientA := NewClient("key-a")
+	clientA2 := NewClient("key-a")
+	clientB := NewClient("key-b")
+	otherProvider := NewClient("key-a", WithBaseURL("https://example.com/v1"))
+
+	got := clientA.scopedPromptCacheKey("run-key")
+	if len(got) != 64 || got != clientA2.scopedPromptCacheKey("run-key") {
+		t.Fatalf("credential-scoped key is not stable: %q", got)
+	}
+	if got == clientB.scopedPromptCacheKey("run-key") {
+		t.Fatal("different credentials produced the same prompt cache key")
+	}
+	if got == otherProvider.scopedPromptCacheKey("run-key") {
+		t.Fatal("different provider endpoints produced the same prompt cache key")
+	}
+	oauthA := NewClientWithAuthSession(&OpenAIAuthSession{mode: AuthModeOAuth, oauth: &oauthSessionState{accountID: "acct-a"}})
+	oauthARefreshed := NewClientWithAuthSession(&OpenAIAuthSession{mode: AuthModeOAuth, oauth: &oauthSessionState{accountID: "acct-a", accessToken: "rotated"}})
+	oauthB := NewClientWithAuthSession(&OpenAIAuthSession{mode: AuthModeOAuth, oauth: &oauthSessionState{accountID: "acct-b"}})
+	if key := oauthA.scopedPromptCacheKey("run-key"); key != oauthARefreshed.scopedPromptCacheKey("run-key") || key == oauthB.scopedPromptCacheKey("run-key") {
+		t.Fatal("OAuth cache scope must be stable across token refresh and isolated by account")
+	}
+
+	customWithoutStableCredential := NewClientWithAuthSession(NewCustomAuthSession(CustomAuthSessionConfig{}))
+	if got := customWithoutStableCredential.scopedPromptCacheKey("run-key"); got != "" {
+		t.Fatalf("unscoped custom auth key = %q, want omitted", got)
+	}
+}
+
 func TestToResponseParams_SetsTruncationAndCacheRetention(t *testing.T) {
 	req := anthropic.CreateMessageRequest{
-		Model:     "gpt-5.4",
-		MaxTokens: 4096,
-		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+		Model:          "gpt-5.4",
+		MaxTokens:      4096,
+		PromptCacheKey: "parent-run-123",
+		Messages:       []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
 	}
 
 	params, err := toResponseParams(req)
@@ -912,6 +942,13 @@ func TestToResponseParams_SetsTruncationAndCacheRetention(t *testing.T) {
 	}
 	if string(params.PromptCacheRetention) != "24h" {
 		t.Fatalf("PromptCacheRetention = %q, want 24h", params.PromptCacheRetention)
+	}
+	wire, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	if !strings.Contains(string(wire), `"prompt_cache_key":"parent-run-123"`) {
+		t.Fatalf("wire body missing prompt_cache_key: %s", wire)
 	}
 	if len(params.Include) != 0 {
 		t.Fatalf("Include len = %d, want 0 (no reasoning)", len(params.Include))

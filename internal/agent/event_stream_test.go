@@ -101,6 +101,28 @@ func TestEventStreamEmit(t *testing.T) {
 	}
 }
 
+func TestEventStreamSubagentCompletionIncludesCacheUsage(t *testing.T) {
+	var buf bytes.Buffer
+	es := NewEventStream(&buf)
+	es.EmitSubagentCompletedWithUsage(
+		"task-cache", "completed", "done", 2, 120, 45, 0.01, true, 3,
+		Usage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 80, CacheCreateTokens: 10},
+		"end_turn", "result",
+	)
+
+	var ev ContentEvent
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.SubagentCacheReadTokens != 80 || ev.SubagentCacheCreateTokens != 10 {
+		t.Fatalf("cache usage = %d/%d, want 80/10", ev.SubagentCacheReadTokens, ev.SubagentCacheCreateTokens)
+	}
+	wire := buf.String()
+	if !strings.Contains(wire, `"subagent_cache_read_tokens":80`) || !strings.Contains(wire, `"subagent_cache_create_tokens":10`) {
+		t.Fatalf("serialized event missing cache usage: %s", wire)
+	}
+}
+
 func TestChildEventStream(t *testing.T) {
 	var buf bytes.Buffer
 	parent := NewEventStream(&buf)

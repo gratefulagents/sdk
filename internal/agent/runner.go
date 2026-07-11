@@ -2,11 +2,16 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -306,6 +311,24 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	runCtx.TracingProcessor = tp
 	runCtx.Trace = trace
 	runCtx.SpanParentID = spanParent
+	logicalCacheKey := strings.TrimSpace(cfg.PromptCacheKey)
+	if logicalCacheKey == "" {
+		logicalCacheKey = TaskIDFromContext(ctx)
+		if logicalCacheKey == "" {
+			logicalCacheKey = "run"
+		}
+	}
+	cacheNamespace := strings.TrimSpace(cfg.PromptCacheNamespace)
+	if cacheNamespace == "" {
+		cacheNamespace = trace.ID
+	}
+	cfg.PromptCacheKey = promptCacheWireKey(cacheNamespace, logicalCacheKey)
+	if !cfg.IsReadOnly() {
+		if spillDir, mkdirErr := os.MkdirTemp("", "gratefulagents-tool-output-"); mkdirErr == nil {
+			cfg.toolOutputSpillDir = spillDir
+			defer os.RemoveAll(spillDir)
+		}
+	}
 	defer func() {
 		if ownTrace {
 			trace.Finish()
@@ -569,12 +592,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// spend an LLM-summary call per turn on negligible growth.
 		if !compactionCfg.Enabled || !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
 			compactRequest := ModelRequest{
-				Model:        modelName,
-				Instructions: instructions,
-				Input:        currentInput,
-				Tools:        tools,
-				Settings:     settings,
-				OutputSchema: currentAgent.OutputType,
+				Model:          modelName,
+				PromptCacheKey: cfg.PromptCacheKey,
+				Instructions:   instructions,
+				Input:          currentInput,
+				Tools:          tools,
+				Settings:       settings,
+				OutputSchema:   currentAgent.OutputType,
 			}
 			compactCtx, compactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
 			compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
@@ -666,6 +690,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		modelRequest := ModelRequest{
 			Model:               modelName,
+			PromptCacheKey:      cfg.PromptCacheKey,
 			Instructions:        instructions,
 			Input:               requestInput,
 			Tools:               tools,
@@ -795,12 +820,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 			if isContextLengthExceededError(err) {
 				forcedRequest := ModelRequest{
-					Model:        modelName,
-					Instructions: instructions,
-					Input:        currentInput,
-					Tools:        tools,
-					Settings:     settings,
-					OutputSchema: currentAgent.OutputType,
+					Model:          modelName,
+					PromptCacheKey: cfg.PromptCacheKey,
+					Instructions:   instructions,
+					Input:          currentInput,
+					Tools:          tools,
+					Settings:       settings,
+					OutputSchema:   currentAgent.OutputType,
 				}
 				forcedCompactCtx, forcedCompactCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
 				compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(forcedCompactCtx, activeModel, forcedRequest, requestOverheadTokens, compactionCfg, true)
@@ -970,6 +996,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		genData.CompletionTokens = int64(resp.Usage.OutputTokens)
 		genData.CacheReadTokens = int64(resp.Usage.CacheReadTokens)
 		genData.CacheCreateTokens = int64(resp.Usage.CacheCreateTokens)
+		genData.InputTokensIncludeCache, genData.InputTokensIncludeCacheKnown = usageInputIncludesCache(activeModel)
 		genData.TotalTokens = resp.Usage.TotalTokens()
 		genData.CostUSD = costUSD
 		genData.CostKnown = costKnown
@@ -993,6 +1020,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		ev.OutputTokens = genData.CompletionTokens
 		ev.CacheReadInputTokens = resp.Usage.CacheReadTokens
 		ev.CacheCreationInputTokens = resp.Usage.CacheCreateTokens
+		ev.InputTokensIncludeCache = genData.InputTokensIncludeCache
+		ev.InputTokensIncludeCacheKnown = genData.InputTokensIncludeCacheKnown
 		ev.TotalTokens = genData.TotalTokens
 		ev.CostUsd = genData.CostUSD
 		ev.CostKnown = genData.CostKnown
@@ -1968,10 +1997,30 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 
 	// Cap the model-facing output. Hooks, traces, and the event stream above
 	// received the raw content; only the conversation item is truncated so one
-	// oversized tool result cannot flood the context window.
+	// oversized tool result cannot flood the context window. Reserve space for
+	// the untrusted-output delimiters that are added when constructing the next
+	// model request, so the final serialized content still respects the cap.
 	content := result.Content
-	if maxBytes := cfg.EffectiveMaxToolOutputBytes(); maxBytes > 0 && len(content) > maxBytes {
-		content = TruncateMiddle(content, maxBytes)
+	if maxBytes := cfg.EffectiveMaxToolOutputBytes(); maxBytes > 0 {
+		contentBudget := maxBytes
+		if cfg.ShouldTagUntrustedToolOutputs() {
+			contentBudget -= len(wrapToolOutputContent(""))
+			if contentBudget < 0 {
+				contentBudget = 0
+			}
+		}
+		if len(content) > contentBudget {
+			if spillPath, ok := spillToolOutput(cfg, result.Content); ok {
+				hint := fmt.Sprintf("\n[full output saved to %s]", spillPath)
+				if len(hint) < contentBudget {
+					content = truncateMiddleBytes(content, contentBudget-len(hint)) + hint
+				} else {
+					content = truncateMiddleBytes(content, contentBudget)
+				}
+			} else {
+				content = truncateMiddleBytes(content, contentBudget)
+			}
+		}
 	}
 
 	res.item = RunItem{
@@ -1983,6 +2032,36 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	}
 	res.shouldPause = result.ShouldPause
 	return res
+}
+
+func promptCacheWireKey(namespace, logical string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + logical))
+	return hex.EncodeToString(sum[:])
+}
+
+func spillToolOutput(cfg RunConfig, output string) (string, bool) {
+	if cfg.IsReadOnly() || cfg.toolOutputSpillDir == "" {
+		return "", false
+	}
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", false
+	}
+	path := filepath.Join(cfg.toolOutputSpillDir, hex.EncodeToString(random[:])+".txt")
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", false
+	}
+	if _, err = file.WriteString(output); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", false
+	}
+	if err = file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", false
+	}
+	return path, true
 }
 
 func isToolGuardrailTripwire(err error) bool {

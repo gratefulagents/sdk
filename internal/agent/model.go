@@ -45,6 +45,14 @@ type UsageCacheSemantics interface {
 // fields on top of OpenAI-style input_tokens double-counts the cached prompt
 // (nearly the whole context on warm requests) — that inflated the estimator
 // calibration and made compaction fire at ~half the real window.
+func usageInputIncludesCache(model Model) (bool, bool) {
+	semantics, known := model.(UsageCacheSemantics)
+	if !known {
+		return false, false
+	}
+	return semantics.UsageInputIncludesCacheTokens(), true
+}
+
 func usageContextTokens(model Model, usage Usage) int64 {
 	if semantics, ok := model.(UsageCacheSemantics); ok && semantics.UsageInputIncludesCacheTokens() {
 		return usage.InputTokens
@@ -55,6 +63,7 @@ func usageContextTokens(model Model, usage Usage) int64 {
 // ModelRequest contains everything needed for a model call.
 type ModelRequest struct {
 	Model               string
+	PromptCacheKey      string
 	Instructions        string
 	Input               []RunItem
 	Tools               []Tool

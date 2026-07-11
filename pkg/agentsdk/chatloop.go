@@ -156,6 +156,9 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if runCfg.Trace == nil && strings.TrimSpace(runCfg.PromptCacheNamespace) == "" {
+		runCfg.PromptCacheNamespace = NewTrace(agent.Name).ID
+	}
 
 	history := append([]RunItem(nil), inputItems...)
 	var allNewItems []RunItem
