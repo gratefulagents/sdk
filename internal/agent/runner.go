@@ -1062,12 +1062,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		switch s := step.(type) {
 		case *finalOutputStep:
 			// OpenAI's Codex backend can request another sampling step while emitting
-			// commentary text with no tool call. Prefer its explicit end_turn signal;
-			// when that extension is omitted, use the retained Responses message phase
-			// as the fallback. Providers that expose neither signal keep the legacy
-			// text-only-is-final behavior.
+			// commentary text with no tool call. Treat either protocol signal as a
+			// continuation request: the backend has been observed returning end_turn=true
+			// alongside a commentary message that explicitly says work is continuing.
+			// Providers that expose neither signal keep the legacy text-only-is-final
+			// behavior.
 			continueSampling := resp.EndTurn != nil && !*resp.EndTurn
-			if resp.EndTurn == nil && lastMessagePhase(newItems) == "commentary" {
+			if lastMessagePhase(newItems) == "commentary" {
 				continueSampling = true
 			}
 			if continueSampling {
