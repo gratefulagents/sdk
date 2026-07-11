@@ -829,6 +829,24 @@ func TestToResponseInputItemsIncludesEncryptedReasoning(t *testing.T) {
 	if got == nil || *got != "encrypted_reasoning" {
 		t.Fatalf("encrypted reasoning = %v", got)
 	}
+	// The Codex /responses backend rejects reasoning input items without a
+	// "summary" key ("Missing required parameter: 'input[N].summary'"), so it
+	// must serialize as an empty array rather than being omitted.
+	raw, err := json.Marshal(items[0])
+	if err != nil {
+		t.Fatalf("marshal reasoning input item: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal reasoning input item: %v", err)
+	}
+	summary, ok := obj["summary"]
+	if !ok {
+		t.Fatalf("reasoning input item JSON omits summary: %s", raw)
+	}
+	if string(summary) != "[]" {
+		t.Fatalf("summary = %s, want []", summary)
+	}
 }
 
 func TestToAnthropicResponse_HandlesBuiltInToolCalls(t *testing.T) {
