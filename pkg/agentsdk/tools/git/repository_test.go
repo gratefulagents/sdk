@@ -44,7 +44,7 @@ func TestAttachRepositoryClonesIntoWorkspaceRepoList(t *testing.T) {
 		t.Fatalf("workspace root unexpectedly became a git repo")
 	}
 
-	wantClonePrefix := "-c protocol.allow=never -c protocol.https.allow=always clone --branch main -- https://github.com/acme/helm-charts.git"
+	wantClonePrefix := "-c protocol.allow=never -c protocol.https.allow=always clone --depth 1 --single-branch --no-tags --branch main -- https://github.com/acme/helm-charts.git"
 	if !strings.HasPrefix(runner.gitCalls[0], wantClonePrefix) || runner.gitCalls[1] != "checkout -B agent-run-123" {
 		t.Fatalf("git calls = %#v, want clone prefix %q then checkout", runner.gitCalls, wantClonePrefix)
 	}
