@@ -829,9 +829,10 @@ func TestToResponseInputItemsIncludesEncryptedReasoning(t *testing.T) {
 	if got == nil || *got != "encrypted_reasoning" {
 		t.Fatalf("encrypted reasoning = %v", got)
 	}
-	// The Codex /responses backend rejects reasoning input items without a
-	// "summary" key ("Missing required parameter: 'input[N].summary'"), so it
-	// must serialize as an empty array rather than being omitted.
+	// The Codex /responses backend validates the exact wire shape of replayed
+	// reasoning items: "summary" is required ("Missing required parameter:
+	// 'input[N].summary'") and unrecognized fields like "status" are rejected
+	// ("Unknown parameter: 'input[N].status'"). Assert the exact key set.
 	raw, err := json.Marshal(items[0])
 	if err != nil {
 		t.Fatalf("marshal reasoning input item: %v", err)
@@ -840,12 +841,23 @@ func TestToResponseInputItemsIncludesEncryptedReasoning(t *testing.T) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		t.Fatalf("unmarshal reasoning input item: %v", err)
 	}
-	summary, ok := obj["summary"]
-	if !ok {
-		t.Fatalf("reasoning input item JSON omits summary: %s", raw)
+	want := map[string]string{
+		"type":              `"reasoning"`,
+		"id":                `"rs_1"`,
+		"summary":           `[]`,
+		"encrypted_content": `"encrypted_reasoning"`,
 	}
-	if string(summary) != "[]" {
-		t.Fatalf("summary = %s, want []", summary)
+	if len(obj) != len(want) {
+		t.Fatalf("reasoning input item JSON has unexpected keys: %s", raw)
+	}
+	for key, wantVal := range want {
+		gotVal, ok := obj[key]
+		if !ok {
+			t.Fatalf("reasoning input item JSON omits %q: %s", key, raw)
+		}
+		if string(gotVal) != wantVal {
+			t.Fatalf("%s = %s, want %s", key, gotVal, wantVal)
+		}
 	}
 }
 
