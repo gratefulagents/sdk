@@ -201,7 +201,11 @@ func (t *AttachRepositoryTool) runner() CommandRunner {
 }
 
 func cloneRepository(ctx context.Context, runner CommandRunner, workDir, repoURL, dest, baseBranch string) (string, error) {
-	args := []string{"-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "clone"}
+	args := []string{
+		"-c", "protocol.allow=never",
+		"-c", "protocol.https.allow=always",
+		"clone", "--depth", "1", "--single-branch", "--no-tags",
+	}
 	if strings.TrimSpace(baseBranch) != "" {
 		args = append(args, "--branch", strings.TrimSpace(baseBranch))
 	}
