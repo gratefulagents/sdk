@@ -8,14 +8,16 @@ import (
 
 // ModelPricing holds per-million-token prices in USD.
 type ModelPricing struct {
-	InputPerMillion       float64
-	CachedInputPerMillion float64
-	OutputPerMillion      float64
+	InputPerMillion           float64
+	CachedInputPerMillion     float64
+	CacheWriteInputPerMillion float64
+	OutputPerMillion          float64
 }
 
 // modelPricing holds OpenAI standard-tier list prices in USD per 1M tokens,
 // verified against https://developers.openai.com/api/docs/pricing (2026-07).
-// CachedInputPerMillion is the prompt-cache read rate; OutputPerMillion already
+// CachedInputPerMillion is the prompt-cache read rate. CacheWriteInputPerMillion
+// is the GPT-5.6+ cache-write rate (1.25x regular input). OutputPerMillion already
 // covers reasoning tokens (OpenAI includes them in output_tokens). Batch, Flex,
 // and Priority tiers are not modeled. Keep in sync when OpenAI updates pricing.
 var modelPricing = map[string]ModelPricing{
@@ -99,19 +101,22 @@ var modelPricing = map[string]ModelPricing{
 		OutputPerMillion:      1.25,
 	},
 	"gpt-5.6-sol": {
-		InputPerMillion:       5.0,
-		CachedInputPerMillion: 0.50,
-		OutputPerMillion:      30.0,
+		InputPerMillion:           5.0,
+		CachedInputPerMillion:     0.50,
+		CacheWriteInputPerMillion: 6.25,
+		OutputPerMillion:          30.0,
 	},
 	"gpt-5.6-terra": {
-		InputPerMillion:       2.5,
-		CachedInputPerMillion: 0.25,
-		OutputPerMillion:      15.0,
+		InputPerMillion:           2.5,
+		CachedInputPerMillion:     0.25,
+		CacheWriteInputPerMillion: 3.125,
+		OutputPerMillion:          15.0,
 	},
 	"gpt-5.6-luna": {
-		InputPerMillion:       1.0,
-		CachedInputPerMillion: 0.10,
-		OutputPerMillion:      6.0,
+		InputPerMillion:           1.0,
+		CachedInputPerMillion:     0.10,
+		CacheWriteInputPerMillion: 1.25,
+		OutputPerMillion:          6.0,
 	},
 	"gpt-5.5": {
 		InputPerMillion:       5.0,
@@ -162,22 +167,29 @@ func EstimateCost(model string, usage anthropic.Usage) (float64, bool) {
 		return 0, false
 	}
 
-	inputTokens := usage.InputTokens
-	cacheReadTokens := usage.CacheReadInputTokens
-	if cacheReadTokens < 0 {
-		cacheReadTokens = 0
-	}
+	inputTokens := max(usage.InputTokens, 0)
+	cacheReadTokens := max(usage.CacheReadInputTokens, 0)
 	if cacheReadTokens > inputTokens {
 		cacheReadTokens = inputTokens
+	}
+	cacheWriteTokens := max(usage.CacheCreationInputTokens, 0)
+	if cacheWriteTokens > inputTokens-cacheReadTokens {
+		cacheWriteTokens = inputTokens - cacheReadTokens
 	}
 	uncachedInputTokens := inputTokens
 	if pricing.CachedInputPerMillion > 0 {
 		uncachedInputTokens -= cacheReadTokens
 	}
+	if pricing.CacheWriteInputPerMillion > 0 {
+		uncachedInputTokens -= cacheWriteTokens
+	}
 
 	cost := float64(uncachedInputTokens) * pricing.InputPerMillion / 1_000_000
 	if pricing.CachedInputPerMillion > 0 {
 		cost += float64(cacheReadTokens) * pricing.CachedInputPerMillion / 1_000_000
+	}
+	if pricing.CacheWriteInputPerMillion > 0 {
+		cost += float64(cacheWriteTokens) * pricing.CacheWriteInputPerMillion / 1_000_000
 	}
 	cost += float64(usage.OutputTokens) * pricing.OutputPerMillion / 1_000_000
 	return cost, true

@@ -323,10 +323,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		cacheNamespace = trace.ID
 	}
 	cfg.PromptCacheKey = promptCacheWireKey(cacheNamespace, logicalCacheKey)
-	if !cfg.IsReadOnly() {
-		if spillDir, mkdirErr := os.MkdirTemp("", "gratefulagents-tool-output-"); mkdirErr == nil {
-			cfg.toolOutputSpillDir = spillDir
-			defer os.RemoveAll(spillDir)
+	if !cfg.IsReadOnly() && strings.TrimSpace(cfg.WorkDir) != "" {
+		if workDir, absErr := filepath.Abs(cfg.WorkDir); absErr == nil {
+			if resolvedWorkDir, resolveErr := filepath.EvalSymlinks(workDir); resolveErr == nil {
+				if spillDir, mkdirErr := os.MkdirTemp(resolvedWorkDir, ".gratefulagents-tool-output-"); mkdirErr == nil {
+					cfg.toolOutputSpillDir = spillDir
+					defer os.RemoveAll(spillDir)
+				}
+			}
 		}
 	}
 	defer func() {

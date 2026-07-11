@@ -54,7 +54,8 @@ func TestRunnerToolOutputSpillIsModelFacingAndCleanedOnReturn(t *testing.T) {
 			return strings.Repeat("界", 1000), nil
 		},
 	}}}
-	_, err := NewRunnerWithModel(model).Run(context.Background(), agent, nil, RunConfig{MaxToolOutputBytes: 300})
+	workDir := t.TempDir()
+	_, err := NewRunnerWithModel(model).Run(context.Background(), agent, nil, RunConfig{MaxToolOutputBytes: 300, WorkDir: workDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +77,9 @@ func TestRunnerToolOutputSpillIsModelFacingAndCleanedOnReturn(t *testing.T) {
 	path := modelOutput[start+len(prefix) : end]
 	if !filepath.IsAbs(path) {
 		t.Fatalf("spill hint path = %q, want absolute", path)
+	}
+	if rel, err := filepath.Rel(workDir, path); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("spill hint path = %q, want inside workspace %q", path, workDir)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("spill path remains after Run: %v", err)

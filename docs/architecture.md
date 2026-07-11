@@ -83,8 +83,9 @@ of a run, or accept the cache cost of changing it.
 Model-facing tool results default to a 16 KiB cap and are middle-truncated on
 UTF-8 byte boundaries. For writable runs, the uncapped result is best-effort
 spilled to an exclusive mode-0600 file in an SDK-created mode-0700 temporary
-directory; the preview names its absolute path. The directory is removed when
-`Runner.Run` returns. Hooks and traces continue to receive the raw result.
+directory under the writable workspace, so sandboxed tools can read it; the
+preview names its absolute path. The directory is removed when `Runner.Run`
+returns. Hooks and traces continue to receive the raw result.
 Read-only runs never spill tool output.
 
 ## Sub-Agents

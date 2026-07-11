@@ -191,6 +191,17 @@ func TestEstimateCost(t *testing.T) {
 			wantKnown: true,
 		},
 		{
+			name:  "gpt-5.6-luna applies cache-write premium",
+			model: "gpt-5.6-luna",
+			usage: anthropic.Usage{
+				InputTokens:              1_000_000,
+				CacheReadInputTokens:     200_000,
+				CacheCreationInputTokens: 300_000,
+			},
+			wantCost:  0.895,
+			wantKnown: true,
+		},
+		{
 			name:  "gpt-5.3-codex applies cached discount",
 			model: "gpt-5.3-codex",
 			usage: anthropic.Usage{
