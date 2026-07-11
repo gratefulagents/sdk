@@ -389,6 +389,8 @@ func addGenerationSpanData(entry map[string]any, d agent.GenerationSpanData) {
 	entry["completion_tokens"] = d.CompletionTokens
 	entry["cache_read_tokens"] = d.CacheReadTokens
 	entry["cache_creation_tokens"] = d.CacheCreateTokens
+	entry["input_tokens_include_cache"] = d.InputTokensIncludeCache
+	entry["input_tokens_include_cache_known"] = d.InputTokensIncludeCacheKnown
 	entry["total_tokens"] = d.TotalTokens
 	entry["cost_usd"] = d.CostUSD
 	entry["cost_known"] = d.CostKnown
@@ -469,6 +471,8 @@ func addSubagentSpanData(entry map[string]any, d agent.SubagentSpanData) {
 	entry["total_tokens"] = d.TotalTokens
 	entry["input_tokens"] = d.InputTokens
 	entry["output_tokens"] = d.OutputTokens
+	entry["cache_read_tokens"] = d.CacheReadTokens
+	entry["cache_creation_tokens"] = d.CacheCreateTokens
 	entry["tool_count"] = d.ToolCount
 	entry["duration_ms"] = d.DurationMS
 	entry["stop_reason"] = d.StopReason

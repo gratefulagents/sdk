@@ -36,8 +36,9 @@ type CreateMessageRequest struct {
 	// the chat body's "reasoning" field; ignored on the native Anthropic path.
 	ReasoningEffort string `json:"-"`
 
-	// OpenAI Responses shim only: token threshold for server-side compaction.
-	CompactionThreshold int `json:"-"`
+	// OpenAI Responses shim only.
+	PromptCacheKey      string `json:"-"`
+	CompactionThreshold int    `json:"-"`
 }
 
 // Metadata for the API request.

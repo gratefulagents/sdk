@@ -102,6 +102,12 @@ func TestChatLoopResolvesToolApprovalAndResumes(t *testing.T) {
 	if len(model.requests) != 2 {
 		t.Fatalf("model requests = %d, want 2", len(model.requests))
 	}
+	if model.requests[0].PromptCacheKey == "" || model.requests[0].PromptCacheKey != model.requests[1].PromptCacheKey {
+		t.Fatalf("approval resume cache keys = %q, %q; want one stable identity", model.requests[0].PromptCacheKey, model.requests[1].PromptCacheKey)
+	}
+	if len(model.requests[0].PromptCacheKey) != 64 {
+		t.Fatalf("prompt cache wire key length = %d, want 64", len(model.requests[0].PromptCacheKey))
+	}
 }
 
 func TestChatLoopApprovedToolUsesRunnerGuardrails(t *testing.T) {

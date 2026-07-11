@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // subAgentRunSpec describes one nested sub-agent execution for runSubAgentOnce.
@@ -84,6 +86,9 @@ func (s subAgentRunSpec) activityFiles() (filesRead, filesWritten []string) {
 // classifies the outcome, and emits completion events. Registry bookkeeping
 // (task status, semaphores, dependency waits) stays with the caller.
 func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome {
+	if spec.TaskID == "" {
+		spec.TaskID = "task_" + uuid.NewString()
+	}
 	description := Truncate(spec.Message, 160)
 
 	var childTracker *ProgressTracker
@@ -119,6 +124,7 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(spec.RunConfig.MaxTurns)
 
 	cfg := spec.RunConfig
+	cfg.PromptCacheKey = spec.TaskID
 	cfg.Hooks = hooks
 	cfg.ForceFinalSummaryTurn = true
 
@@ -184,7 +190,7 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 			spec.Tracker.RecordSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, outcome.CostUSD, 0, outcome.Usage, "", filesRead, filesWritten)
 		}
 		if spec.EventStream != nil {
-			spec.EventStream.EmitSubagentCompleted(spec.TaskID, outcome.Status, outcome.ErrMsg, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, 0, outcome.Status, "")
+			spec.EventStream.EmitSubagentCompletedWithUsage(spec.TaskID, outcome.Status, outcome.ErrMsg, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, 0, outcome.Usage, outcome.Status, "")
 		}
 		return outcome
 	}
@@ -230,7 +236,7 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 		)
 	}
 	if spec.EventStream != nil {
-		spec.EventStream.EmitSubagentCompleted(spec.TaskID, outcome.Status, outcome.FinalText, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, int32(outcome.NumTurns), "", outcome.FinalText)
+		spec.EventStream.EmitSubagentCompletedWithUsage(spec.TaskID, outcome.Status, outcome.FinalText, outcome.ToolCount, outcome.Tokens, outcome.Duration.Milliseconds(), outcome.CostUSD, outcome.CostKnown, int32(outcome.NumTurns), outcome.Usage, "", outcome.FinalText)
 	}
 	return outcome
 }

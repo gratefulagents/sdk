@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ModelUsageEntry holds per-model token usage.
@@ -522,6 +523,33 @@ func Truncate(s string, n int) string {
 		return s
 	}
 	return string(runes[:n-3]) + "..."
+}
+
+func truncateMiddleBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	const marker = "\n…[elided]…\n"
+	if n <= len(marker) {
+		end := n
+		for end > 0 && !utf8.ValidString(s[:end]) {
+			end--
+		}
+		return s[:end]
+	}
+	keep := n - len(marker)
+	headEnd := keep * 2 / 3
+	for headEnd > 0 && !utf8.ValidString(s[:headEnd]) {
+		headEnd--
+	}
+	tailStart := len(s) - (keep - headEnd)
+	for tailStart < len(s) && !utf8.ValidString(s[tailStart:]) {
+		tailStart++
+	}
+	return s[:headEnd] + marker + s[tailStart:]
 }
 
 // TruncateMiddle truncates s to at most n runes by keeping the head and tail

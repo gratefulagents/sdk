@@ -67,9 +67,26 @@ The runner keeps each model request prompt-cache friendly:
 - **Transient tail content.** Per-turn dynamic context (e.g. `PlanRecitation`)
   is appended as the final input item of a single request and regenerated each
   turn rather than persisted, so it never perturbs earlier cached spans.
+- **Responses cache identity.** The runner sends a fixed 64-character SHA-256
+  `prompt_cache_key` derived from a namespace and logical key. The logical key is
+  explicit `RunConfig.PromptCacheKey`, otherwise the child task ID, otherwise
+  `run`. The namespace defaults to the shared trace ID; setting
+  `RunConfig.PromptCacheNamespace` deliberately enables reuse across separate
+  runs. ChatLoop creates one namespace before its approval-resume loop. The
+  OpenAI transport hashes this identity again with the normalized provider
+  endpoint and a non-secret credential/account scope; sessions without a stable
+  credential scope omit explicit affinity rather than risk cross-tenant reuse.
 
 Hosts using `Agent.InstructionsFn` should return a stable string for the duration
 of a run, or accept the cache cost of changing it.
+
+Model-facing tool results default to a 16 KiB cap and are middle-truncated on
+UTF-8 byte boundaries. For writable runs, the uncapped result is best-effort
+spilled to an exclusive mode-0600 file in an SDK-created mode-0700 temporary
+directory under the writable workspace, so sandboxed tools can read it; the
+preview names its absolute path. The directory is removed when `Runner.Run`
+returns. Hooks and traces continue to receive the raw result.
+Read-only runs never spill tool output.
 
 ## Sub-Agents
 

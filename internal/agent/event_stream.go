@@ -78,13 +78,15 @@ type ContentEvent struct {
 	SubagentResultText string `json:"subagent_result_text,omitempty"`
 
 	// Subagent completion metrics
-	SubagentToolCount  int32   `json:"subagent_tool_count,omitempty"`
-	SubagentTokens     int64   `json:"subagent_tokens,omitempty"`
-	SubagentDurationMs int64   `json:"subagent_duration_ms,omitempty"`
-	SubagentCostUsd    float64 `json:"subagent_cost_usd,omitempty"`
-	SubagentCostKnown  bool    `json:"subagent_cost_known,omitempty"`
-	SubagentNumTurns   int32   `json:"subagent_num_turns,omitempty"`
-	SubagentStopReason string  `json:"subagent_stop_reason,omitempty"`
+	SubagentToolCount         int32   `json:"subagent_tool_count,omitempty"`
+	SubagentTokens            int64   `json:"subagent_tokens,omitempty"`
+	SubagentDurationMs        int64   `json:"subagent_duration_ms,omitempty"`
+	SubagentCostUsd           float64 `json:"subagent_cost_usd,omitempty"`
+	SubagentCostKnown         bool    `json:"subagent_cost_known,omitempty"`
+	SubagentNumTurns          int32   `json:"subagent_num_turns,omitempty"`
+	SubagentCacheReadTokens   int64   `json:"subagent_cache_read_tokens,omitempty"`
+	SubagentCacheCreateTokens int64   `json:"subagent_cache_create_tokens,omitempty"`
+	SubagentStopReason        string  `json:"subagent_stop_reason,omitempty"`
 
 	// Subagent progress snapshot fields.
 	SubagentDependsOn         []string `json:"subagent_depends_on,omitempty"`
@@ -107,15 +109,17 @@ type ContentEvent struct {
 	McpServers     []string `json:"mcp_servers,omitempty"`
 
 	// Session end metrics (populated on session_end events)
-	CostUsd                  float64 `json:"cost_usd,omitempty"`
-	CostKnown                bool    `json:"cost_known,omitempty"`
-	InputTokens              int64   `json:"input_tokens,omitempty"`
-	OutputTokens             int64   `json:"output_tokens,omitempty"`
-	CacheReadInputTokens     int64   `json:"cache_read_input_tokens,omitempty"`
-	CacheCreationInputTokens int64   `json:"cache_creation_input_tokens,omitempty"`
-	NumTurns                 int32   `json:"num_turns,omitempty"`
-	DurationMs               int64   `json:"duration_ms,omitempty"`
-	StopReason               string  `json:"stop_reason,omitempty"`
+	CostUsd                      float64 `json:"cost_usd,omitempty"`
+	CostKnown                    bool    `json:"cost_known,omitempty"`
+	InputTokens                  int64   `json:"input_tokens,omitempty"`
+	OutputTokens                 int64   `json:"output_tokens,omitempty"`
+	CacheReadInputTokens         int64   `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens     int64   `json:"cache_creation_input_tokens,omitempty"`
+	InputTokensIncludeCache      bool    `json:"input_tokens_include_cache"`
+	InputTokensIncludeCacheKnown bool    `json:"input_tokens_include_cache_known"`
+	NumTurns                     int32   `json:"num_turns,omitempty"`
+	DurationMs                   int64   `json:"duration_ms,omitempty"`
+	StopReason                   string  `json:"stop_reason,omitempty"`
 
 	// Context compaction metadata.
 	TokensBefore int32 `json:"tokens_before,omitempty"`
@@ -420,19 +424,26 @@ func (es *EventStream) EmitSubagentStarted(taskID, toolUseID, description, subag
 
 // EmitSubagentCompleted emits a subagent lifecycle completion event with metrics.
 func (es *EventStream) EmitSubagentCompleted(taskID, status, description string, toolCount int32, tokens int64, durationMs int64, costUsd float64, costKnown bool, numTurns int32, stopReason, resultText string) {
+	es.EmitSubagentCompletedWithUsage(taskID, status, description, toolCount, tokens, durationMs, costUsd, costKnown, numTurns, Usage{}, stopReason, resultText)
+}
+
+// EmitSubagentCompletedWithUsage includes provider cache token metrics.
+func (es *EventStream) EmitSubagentCompletedWithUsage(taskID, status, description string, toolCount int32, tokens int64, durationMs int64, costUsd float64, costKnown bool, numTurns int32, usage Usage, stopReason, resultText string) {
 	es.Emit(ContentEvent{
-		Type:               "subagent_status",
-		TaskID:             taskID,
-		Status:             status,
-		Message:            description,
-		SubagentToolCount:  toolCount,
-		SubagentTokens:     tokens,
-		SubagentDurationMs: durationMs,
-		SubagentCostUsd:    costUsd,
-		SubagentCostKnown:  costKnown,
-		SubagentNumTurns:   numTurns,
-		SubagentStopReason: stopReason,
-		SubagentResultText: Truncate(resultText, 4096),
+		Type:                      "subagent_status",
+		TaskID:                    taskID,
+		Status:                    status,
+		Message:                   description,
+		SubagentToolCount:         toolCount,
+		SubagentTokens:            tokens,
+		SubagentDurationMs:        durationMs,
+		SubagentCostUsd:           costUsd,
+		SubagentCostKnown:         costKnown,
+		SubagentNumTurns:          numTurns,
+		SubagentCacheReadTokens:   usage.CacheReadTokens,
+		SubagentCacheCreateTokens: usage.CacheCreateTokens,
+		SubagentStopReason:        stopReason,
+		SubagentResultText:        Truncate(resultText, 4096),
 	})
 }
 
