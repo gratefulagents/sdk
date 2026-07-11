@@ -13,11 +13,12 @@ import (
 
 func TestRunnerExplicitEndTurnFalseContinuesSampling(t *testing.T) {
 	keepGoing := false
-	testRunnerContinuesAfterMessage(t, &keepGoing, "")
+	testRunnerContinuesAfterMessage(t, &keepGoing, "commentary")
 }
 
-func TestRunnerCommentaryPhaseContinuesWhenEndTurnOmitted(t *testing.T) {
-	testRunnerContinuesAfterMessage(t, nil, "commentary")
+func TestRunnerExplicitEndTurnFalseContinuesFinalAnswerPhase(t *testing.T) {
+	keepGoing := false
+	testRunnerContinuesAfterMessage(t, &keepGoing, "final_answer")
 }
 
 func testRunnerContinuesAfterMessage(t *testing.T, endTurn *bool, phase string) {
@@ -57,9 +58,35 @@ func testRunnerContinuesAfterMessage(t *testing.T, endTurn *bool, phase string) 
 	}
 }
 
-func TestRunnerCommentaryPhaseOverridesExplicitEndTurnTrue(t *testing.T) {
+func TestRunnerCommentaryPhaseStopsWhenEndTurnOmitted(t *testing.T) {
+	testRunnerStopsAfterCommentary(t, nil)
+}
+
+func TestRunnerCommentaryPhaseStopsWhenEndTurnTrue(t *testing.T) {
 	endTurn := true
-	testRunnerContinuesAfterMessage(t, &endTurn, "commentary")
+	testRunnerStopsAfterCommentary(t, &endTurn)
+}
+
+func testRunnerStopsAfterCommentary(t *testing.T, endTurn *bool) {
+	t.Helper()
+	model := &mockModel{responses: []*ModelResponse{{
+		Items: []RunItem{{
+			Type:    RunItemMessage,
+			Message: &MessageOutput{Text: "Status update.", Phase: "commentary"},
+		}},
+		EndTurn: endTurn,
+	}}}
+
+	result, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{MaxTurns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.FinalText(); got != "Status update." {
+		t.Fatalf("FinalText() = %q, want commentary text", got)
+	}
+	if model.callIdx != 1 {
+		t.Fatalf("model calls = %d, want 1", model.callIdx)
+	}
 }
 
 func TestRunnerExplicitEndTurnTrueFinalAnswerStops(t *testing.T) {
@@ -81,6 +108,48 @@ func TestRunnerExplicitEndTurnTrueFinalAnswerStops(t *testing.T) {
 	}
 	if model.callIdx != 1 {
 		t.Fatalf("model calls = %d, want 1 for final-answer response", model.callIdx)
+	}
+}
+
+func TestRunnerToolCallContinuesWhenEndTurnTrue(t *testing.T) {
+	endTurn := true
+	tool := &FunctionTool{
+		ToolName:        "check",
+		ToolDescription: "check",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			return "checked", nil
+		},
+	}
+	model := &mockModel{responses: []*ModelResponse{
+		{
+			Items: []RunItem{
+				{
+					Type:    RunItemMessage,
+					Message: &MessageOutput{Text: "Checking now.", Phase: "commentary"},
+				},
+				{
+					Type:     RunItemToolCall,
+					ToolCall: &ToolCallData{ID: "call-1", Name: "check", Input: json.RawMessage(`{}`)},
+				},
+			},
+			EndTurn: &endTurn,
+		},
+		{Items: []RunItem{{
+			Type:    RunItemMessage,
+			Message: &MessageOutput{Text: "Tool follow-up complete.", Phase: "final_answer"},
+		}}},
+	}}
+
+	result, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test", Tools: []Tool{tool}}, nil, RunConfig{MaxTurns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.FinalText(); got != "Tool follow-up complete." {
+		t.Fatalf("FinalText() = %q, want tool follow-up response", got)
+	}
+	if model.callIdx != 2 {
+		t.Fatalf("model calls = %d, want 2 after tool call", model.callIdx)
 	}
 }
 

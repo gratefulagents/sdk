@@ -1061,17 +1061,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
-			// OpenAI's Codex backend can request another sampling step while emitting
-			// commentary text with no tool call. Treat either protocol signal as a
-			// continuation request: the backend has been observed returning end_turn=true
-			// alongside a commentary message that explicitly says work is continuing.
-			// Providers that expose neither signal keep the legacy text-only-is-final
-			// behavior.
-			continueSampling := resp.EndTurn != nil && !*resp.EndTurn
-			if lastMessagePhase(newItems) == "commentary" {
-				continueSampling = true
-			}
-			if continueSampling {
+			// Match Codex CLI's Responses loop: a completed text-only response requests
+			// another sample only when the backend explicitly sends end_turn=false.
+			// Message phase is descriptive and does not independently control the loop.
+			// Tool calls are classified separately below and always receive a follow-up,
+			// so end_turn=true cannot cancel tool-driven continuation.
+			if resp.EndTurn != nil && !*resp.EndTurn {
 				pendingCompletion = false
 				stopGateBlocks = 0
 				currentInput = append(currentInput, newItems...)
@@ -1648,18 +1643,6 @@ func finalOutputText(output any) string {
 		}
 		return string(b)
 	}
-}
-
-// lastMessagePhase returns the normalized phase of the last non-empty message.
-// Providers that do not expose message phases leave it empty.
-func lastMessagePhase(items []RunItem) string {
-	for i := len(items) - 1; i >= 0; i-- {
-		item := items[i]
-		if item.Type == RunItemMessage && item.Message != nil && strings.TrimSpace(item.Message.Text) != "" {
-			return strings.ToLower(strings.TrimSpace(item.Message.Phase))
-		}
-	}
-	return ""
 }
 
 // classifyResponse determines what the model wants to do: final output, handoff, or tool calls.
