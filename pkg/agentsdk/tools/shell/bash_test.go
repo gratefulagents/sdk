@@ -192,6 +192,25 @@ func TestCommandBlockedKeepsDynamicSyntaxStrictWithoutEnforcement(t *testing.T) 
 	}
 }
 
+func TestCommandBlockedRejectsDynamicPushRefsWithEnforcement(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []string{
+		"git push origin $(printf main)",
+		"BR=main; git push origin $BR",
+		"BR=main git push origin $BR",
+	} {
+		blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, command, true)
+		if !blocked || !strings.Contains(reason, "dynamic git push arguments") {
+			t.Fatalf("enforced workspace-write command %q = blocked %v, reason %q; want dynamic push refusal", command, blocked, reason)
+		}
+	}
+
+	if blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "git push origin feature", true); blocked {
+		t.Fatalf("static feature push blocked: %s", reason)
+	}
+}
+
 func TestBashNetworkPolicyMatchesPermissionMode(t *testing.T) {
 	t.Parallel()
 

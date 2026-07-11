@@ -358,13 +358,23 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 
 func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnforced bool) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
+	dynamicReason := restrictedShellSyntaxReason(command)
 
 	// Dynamic shell syntax is safe for workspace-local effects when an OS
 	// sandbox enforces the filesystem boundary. Keep it fail-closed in read-only
 	// mode and on advisory/non-enforcing workspace-write hosts.
-	if readOnly || workspaceWrite && !fsEnforced {
-		if reason := restrictedShellSyntaxReason(command); reason != "" {
-			return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, reason)
+	if dynamicReason != "" && (readOnly || workspaceWrite && !fsEnforced) {
+		return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, dynamicReason)
+	}
+
+	// Even with filesystem confinement, network side effects cannot be contained.
+	// The protected-branch check below can only validate literal ref arguments,
+	// so reject git pushes whose refs may be produced dynamically at runtime.
+	if dynamicReason != "" && workspaceWrite {
+		for _, argv := range gitInvocations(command) {
+			if gitSubcommand(argv) == "push" {
+				return true, fmt.Sprintf("Command blocked in %s mode: dynamic git push arguments cannot be authorized statically", mode)
+			}
 		}
 	}
 
