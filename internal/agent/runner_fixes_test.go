@@ -13,20 +13,20 @@ import (
 
 func TestRunnerExplicitEndTurnFalseContinuesSampling(t *testing.T) {
 	keepGoing := false
-	testRunnerContinuesAfterCommentary(t, &keepGoing)
+	testRunnerContinuesAfterMessage(t, &keepGoing, "")
 }
 
 func TestRunnerCommentaryPhaseContinuesWhenEndTurnOmitted(t *testing.T) {
-	testRunnerContinuesAfterCommentary(t, nil)
+	testRunnerContinuesAfterMessage(t, nil, "commentary")
 }
 
-func testRunnerContinuesAfterCommentary(t *testing.T, endTurn *bool) {
+func testRunnerContinuesAfterMessage(t *testing.T, endTurn *bool, phase string) {
 	t.Helper()
 	model := &mockModel{responses: []*ModelResponse{
 		{
 			Items: []RunItem{{
 				Type:    RunItemMessage,
-				Message: &MessageOutput{Text: "I’m running the final checks now.", Phase: "commentary"},
+				Message: &MessageOutput{Text: "I’m running the final checks now.", Phase: phase},
 			}},
 			EndTurn: endTurn,
 		},
@@ -47,22 +47,27 @@ func testRunnerContinuesAfterCommentary(t *testing.T, endTurn *bool) {
 		t.Fatalf("FinalText() = %q, want final response from follow-up sampling", got)
 	}
 	if model.callIdx != 2 {
-		t.Fatalf("model calls = %d, want 2 after commentary", model.callIdx)
+		t.Fatalf("model calls = %d, want 2 after continuation signal", model.callIdx)
 	}
 	if len(model.requests[1].Input) != 1 || model.requests[1].Input[0].Message == nil {
-		t.Fatalf("follow-up input = %+v, want prior commentary message", model.requests[1].Input)
+		t.Fatalf("follow-up input = %+v, want prior message", model.requests[1].Input)
 	}
-	if got := model.requests[1].Input[0].Message.Phase; got != "commentary" {
-		t.Fatalf("follow-up message phase = %q, want commentary", got)
+	if got := model.requests[1].Input[0].Message.Phase; got != phase {
+		t.Fatalf("follow-up message phase = %q, want %q", got, phase)
 	}
 }
 
-func TestRunnerExplicitEndTurnTrueOverridesCommentaryPhase(t *testing.T) {
+func TestRunnerCommentaryPhaseOverridesExplicitEndTurnTrue(t *testing.T) {
+	endTurn := true
+	testRunnerContinuesAfterMessage(t, &endTurn, "commentary")
+}
+
+func TestRunnerExplicitEndTurnTrueFinalAnswerStops(t *testing.T) {
 	endTurn := true
 	model := &mockModel{responses: []*ModelResponse{{
 		Items: []RunItem{{
 			Type:    RunItemMessage,
-			Message: &MessageOutput{Text: "Stopping here.", Phase: "commentary"},
+			Message: &MessageOutput{Text: "Stopping here.", Phase: "final_answer"},
 		}},
 		EndTurn: &endTurn,
 	}}}
@@ -72,10 +77,10 @@ func TestRunnerExplicitEndTurnTrueOverridesCommentaryPhase(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := result.FinalText(); got != "Stopping here." {
-		t.Fatalf("FinalText() = %q, want explicit end_turn response", got)
+		t.Fatalf("FinalText() = %q, want explicit final-answer response", got)
 	}
 	if model.callIdx != 1 {
-		t.Fatalf("model calls = %d, want 1 when end_turn=true", model.callIdx)
+		t.Fatalf("model calls = %d, want 1 for final-answer response", model.callIdx)
 	}
 }
 
