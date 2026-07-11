@@ -1421,7 +1421,11 @@ func toResponseInputItems(messages []anthropic.Message) (responses.ResponseInput
 				if id == "" {
 					id = fmt.Sprintf("reasoning_%d", len(items))
 				}
-				item := responses.ResponseInputItemParamOfReasoning(id, nil)
+				// Summary must be a non-nil empty slice: the field is
+				// `omitzero`, and the Codex /responses backend rejects
+				// reasoning input items that omit "summary" entirely
+				// ("Missing required parameter: 'input[N].summary'").
+				item := responses.ResponseInputItemParamOfReasoning(id, []responses.ResponseReasoningItemSummaryParam{})
 				item.OfReasoning.EncryptedContent = sdk.String(block.EncryptedContent)
 				item.OfReasoning.Status = responses.ResponseReasoningItemStatusCompleted
 				items = append(items, item)
