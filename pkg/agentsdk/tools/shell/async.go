@@ -80,10 +80,14 @@ func (m *AsyncManager) start(ctx context.Context, in asyncStartInput, workDir st
 			timeout = effectiveMaxBashTimeout()
 		}
 	}
+	mode = policy.NormalizePermissionMode(string(mode))
 	req := sandbox.Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", in.Command},
 		WorkDir:        workDir,
 		PermissionMode: mode,
+		// Match synchronous Bash: workspace-write development commands need
+		// egress, while read-only commands stay network-isolated.
+		AllowNetwork: mode == policy.PermissionModeWorkspaceWrite,
 	}
 	built, err := executor.Build(ctx, req)
 	if err != nil {

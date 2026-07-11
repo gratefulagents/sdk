@@ -1061,12 +1061,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
-			// OpenAI's Codex backend can explicitly request another sampling step
-			// with end_turn=false even when this response contains commentary text
-			// and no tool call. Preserve that protocol decision instead of treating
-			// every text-only response as a final answer. Providers that omit the
-			// signal (EndTurn == nil) keep the existing classification fallback.
-			if resp.EndTurn != nil && !*resp.EndTurn {
+			// OpenAI's Codex backend can request another sampling step while emitting
+			// commentary text with no tool call. Prefer its explicit end_turn signal;
+			// when that extension is omitted, use the retained Responses message phase
+			// as the fallback. Providers that expose neither signal keep the legacy
+			// text-only-is-final behavior.
+			continueSampling := resp.EndTurn != nil && !*resp.EndTurn
+			if resp.EndTurn == nil && lastMessagePhase(newItems) == "commentary" {
+				continueSampling = true
+			}
+			if continueSampling {
 				pendingCompletion = false
 				stopGateBlocks = 0
 				currentInput = append(currentInput, newItems...)
@@ -1643,6 +1647,18 @@ func finalOutputText(output any) string {
 		}
 		return string(b)
 	}
+}
+
+// lastMessagePhase returns the normalized phase of the last non-empty message.
+// Providers that do not expose message phases leave it empty.
+func lastMessagePhase(items []RunItem) string {
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		if item.Type == RunItemMessage && item.Message != nil && strings.TrimSpace(item.Message.Text) != "" {
+			return strings.ToLower(strings.TrimSpace(item.Message.Phase))
+		}
+	}
+	return ""
 }
 
 // classifyResponse determines what the model wants to do: final output, handoff, or tool calls.

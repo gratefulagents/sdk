@@ -225,14 +225,14 @@ func TestAsyncShellStartPollAndKill(t *testing.T) {
 	}
 }
 
-func TestBashStartUsesRestrictedBashPolicy(t *testing.T) {
+func TestBashStartKeepsRestrictedGitPolicy(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithAsyncShellTools())
-	res, err := r.Get("BashStart").Execute(context.Background(), json.RawMessage(`{"command":"echo $HOME"}`), r.WorkDir())
+	res, err := r.Get("BashStart").Execute(context.Background(), json.RawMessage(`{"command":"git push origin main"}`), r.WorkDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.IsError || !strings.Contains(res.Content, "cannot be authorized statically") {
-		t.Fatalf("BashStart result = %+v, want restricted policy refusal", res)
+	if !res.IsError || !strings.Contains(res.Content, "main/master") {
+		t.Fatalf("BashStart result = %+v, want protected-branch refusal", res)
 	}
 }
 

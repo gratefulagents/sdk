@@ -13,13 +13,22 @@ import (
 
 func TestRunnerExplicitEndTurnFalseContinuesSampling(t *testing.T) {
 	keepGoing := false
+	testRunnerContinuesAfterCommentary(t, &keepGoing)
+}
+
+func TestRunnerCommentaryPhaseContinuesWhenEndTurnOmitted(t *testing.T) {
+	testRunnerContinuesAfterCommentary(t, nil)
+}
+
+func testRunnerContinuesAfterCommentary(t *testing.T, endTurn *bool) {
+	t.Helper()
 	model := &mockModel{responses: []*ModelResponse{
 		{
 			Items: []RunItem{{
 				Type:    RunItemMessage,
 				Message: &MessageOutput{Text: "I’m running the final checks now.", Phase: "commentary"},
 			}},
-			EndTurn: &keepGoing,
+			EndTurn: endTurn,
 		},
 		{
 			Items: []RunItem{{
@@ -38,13 +47,55 @@ func TestRunnerExplicitEndTurnFalseContinuesSampling(t *testing.T) {
 		t.Fatalf("FinalText() = %q, want final response from follow-up sampling", got)
 	}
 	if model.callIdx != 2 {
-		t.Fatalf("model calls = %d, want 2 after end_turn=false", model.callIdx)
+		t.Fatalf("model calls = %d, want 2 after commentary", model.callIdx)
 	}
 	if len(model.requests[1].Input) != 1 || model.requests[1].Input[0].Message == nil {
 		t.Fatalf("follow-up input = %+v, want prior commentary message", model.requests[1].Input)
 	}
 	if got := model.requests[1].Input[0].Message.Phase; got != "commentary" {
 		t.Fatalf("follow-up message phase = %q, want commentary", got)
+	}
+}
+
+func TestRunnerExplicitEndTurnTrueOverridesCommentaryPhase(t *testing.T) {
+	endTurn := true
+	model := &mockModel{responses: []*ModelResponse{{
+		Items: []RunItem{{
+			Type:    RunItemMessage,
+			Message: &MessageOutput{Text: "Stopping here.", Phase: "commentary"},
+		}},
+		EndTurn: &endTurn,
+	}}}
+
+	result, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{MaxTurns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.FinalText(); got != "Stopping here." {
+		t.Fatalf("FinalText() = %q, want explicit end_turn response", got)
+	}
+	if model.callIdx != 1 {
+		t.Fatalf("model calls = %d, want 1 when end_turn=true", model.callIdx)
+	}
+}
+
+func TestRunnerPhaseLessTextKeepsLegacyFinalization(t *testing.T) {
+	model := &mockModel{responses: []*ModelResponse{{
+		Items: []RunItem{{
+			Type:    RunItemMessage,
+			Message: &MessageOutput{Text: "Legacy provider answer."},
+		}},
+	}}}
+
+	result, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{MaxTurns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.FinalText(); got != "Legacy provider answer." {
+		t.Fatalf("FinalText() = %q, want phase-less response finalized", got)
+	}
+	if model.callIdx != 1 {
+		t.Fatalf("model calls = %d, want 1 for phase-less response", model.callIdx)
 	}
 }
 
