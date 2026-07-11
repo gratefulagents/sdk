@@ -938,11 +938,14 @@ type collectedSSEOutputItem struct {
 	role   string
 	status string
 
-	callID string
-	name   string
+	callID           string
+	name             string
+	encryptedContent string
 
-	text      strings.Builder
-	arguments strings.Builder
+	text             strings.Builder
+	arguments        strings.Builder
+	reasoningText    strings.Builder
+	reasoningSummary strings.Builder
 }
 
 func collectSSEOutputEvent(items map[int]*collectedSSEOutputItem, evt collectedSSEEvent) {
@@ -963,6 +966,22 @@ func collectSSEOutputEvent(items map[int]*collectedSSEOutputItem, evt collectedS
 		item.ensureType("message")
 		if item.text.Len() == 0 && evt.Text != "" {
 			item.text.WriteString(evt.Text)
+		}
+	case "response.reasoning_text.delta":
+		item.ensureType("reasoning")
+		item.reasoningText.WriteString(evt.Delta)
+	case "response.reasoning_text.done":
+		item.ensureType("reasoning")
+		if item.reasoningText.Len() == 0 && evt.Text != "" {
+			item.reasoningText.WriteString(evt.Text)
+		}
+	case "response.reasoning_summary_text.delta":
+		item.ensureType("reasoning")
+		item.reasoningSummary.WriteString(evt.Delta)
+	case "response.reasoning_summary_text.done":
+		item.ensureType("reasoning")
+		if item.reasoningSummary.Len() == 0 && evt.Text != "" {
+			item.reasoningSummary.WriteString(evt.Text)
 		}
 	case "response.function_call_arguments.delta":
 		item.ensureType("function_call")
@@ -1002,6 +1021,10 @@ func mergeSSEOutputItem(item *collectedSSEOutputItem, raw json.RawMessage) {
 	if item.typ == "message" {
 		mergeSSEContentText(item, obj["content"])
 	}
+	if item.typ == "reasoning" {
+		mergeSSEReasoningText(item, obj["content"])
+		mergeSSEReasoningSummary(item, obj["summary"])
+	}
 	if item.typ == "function_call" {
 		if item.arguments.Len() == 0 {
 			if args, _ := obj["arguments"].(string); args != "" {
@@ -1019,11 +1042,26 @@ func mergeSSEContentPart(item *collectedSSEOutputItem, raw json.RawMessage) {
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return
 	}
-	if typ, _ := obj["type"].(string); typ == "output_text" {
+	switch typ, _ := obj["type"].(string); typ {
+	case "output_text":
 		item.ensureType("message")
 		if item.text.Len() == 0 {
 			if text, _ := obj["text"].(string); text != "" {
 				item.text.WriteString(text)
+			}
+		}
+	case "reasoning_text":
+		item.ensureType("reasoning")
+		if item.reasoningText.Len() == 0 {
+			if text, _ := obj["text"].(string); text != "" {
+				item.reasoningText.WriteString(text)
+			}
+		}
+	case "summary_text":
+		item.ensureType("reasoning")
+		if item.reasoningSummary.Len() == 0 {
+			if text, _ := obj["text"].(string); text != "" {
+				item.reasoningSummary.WriteString(text)
 			}
 		}
 	}
@@ -1048,6 +1086,9 @@ func mergeSSECommonFields(item *collectedSSEOutputItem, obj map[string]any) {
 	if name, _ := obj["name"].(string); name != "" {
 		item.name = name
 	}
+	if encryptedContent, _ := obj["encrypted_content"].(string); encryptedContent != "" {
+		item.encryptedContent = encryptedContent
+	}
 }
 
 func mergeSSEContentText(item *collectedSSEOutputItem, raw any) {
@@ -1068,6 +1109,51 @@ func mergeSSEContentText(item *collectedSSEOutputItem, raw any) {
 		}
 		if text, _ := part["text"].(string); text != "" {
 			item.text.WriteString(text)
+		}
+	}
+}
+
+func mergeSSEReasoningText(item *collectedSSEOutputItem, raw any) {
+	if item == nil || item.reasoningText.Len() != 0 {
+		return
+	}
+	content, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	for _, partRaw := range content {
+		part, ok := partRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := part["type"].(string)
+		if typ != "reasoning_text" && typ != "output_text" {
+			continue
+		}
+		if text, _ := part["text"].(string); text != "" {
+			item.reasoningText.WriteString(text)
+		}
+	}
+}
+
+func mergeSSEReasoningSummary(item *collectedSSEOutputItem, raw any) {
+	if item == nil || item.reasoningSummary.Len() != 0 {
+		return
+	}
+	summary, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	for _, partRaw := range summary {
+		part, ok := partRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := part["type"].(string); typ != "summary_text" {
+			continue
+		}
+		if text, _ := part["text"].(string); text != "" {
+			item.reasoningSummary.WriteString(text)
 		}
 	}
 }
@@ -1135,6 +1221,40 @@ func collectedSSEOutput(items map[int]*collectedSSEOutputItem) []any {
 				call["status"] = item.status
 			}
 			out = append(out, call)
+		case item.typ == "reasoning" || item.reasoningText.Len() > 0 || item.reasoningSummary.Len() > 0 || item.encryptedContent != "":
+			if item.reasoningText.Len() == 0 && item.reasoningSummary.Len() == 0 && item.encryptedContent == "" {
+				continue
+			}
+			reasoning := map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+			}
+			if item.id != "" {
+				reasoning["id"] = item.id
+			}
+			if item.status != "" {
+				reasoning["status"] = item.status
+			}
+			if item.encryptedContent != "" {
+				reasoning["encrypted_content"] = item.encryptedContent
+			}
+			if text := item.reasoningText.String(); text != "" {
+				reasoning["content"] = []any{
+					map[string]any{
+						"type": "reasoning_text",
+						"text": text,
+					},
+				}
+			}
+			if text := item.reasoningSummary.String(); text != "" {
+				reasoning["summary"] = []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": text,
+					},
+				}
+			}
+			out = append(out, reasoning)
 		case item.typ == "message" || item.text.Len() > 0:
 			text := item.text.String()
 			if text == "" {

@@ -744,7 +744,7 @@ func TestToAnthropicResponse_HandlesReasoningOutput(t *testing.T) {
 				Type:             "reasoning",
 				EncryptedContent: "encrypted_reasoning",
 				Content: []responses.ResponseOutputMessageContentUnion{
-					{Type: "output_text", Text: "Let me think about this..."},
+					{Type: "reasoning_text", Text: "Let me think about this..."},
 				},
 			},
 			{
@@ -776,6 +776,37 @@ func TestToAnthropicResponse_HandlesReasoningOutput(t *testing.T) {
 	}
 	if got.Content[1].Type != "text" {
 		t.Fatalf("second block type = %q, want text", got.Content[1].Type)
+	}
+}
+
+func TestToAnthropicResponse_UsesReasoningSummary(t *testing.T) {
+	resp := &responses.Response{
+		ID:    "resp_reasoning_summary",
+		Model: "gpt-5.4",
+		Output: []responses.ResponseOutputItemUnion{
+			{
+				ID:               "rs_1",
+				Type:             "reasoning",
+				EncryptedContent: "encrypted_reasoning",
+				Summary: []responses.ResponseReasoningItemSummary{
+					{Type: "summary_text", Text: "Analyzing the request."},
+				},
+			},
+		},
+	}
+
+	got, err := toAnthropicResponseFromResponses(resp)
+	if err != nil {
+		t.Fatalf("toAnthropicResponseFromResponses() error = %v", err)
+	}
+	if len(got.Content) != 1 || got.Content[0].Type != "thinking" {
+		t.Fatalf("content = %+v, want one thinking block", got.Content)
+	}
+	if got.Content[0].Thinking != "Analyzing the request." {
+		t.Fatalf("thinking text = %q, want reasoning summary", got.Content[0].Thinking)
+	}
+	if got.Content[0].ID != "rs_1" || got.Content[0].EncryptedContent != "encrypted_reasoning" {
+		t.Fatalf("thinking metadata = id:%q encrypted:%q", got.Content[0].ID, got.Content[0].EncryptedContent)
 	}
 }
 

@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/openai/openai-go/v3/responses"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -833,6 +835,74 @@ func TestCollectSSEToJSON(t *testing.T) {
 		}
 		if len(parsed.Output[0].Content) != 1 || parsed.Output[0].Content[0].Text != "hello world" {
 			t.Fatalf("message content = %+v, want hello world", parsed.Output[0].Content)
+		}
+	})
+
+	t.Run("reconstructs reasoning summary from SSE deltas when completed output is empty", func(t *testing.T) {
+		sseBody := strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_reasoning","status":"in_progress"}}`,
+			"",
+			`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","status":"in_progress"}}`,
+			"",
+			`data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"Analyzing "}`,
+			"",
+			`data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"the request."}`,
+			"",
+			`data: {"type":"response.reasoning_summary_text.done","output_index":0,"summary_index":0,"text":"Analyzing the request."}`,
+			"",
+			`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","status":"completed","encrypted_content":"enc_1"}}`,
+			"",
+			`data: {"type":"response.completed","response":{"id":"resp_reasoning","status":"completed","output":[]}}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n")
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseBody)),
+		}
+
+		synth, err := collectSSEToJSON(resp)
+		if err != nil {
+			t.Fatalf("collectSSEToJSON() error = %v", err)
+		}
+		body, _ := io.ReadAll(synth.Body)
+		var parsed struct {
+			Output []struct {
+				Type             string `json:"type"`
+				ID               string `json:"id"`
+				EncryptedContent string `json:"encrypted_content"`
+				Summary          []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"summary"`
+			} `json:"output"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("response body is not valid JSON: %s", string(body))
+		}
+		if len(parsed.Output) != 1 || parsed.Output[0].Type != "reasoning" {
+			t.Fatalf("output = %+v, want one reasoning item", parsed.Output)
+		}
+		reasoning := parsed.Output[0]
+		if reasoning.ID != "rs_1" || reasoning.EncryptedContent != "enc_1" {
+			t.Fatalf("reasoning metadata = id:%q encrypted:%q", reasoning.ID, reasoning.EncryptedContent)
+		}
+		if len(reasoning.Summary) != 1 || reasoning.Summary[0].Type != "summary_text" || reasoning.Summary[0].Text != "Analyzing the request." {
+			t.Fatalf("reasoning summary = %+v, want reconstructed summary text", reasoning.Summary)
+		}
+
+		var sdkResponse responses.Response
+		if err := json.Unmarshal(body, &sdkResponse); err != nil {
+			t.Fatalf("unmarshal synthetic OpenAI response: %v", err)
+		}
+		message, err := toAnthropicResponseFromResponses(&sdkResponse)
+		if err != nil {
+			t.Fatalf("convert synthetic OpenAI response: %v", err)
+		}
+		if len(message.Content) != 1 || message.Content[0].Type != "thinking" || message.Content[0].Thinking != "Analyzing the request." {
+			t.Fatalf("converted content = %+v, want reconstructed thinking block", message.Content)
 		}
 	})
 

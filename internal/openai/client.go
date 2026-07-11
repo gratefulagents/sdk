@@ -1067,8 +1067,7 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 		// (gpt-5, o-series, codex) still surface human-readable reasoning text via
 		// response.reasoning_summary_text events. Effort "minimal" yields no
 		// reasoning, so a summary is pointless there. The Codex /responses backend
-		// rejects this field; maybeNormalizeCodexResponsesBody strips it (the
-		// backend emits summaries natively).
+		// accepts this field and maybeNormalizeCodexResponsesBody preserves it.
 		if reasoning.Effort != "minimal" {
 			reasoning.Summary = shared.ReasoningSummaryAuto
 		}
@@ -1513,8 +1512,15 @@ func toAnthropicResponseFromResponses(resp *responses.Response) (*anthropic.Crea
 		case "reasoning":
 			var thinkingText string
 			for _, c := range item.Content {
-				if c.Type == "output_text" && strings.TrimSpace(c.Text) != "" {
+				if (c.Type == "reasoning_text" || c.Type == "output_text" || c.Type == "") && strings.TrimSpace(c.Text) != "" {
 					thinkingText += c.Text
+				}
+			}
+			if thinkingText == "" {
+				for _, summary := range item.Summary {
+					if strings.TrimSpace(summary.Text) != "" {
+						thinkingText += summary.Text
+					}
 				}
 			}
 			if thinkingText != "" || item.EncryptedContent != "" {
