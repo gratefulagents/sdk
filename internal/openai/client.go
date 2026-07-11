@@ -1421,13 +1421,16 @@ func toResponseInputItems(messages []anthropic.Message) (responses.ResponseInput
 				if id == "" {
 					id = fmt.Sprintf("reasoning_%d", len(items))
 				}
-				// Summary must be a non-nil empty slice: the field is
-				// `omitzero`, and the Codex /responses backend rejects
-				// reasoning input items that omit "summary" entirely
-				// ("Missing required parameter: 'input[N].summary'").
+				// Wire shape must match what the Codex /responses backend
+				// accepts on reasoning input items (and what codex-cli sends):
+				// exactly {type, id, summary, encrypted_content}.
+				//   - "summary" is `omitzero`, so it must be a non-nil empty
+				//     slice or the key is dropped and Codex rejects with
+				//     "Missing required parameter: 'input[N].summary'".
+				//   - "status" must NOT be set: Codex rejects it with
+				//     "Unknown parameter: 'input[N].status'".
 				item := responses.ResponseInputItemParamOfReasoning(id, []responses.ResponseReasoningItemSummaryParam{})
 				item.OfReasoning.EncryptedContent = sdk.String(block.EncryptedContent)
-				item.OfReasoning.Status = responses.ResponseReasoningItemStatusCompleted
 				items = append(items, item)
 			case "compaction":
 				encryptedContent := strings.TrimSpace(block.EncryptedContent)
