@@ -1,11 +1,15 @@
 package shell
 
 import (
+	"context"
+	"encoding/json"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 )
 
 func TestBashToolForAccessDowngradesToReadOnly(t *testing.T) {
@@ -164,11 +168,99 @@ func TestCommandBlockedForModeHandlesRootRemoveVariants(t *testing.T) {
 	}
 }
 
-func TestCommandBlockedRejectsDynamicSyntaxWhenSandboxEnforces(t *testing.T) {
+func TestCommandBlockedAllowsDynamicSyntaxForEnforcedWorkspaceWrite(t *testing.T) {
 	t.Parallel()
 
-	if blocked, _ := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "echo $HOME", true); !blocked {
-		t.Fatal("dynamic shell syntax must remain blocked under an enforcing sandbox")
+	for _, command := range []string{
+		"env GOROOT=/usr/local/go go env GOPATH",
+		"printf '%s' \"$HOME\"",
+		"wc -l $(find . -name '*.go')",
+	} {
+		if blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, command, true); blocked {
+			t.Fatalf("enforced workspace-write blocked %q: %s", command, reason)
+		}
+	}
+}
+
+func TestCommandBlockedKeepsDynamicSyntaxStrictWithoutEnforcement(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
+		if blocked, _ := isCommandBlockedForMode(mode, "echo $HOME", mode == policy.PermissionModeReadOnly); !blocked {
+			t.Fatalf("dynamic shell syntax allowed in %s", mode)
+		}
+	}
+}
+
+func TestCommandBlockedRejectsDynamicPushRefsWithEnforcement(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []string{
+		"git push origin $(printf main)",
+		"BR=main; git push origin $BR",
+		"BR=main git push origin $BR",
+	} {
+		blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, command, true)
+		if !blocked || !strings.Contains(reason, "dynamic git push arguments") {
+			t.Fatalf("enforced workspace-write command %q = blocked %v, reason %q; want dynamic push refusal", command, blocked, reason)
+		}
+	}
+
+	if blocked, reason := isCommandBlockedForMode(policy.PermissionModeWorkspaceWrite, "git push origin feature", true); blocked {
+		t.Fatalf("static feature push blocked: %s", reason)
+	}
+}
+
+func TestBashNetworkPolicyMatchesPermissionMode(t *testing.T) {
+	t.Parallel()
+
+	workspaceExecutor := &captureExecutor{enforces: true}
+	workspaceTool := &WorkspaceWriteBashTool{BashTool: BashTool{Executor: workspaceExecutor}}
+	if result, err := workspaceTool.Execute(context.Background(), json.RawMessage(`{"command":"true"}`), t.TempDir()); err != nil || result.IsError {
+		t.Fatalf("workspace-write Bash result=%+v err=%v", result, err)
+	}
+	if !workspaceExecutor.request.AllowNetwork {
+		t.Fatal("workspace-write Bash request did not enable network")
+	}
+
+	readOnlyExecutor := &captureExecutor{enforces: true}
+	readOnlyTool := &ReadOnlyBashTool{BashTool: BashTool{Executor: readOnlyExecutor}}
+	if result, err := readOnlyTool.Execute(context.Background(), json.RawMessage(`{"command":"true"}`), t.TempDir()); err != nil || result.IsError {
+		t.Fatalf("read-only Bash result=%+v err=%v", result, err)
+	}
+	if readOnlyExecutor.request.AllowNetwork {
+		t.Fatal("read-only Bash request enabled network")
+	}
+}
+
+type captureExecutor struct {
+	request  sandbox.Request
+	enforces bool
+}
+
+func (e *captureExecutor) Build(_ context.Context, req sandbox.Request) (*exec.Cmd, error) {
+	e.request = req
+	return exec.Command("true"), nil
+}
+
+func (e *captureExecutor) Run(ctx context.Context, req sandbox.Request) (sandbox.Result, error) {
+	e.request = req
+	return sandbox.Result{}, nil
+}
+
+func (e *captureExecutor) EnforcesFilesystem(policy.PermissionMode) bool { return e.enforces }
+
+func TestBashStartWorkspaceWriteEnablesNetwork(t *testing.T) {
+	t.Parallel()
+
+	executor := &captureExecutor{enforces: true}
+	manager := NewAsyncManager(executor)
+	t.Cleanup(func() { _ = manager.Close() })
+	if _, err := manager.start(context.Background(), asyncStartInput{Command: "true"}, t.TempDir(), policy.PermissionModeWorkspaceWrite); err != nil {
+		t.Fatal(err)
+	}
+	if !executor.request.AllowNetwork {
+		t.Fatal("workspace-write BashStart request did not enable network")
 	}
 }
 

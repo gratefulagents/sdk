@@ -112,11 +112,15 @@ func (t *BashTool) execute(ctx context.Context, input json.RawMessage, workDir s
 		executor = sandbox.Default()
 	}
 
+	mode = policy.NormalizePermissionMode(string(mode))
 	req := sandbox.Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", in.Command},
 		WorkDir:        workDir,
 		PermissionMode: mode,
 		Timeout:        timeout,
+		// Workspace-write is the normal development mode: builds and package
+		// managers need egress. Read-only remains network-isolated.
+		AllowNetwork: mode == policy.PermissionModeWorkspaceWrite,
 	}
 
 	maxOutputBytes := effectiveMaxBashOutputBytes()
@@ -354,10 +358,23 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 
 func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnforced bool) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
+	dynamicReason := restrictedShellSyntaxReason(command)
 
-	if readOnly || workspaceWrite {
-		if reason := restrictedShellSyntaxReason(command); reason != "" {
-			return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, reason)
+	// Dynamic shell syntax is safe for workspace-local effects when an OS
+	// sandbox enforces the filesystem boundary. Keep it fail-closed in read-only
+	// mode and on advisory/non-enforcing workspace-write hosts.
+	if dynamicReason != "" && (readOnly || workspaceWrite && !fsEnforced) {
+		return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, dynamicReason)
+	}
+
+	// Even with filesystem confinement, network side effects cannot be contained.
+	// The protected-branch check below can only validate literal ref arguments,
+	// so reject git pushes whose refs may be produced dynamically at runtime.
+	if dynamicReason != "" && workspaceWrite {
+		for _, argv := range gitInvocations(command) {
+			if gitSubcommand(argv) == "push" {
+				return true, fmt.Sprintf("Command blocked in %s mode: dynamic git push arguments cannot be authorized statically", mode)
+			}
 		}
 	}
 
