@@ -432,3 +432,41 @@ func mustJSON(t *testing.T, value any) json.RawMessage {
 	}
 	return data
 }
+
+func TestEditToolsIdenticalStringsMessage(t *testing.T) {
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workDir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	input := mustJSON(t, map[string]any{
+		"file_path":  "a.txt",
+		"old_string": "hello",
+		"new_string": "hello",
+	})
+	want := "old_string and new_string are identical — if the file already shows the desired text, the edit is already applied; re-read the file before retrying"
+
+	for _, tc := range []struct {
+		name string
+		run  func() (string, bool)
+	}{
+		{"FileEditTool", func() (string, bool) {
+			r, err := (&FileEditTool{}).Execute(context.Background(), input, workDir)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			return r.Content, r.IsError
+		}},
+		{"WorkspaceEditTool", func() (string, bool) {
+			r, err := (&WorkspaceEditTool{}).Execute(context.Background(), input, workDir)
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			return r.Content, r.IsError
+		}},
+	} {
+		content, isErr := tc.run()
+		if !isErr || content != want {
+			t.Fatalf("%s: result = (%q, %v), want identical-strings guidance", tc.name, content, isErr)
+		}
+	}
+}

@@ -213,3 +213,87 @@ func writeTestFile(t *testing.T, root, rel, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestGrepToolSkipsFilesWithTooLongLines(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, "ok.txt", "needle here\n")
+	writeTestFile(t, dir, "huge.txt", "needle "+strings.Repeat("x", 2*1024*1024)+"\n")
+
+	result, err := (&GrepTool{}).Execute(context.Background(), json.RawMessage(`{"pattern":"needle"}`), dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("IsError = true, content = %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "ok.txt:1: needle here") {
+		t.Fatalf("Content = %q, want match from ok.txt", result.Content)
+	}
+	if !strings.Contains(result.Content, "[skipped huge.txt: line too long]") {
+		t.Fatalf("Content = %q, want skip note for huge.txt", result.Content)
+	}
+}
+
+func TestWorkspacePathAcceptsAbsolutePathInsideWorkdir(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, filepath.Join("sub", "notes.txt"), "hello\n")
+
+	input, err := json.Marshal(map[string]any{"path": filepath.Join(dir, "sub", "notes.txt")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, execErr := (&ReadFileTool{}).Execute(context.Background(), input, dir)
+	if execErr != nil {
+		t.Fatalf("Execute() error = %v", execErr)
+	}
+	if result.IsError || result.Content != "hello\n" {
+		t.Fatalf("result = %#v, want file contents", result)
+	}
+}
+
+func TestWorkspacePathRejectsAbsolutePathOutsideWorkdir(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(filepath.Dir(dir), "elsewhere.txt")
+
+	input, err := json.Marshal(map[string]any{"path": outside})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, execErr := (&ReadFileTool{}).Execute(context.Background(), input, dir)
+	if execErr == nil || !strings.Contains(execErr.Error(), "path must be relative to workdir") {
+		t.Fatalf("Execute() error = %v, want path must be relative to workdir", execErr)
+	}
+}
+
+func TestReadFileToolNotFoundSuggestsCandidates(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, filepath.Join("cfg", "config.yaml"), "a: 1\n")
+
+	result, err := (&ReadFileTool{}).Execute(context.Background(), json.RawMessage(`{"path":"config.yaml"}`), dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("IsError = false, content = %q", result.Content)
+	}
+	want := "config.yaml: no such file — did you mean one of: " + filepath.Join("cfg", "config.yaml")
+	if result.Content != want {
+		t.Fatalf("Content = %q, want %q", result.Content, want)
+	}
+}
+
+func TestReadFileToolNotFoundWithoutCandidates(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, "other.txt", "x")
+
+	result, err := (&ReadFileTool{}).Execute(context.Background(), json.RawMessage(`{"path":"zzz.bin"}`), dir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("IsError = false, content = %q", result.Content)
+	}
+	if got, want := result.Content, "zzz.bin: no such file — use glob to locate the file"; got != want {
+		t.Fatalf("Content = %q, want %q", got, want)
+	}
+}

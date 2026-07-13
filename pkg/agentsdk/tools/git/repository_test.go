@@ -312,8 +312,8 @@ func TestCreatePullRequestToolUsesRepoPath(t *testing.T) {
 			"status --porcelain":          "",
 		},
 		ghOut: map[string]string{
-			"pr create --fill":           "https://github.com/acme/helm/pull/9\n",
-			"pr view --json url -q .url": "https://github.com/acme/helm/pull/9\n",
+			"pr create --head agent/work --fill": "https://github.com/acme/helm/pull/9\n",
+			"pr view --json url -q .url":         "https://github.com/acme/helm/pull/9\n",
 		},
 	}
 
@@ -324,7 +324,7 @@ func TestCreatePullRequestToolUsesRepoPath(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("Execute() returned error result: %s", result.Content)
 	}
-	wantDirs := []string{repoDir, repoDir, repoDir, repoDir}
+	wantDirs := []string{repoDir, repoDir, repoDir, repoDir, repoDir}
 	if !reflect.DeepEqual(runner.gitDirs, wantDirs) {
 		t.Fatalf("git dirs = %#v, want %#v", runner.gitDirs, wantDirs)
 	}
@@ -362,5 +362,58 @@ func TestCreateIssueToolUsesRepoPath(t *testing.T) {
 	}
 	if !reflect.DeepEqual(runner.ghDirs, []string{repoDir}) {
 		t.Fatalf("gh dirs = %#v, want %#v", runner.ghDirs, []string{repoDir})
+	}
+}
+
+func TestAttachRepositoryToolFallsBackToDefaultBranchWhenBaseBranchMissing(t *testing.T) {
+	workDir := t.TempDir()
+	runner := &fakeRunner{gitFn: func(ctx context.Context, dir string, args ...string) (string, error) {
+		key := strings.Join(args, " ")
+		if strings.Contains(key, "clone") && strings.Contains(key, "--branch missing-branch") {
+			return "Cloning into 'dest'...\nfatal: Remote branch missing-branch not found in upstream origin\n", fmt.Errorf("exit status 128")
+		}
+		return cloneFakeRepo(ctx, dir, args...)
+	}}
+
+	input := json.RawMessage(`{"repository":"acme/repo","base_branch":"missing-branch","branch_name":"work-branch"}`)
+	result, err := NewAttachRepositoryTool(runner).Execute(context.Background(), input, workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `"status":"attached"`) {
+		t.Fatalf("result = %s, want attached status", result.Content)
+	}
+	if !strings.Contains(result.Content, "cloned the repository default branch instead") {
+		t.Fatalf("result = %s, want default-branch fallback note", result.Content)
+	}
+	if strings.Contains(result.Content, `"base_branch":"missing-branch"`) {
+		t.Fatalf("result = %s, want base_branch cleared after fallback", result.Content)
+	}
+}
+
+func TestAttachRepositoryToolDoesNotRetryNonBranchCloneFailures(t *testing.T) {
+	workDir := t.TempDir()
+	cloneCalls := 0
+	runner := &fakeRunner{gitFn: func(ctx context.Context, dir string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "clone") {
+			cloneCalls++
+			return "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n", fmt.Errorf("exit status 128")
+		}
+		return "", nil
+	}}
+
+	input := json.RawMessage(`{"repository":"acme/repo","base_branch":"main"}`)
+	result, err := NewAttachRepositoryTool(runner).Execute(context.Background(), input, workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "git clone failed") {
+		t.Fatalf("result = %+v, want clone failure", result)
+	}
+	if cloneCalls != 1 {
+		t.Fatalf("clone attempts = %d, want 1 (no retry on auth failures)", cloneCalls)
 	}
 }

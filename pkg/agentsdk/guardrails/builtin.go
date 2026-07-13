@@ -161,21 +161,98 @@ func BuiltinToolInputGuardrails() []agentsdk.ToolInputGuardrail {
 	}
 }
 
+// pemEndMarker closes a PEM private-key block opened by the "private key"
+// signature, which only matches the BEGIN header.
+var pemEndMarker = regexp.MustCompile(`-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----`)
+
+// partialSecretSignatures names the signatures whose match is only a marker
+// or fragment of a larger credential block: the companion material (e.g. the
+// AWS secret access key paired with an AKIA/ASIA key ID, or the private-key
+// fields of a GCP service-account JSON) has no independently detectable shape.
+// Redacting just the matched fragment would pass the undetected companion
+// secrets through, so these signatures keep the hard tripwire and block the
+// whole output. Guarded by TestPartialSecretSignatureNamesExist against drift.
+var partialSecretSignatures = map[string]bool{
+	"AWS access key":          true,
+	"GCP service-account key": true,
+}
+
+// redactSecrets replaces every secret-signature match in content with a
+// [REDACTED:<name>] marker. It returns the redacted content, the names of the
+// signatures that matched (in signature order), and the total match count.
+func redactSecrets(content string) (string, []string, int) {
+	var names []string
+	total := 0
+	for _, sig := range secretSignatures {
+		var n int
+		if sig.name == "private key" {
+			content, n = redactPrivateKeyBlocks(content, sig.pattern)
+		} else if n = len(sig.pattern.FindAllStringIndex(content, -1)); n > 0 {
+			content = sig.pattern.ReplaceAllString(content, "[REDACTED:"+sig.name+"]")
+		}
+		if n > 0 {
+			names = append(names, sig.name)
+			total += n
+		}
+	}
+	return content, names, total
+}
+
+// redactPrivateKeyBlocks redacts from each PEM BEGIN header through the
+// matching END marker inclusive (or to the end of content if unterminated) so
+// the key body never survives redaction.
+func redactPrivateKeyBlocks(content string, begin *regexp.Regexp) (string, int) {
+	var b strings.Builder
+	n := 0
+	for {
+		loc := begin.FindStringIndex(content)
+		if loc == nil {
+			b.WriteString(content)
+			return b.String(), n
+		}
+		n++
+		b.WriteString(content[:loc[0]])
+		b.WriteString("[REDACTED:private key]")
+		rest := content[loc[1]:]
+		end := pemEndMarker.FindStringIndex(rest)
+		if end == nil {
+			return b.String(), n
+		}
+		content = rest[end[1]:]
+	}
+}
+
 // BuiltinToolOutputGuardrails returns output guardrails that are always active.
 func BuiltinToolOutputGuardrails() []agentsdk.ToolOutputGuardrail {
 	return []agentsdk.ToolOutputGuardrail{
 		{
 			Name: "detect-secret-in-output",
 			Fn: func(_ *agentsdk.RunContext, _ *agentsdk.Agent, _ agentsdk.Tool, result agentsdk.ToolResult) (*agentsdk.GuardrailResult, error) {
+				// Marker/fragment signatures first: their companion secrets
+				// cannot be detected independently, so partial redaction
+				// would leak them. Fail closed on the whole output.
 				for _, sp := range secretSignatures {
-					if sp.pattern.MatchString(result.Content) {
+					if partialSecretSignatures[sp.name] && sp.pattern.MatchString(result.Content) {
 						return &agentsdk.GuardrailResult{
-							Output:            fmt.Sprintf("Potential %s detected in tool output - content redacted", sp.name),
+							Output:            fmt.Sprintf("Potential %s detected in tool output — output blocked: this marker usually travels with companion credentials (e.g. paired secret keys) that cannot be detected independently, so nothing was passed through. If you need the surrounding content, re-read a narrower range that excludes the credential block.", sp.name),
 							TripwireTriggered: true,
 						}, nil
 					}
 				}
-				return &agentsdk.GuardrailResult{}, nil
+				// Redact matched secrets in place instead of tripping the
+				// tripwire: most hits are source code or fixtures that merely
+				// mention secret-like patterns, and nuking the whole output
+				// makes those tool calls unusable.
+				redacted, names, total := redactSecrets(result.Content)
+				if total == 0 {
+					return &agentsdk.GuardrailResult{}, nil
+				}
+				notice := fmt.Sprintf("[guardrail detect-secret-in-output: redacted %d potential secret(s): %s. If these are placeholders or test fixtures the surrounding content is still usable; do not try to reconstruct redacted values.]", total, strings.Join(names, ", "))
+				return &agentsdk.GuardrailResult{
+					Output:             notice,
+					ContentReplaced:    true,
+					ReplacementContent: redacted + "\n\n" + notice,
+				}, nil
 			},
 		},
 	}

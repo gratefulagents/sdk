@@ -154,7 +154,7 @@ func TestSecretSignatures_NewPatterns(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.TripwireTriggered {
+			if res.TripwireTriggered || res.ContentReplaced {
 				tripped = true
 			}
 		}

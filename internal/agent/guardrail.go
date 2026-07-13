@@ -30,6 +30,12 @@ type ToolOutputGuardrail struct {
 type GuardrailResult struct {
 	Output            any
 	TripwireTriggered bool
+
+	// ReplacementContent and ContentReplaced let a tool-OUTPUT guardrail
+	// rewrite the tool result content (e.g. redacting secrets) instead of
+	// tripping the tripwire. Ignored for input guardrails.
+	ReplacementContent string
+	ContentReplaced    bool
 }
 
 // ToolGuardrailResult is the outcome of a per-tool guardrail check.

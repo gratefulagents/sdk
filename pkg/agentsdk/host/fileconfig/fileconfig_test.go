@@ -110,7 +110,7 @@ Plan carefully.
 	if err != nil {
 		t.Fatalf("ModeDirective: %v", err)
 	}
-	for _, want := range []string{"Mode: Feature Builder", "Tool access: read-only", "Follow the feature workflow."} {
+	for _, want := range []string{"Mode: Feature Builder", "Tool access: read-only", "Bash is restricted to statically-authorized commands", "no command substitution $(...) or backticks", "Follow the feature workflow."} {
 		if !strings.Contains(directive, want) {
 			t.Fatalf("directive missing %q:\n%s", want, directive)
 		}

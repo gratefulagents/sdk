@@ -16,8 +16,8 @@ func TestCreatePullRequestToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 			"status --porcelain":          " M changed.go\n?? new.go\n",
 		},
 		ghOut: map[string]string{
-			"pr create --title Add feature --body  --base main --draft": "",
-			"pr view --json url -q .url":                                "https://github.com/acme/repo/pull/7\n",
+			"pr create --head agent/work --title Add feature --body  --base main --draft": "",
+			"pr view --json url -q .url": "https://github.com/acme/repo/pull/7\n",
 		},
 	}
 	sink := &fakeSink{}
@@ -45,6 +45,7 @@ func TestCreatePullRequestToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 		"add -A",
 		"commit --no-verify -m Add feature",
 		"push --no-verify -u origin HEAD",
+		"rev-parse --abbrev-ref HEAD",
 	}
 	if !reflect.DeepEqual(runner.gitCalls, wantGit) {
 		t.Fatalf("git calls = %#v, want %#v", runner.gitCalls, wantGit)
@@ -61,8 +62,8 @@ func TestCreatePullRequestToolCommitsUntrackedOnlyChanges(t *testing.T) {
 			"status --porcelain":          "?? new.go\n",
 		},
 		ghOut: map[string]string{
-			"pr create --fill":           "https://github.com/acme/repo/pull/9\n",
-			"pr view --json url -q .url": "https://github.com/acme/repo/pull/9\n",
+			"pr create --head agent/work --fill": "https://github.com/acme/repo/pull/9\n",
+			"pr view --json url -q .url":         "https://github.com/acme/repo/pull/9\n",
 		},
 	}
 
@@ -80,6 +81,7 @@ func TestCreatePullRequestToolCommitsUntrackedOnlyChanges(t *testing.T) {
 		"add -A",
 		"commit --no-verify -m changes from agent run",
 		"push --no-verify -u origin HEAD",
+		"rev-parse --abbrev-ref HEAD",
 	}
 	if !reflect.DeepEqual(runner.gitCalls, wantGit) {
 		t.Fatalf("git calls = %#v, want %#v", runner.gitCalls, wantGit)
@@ -95,7 +97,7 @@ func TestCreatePullRequestToolUsesExistingPRWhenCreateFails(t *testing.T) {
 			"pr view --json url -q .url": "https://github.com/acme/repo/pull/8\n",
 		},
 		ghErr: map[string]error{
-			"pr create --fill": errors.New("already exists"),
+			"pr create --head agent/work --fill": errors.New("already exists"),
 		},
 	}
 	sink := &fakeSink{}
@@ -295,4 +297,58 @@ func mustJSON(t *testing.T, value any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestCreateIssueToolRetriesWithoutMissingLabels(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"issue create --title Bug report --body details": "https://github.com/acme/repo/issues/12\n",
+		},
+		ghErr: map[string]error{
+			"issue create --title Bug report --body details --label tests": errors.New("exit status 1"),
+		},
+	}
+	runner.ghOut["issue create --title Bug report --body details --label tests"] = "could not add label: 'tests' not found\n"
+	sink := &fakeSink{}
+	tool := NewCreateIssueTool(runner, sink)
+
+	input := mustJSON(t, map[string]any{"title": "Bug report", "body": "details", "labels": []string{"tests"}})
+	result, err := tool.Execute(context.Background(), input, "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `"issue_url":"https://github.com/acme/repo/issues/12"`) {
+		t.Fatalf("result = %s, want issue URL from label-free retry", result.Content)
+	}
+	if !strings.Contains(result.Content, "without labels") {
+		t.Fatalf("result = %s, want dropped-labels status note", result.Content)
+	}
+	if sink.issueURL != "https://github.com/acme/repo/issues/12" {
+		t.Fatalf("recorded issue URL = %q", sink.issueURL)
+	}
+}
+
+func TestCreateIssueToolDoesNotRetryOtherFailures(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"issue create --title Bug report": "GraphQL: rate limited\n",
+		},
+		ghErr: map[string]error{
+			"issue create --title Bug report": errors.New("exit status 1"),
+		},
+	}
+
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{"title": "Bug report"}), "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "gh issue create failed") {
+		t.Fatalf("result = %+v, want create failure", result)
+	}
+	if len(runner.ghCalls) != 1 {
+		t.Fatalf("gh calls = %v, want single attempt", runner.ghCalls)
+	}
 }

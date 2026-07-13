@@ -151,6 +151,13 @@ func (t *CreatePullRequestTool) Execute(ctx context.Context, input json.RawMessa
 	}
 
 	args := []string{"pr", "create"}
+	// Pass --head explicitly so gh does not have to infer the branch from
+	// upstream state ("you must first push the current branch" failures).
+	if branchOut, branchErr := runner.RunGit(ctx, repoDir, "rev-parse", "--abbrev-ref", "HEAD"); branchErr == nil {
+		if branch := strings.TrimSpace(branchOut); branch != "" && branch != "HEAD" {
+			args = append(args, "--head", branch)
+		}
+	}
 	if in.Title != "" {
 		args = append(args, "--title", in.Title)
 	}
@@ -365,6 +372,25 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 
 	out, err := t.runner().RunGH(ctx, repoDir, args...)
 	if err != nil {
+		// Nonexistent labels abort issue creation entirely; retry without
+		// labels rather than losing the report over metadata.
+		if len(in.Labels) > 0 && strings.Contains(out, "could not add label") {
+			retryArgs := []string{"issue", "create", "--title", in.Title}
+			if in.Body != "" {
+				retryArgs = append(retryArgs, "--body", in.Body)
+			}
+			for _, assignee := range in.Assignees {
+				retryArgs = append(retryArgs, "--assignee", assignee)
+			}
+			retryOut, retryErr := t.runner().RunGH(ctx, repoDir, retryArgs...)
+			if retryErr == nil {
+				if issueURL := strings.TrimSpace(retryOut); strings.HasPrefix(issueURL, "https://") {
+					t.recordIssue(ctx, issueURL)
+					return issueSuccessWithStatus(issueURL, fmt.Sprintf(
+						"Issue created without labels %v (labels do not exist in this repository; create them first or omit them).", in.Labels))
+				}
+			}
+		}
 		return issueError(fmt.Sprintf("gh issue create failed: %s\n%s", err, out))
 	}
 
@@ -396,7 +422,11 @@ func (t *CreateIssueTool) recordIssue(ctx context.Context, url string) {
 }
 
 func issueSuccess(issueURL string) (agentsdk.ToolResult, error) {
-	out := createIssueOutput{IssueURL: issueURL, Status: "Issue created successfully"}
+	return issueSuccessWithStatus(issueURL, "Issue created successfully")
+}
+
+func issueSuccessWithStatus(issueURL, status string) (agentsdk.ToolResult, error) {
+	out := createIssueOutput{IssueURL: issueURL, Status: status}
 	b, _ := json.Marshal(out)
 	return agentsdk.ToolResult{Content: string(b)}, nil
 }

@@ -330,6 +330,76 @@ func TestRunnerToolOutputGuardrailTripwireReturnsToolErrorAndRedactsTrace(t *tes
 	}
 }
 
+func TestRunnerToolOutputGuardrailContentReplacedRewritesOutputWithoutError(t *testing.T) {
+	const secretOutput = "SECRET_TOKEN_VALUE"
+	const rewritten = "token=[REDACTED] rest of output"
+	model := &mockModel{
+		responses: []*ModelResponse{
+			{
+				Items: []RunItem{
+					{Type: RunItemToolCall, ToolCall: &ToolCallData{
+						ID:    "call1",
+						Name:  "read_secret",
+						Input: json.RawMessage(`{"path":"secret.txt"}`),
+					}},
+				},
+			},
+			{
+				Items: []RunItem{
+					{Type: RunItemMessage, Message: &MessageOutput{Text: "redacted handled"}},
+				},
+			},
+		},
+	}
+	tool := &FunctionTool{
+		ToolName:        "read_secret",
+		ToolDescription: "returns secret content",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			return "token=" + secretOutput + " rest of output", nil
+		},
+	}
+	tracing := &captureTracingProcessor{}
+
+	result, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test", Tools: []Tool{tool}}, nil, RunConfig{
+		MaxTurns:         3,
+		TracingProcessor: tracing,
+		ToolOutputGuardrails: []ToolOutputGuardrail{{
+			Name: "redact-secret-output",
+			Fn: func(_ *RunContext, _ *Agent, _ Tool, result ToolResult) (*GuardrailResult, error) {
+				if !strings.Contains(result.Content, secretOutput) {
+					return &GuardrailResult{}, nil
+				}
+				return &GuardrailResult{
+					ContentReplaced:    true,
+					ReplacementContent: strings.Replace(result.Content, secretOutput, "[REDACTED]", 1),
+				}, nil
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if result.FinalText() != "redacted handled" {
+		t.Fatalf("FinalText() = %q, want redacted handled", result.FinalText())
+	}
+	if len(result.ToolOutputGuardrailResults) != 1 || result.ToolOutputGuardrailResults[0].TripwireTriggered {
+		t.Fatalf("ToolOutputGuardrailResults = %#v, want one non-triggered result", result.ToolOutputGuardrailResults)
+	}
+	if !runItemsContainToolOutput(result.NewItems, rewritten) {
+		t.Fatalf("NewItems = %#v, want rewritten tool output", result.NewItems)
+	}
+	if runItemsContainText(result.NewItems, secretOutput) {
+		t.Fatalf("NewItems leaked original tool output: %#v", result.NewItems)
+	}
+	if runItemsContainText(model.requests[1].Input, secretOutput) {
+		t.Fatalf("second model input leaked original tool output: %#v", model.requests[1].Input)
+	}
+	if tracing.functionOutputContains(secretOutput) {
+		t.Fatalf("function span leaked original tool output: %#v", tracing.spans)
+	}
+}
+
 func TestRunnerReadOnlyAccessAllowsExplicitMutatingTool(t *testing.T) {
 	model := &mockModel{
 		responses: []*ModelResponse{

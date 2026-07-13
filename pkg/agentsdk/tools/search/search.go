@@ -118,6 +118,9 @@ func (t *ReadFileTool) Execute(_ context.Context, input json.RawMessage, workDir
 	}
 	data, truncated, err := readFileNoFollowBounded(workDir, path, params.StartLine, params.EndLine)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return agentsdk.ToolResult{Content: notFoundMessage(workDir, params.Path), IsError: true}, nil
+		}
 		return agentsdk.ToolResult{}, err
 	}
 	out := string(data)
@@ -280,13 +283,89 @@ func workspacePath(workDir, inputPath string) (string, error) {
 		clean = "."
 	}
 	if filepath.IsAbs(clean) {
-		return "", fmt.Errorf("path must be relative to workdir: %s", inputPath)
+		rel, ok := relativizeToWorkdir(workDir, clean)
+		if !ok {
+			return "", fmt.Errorf("path must be relative to workdir: %s", inputPath)
+		}
+		clean = rel
 	}
 	return pathutil.ResolveWorkspace(workDir, clean)
 }
 
+func relativizeToWorkdir(workDir, absPath string) (string, bool) {
+	baseAbs, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(filepath.Clean(baseAbs), filepath.Clean(absPath))
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
+}
+
 func workspaceRoot(workDir string) (string, error) {
 	return pathutil.ResolveWorkspace(workDir, ".")
+}
+
+func notFoundMessage(workDir, requested string) string {
+	suggestions := notFoundSuggestions(workDir, requested)
+	if suggestions == "" {
+		return fmt.Sprintf("%s: no such file — use glob to locate the file", requested)
+	}
+	return fmt.Sprintf("%s: no such file — did you mean one of: %s", requested, suggestions)
+}
+
+func notFoundSuggestions(workDir, requested string) string {
+	base := filepath.Base(requested)
+	if base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	root, err := filepath.Abs(workDir)
+	if err != nil {
+		return ""
+	}
+	lower := strings.ToLower(base)
+	var exact, partial []string
+	visited := 0
+	stopWalk := errors.New("stop-walk")
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		visited++
+		if visited > 20000 {
+			return stopWalk
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "node_modules", "vendor", "dist", "build":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		if d.Name() == base {
+			exact = append(exact, rel)
+			if len(exact) >= 5 {
+				return stopWalk
+			}
+		} else if len(partial) < 5 && strings.Contains(strings.ToLower(d.Name()), lower) {
+			partial = append(partial, rel)
+		}
+		return nil
+	})
+	candidates := exact
+	if len(candidates) == 0 {
+		candidates = partial
+	}
+	return strings.Join(candidates, ", ")
 }
 
 func readFileNoFollowBounded(workDir, path string, startLine, endLine int) ([]byte, bool, error) {
@@ -441,6 +520,7 @@ func doubleStarMatch(pattern, name string) bool {
 
 func grepWalk(workDir, root, base string, re *regexp.Regexp, glob string, limit int) (string, error) {
 	var b strings.Builder
+	var skipped []string
 	count := 0
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -494,6 +574,10 @@ func grepWalk(workDir, root, base string, re *regexp.Regexp, glob string, limit 
 		}
 		if scanErr := scanner.Err(); scanErr != nil {
 			_ = f.Close()
+			if errors.Is(scanErr, bufio.ErrTooLong) {
+				skipped = append(skipped, rel)
+				return nil
+			}
 			return fmt.Errorf("scanning %s: %w", path, scanErr)
 		}
 		if closeErr := f.Close(); closeErr != nil {
@@ -504,5 +588,12 @@ func grepWalk(workDir, root, base string, re *regexp.Regexp, glob string, limit 
 	if err != nil && err.Error() != "limit-reached" {
 		return "", err
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	out := strings.TrimRight(b.String(), "\n")
+	for _, rel := range skipped {
+		if out != "" {
+			out += "\n"
+		}
+		out += fmt.Sprintf("[skipped %s: line too long]", rel)
+	}
+	return out, nil
 }

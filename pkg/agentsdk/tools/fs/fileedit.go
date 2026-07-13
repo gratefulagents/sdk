@@ -45,7 +45,7 @@ func (t *WorkspaceEditTool) Execute(ctx context.Context, input json.RawMessage, 
 		return agentsdk.ToolResult{Content: "old_string is required", IsError: true}, nil
 	}
 	if in.OldString == in.NewString {
-		return agentsdk.ToolResult{Content: "old_string and new_string are identical", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "old_string and new_string are identical — if the file already shows the desired text, the edit is already applied; re-read the file before retrying", IsError: true}, nil
 	}
 	canonical, err := pathutil.ResolveWorkspace(workDir, in.FilePath)
 	if err != nil {
@@ -152,7 +152,7 @@ func executeFileEdit(ctx context.Context, input json.RawMessage, workDir string,
 		return agentsdk.ToolResult{Content: "old_string is required", IsError: true}, nil
 	}
 	if in.OldString == in.NewString {
-		return agentsdk.ToolResult{Content: "old_string and new_string are identical", IsError: true}, nil
+		return agentsdk.ToolResult{Content: "old_string and new_string are identical — if the file already shows the desired text, the edit is already applied; re-read the file before retrying", IsError: true}, nil
 	}
 
 	resolvedPath, err := resolvePath(workDir, in.FilePath)

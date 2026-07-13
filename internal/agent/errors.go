@@ -95,7 +95,11 @@ type ToolInputGuardrailTripwireTriggered struct {
 }
 
 func (e *ToolInputGuardrailTripwireTriggered) Error() string {
-	return fmt.Sprintf("tool input guardrail %q tripwire triggered for tool %q", e.GuardrailName, e.ToolName)
+	msg := fmt.Sprintf("tool input guardrail %q tripwire triggered for tool %q", e.GuardrailName, e.ToolName)
+	if detail := guardrailOutputDetail(e.Result.Output); detail != "" {
+		msg += ": " + detail
+	}
+	return msg
 }
 
 // ToolOutputGuardrailTripwireTriggered is returned when a tool output guardrail's tripwire fires.
@@ -106,7 +110,25 @@ type ToolOutputGuardrailTripwireTriggered struct {
 }
 
 func (e *ToolOutputGuardrailTripwireTriggered) Error() string {
-	return fmt.Sprintf("tool output guardrail %q tripwire triggered for tool %q", e.GuardrailName, e.ToolName)
+	msg := fmt.Sprintf("tool output guardrail %q tripwire triggered for tool %q", e.GuardrailName, e.ToolName)
+	if detail := guardrailOutputDetail(e.Result.Output); detail != "" {
+		msg += ": " + detail
+	}
+	return msg
+}
+
+// guardrailOutputDetail renders a guardrail's Output for tripwire error
+// messages so the model learns why the call was blocked (and how to proceed)
+// instead of receiving an opaque failure.
+func guardrailOutputDetail(output any) string {
+	switch v := output.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // RunErrorDetails provides structured context about a run-level error.
