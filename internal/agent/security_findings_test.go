@@ -177,7 +177,7 @@ func TestRunner_M3_AgentPrefixDoesNotBypassReadOnlyForOrdinaryTools(t *testing.T
 		},
 	}
 
-	got := filterByAccess([]Tool{mutating}, ToolAccessLevelReadOnly, &RunContext{ToolAccessLevel: ToolAccessLevelReadOnly})
+	got := filterByAccess([]Tool{mutating}, ToolAccessLevelReadOnly, &RunContext{ToolAccessLevel: ToolAccessLevelReadOnly}, nil)
 	if len(got) != 0 {
 		t.Fatalf("read-only filtering allowed ordinary agent_* tool: %#v", got)
 	}
@@ -185,6 +185,64 @@ func TestRunner_M3_AgentPrefixDoesNotBypassReadOnlyForOrdinaryTools(t *testing.T
 	wrapped := applyToolPolicy([]Tool{mutating}, &ToolPolicy{ApprovalRequired: true})
 	if len(wrapped) != 1 || !wrapped[0].NeedsApproval() {
 		t.Fatalf("ordinary agent_* tool bypassed approval policy")
+	}
+}
+
+func TestRunner_ReadOnlyMutatingExceptionsRequireExactNames(t *testing.T) {
+	ctx := &RunContext{ToolAccessLevel: ToolAccessLevelReadOnly}
+	for _, allowed := range [][]string{
+		nil,
+		{""},
+		{"Submit_Review"},
+		{"submit"},
+		{"submit_review_extra"},
+	} {
+		tool := &enabledMutatingTool{name: "submit_review"}
+		if got := filterByAccess([]Tool{tool}, ToolAccessLevelReadOnly, ctx, allowed); len(got) != 0 {
+			t.Errorf("allowlist %q unexpectedly matched submit_review", allowed)
+		}
+	}
+
+	tool := &enabledMutatingTool{name: "submit_review"}
+	got := filterByAccess([]Tool{tool}, ToolAccessLevelReadOnly, ctx, []string{"submit_review"})
+	if len(got) != 1 || got[0] != tool {
+		t.Fatalf("exact allowlist match returned %#v, want original tool", got)
+	}
+	if got[0].IsReadOnly() {
+		t.Fatal("explicit mutating exception was reclassified as read-only")
+	}
+}
+
+func TestRunner_ReadOnlyMutatingExceptionPreservesPolicyAndSerialization(t *testing.T) {
+	tool := &enabledMutatingTool{name: "submit_review"}
+	ctx := &RunContext{ToolAccessLevel: ToolAccessLevelReadOnly}
+	got := prepareToolsForRun([]Tool{tool}, RunConfig{
+		ToolAccessLevel:      ToolAccessLevelReadOnly,
+		AllowedMutatingTools: []string{"submit_review"},
+		ToolPolicy:           &ToolPolicy{ApprovalRequired: true},
+	}, ctx)
+	if len(got) != 1 {
+		t.Fatalf("prepared tools = %#v, want one", got)
+	}
+	if !got[0].NeedsApproval() {
+		t.Fatal("allowlisted mutating tool bypassed approval policy")
+	}
+	if isParallelSafeTool(got[0]) {
+		t.Fatal("allowlisted mutating tool was treated as parallel-safe")
+	}
+}
+
+func TestRunner_ReadOnlyMutatingExceptionSkipsAccessAdapter(t *testing.T) {
+	tool := &accessAdaptingTool{}
+	ctx := &RunContext{ToolAccessLevel: ToolAccessLevelReadOnly}
+
+	allowed := filterByAccess([]Tool{tool}, ToolAccessLevelReadOnly, ctx, []string{"Bash"})
+	if len(allowed) != 1 || allowed[0] != tool || allowed[0].IsReadOnly() {
+		t.Fatalf("allowlisted adapter result = %#v, want original mutating tool", allowed)
+	}
+	notAllowed := filterByAccess([]Tool{tool}, ToolAccessLevelReadOnly, ctx, nil)
+	if len(notAllowed) != 1 || !notAllowed[0].IsReadOnly() {
+		t.Fatalf("non-allowlisted adapter result = %#v, want read-only variant", notAllowed)
 	}
 }
 
@@ -198,7 +256,7 @@ func TestRunner_UnknownToolAccessLevelFailsClosed(t *testing.T) {
 		},
 	}
 
-	got := filterByAccess([]Tool{mutating}, ToolAccessLevel("typo-full"), &RunContext{ToolAccessLevel: ToolAccessLevel("typo-full")})
+	got := filterByAccess([]Tool{mutating}, ToolAccessLevel("typo-full"), &RunContext{ToolAccessLevel: ToolAccessLevel("typo-full")}, nil)
 	if len(got) != 0 {
 		t.Fatalf("unknown access level allowed mutating tool: %#v", got)
 	}

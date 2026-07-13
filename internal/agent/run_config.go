@@ -257,11 +257,16 @@ type RunConfig struct {
 	// It is retained so operator-era callers keep working.
 	ModeInstructions string
 
-	WorkingStateContext    string          // durable working-state summary appended to compaction carry-forward
-	ToolAccessLevel        ToolAccessLevel // controls tool access tier (full/read-only)
-	ToolPolicy             *ToolPolicy     // optional approval and timeout policy applied to tools
-	MaxConcurrentSubAgents int             // 0 = unlimited
-	ForceFinalSummaryTurn  bool            // reserve the final turn for a no-tool summary instead of hard-failing
+	WorkingStateContext string          // durable working-state summary appended to compaction carry-forward
+	ToolAccessLevel     ToolAccessLevel // controls tool access tier (full/read-only)
+	// AllowedMutatingTools lists exact tool names that may remain available when
+	// ToolAccessLevel is read-only. The tools keep their mutating classification,
+	// so approval and execution-serialization policies still apply. This is a
+	// host-controlled exception and is not inherited by nested sub-agent runs.
+	AllowedMutatingTools   []string
+	ToolPolicy             *ToolPolicy // optional approval and timeout policy applied to tools
+	MaxConcurrentSubAgents int         // 0 = unlimited
+	ForceFinalSummaryTurn  bool        // reserve the final turn for a no-tool summary instead of hard-failing
 
 	// RequireCompletionConfirmation bounces the model's first final answer
 	// back with a verification prompt; only a second consecutive final answer

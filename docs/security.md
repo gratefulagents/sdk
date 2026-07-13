@@ -93,6 +93,21 @@ length-bounded, and provenance-tagged. Model-facing dynamic tool descriptions
 are also flattened and bounded, and explicitly frame the server-supplied
 description as untrusted descriptive data rather than instructions.
 
+### Explicit mutating exceptions in read-only runs
+
+Hosts may set `RunConfig.AllowedMutatingTools` (or the matching runtime
+`Config` field) to exact tool names that must remain available while the run's
+workspace access is read-only—for example, a PR reviewer that may post review
+comments but may not edit the checkout. These exceptions are host-controlled
+capabilities: matching is exact and case-sensitive, and an allowlisted tool
+remains mutating for approval and execution serialization. Exceptions are not
+inherited by nested sub-agent runs.
+
+The tool still receives the real read-only `RunContext` and its `IsEnabled`
+method may decline availability. The allowlist only overrides the runner's
+central mutating-tool filter; it does not force-enable a tool or weaken the
+filesystem sandbox.
+
 ### Sandbox executor: fail-closed read-only
 
 When a tool is invoked under `ToolAccessLevelReadOnly`, the executor selects

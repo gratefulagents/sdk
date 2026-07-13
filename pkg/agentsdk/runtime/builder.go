@@ -88,9 +88,12 @@ type Config struct {
 	MaxConcurrentSubAgents int
 	ToolTimeout            int
 	ToolAccess             agentsdk.ToolAccessLevel
-	PermissionMode         policy.PermissionMode
-	CommandSandboxConfig   *sdksandbox.Config
-	Features               *Features
+	// AllowedMutatingTools lists exact host-trusted tool names that remain
+	// available when ToolAccess is read-only.
+	AllowedMutatingTools []string
+	PermissionMode       policy.PermissionMode
+	CommandSandboxConfig *sdksandbox.Config
+	Features             *Features
 
 	EnableTools              bool
 	EnableMCP                bool
@@ -744,6 +747,7 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 		AdditionalInstructions: additionalInstructions(cfg),
 		WorkingStateContext:    firstNonEmpty(cfg.WorkingStateText, "Runtime state is maintained by the host adapter."),
 		ToolAccessLevel:        cfg.ToolAccess,
+		AllowedMutatingTools:   cloneStrings(cfg.AllowedMutatingTools),
 		ToolPolicy:             toolPolicy(cfg),
 		MaxConcurrentSubAgents: cfg.MaxConcurrentSubAgents,
 		ForceFinalSummaryTurn:  features.value.Runtime.ForceFinalSummary,
