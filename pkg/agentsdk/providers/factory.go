@@ -282,7 +282,7 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 		ProviderName:   provider,
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
-		APIMode:        apiModeForProvider(spec, provider, defaultOpenAICompatibleAPIMode(provider)),
+		APIMode:        apiModeForProvider(spec, provider, defaultOpenAICompatibleAPIMode(provider, len(modelFallbacks) > 0)),
 		AuthMode:       sdkopenai.AuthModeAPIKey,
 		ModelFallbacks: modelFallbacks,
 	})
@@ -677,13 +677,20 @@ func baseURLForProvider(spec ProviderSpec, provider string) string {
 	return ""
 }
 
-// defaultOpenAICompatibleAPIMode selects the provider's native request shape.
-// xAI reasoning uses the OpenAI Responses API's `reasoning` object; its Chat
-// Completions API instead expects `reasoning_effort`, so default xAI routes to
-// Responses rather than sending an incompatible chat payload.
-func defaultOpenAICompatibleAPIMode(provider string) string {
-	if normalizeProviderName(provider) == DefaultProviderXAI {
+// defaultOpenAICompatibleAPIMode selects the provider's preferred request
+// shape. xAI reasoning uses the Responses API's `reasoning` object; its Chat
+// Completions API instead expects `reasoning_effort`. OpenRouter's Responses
+// API Beta supports multiple routed models plus reasoning and tool calling, so
+// prefer it as well. OpenRouter's `models` fallback array is currently a Chat
+// Completions feature, so preserve Chat Completions when fallbacks are enabled.
+func defaultOpenAICompatibleAPIMode(provider string, hasModelFallbacks bool) string {
+	switch normalizeProviderName(provider) {
+	case DefaultProviderXAI:
 		return "responses"
+	case DefaultProviderOpenRouter:
+		if !hasModelFallbacks {
+			return "responses"
+		}
 	}
 	return "chat-completions"
 }
