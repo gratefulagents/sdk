@@ -135,13 +135,10 @@ func TestMultiChunkStreamingExample(t *testing.T) {
 }
 
 // TestSDKOpenAIStreamingViaHTTPTest exercises the real public sdkopenai
-// provider end-to-end against a local httptest.Server. It uses APIMode
-// "chat-completions" because that path is fully driven by net/http and JSON
-// (the Responses-API path requires the upstream OpenAI SDK's SSE machinery
-// which is not feasible to fake offline). The model.StreamResponse call
-// drives the provider's chat-completions buffering plus its
-// response-to-events synthesizer, proving the public NewProviderWithConfig +
-// WithBaseURL + StreamResponse wiring works without network access.
+// provider end-to-end against a local httptest.Server. Chat Completions now
+// consumes the provider's SSE stream directly, so this fixture verifies the
+// public NewProviderWithConfig + WithBaseURL + StreamResponse wiring and live
+// delta/usage assembly without external network access.
 func TestSDKOpenAIStreamingViaHTTPTest(t *testing.T) {
 	mux := http.NewServeMux()
 	var receivedBody []byte
@@ -150,17 +147,14 @@ func TestSDKOpenAIStreamingViaHTTPTest(t *testing.T) {
 		receivedPath = r.URL.Path
 		body, _ := io.ReadAll(r.Body)
 		receivedBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-"id": "chatcmpl-test",
-"model": "gpt-4.1-mini",
-"choices": [{
-"index": 0,
-"message": {"role": "assistant", "content": "hello from test server"},
-"finish_reason": "stop"
-}],
-"usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
-}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"id":"chatcmpl-test","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"hello from "}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"test server"},"finish_reason":"stop"}]}`,
+			`data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n")))
 	})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -204,8 +198,8 @@ func TestSDKOpenAIStreamingViaHTTPTest(t *testing.T) {
 	if final.Usage.OutputTokens != 4 {
 		t.Fatalf("Final.Usage.OutputTokens = %d, want 4 (%+v)", final.Usage.OutputTokens, final.Usage)
 	}
-	if len(receivedBody) == 0 || !strings.Contains(string(receivedBody), `"gpt-4.1-mini"`) {
-		t.Fatalf("server did not receive expected request body: %q", string(receivedBody))
+	if len(receivedBody) == 0 || !strings.Contains(string(receivedBody), `"gpt-4.1-mini"`) || !strings.Contains(string(receivedBody), `"stream":true`) {
+		t.Fatalf("server did not receive expected streaming request body: %q", string(receivedBody))
 	}
 	if !strings.HasSuffix(receivedPath, "/chat/completions") {
 		t.Fatalf("server got path %q, want suffix /chat/completions", receivedPath)

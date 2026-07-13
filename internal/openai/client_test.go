@@ -1630,6 +1630,47 @@ func TestCreateMessageNonCopilotChatUsesBufferedPath(t *testing.T) {
 	}
 }
 
+func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
+	var streamed bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		streamed = strings.Contains(string(body), `"stream":true`)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, strings.Join([]string{
+			`data: {"id":"gen-live","model":"openai/gpt-4o-mini","choices":[{"index":0,"delta":{"content":"live"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n"))
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", WithBaseURL(server.URL+"/v1"), WithAPIMode("chat-completions"))
+	stream, err := client.CreateMessageStream(context.Background(), anthropic.CreateMessageRequest{
+		Model:     "openai/gpt-4o-mini",
+		MaxTokens: 32,
+		Messages: []anthropic.Message{{
+			Role:    anthropic.RoleUser,
+			Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	resp, err := drainStreamToResponse(stream, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !streamed {
+		t.Fatal("chat stream request did not send stream:true")
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Text != "live" {
+		t.Fatalf("response = %+v", resp.Content)
+	}
+}
+
 func TestDrainStreamFeedsReasoningSink(t *testing.T) {
 	var chunks []string
 	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{

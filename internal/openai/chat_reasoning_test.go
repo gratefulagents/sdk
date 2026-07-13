@@ -8,6 +8,28 @@ import (
 	"github.com/gratefulagents/sdk/internal/anthropic"
 )
 
+func TestToChatRequestEmitsReasoningBudget(t *testing.T) {
+	req := anthropic.CreateMessageRequest{
+		Model:     "anthropic/claude-sonnet-4.6",
+		MaxTokens: 8192,
+		Thinking: &anthropic.ThinkingConfig{
+			Type:         "enabled",
+			BudgetTokens: 2048,
+		},
+	}
+	chatReq, err := toChatRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"reasoning":{"max_tokens":2048}`) {
+		t.Fatalf("reasoning budget missing from body: %s", body)
+	}
+}
+
 func TestToChatRequestEmitsReasoningEffort(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -26,6 +29,34 @@ func drainChatStream(t *testing.T, sse string) *anthropic.CreateMessageResponse 
 		assembler.Add(ev)
 	}
 	return assembler.Response()
+}
+
+func TestCopilotStreamDropsBudgetOnlyOpenRouterReasoning(t *testing.T) {
+	var body string
+	client := &Client{
+		completionsURL: "https://api.githubcopilot.com/chat/completions",
+		httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(req.Body)
+			body = string(raw)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		})},
+	}
+	stream, err := client.sendChatStream(context.Background(), anthropic.CreateMessageRequest{
+		Model:     "claude-sonnet-4.6",
+		MaxTokens: 4096,
+		Thinking:  &anthropic.ThinkingConfig{Type: "enabled", BudgetTokens: 2048},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if strings.Contains(body, `"reasoning":`) {
+		t.Fatalf("Copilot request leaked nested OpenRouter reasoning: %s", body)
+	}
 }
 
 func TestChatStreamReaderReasoningAndText(t *testing.T) {
@@ -228,9 +259,9 @@ func TestToChatMessagesRoundTripsReasoning(t *testing.T) {
 	}
 }
 
-// TestToChatMessagesOmitsReasoningWithoutSignature verifies reasoning_text is
-// not resent without its encrypted signature (Copilot rejects that shape).
-func TestToChatMessagesOmitsReasoningWithoutSignature(t *testing.T) {
+// TestToChatMessagesPreservesPlaintextReasoning verifies OpenRouter reasoning
+// without provider-native details is echoed through its plaintext field.
+func TestToChatMessagesPreservesPlaintextReasoning(t *testing.T) {
 	req := anthropic.CreateMessageRequest{
 		Messages: []anthropic.Message{{
 			Role: anthropic.RoleAssistant,
@@ -244,7 +275,120 @@ func TestToChatMessagesOmitsReasoningWithoutSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msgs[0].ReasoningText != "" || msgs[0].ReasoningOpaque != "" {
-		t.Fatalf("reasoning must be omitted without signature, got text=%q opaque=%q", msgs[0].ReasoningText, msgs[0].ReasoningOpaque)
+	if msgs[0].Reasoning != "no signature here" {
+		t.Fatalf("reasoning = %q, want plaintext reasoning", msgs[0].Reasoning)
+	}
+	if msgs[0].ReasoningText != "" || msgs[0].ReasoningOpaque != "" || len(msgs[0].ReasoningDetails) != 0 {
+		t.Fatalf("unexpected provider-specific reasoning fields: %+v", msgs[0])
+	}
+}
+
+func TestOpenRouterReasoningDetailsRoundTrip(t *testing.T) {
+	details := json.RawMessage(`[{"type":"reasoning.text","text":"inspect state"},{"type":"reasoning.encrypted","data":"opaque"}]`)
+	out, err := toAnthropicResponseFromChat(chatCompletionResponse{
+		ID:    "gen-1",
+		Model: "anthropic/claude-sonnet-4.6",
+		Choices: []chatChoice{{
+			Message: chatMessage{
+				Role:             "assistant",
+				Content:          nil,
+				Reasoning:        "inspect state",
+				ReasoningDetails: details,
+				ToolCalls: []chatToolCall{{
+					ID:   "call_1",
+					Type: "function",
+					Function: chatFunction{
+						Name:      "inspect",
+						Arguments: `{}`,
+					},
+				}},
+			},
+			FinishReason: "tool_calls",
+		}},
+		Usage: &chatUsage{
+			PromptTokens:     100,
+			CompletionTokens: 20,
+			PromptTokensDetails: &chatPromptTokensDetails{
+				CachedTokens:     70,
+				CacheWriteTokens: 5,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 2 || out.Content[0].Type != "thinking" || out.Content[1].Type != "tool_use" {
+		t.Fatalf("content = %+v, want thinking then tool", out.Content)
+	}
+	if out.Usage.CacheReadInputTokens != 70 || out.Usage.CacheCreationInputTokens != 5 {
+		t.Fatalf("usage = %+v, want cache read=70 write=5", out.Usage)
+	}
+
+	msgs, err := toChatMessages(anthropic.CreateMessageRequest{Messages: []anthropic.Message{{
+		Role:    anthropic.RoleAssistant,
+		Content: out.Content,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || string(msgs[0].ReasoningDetails) != string(details) {
+		t.Fatalf("reasoning_details = %s, want %s", msgs[0].ReasoningDetails, details)
+	}
+	if msgs[0].Reasoning != "" || msgs[0].ReasoningOpaque != "" {
+		t.Fatalf("structured details must not be downgraded: %+v", msgs[0])
+	}
+}
+
+func TestChatStreamReaderOpenRouterReasoningDetailsAndCacheUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"id":"gen-1","model":"anthropic/claude-sonnet-4.6","choices":[{"index":0,"delta":{"reasoning":"inspect ","reasoning_details":[{"type":"reasoning.text","text":"inspect "}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"reasoning":"state","reasoning_details":[{"type":"reasoning.text","text":"state"}]}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":70,"cache_write_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+
+	resp := drainChatStream(t, sse)
+	if len(resp.Content) != 2 || resp.Content[0].Thinking != "inspect state" || resp.Content[1].Type != "tool_use" {
+		t.Fatalf("content = %+v", resp.Content)
+	}
+	details := decodeOpenRouterReasoningDetails(resp.Content[0].Signature)
+	if string(details) != `[{"type":"reasoning.text","text":"inspect "},{"type":"reasoning.text","text":"state"}]` {
+		t.Fatalf("decoded reasoning details = %s", details)
+	}
+	if resp.Usage.CacheReadInputTokens != 70 || resp.Usage.CacheCreationInputTokens != 5 {
+		t.Fatalf("usage = %+v", resp.Usage)
+	}
+}
+
+func TestChatStreamReaderPreservesChoiceErrorStatus(t *testing.T) {
+	sse := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\",\"error\":{\"code\":429,\"message\":\"provider rate limited\",\"metadata\":{\"provider_name\":\"upstream\"}}}]}\n\n"
+	reader := newChatStreamReader(&http.Response{Body: io.NopCloser(strings.NewReader(sse))})
+	_, err := reader.Next()
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("error = %v, want RequestError", err)
+	}
+	if reqErr.StatusCode != http.StatusTooManyRequests || !strings.Contains(reqErr.Body, "provider rate limited") || !strings.Contains(reqErr.Body, "provider_name") {
+		t.Fatalf("request error = %+v", reqErr)
+	}
+}
+
+func TestBufferedChatPreservesChoiceErrorStatus(t *testing.T) {
+	_, err := toAnthropicResponseFromChat(chatCompletionResponse{Choices: []chatChoice{{
+		FinishReason: "error",
+		Error: &chatAPIError{
+			Code:     json.RawMessage(`503`),
+			Message:  "all providers failed",
+			Metadata: json.RawMessage(`{"provider_name":"upstream"}`),
+		},
+	}}})
+	var reqErr *RequestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %#v, want status 503 RequestError", err)
+	}
+	if !strings.Contains(reqErr.Body, "all providers failed") || !strings.Contains(reqErr.Body, "provider_name") {
+		t.Fatalf("body = %q", reqErr.Body)
 	}
 }
