@@ -40,6 +40,12 @@ func TestNewProviderFromConfigSupportsXAI(t *testing.T) {
 	if got := defaultBaseURLForProvider(DefaultProviderXAI); got != "https://api.x.ai/v1" {
 		t.Fatalf("defaultBaseURLForProvider(xai) = %q", got)
 	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderXAI); got != "responses" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(xai) = %q, want responses", got)
+	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter); got != "chat-completions" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter) = %q, want chat-completions", got)
+	}
 }
 
 func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {

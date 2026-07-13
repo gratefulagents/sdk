@@ -282,7 +282,7 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 		ProviderName:   provider,
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
-		APIMode:        apiModeForProvider(spec, provider, "chat-completions"),
+		APIMode:        apiModeForProvider(spec, provider, defaultOpenAICompatibleAPIMode(provider)),
 		AuthMode:       sdkopenai.AuthModeAPIKey,
 		ModelFallbacks: modelFallbacks,
 	})
@@ -675,6 +675,17 @@ func baseURLForProvider(spec ProviderSpec, provider string) string {
 		return baseURL
 	}
 	return ""
+}
+
+// defaultOpenAICompatibleAPIMode selects the provider's native request shape.
+// xAI reasoning uses the OpenAI Responses API's `reasoning` object; its Chat
+// Completions API instead expects `reasoning_effort`, so default xAI routes to
+// Responses rather than sending an incompatible chat payload.
+func defaultOpenAICompatibleAPIMode(provider string) string {
+	if normalizeProviderName(provider) == DefaultProviderXAI {
+		return "responses"
+	}
+	return "chat-completions"
 }
 
 func apiModeForProvider(spec ProviderSpec, provider, fallback string) string {
