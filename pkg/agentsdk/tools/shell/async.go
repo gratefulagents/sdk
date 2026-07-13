@@ -367,7 +367,7 @@ func (t *BashStartTool) InputSchema() json.RawMessage {
 
 func (t *BashStartTool) IsReadOnly() bool { return false }
 func (t *BashStartTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *BashStartTool) NeedsApproval() bool { return false }
 func (t *BashStartTool) TimeoutSeconds() int { return 0 }
@@ -490,7 +490,7 @@ func (t *BashKillTool) InputSchema() json.RawMessage {
 
 func (t *BashKillTool) IsReadOnly() bool { return false }
 func (t *BashKillTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *BashKillTool) NeedsApproval() bool { return false }
 func (t *BashKillTool) TimeoutSeconds() int { return 0 }

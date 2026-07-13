@@ -347,7 +347,16 @@ func TestRunnerReadOnlyAccessAllowsExplicitMutatingTool(t *testing.T) {
 			},
 		},
 	}
-	allowed := &enabledMutatingTool{name: "submit_review", output: "review submitted"}
+	var allowedExecuted bool
+	allowed := &FunctionTool{
+		ToolName:        "submit_review",
+		ToolDescription: "submit an external review",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			allowedExecuted = true
+			return "review submitted", nil
+		},
+	}
 	blocked := &FunctionTool{
 		ToolName:        "edit_workspace",
 		ToolDescription: "edit the workspace",
@@ -372,11 +381,8 @@ func TestRunnerReadOnlyAccessAllowsExplicitMutatingTool(t *testing.T) {
 	if model.requests[0].Tools[0].IsReadOnly() {
 		t.Fatal("allowlisted mutating tool was reclassified as read-only")
 	}
-	if allowed.enabledAccess != ToolAccessLevelReadOnly {
-		t.Fatalf("IsEnabled access = %q, want the actual read-only context", allowed.enabledAccess)
-	}
-	if !allowed.executed {
-		t.Fatal("allowlisted mutating tool did not execute")
+	if !allowedExecuted {
+		t.Fatal("allowlisted FunctionTool did not execute")
 	}
 	var gotOutput string
 	for _, item := range result.NewItems {

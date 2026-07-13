@@ -118,7 +118,7 @@ func (t *InstallTool) Description() string {
 }
 func (t *InstallTool) IsReadOnly() bool { return false }
 func (t *InstallTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *InstallTool) NeedsApproval() bool { return false }
 func (t *InstallTool) TimeoutSeconds() int { return 0 }

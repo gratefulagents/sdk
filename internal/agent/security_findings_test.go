@@ -211,6 +211,9 @@ func TestRunner_ReadOnlyMutatingExceptionsRequireExactNames(t *testing.T) {
 	if got[0].IsReadOnly() {
 		t.Fatal("explicit mutating exception was reclassified as read-only")
 	}
+	if tool.enabledAccess != ToolAccessLevelReadOnly {
+		t.Fatalf("IsEnabled access = %q, want the actual read-only context", tool.enabledAccess)
+	}
 }
 
 func TestRunner_ReadOnlyMutatingExceptionPreservesPolicyAndSerialization(t *testing.T) {

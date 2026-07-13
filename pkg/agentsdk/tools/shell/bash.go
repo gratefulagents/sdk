@@ -71,7 +71,7 @@ func (t *BashTool) InputSchema() json.RawMessage {
 func (t *BashTool) IsReadOnly() bool { return false }
 
 func (t *BashTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 
 func (t *BashTool) NeedsApproval() bool { return false }

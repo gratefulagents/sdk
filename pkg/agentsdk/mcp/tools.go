@@ -75,10 +75,7 @@ func (t *DynamicTool) InputSchema() json.RawMessage {
 func (t *DynamicTool) IsReadOnly() bool { return t.Descriptor.ReadOnly }
 
 func (t *DynamicTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	if ctx != nil && ctx.ToolAccessLevel == agentsdk.ToolAccessLevelReadOnly {
-		return t.IsReadOnly()
-	}
-	return true
+	return t.IsReadOnly() || agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 
 func (t *DynamicTool) NeedsApproval() bool { return false }

@@ -103,9 +103,11 @@ capabilities: matching is exact and case-sensitive, and an allowlisted tool
 remains mutating for approval and execution serialization. Exceptions are not
 inherited by nested sub-agent runs.
 
-The tool still receives the real read-only `RunContext` and its `IsEnabled`
-method may decline availability. The allowlist only overrides the runner's
-central mutating-tool filter; it does not force-enable a tool or weaken the
+The tool still receives the real read-only `RunContext`. `FunctionTool` and
+SDK built-in mutators use `MutatingToolEnabled` so an exact-name exception is
+not rejected merely because the context is read-only; custom access-aware
+`IsEnabled` methods should use the same helper. They may still decline
+availability for unrelated reasons. The allowlist does not weaken the
 filesystem sandbox.
 
 ### Sandbox executor: fail-closed read-only
