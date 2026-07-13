@@ -105,6 +105,7 @@ var openAICompatibleProviderNames = []string{
 	DefaultProviderOpenRouter,
 	DefaultProviderGemini,
 	DefaultProviderGroq,
+	DefaultProviderXAI,
 	DefaultProviderLocal,
 }
 
@@ -128,7 +129,7 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 		return newOpenAIProviderFromSpec(spec)
 	case DefaultProviderAnthropic:
 		return sdkanthropic.NewProviderWithConfig(anthropicProviderConfig(spec)), nil
-	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderLocal:
+	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderXAI, DefaultProviderLocal:
 		return newOpenAICompatibleProviderFromSpec(provider, spec), nil
 	case DefaultProviderCopilot:
 		return newCopilotProviderFromSpec(spec), nil
@@ -709,6 +710,8 @@ func defaultBaseURLForProvider(provider string) string {
 		return "https://generativelanguage.googleapis.com/v1beta/openai"
 	case DefaultProviderGroq:
 		return "https://api.groq.com/openai/v1"
+	case DefaultProviderXAI:
+		return "https://api.x.ai/v1"
 	case DefaultProviderLocal:
 		return "http://localhost:11434/v1"
 	case DefaultProviderCopilot:

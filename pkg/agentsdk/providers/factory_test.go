@@ -29,6 +29,19 @@ func TestNewProviderFromConfigSupportsLocal(t *testing.T) {
 	}
 }
 
+func TestNewProviderFromConfigSupportsXAI(t *testing.T) {
+	provider, err := NewProviderFromConfig(ProviderSpec{Provider: DefaultProviderXAI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider == nil {
+		t.Fatal("provider is nil")
+	}
+	if got := defaultBaseURLForProvider(DefaultProviderXAI); got != "https://api.x.ai/v1" {
+		t.Fatalf("defaultBaseURLForProvider(xai) = %q", got)
+	}
+}
+
 func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {
 	var gotPath, gotModel string
 	gotHeaders := http.Header{}
