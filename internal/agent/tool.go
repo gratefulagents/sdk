@@ -17,6 +17,16 @@ type Tool interface {
 	TimeoutSeconds() int
 }
 
+// ToolTimeoutResultPreserver is implemented by context-aware tools that turn
+// their own deadline into a complete, model-safe result. The runner normally
+// replaces any result produced at the tool-policy deadline with
+// ToolTimeoutError; this opt-in lets managed wait tools return a non-fatal
+// progress snapshot instead. The result is preserved only when Execute returns
+// no error and a non-error ToolResult.
+type ToolTimeoutResultPreserver interface {
+	PreserveResultOnTimeout() bool
+}
+
 // ToolAccessAdapter lets a host application provide a safer tool
 // implementation for a specific access level.
 type ToolAccessAdapter interface {
@@ -120,6 +130,11 @@ func (w *policyToolWrapper) TimeoutSeconds() int {
 		return w.timeout
 	}
 	return w.inner.TimeoutSeconds()
+}
+
+func (w *policyToolWrapper) PreserveResultOnTimeout() bool {
+	preserver, ok := w.inner.(ToolTimeoutResultPreserver)
+	return ok && preserver.PreserveResultOnTimeout()
 }
 
 // ToolForAccess delegates to the inner tool's ToolAccessAdapter (if any) and

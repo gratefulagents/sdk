@@ -13,12 +13,14 @@ import (
 type subagentToolMockModel struct {
 	mu        sync.Mutex
 	responses []*ModelResponse
+	requests  []ModelRequest
 	callIdx   int
 }
 
 func (m *subagentToolMockModel) GetResponse(_ context.Context, req ModelRequest) (*ModelResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.requests = append(m.requests, req)
 	idx := m.callIdx
 	m.callIdx++
 	if idx >= len(m.responses) {
@@ -137,6 +139,53 @@ func TestSubagentToolSyncWaitDeadlineLeavesTaskRunning(t *testing.T) {
 	close(model.release)
 	if _, err := registry.WaitForUndeliveredResults(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSubagentToolPreservesPendingResultThroughRunnerToolPolicyTimeout(t *testing.T) {
+	parentModel := &subagentToolMockModel{responses: []*ModelResponse{
+		{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{
+			ID: "spawn-review", Name: "subagent", Input: json.RawMessage(`{"agent_name":"worker","message":"review"}`),
+		}}}},
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent continued"}}}},
+	}}
+	childModel := &blockingSubagentToolModel{started: make(chan struct{}), release: make(chan struct{})}
+	runner := NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{
+		"parent-model": parentModel,
+		"child-model":  childModel,
+	}})
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: runner,
+		Agents: map[string]*Agent{"worker": {Name: "worker", Model: "child-model"}},
+	})
+	spawnTool := &subagentTool{registry: registry, defaultAgent: "worker"}
+	parent := &Agent{Name: "parent", Model: "parent-model", Tools: []Tool{spawnTool}}
+
+	releaseTimer := time.AfterFunc(1200*time.Millisecond, func() { close(childModel.release) })
+	defer releaseTimer.Stop()
+	result, err := runner.Run(context.Background(), parent, nil, RunConfig{
+		MaxTurns:   3,
+		ToolPolicy: &ToolPolicy{DefaultTimeout: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalOutput != "parent continued" {
+		t.Fatalf("final output = %q", result.FinalOutput)
+	}
+
+	parentModel.mu.Lock()
+	requests := append([]ModelRequest(nil), parentModel.requests...)
+	parentModel.mu.Unlock()
+	if len(requests) < 2 {
+		t.Fatalf("parent model requests = %d, want tool result follow-up", len(requests))
+	}
+	secondInput := requests[1].Input
+	if !containsToolOutput(secondInput, `"timed_out": true`) || !containsToolOutput(secondInput, `"status": "running"`) {
+		t.Fatalf("runner did not preserve managed pending result: %#v", secondInput)
+	}
+	if containsToolOutput(secondInput, `tool "subagent" timed out`) {
+		t.Fatalf("runner replaced managed result with ToolTimeoutError: %#v", secondInput)
 	}
 }
 
@@ -349,6 +398,52 @@ func TestSubagentToolBatchWaitDeadlineLeavesTasksRunning(t *testing.T) {
 	}
 
 	close(model.release)
+	if _, err := registry.WaitForUndeliveredResults(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubagentToolBatchTimeoutMarksCompletedResultsDelivered(t *testing.T) {
+	fastModel := &subagentToolMockModel{responses: []*ModelResponse{{
+		Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "fast result"}}},
+	}}}
+	slowModel := &blockingSubagentToolModel{started: make(chan struct{}), release: make(chan struct{})}
+	runner := NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{
+		"fast-model": fastModel,
+		"slow-model": slowModel,
+	}})
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: runner,
+		Agents: map[string]*Agent{
+			"fast": {Name: "fast", Model: "fast-model"},
+			"slow": {Name: "slow", Model: "slow-model"},
+		},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "fast"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"timeout_ms": 100,
+		"tasks": [
+			{"key": "fast", "agent_name": "fast", "message": "finish"},
+			{"key": "slow", "agent_name": "slow", "message": "block", "depends_on": ["fast"]}
+		]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(result.Content, `"result": "fast result"`) {
+		t.Fatalf("timed-out batch must return completed result once: %+v", result)
+	}
+
+	undelivered, active := registry.FinalJoinSnapshot()
+	if len(undelivered) != 0 {
+		t.Fatalf("completed timeout results were redelivered by final join: %+v", undelivered)
+	}
+	if len(active) != 1 || active[0].AgentName != "slow" {
+		t.Fatalf("active tasks = %+v, want slow task", active)
+	}
+
+	close(slowModel.release)
 	if _, err := registry.WaitForUndeliveredResults(context.Background()); err != nil {
 		t.Fatal(err)
 	}

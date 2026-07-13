@@ -53,7 +53,8 @@ type subagentBatchTaskInput struct {
 	IncludeDependencyResults *bool    `json:"include_dependency_results"`
 }
 
-func (t *subagentTool) Name() string { return "subagent" }
+func (t *subagentTool) Name() string                  { return "subagent" }
+func (t *subagentTool) PreserveResultOnTimeout() bool { return true }
 func (t *subagentTool) Description() string {
 	return "Delegate work to specialist sub-agents. Send one task (message) or a dependency DAG of tasks (tasks). mode=sync returns final results in this call; mode=background returns task ids immediately and results are delivered automatically as each task finishes."
 }
@@ -314,6 +315,8 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 	}
 	if waitErr == nil {
 		markTasksDelivered(t.registry, taskIDs)
+	} else if timedOut {
+		markTerminalTasksDelivered(t.registry, tasks)
 	}
 	waitError := waitErr
 	if timedOut {
@@ -544,6 +547,17 @@ func markTasksDelivered(registry *SubAgentScheduler, taskIDs []string) {
 	}
 	for _, taskID := range uniqueNonEmptyTaskIDs(taskIDs) {
 		_, _ = registry.CollectResult(taskID)
+	}
+}
+
+func markTerminalTasksDelivered(registry *SubAgentScheduler, tasks []SubAgentTask) {
+	if registry == nil {
+		return
+	}
+	for i := range tasks {
+		if tasks[i].IsTerminal() {
+			_, _ = registry.CollectResult(tasks[i].ID)
+		}
 	}
 }
 
@@ -877,7 +891,8 @@ type subagentWaitTool struct {
 	registry *SubAgentScheduler
 }
 
-func (t *subagentWaitTool) Name() string { return "subagent_wait" }
+func (t *subagentWaitTool) Name() string                  { return "subagent_wait" }
+func (t *subagentWaitTool) PreserveResultOnTimeout() bool { return true }
 func (t *subagentWaitTool) Description() string {
 	return "Block until sub-agent tasks finish, then return their results. Use this instead of polling subagent_status or sleeping in Bash: it wakes the moment tasks finish, so it never overshoots. wait_for=all (default) waits for every watched task; wait_for=any returns as soon as one finishes with a new result. Omit task_ids to wait on all active tasks. timeout_ms caps the wait (timing out is a normal outcome, not an error)."
 }
