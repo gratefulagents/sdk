@@ -42,7 +42,7 @@ type bashInput struct {
 func (t *BashTool) Name() string { return "Bash" }
 
 func (t *BashTool) Description() string {
-	return "Executes a bash command and returns its output (stdout and stderr combined). Use for running shell commands, build tools, git operations, and other CLI tasks. Each call runs in a fresh process: cd and environment variables do not persist between calls, so chain dependent steps with && in one command. Disable pagers (git --no-pager, | cat) for interactive-output commands. For long-running commands use BashStart/BashPoll; for interactive programs use the Terminal tool if available."
+	return "Executes a bash command and returns its output (stdout and stderr combined). Use for running shell commands, build tools, git operations, and other CLI tasks. Each call runs in a fresh process: cd and environment variables do not persist between calls, so chain dependent steps with && in one command. Disable pagers (git --no-pager, | cat) for interactive-output commands. For long-running commands use BashStart/BashPoll; for interactive programs use the Terminal tool if available. In restricted sessions (read-only/plan mode, read-only sub-agents, or hosts without an enforcing OS sandbox) commands are statically authorized before running: command substitution $(...) or backticks, heredocs/here-strings, VAR=value prefixes, eval/source/alias, function definitions, `git remote`, dynamically-built `git push` refs, and the gh CLI are rejected — write plain literal commands, split pipelines into separate calls, and use the built-in git/GitHub tools for anything git must not do here."
 }
 
 func (t *BashTool) InputSchema() json.RawMessage {
@@ -364,7 +364,7 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 	// sandbox enforces the filesystem boundary. Keep it fail-closed in read-only
 	// mode and on advisory/non-enforcing workspace-write hosts.
 	if dynamicReason != "" && (readOnly || workspaceWrite && !fsEnforced) {
-		return true, fmt.Sprintf("Command blocked in %s mode: %s", mode, dynamicReason)
+		return true, fmt.Sprintf("Command blocked in %s mode: %s — write the command with only literal arguments, or split it into separate Bash calls", mode, dynamicReason)
 	}
 
 	// Even with filesystem confinement, network side effects cannot be contained.
@@ -390,12 +390,12 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 	for _, argv := range gitInvocations(command) {
 		if readOnly {
 			if blocked, sub := isReadOnlyGitDenied(argv); blocked {
-				return true, fmt.Sprintf("Command blocked in %s mode: git %s is not allowed", mode, sub)
+				return true, fmt.Sprintf("Command blocked in %s mode: git %s is not allowed%s", mode, sub, gitDenialHint(sub))
 			}
 		}
 		if workspaceWrite {
 			if blocked, sub := isWorkspaceWriteGitDenied(argv); blocked {
-				return true, fmt.Sprintf("Command blocked in %s mode: git %s is not allowed", mode, sub)
+				return true, fmt.Sprintf("Command blocked in %s mode: git %s is not allowed%s", mode, sub, gitDenialHint(sub))
 			}
 		}
 		if (readOnly || workspaceWrite) && pushTargetsProtectedBranch(argv) {
@@ -415,6 +415,13 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 	}
 
 	return false, ""
+}
+
+func gitDenialHint(sub string) string {
+	if sub == "remote" {
+		return " — remote configuration is platform-managed; use git_status or the built-in git/GitHub tools instead"
+	}
+	return " — this session cannot mutate the repository"
 }
 
 // IsPushToProtectedBranch detects git push commands that target main or

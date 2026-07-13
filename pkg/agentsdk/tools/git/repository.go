@@ -112,6 +112,7 @@ type attachRepositoryOutput struct {
 	AbsolutePath string `json:"absolute_path,omitempty"`
 	BaseBranch   string `json:"base_branch,omitempty"`
 	BranchName   string `json:"branch_name,omitempty"`
+	Note         string `json:"note,omitempty"`
 	Error        string `json:"error,omitempty"`
 }
 
@@ -165,8 +166,21 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 		return attachRepositoryError(fmt.Sprintf("creating repository store: %v", err))
 	}
 
+	cloneNote := ""
 	if out, err := cloneRepository(ctx, runner, workspaceRoot, repoURL, dest, baseBranch); err != nil {
-		return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", err, out))
+		// A requested branch that does not exist on the remote is a recoverable
+		// mistake (agents often pass their working branch as base_branch): fall
+		// back to the repository default branch instead of failing the attach.
+		if strings.TrimSpace(baseBranch) != "" && isMissingRemoteBranchCloneError(out) {
+			retryOut, retryErr := cloneRepository(ctx, runner, workspaceRoot, repoURL, dest, "")
+			if retryErr != nil {
+				return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", retryErr, retryOut))
+			}
+			cloneNote = fmt.Sprintf("requested base branch %q not found on the remote; cloned the repository default branch instead", baseBranch)
+			baseBranch = ""
+		} else {
+			return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", err, out))
+		}
 	}
 	if branchName != "" {
 		if out, err := runner.RunGit(ctx, dest, "checkout", "-B", branchName); err != nil {
@@ -182,7 +196,7 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 		}
 	}
 
-	return attachedRepositoryResult(workspaceRoot, dest, "attached", repoURL, baseBranch, branchName)
+	return attachedRepositoryResult(workspaceRoot, dest, "attached", repoURL, baseBranch, branchName, cloneNote)
 }
 
 func repositoryStoreExcludePattern(workspaceRoot, storeAbs string) string {
@@ -213,6 +227,14 @@ func cloneRepository(ctx context.Context, runner CommandRunner, workDir, repoURL
 	return runner.RunGit(ctx, workDir, args...)
 }
 
+// isMissingRemoteBranchCloneError reports whether a git clone failure output
+// indicates the requested --branch does not exist on the remote (as opposed to
+// auth, network, or not-found-repository failures, which must not be retried).
+func isMissingRemoteBranchCloneError(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "remote branch") && strings.Contains(lower, "not found in upstream")
+}
+
 func attachExistingRepository(ctx context.Context, runner CommandRunner, workspaceRoot, dest, repoURL, alias, baseBranch, branchName string) (agentsdk.ToolResult, error) {
 	if !isGitRepository(dest) {
 		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s but is not a git repository", alias, dest))
@@ -227,10 +249,10 @@ func attachExistingRepository(ctx context.Context, runner CommandRunner, workspa
 		return attachRepositoryError(fmt.Sprintf("repository alias %q already exists at %s with origin %q, not %q", alias, dest, origin, repoURL))
 	}
 
-	return attachedRepositoryResult(workspaceRoot, dest, "already_attached", repoURL, baseBranch, branchName)
+	return attachedRepositoryResult(workspaceRoot, dest, "already_attached", repoURL, baseBranch, branchName, "")
 }
 
-func attachedRepositoryResult(workspaceRoot, dest, status, repoURL, baseBranch, branchName string) (agentsdk.ToolResult, error) {
+func attachedRepositoryResult(workspaceRoot, dest, status, repoURL, baseBranch, branchName, note string) (agentsdk.ToolResult, error) {
 	relPath, err := filepath.Rel(workspaceRoot, dest)
 	if err != nil {
 		return attachRepositoryError(fmt.Sprintf("computing repository path: %v", err))
@@ -242,6 +264,7 @@ func attachedRepositoryResult(workspaceRoot, dest, status, repoURL, baseBranch, 
 		AbsolutePath: dest,
 		BaseBranch:   baseBranch,
 		BranchName:   branchName,
+		Note:         note,
 	})
 }
 

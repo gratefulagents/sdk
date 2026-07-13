@@ -259,7 +259,7 @@ func BuildModeDirective(spec *sdkmode.TemplateSpec) string {
 		parts = append(parts, "Mode description: "+strings.TrimSpace(spec.Description))
 	}
 	if normalizeToolAccess(spec.ToolAccess) == "read-only" {
-		parts = append(parts, "Tool access: read-only. Do not modify files or run mutating commands.")
+		parts = append(parts, "Tool access: read-only. Do not modify files or run mutating commands. Bash is restricted to statically-authorized commands: no command substitution $(...) or backticks, no heredocs, no VAR=value prefixes, no eval/source, no function definitions, no git-mutating subcommands (commit/add/push/merge/rebase/branch/tag/stash/remote), and no gh CLI — use plain literal read commands and the dedicated read tools (read_file, grep, glob, list_files) instead.")
 	}
 	if strings.TrimSpace(spec.Instructions) != "" {
 		parts = append(parts, strings.TrimSpace(spec.Instructions))

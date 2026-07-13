@@ -1980,7 +1980,7 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	// Tool output guardrails.
 	var outputGuardrailErr error
 	if len(cfg.ToolOutputGuardrails) > 0 {
-		outputResults, guardrailErr := runToolOutputGuardrails(runCtx, agent, t, result, cfg.ToolOutputGuardrails)
+		guardedResult, outputResults, guardrailErr := runToolOutputGuardrails(runCtx, agent, t, result, cfg.ToolOutputGuardrails)
 		res.outputGuardrails = outputResults
 		if guardrailErr != nil {
 			outputGuardrailErr = guardrailErr
@@ -1988,6 +1988,8 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 				res.guardrailErr = guardrailErr
 			}
 			result = ToolResult{Content: guardrailErr.Error(), IsError: true}
+		} else {
+			result = guardedResult
 		}
 	}
 
@@ -3059,13 +3061,15 @@ func callToolInputGuardrail(g ToolInputGuardrail, ctx *RunContext, agent *Agent,
 	return g.Fn(ctx, agent, tool, input)
 }
 
-// runToolOutputGuardrails runs all tool output guardrails for a single tool result.
-func runToolOutputGuardrails(ctx *RunContext, agent *Agent, tool Tool, result ToolResult, guardrails []ToolOutputGuardrail) ([]ToolGuardrailResult, error) {
+// runToolOutputGuardrails runs all tool output guardrails for a single tool
+// result. A guardrail may rewrite the result content via ContentReplaced; the
+// rewritten result is fed to subsequent guardrails and returned to the caller.
+func runToolOutputGuardrails(ctx *RunContext, agent *Agent, tool Tool, result ToolResult, guardrails []ToolOutputGuardrail) (ToolResult, []ToolGuardrailResult, error) {
 	results := make([]ToolGuardrailResult, 0, len(guardrails))
 	for _, g := range guardrails {
 		gr, err := callToolOutputGuardrail(g, ctx, agent, tool, result)
 		if err != nil {
-			return nil, &AgentError{Message: fmt.Sprintf("tool output guardrail %q failed for tool %q", g.Name, tool.Name()), Cause: err}
+			return result, nil, &AgentError{Message: fmt.Sprintf("tool output guardrail %q failed for tool %q", g.Name, tool.Name()), Cause: err}
 		}
 		if gr == nil {
 			gr = &GuardrailResult{}
@@ -3077,10 +3081,13 @@ func runToolOutputGuardrails(ctx *RunContext, agent *Agent, tool Tool, result To
 			TripwireTriggered: gr.TripwireTriggered,
 		})
 		if gr.TripwireTriggered {
-			return results, &ToolOutputGuardrailTripwireTriggered{GuardrailName: g.Name, ToolName: tool.Name(), Result: *gr}
+			return result, results, &ToolOutputGuardrailTripwireTriggered{GuardrailName: g.Name, ToolName: tool.Name(), Result: *gr}
+		}
+		if gr.ContentReplaced {
+			result.Content = gr.ReplacementContent
 		}
 	}
-	return results, nil
+	return result, results, nil
 }
 
 func callToolOutputGuardrail(g ToolOutputGuardrail, ctx *RunContext, agent *Agent, tool Tool, result ToolResult) (gr *GuardrailResult, err error) {
