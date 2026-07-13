@@ -26,6 +26,24 @@ ANTHROPIC_API_KEY=sk-...     go test -run TestMultiProvider   ./examples/feature
 
 Optional overrides: `ANTHROPIC_LIVE_MODEL`, `ANTHROPIC_BASE_URL`, `OPENROUTER_LIVE_MODEL`, `OPENROUTER_BASE_URL`.
 
+## OpenRouter
+
+Use the provider factory for first-class OpenRouter behavior:
+
+```go
+provider, err := providers.NewProviderFromConfig(providers.ProviderSpec{
+	Provider: "openrouter",
+	APIKey:   openRouterAPIKey,
+})
+```
+
+The factory defaults OpenRouter to its normalized Chat Completions endpoint,
+preserves `reasoning_details` across tool turns, streams SSE events as they
+arrive, and sends SDK attribution headers only to `openrouter.ai`. Set
+`APIMode: "responses"` explicitly if an application has validated its selected
+models against OpenRouter's evolving Responses API. `ModelFallbacks` remains
+available for OpenRouter's ordered `models` routing array.
+
 ## Anthropic OAuth
 
 The Anthropic provider accepts either an API key or a host-supplied OAuth access token. For OAuth, pass the access token as `APIKey` and set `AuthMode: "oauth"`:

@@ -38,6 +38,7 @@ type chatChunkChoice struct {
 	Index        int            `json:"index"`
 	Delta        chatChunkDelta `json:"delta"`
 	FinishReason string         `json:"finish_reason"`
+	Error        *chatAPIError  `json:"error,omitempty"`
 }
 
 type chatChunkDelta struct {
@@ -45,6 +46,13 @@ type chatChunkDelta struct {
 	Content   string              `json:"content"`
 	Refusal   string              `json:"refusal"`
 	ToolCalls []chatChunkToolCall `json:"tool_calls"`
+
+	// OpenRouter reasoning fields. reasoning_content is a compatibility alias;
+	// reasoning_details carries provider-native blocks that must be preserved.
+	Reasoning        string            `json:"reasoning"`
+	ReasoningContent string            `json:"reasoning_content"`
+	ReasoningDetails []json.RawMessage `json:"reasoning_details"`
+
 	// Copilot-specific reasoning fields.
 	ReasoningText   string `json:"reasoning_text"`
 	ReasoningOpaque string `json:"reasoning_opaque"`
@@ -98,7 +106,15 @@ func (c *Client) sendChatStream(ctx context.Context, req anthropic.CreateMessage
 	if isGitHubCopilotHost(hostFromURL(c.completionsURL)) {
 		if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
 			chatReq.ReasoningEffort = effort
-			chatReq.Reasoning = nil
+		}
+		// Copilot does not accept OpenRouter's nested reasoning control, including
+		// max_tokens from a budget-only request; it only supports reasoning_effort.
+		chatReq.Reasoning = nil
+		// Copilot rejects OpenRouter's plaintext/structured reasoning fields.
+		for i := range chatReq.Messages {
+			chatReq.Messages[i].Reasoning = ""
+			chatReq.Messages[i].ReasoningContent = ""
+			chatReq.Messages[i].ReasoningDetails = nil
 		}
 	}
 
@@ -147,9 +163,10 @@ type chatStreamReader struct {
 
 	nextIndex int
 
-	openKind        int // chatBlockNone | chatBlockReasoning | chatBlockText
-	openIndex       int
-	reasoningOpaque string
+	openKind         int // chatBlockNone | chatBlockReasoning | chatBlockText
+	openIndex        int
+	reasoningOpaque  string
+	reasoningDetails []json.RawMessage
 
 	toolOrder []int
 	toolAccs  map[int]*chatStreamToolAcc
@@ -209,11 +226,31 @@ func (r *chatStreamReader) Next() (anthropic.StreamEvent, error) {
 
 		var chunk chatCompletionChunk
 		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			// Skip malformed keep-alive or partial payloads.
-			continue
+			return anthropic.StreamEvent{}, fmt.Errorf("decode chat stream event: %w", err)
 		}
 		if chunk.Error != nil {
-			return anthropic.StreamEvent{}, &RequestError{StatusCode: 400, Body: chunk.Error.Message, API: "chat_completions"}
+			return anthropic.StreamEvent{}, &RequestError{
+				StatusCode: chatErrorStatus(chunk.Error, http.StatusBadRequest),
+				Body:       chatErrorBody(chunk.Error),
+				API:        "chat_completions_stream",
+			}
+		}
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			if choice.Error != nil {
+				return anthropic.StreamEvent{}, &RequestError{
+					StatusCode: chatErrorStatus(choice.Error, http.StatusBadGateway),
+					Body:       chatErrorBody(choice.Error),
+					API:        "chat_completions_stream",
+				}
+			}
+			if strings.EqualFold(strings.TrimSpace(choice.FinishReason), "error") {
+				return anthropic.StreamEvent{}, &RequestError{
+					StatusCode: http.StatusBadGateway,
+					Body:       "chat completion stream finished with an error",
+					API:        "chat_completions_stream",
+				}
+			}
 		}
 		r.translateChunk(chunk)
 	}
@@ -258,6 +295,25 @@ func (r *chatStreamReader) ensureMessageStart() {
 	})
 }
 
+func reasoningTextFromDetails(details []json.RawMessage) string {
+	var out strings.Builder
+	for _, raw := range details {
+		var detail struct {
+			Text    string `json:"text"`
+			Summary string `json:"summary"`
+		}
+		if json.Unmarshal(raw, &detail) != nil {
+			continue
+		}
+		if detail.Text != "" {
+			out.WriteString(detail.Text)
+		} else if detail.Summary != "" {
+			out.WriteString(detail.Summary)
+		}
+	}
+	return out.String()
+}
+
 func (r *chatStreamReader) translateChunk(chunk chatCompletionChunk) {
 	if chunk.ID != "" {
 		r.streamID = chunk.ID
@@ -279,16 +335,25 @@ func (r *chatStreamReader) translateChunk(chunk chatCompletionChunk) {
 	if delta.ReasoningOpaque != "" {
 		r.reasoningOpaque = delta.ReasoningOpaque
 	}
+	if len(delta.ReasoningDetails) > 0 {
+		r.reasoningDetails = append(r.reasoningDetails, delta.ReasoningDetails...)
+	}
 
-	if delta.ReasoningText != "" {
+	reasoningText := firstNonEmptyString(delta.Reasoning, delta.ReasoningContent, delta.ReasoningText)
+	if reasoningText == "" {
+		reasoningText = reasoningTextFromDetails(delta.ReasoningDetails)
+	}
+	if reasoningText != "" || len(delta.ReasoningDetails) > 0 {
 		if r.openKind != chatBlockReasoning {
 			r.startBlock(chatBlockReasoning, anthropic.ContentBlock{Type: "thinking"})
 		}
-		r.emit(anthropic.StreamEvent{
-			Type:  anthropic.EventContentBlockDelta,
-			Index: r.openIndex,
-			Delta: &anthropic.DeltaBlock{Type: "thinking_delta", Thinking: delta.ReasoningText, Text: delta.ReasoningText},
-		})
+		if reasoningText != "" {
+			r.emit(anthropic.StreamEvent{
+				Type:  anthropic.EventContentBlockDelta,
+				Index: r.openIndex,
+				Delta: &anthropic.DeltaBlock{Type: "thinking_delta", Thinking: reasoningText, Text: reasoningText},
+			})
+		}
 	}
 
 	if delta.Content != "" {
@@ -366,16 +431,23 @@ func (r *chatStreamReader) startBlock(kind int, block anthropic.ContentBlock) {
 func (r *chatStreamReader) closeOpenBlock() {
 	switch r.openKind {
 	case chatBlockReasoning:
-		if r.reasoningOpaque != "" {
+		signature := r.reasoningOpaque
+		if len(r.reasoningDetails) > 0 {
+			if raw, err := json.Marshal(r.reasoningDetails); err == nil {
+				signature = encodeOpenRouterReasoningDetails(raw)
+			}
+		}
+		if signature != "" {
 			r.emit(anthropic.StreamEvent{
 				Type:  anthropic.EventContentBlockDelta,
 				Index: r.openIndex,
-				Delta: &anthropic.DeltaBlock{Type: "signature_delta", Signature: r.reasoningOpaque},
+				Delta: &anthropic.DeltaBlock{Type: "signature_delta", Signature: signature},
 			})
-			// The signature belongs to the block being closed; a later reasoning
-			// block must carry its own.
-			r.reasoningOpaque = ""
 		}
+		// Opaque state belongs to the block being closed; a later reasoning
+		// block must carry its own.
+		r.reasoningOpaque = ""
+		r.reasoningDetails = nil
 		r.emit(anthropic.StreamEvent{Type: anthropic.EventContentBlockStop, Index: r.openIndex})
 	case chatBlockText:
 		r.emit(anthropic.StreamEvent{Type: anthropic.EventContentBlockStop, Index: r.openIndex})
@@ -416,11 +488,8 @@ func (r *chatStreamReader) finalize() {
 		r.emit(anthropic.StreamEvent{Type: anthropic.EventContentBlockStop, Index: blockIdx})
 	}
 
-	usage := &anthropic.Usage{}
-	if r.usage != nil {
-		usage.InputTokens = r.usage.PromptTokens
-		usage.OutputTokens = r.usage.CompletionTokens
-	}
+	convertedUsage := chatUsageToAnthropic(r.usage)
+	usage := &convertedUsage
 	r.emit(anthropic.StreamEvent{
 		Type: anthropic.EventMessageDelta,
 		Delta: &anthropic.DeltaBlock{

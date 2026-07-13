@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -12,7 +13,11 @@ import (
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 )
 
-const DefaultCodexBackendBaseURL = "https://chatgpt.com/backend-api/codex"
+const (
+	DefaultCodexBackendBaseURL = "https://chatgpt.com/backend-api/codex"
+	openRouterReferer          = "https://github.com/gratefulagents/sdk"
+	openRouterTitle            = "gratefulagents/sdk"
+)
 
 type ProviderSpec struct {
 	Provider                 string
@@ -275,8 +280,10 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 	// OpenRouter routing feature. Other OpenAI-compatible backends may reject an
 	// unknown "models" field, so only forward fallbacks to OpenRouter.
 	var modelFallbacks []string
+	var authSession *sdkopenai.AuthSession
 	if provider == DefaultProviderOpenRouter {
 		modelFallbacks = spec.ModelFallbacks
+		authSession = openRouterAuthSession(apiKey, baseURL)
 	}
 	return sdkopenai.NewProviderWithConfig(sdkopenai.ProviderConfig{
 		ProviderName:   provider,
@@ -284,8 +291,39 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 		APIKey:         apiKey,
 		APIMode:        apiModeForProvider(spec, provider, defaultOpenAICompatibleAPIMode(provider, len(modelFallbacks) > 0)),
 		AuthMode:       sdkopenai.AuthModeAPIKey,
+		AuthSession:    authSession,
 		ModelFallbacks: modelFallbacks,
 	})
+}
+
+// openRouterAuthSession matches OpenCode's first-class OpenRouter adapter by
+// identifying genuine OpenRouter traffic for dashboard attribution. It returns
+// nil for empty credentials or custom hosts so those headers never leak to an
+// arbitrary OpenAI-compatible endpoint.
+func openRouterAuthSession(apiKey, baseURL string) *sdkopenai.AuthSession {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" || !isOpenRouterBaseURL(baseURL) {
+		return nil
+	}
+	return sdkopenai.NewCustomAuthSession(sdkopenai.CustomAuthSessionConfig{
+		SDKAPIKey: apiKey,
+		RequestHeaders: func(context.Context) (map[string]string, error) {
+			return map[string]string{
+				"Authorization":      "Bearer " + apiKey,
+				"HTTP-Referer":       openRouterReferer,
+				"X-OpenRouter-Title": openRouterTitle,
+			}, nil
+		},
+	})
+}
+
+func isOpenRouterBaseURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai")
 }
 
 func newCopilotProviderFromSpec(spec ProviderSpec) agentsdk.ModelProvider {
@@ -678,19 +716,12 @@ func baseURLForProvider(spec ProviderSpec, provider string) string {
 }
 
 // defaultOpenAICompatibleAPIMode selects the provider's preferred request
-// shape. xAI reasoning uses the Responses API's `reasoning` object; its Chat
-// Completions API instead expects `reasoning_effort`. OpenRouter's Responses
-// API Beta supports multiple routed models plus reasoning and tool calling, so
-// prefer it as well. OpenRouter's `models` fallback array is currently a Chat
-// Completions feature, so preserve Chat Completions when fallbacks are enabled.
-func defaultOpenAICompatibleAPIMode(provider string, hasModelFallbacks bool) string {
-	switch normalizeProviderName(provider) {
-	case DefaultProviderXAI:
+// shape. xAI reasoning uses the Responses API's `reasoning` object. OpenRouter
+// defaults to its stable, fully normalized Chat Completions API (as OpenCode's
+// dedicated adapter does); callers can still explicitly select Responses.
+func defaultOpenAICompatibleAPIMode(provider string, _ bool) string {
+	if normalizeProviderName(provider) == DefaultProviderXAI {
 		return "responses"
-	case DefaultProviderOpenRouter:
-		if !hasModelFallbacks {
-			return "responses"
-		}
 	}
 	return "chat-completions"
 }

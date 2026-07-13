@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -850,17 +851,10 @@ func (c *Client) CreateMessageStream(ctx context.Context, req anthropic.CreateMe
 		return &ResponsesStreamReader{stream: stream}, nil
 	}
 
-	// Chat Completions: GitHub Copilot supports real SSE streaming and only
-	// exposes plaintext reasoning (message.reasoning_text) on this path, so
-	// stream it live. Other chat-only providers keep the buffered replay.
-	if isGitHubCopilotHost(hostFromURL(c.completionsURL)) {
-		return c.createChatStream(ctx, req)
-	}
-	resp, err := c.CreateMessage(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	return &StreamReader{events: responseToEvents(resp)}, nil
+	// Chat Completions providers, including OpenRouter, support SSE. Stream the
+	// network response directly so callers receive tokens and tool/reasoning
+	// deltas as they arrive instead of a buffered replay after completion.
+	return c.createChatStream(ctx, req)
 }
 
 func (c *Client) createViaResponses(ctx context.Context, params responses.ResponseNewParams) (*anthropic.CreateMessageResponse, error) {
@@ -987,7 +981,12 @@ func (c *Client) createViaChatCompletions(ctx context.Context, req anthropic.Cre
 		return nil, fmt.Errorf("unmarshal chat completion response: %w", err)
 	}
 	if resp.Error != nil {
-		return nil, &RequestError{StatusCode: 400, Body: resp.Error.Message}
+		return nil, &RequestError{
+			StatusCode: chatErrorStatus(resp.Error, http.StatusBadRequest),
+			Body:       chatErrorBody(resp.Error),
+			API:        "chat_completions",
+			Endpoint:   c.completionsURL,
+		}
 	}
 
 	return toAnthropicResponseFromChat(resp)
@@ -2210,9 +2209,16 @@ type chatMessage struct {
 	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
 	// Refusal is set by the API on refused responses; never sent in requests.
 	Refusal string `json:"refusal,omitempty"`
+
+	// OpenRouter normalizes visible reasoning into Reasoning and returns the
+	// provider-native, potentially encrypted blocks in ReasoningDetails. The
+	// details must be passed back byte-for-byte on a later tool turn.
+	Reasoning        string          `json:"reasoning,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ReasoningDetails json.RawMessage `json:"reasoning_details,omitempty"`
+
 	// Copilot-specific reasoning round-trip fields. ReasoningText is only sent
-	// back when ReasoningOpaque (the encrypted multi-turn signature) is present,
-	// mirroring opencode's github-copilot chat adapter.
+	// back when ReasoningOpaque (the encrypted multi-turn signature) is present.
 	ReasoningText   string `json:"reasoning_text,omitempty"`
 	ReasoningOpaque string `json:"reasoning_opaque,omitempty"`
 }
@@ -2244,20 +2250,80 @@ type chatCompletionResponse struct {
 }
 
 type chatChoice struct {
-	Index        int         `json:"index"`
-	Message      chatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"`
+	Index        int           `json:"index"`
+	Message      chatMessage   `json:"message"`
+	FinishReason string        `json:"finish_reason"`
+	Error        *chatAPIError `json:"error,omitempty"`
 }
 
 type chatUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	PromptTokens            int64                       `json:"prompt_tokens"`
+	CompletionTokens        int64                       `json:"completion_tokens"`
+	TotalTokens             int64                       `json:"total_tokens"`
+	PromptTokensDetails     *chatPromptTokensDetails    `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *chatCompletionTokenDetails `json:"completion_tokens_details,omitempty"`
+}
+
+type chatPromptTokensDetails struct {
+	CachedTokens     int64 `json:"cached_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+}
+
+type chatCompletionTokenDetails struct {
+	ReasoningTokens int64 `json:"reasoning_tokens"`
 }
 
 type chatAPIError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
+	Message  string          `json:"message"`
+	Type     string          `json:"type"`
+	Code     json.RawMessage `json:"code,omitempty"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+}
+
+const openRouterReasoningDetailsPrefix = "openrouter-reasoning-details:"
+
+// encodeOpenRouterReasoningDetails stores OpenRouter's opaque reasoning_details
+// array in the provider-neutral reasoning signature field. Base64 keeps it safe
+// across snapshots and lets the next chat request restore the exact JSON.
+func encodeOpenRouterReasoningDetails(details json.RawMessage) string {
+	if len(details) == 0 || !json.Valid(details) {
+		return ""
+	}
+	return openRouterReasoningDetailsPrefix + base64.RawStdEncoding.EncodeToString(details)
+}
+
+func decodeOpenRouterReasoningDetails(signature string) json.RawMessage {
+	encoded := strings.TrimPrefix(signature, openRouterReasoningDetailsPrefix)
+	if encoded == signature || encoded == "" {
+		return nil
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil || !json.Valid(raw) {
+		return nil
+	}
+	return json.RawMessage(raw)
+}
+
+func chatErrorStatus(apiErr *chatAPIError, fallback int) int {
+	if apiErr == nil || len(apiErr.Code) == 0 {
+		return fallback
+	}
+	var code int
+	if json.Unmarshal(apiErr.Code, &code) == nil && code >= 400 && code <= 599 {
+		return code
+	}
+	return fallback
+}
+
+func chatErrorBody(apiErr *chatAPIError) string {
+	if apiErr == nil {
+		return "unknown chat completion error"
+	}
+	body, err := json.Marshal(apiErr)
+	if err == nil {
+		return string(body)
+	}
+	return apiErr.Message
 }
 
 // withModelFallbacks builds the OpenRouter-style "models" array for a request.
@@ -2298,10 +2364,12 @@ func toChatRequest(req anthropic.CreateMessageRequest) (chatCompletionRequest, e
 		MaxTokens: req.MaxTokens,
 	}
 	// OpenRouter unifies reasoning control via the request "reasoning" field.
-	// effort "none" disables reasoning entirely; other levels enable it at the
-	// requested effort. An empty effort omits the field (provider default).
+	// Prefer an explicit effort when present; otherwise preserve an explicit
+	// token budget. Previously the chat path silently discarded ThinkingBudget.
 	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
 		out.Reasoning = map[string]any{"effort": effort}
+	} else if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens > 0 {
+		out.Reasoning = map[string]any{"max_tokens": req.Thinking.BudgetTokens}
 	}
 
 	if len(req.Tools) > 0 {
@@ -2417,6 +2485,7 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 			var textParts []string
 			var toolCalls []chatToolCall
 			var reasoningText, reasoningOpaque string
+			var reasoningDetails json.RawMessage
 			for _, block := range m.Content {
 				switch block.Type {
 				case "text":
@@ -2427,7 +2496,9 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 					if reasoningText == "" {
 						reasoningText = block.Thinking
 					}
-					if reasoningOpaque == "" {
+					if details := decodeOpenRouterReasoningDetails(block.Signature); len(details) > 0 {
+						reasoningDetails = details
+					} else if reasoningOpaque == "" {
 						reasoningOpaque = block.Signature
 					}
 				case "tool_use":
@@ -2453,11 +2524,19 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 			if len(toolCalls) > 0 {
 				msg.ToolCalls = toolCalls
 			}
-			// Copilot multi-turn reasoning: only resend reasoning_text alongside
-			// its encrypted signature, matching opencode's chat adapter.
-			if reasoningOpaque != "" {
+			if len(reasoningDetails) > 0 {
+				// OpenRouter requires the complete provider-native sequence to be
+				// echoed unchanged, especially when continuing after tool use.
+				msg.ReasoningDetails = reasoningDetails
+			} else if reasoningOpaque != "" {
+				// Copilot multi-turn reasoning: only resend reasoning_text alongside
+				// its encrypted signature.
 				msg.ReasoningOpaque = reasoningOpaque
 				msg.ReasoningText = reasoningText
+			} else if reasoningText != "" {
+				// OpenRouter accepts plaintext reasoning for models that do not emit
+				// structured details. Copilot strips this field before sending.
+				msg.Reasoning = reasoningText
 			}
 			if msg.Content == nil && len(msg.ToolCalls) == 0 {
 				msg.Content = ""
@@ -2475,6 +2554,20 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 	}
 
 	choice := resp.Choices[0]
+	if choice.Error != nil {
+		return nil, &RequestError{
+			StatusCode: chatErrorStatus(choice.Error, http.StatusBadGateway),
+			Body:       chatErrorBody(choice.Error),
+			API:        "chat_completions",
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(choice.FinishReason), "error") {
+		return nil, &RequestError{
+			StatusCode: http.StatusBadGateway,
+			Body:       "chat completion finished with an error",
+			API:        "chat_completions",
+		}
+	}
 
 	out := &anthropic.CreateMessageResponse{
 		ID:    resp.ID,
@@ -2483,18 +2576,24 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 		Model: resp.Model,
 	}
 	if resp.Usage != nil {
-		out.Usage = anthropic.Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-		}
+		out.Usage = chatUsageToAnthropic(resp.Usage)
 	}
 
-	// Reasoning first: Copilot returns plaintext reasoning in reasoning_text and
-	// the encrypted multi-turn signature in reasoning_opaque. Emit a thinking
-	// block so it surfaces as a reasoning item and round-trips on later turns.
-	if reasoning := strings.TrimSpace(choice.Message.ReasoningText); reasoning != "" {
-		block := anthropic.NewThinkingBlock(choice.Message.ReasoningText)
-		block.Signature = choice.Message.ReasoningOpaque
+	// Reasoning first. OpenRouter returns visible text in reasoning (with
+	// reasoning_content as a compatibility alias) and opaque provider state in
+	// reasoning_details; Copilot uses reasoning_text/reasoning_opaque.
+	reasoning := firstNonEmptyString(
+		choice.Message.Reasoning,
+		choice.Message.ReasoningContent,
+		choice.Message.ReasoningText,
+	)
+	signature := choice.Message.ReasoningOpaque
+	if len(choice.Message.ReasoningDetails) > 0 {
+		signature = encodeOpenRouterReasoningDetails(choice.Message.ReasoningDetails)
+	}
+	if strings.TrimSpace(reasoning) != "" || signature != "" {
+		block := anthropic.NewThinkingBlock(reasoning)
+		block.Signature = signature
 		out.Content = append(out.Content, block)
 	}
 
@@ -2519,6 +2618,30 @@ func toAnthropicResponseFromChat(resp chatCompletionResponse) (*anthropic.Create
 	out.StopReason = chatStopReason(choice.FinishReason, len(choice.Message.ToolCalls) > 0)
 
 	return out, nil
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func chatUsageToAnthropic(usage *chatUsage) anthropic.Usage {
+	if usage == nil {
+		return anthropic.Usage{}
+	}
+	out := anthropic.Usage{
+		InputTokens:  usage.PromptTokens,
+		OutputTokens: usage.CompletionTokens,
+	}
+	if usage.PromptTokensDetails != nil {
+		out.CacheReadInputTokens = usage.PromptTokensDetails.CachedTokens
+		out.CacheCreationInputTokens = usage.PromptTokensDetails.CacheWriteTokens
+	}
+	return out
 }
 
 func extractTextContent(content any) string {

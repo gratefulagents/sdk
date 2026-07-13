@@ -13,6 +13,74 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
 
+func TestOpenRouterBaseURLDetection(t *testing.T) {
+	for _, raw := range []string{"https://openrouter.ai/api/v1", "https://eu.openrouter.ai/api/v1"} {
+		if !isOpenRouterBaseURL(raw) {
+			t.Fatalf("isOpenRouterBaseURL(%q) = false", raw)
+		}
+	}
+	for _, raw := range []string{"https://openrouter.ai.evil.example/v1", "https://example.com/v1", "not-a-url"} {
+		if isOpenRouterBaseURL(raw) {
+			t.Fatalf("isOpenRouterBaseURL(%q) = true", raw)
+		}
+	}
+}
+
+func TestOpenRouterAttributionHeadersAreHostScoped(t *testing.T) {
+	session := openRouterAuthSession("test-key", "https://openrouter.ai/api/v1")
+	if session == nil {
+		t.Fatal("expected OpenRouter auth session")
+	}
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers["Authorization"] != "Bearer test-key" || headers["HTTP-Referer"] != openRouterReferer || headers["X-OpenRouter-Title"] != openRouterTitle {
+		t.Fatalf("headers = %#v", headers)
+	}
+	if got := openRouterAuthSession("test-key", "https://example.com/v1"); got != nil {
+		t.Fatal("custom OpenAI-compatible host must not receive OpenRouter attribution")
+	}
+	if got := openRouterAuthSession("", "https://openrouter.ai/api/v1"); got != nil {
+		t.Fatal("empty API key must preserve normal missing-credential validation")
+	}
+}
+
+func TestOpenRouterFactoryDefaultsToChatCompletions(t *testing.T) {
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"gen-1","model":"anthropic/claude-sonnet-4.6","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`))
+	}))
+	defer server.Close()
+
+	provider, err := NewProviderFromConfig(ProviderSpec{
+		Provider: DefaultProviderOpenRouter,
+		BaseURL:  server.URL + "/api/v1",
+		APIKey:   "test-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := provider.GetModel("openrouter/anthropic/claude-sonnet-4.6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Input: []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/api/v1/chat/completions" {
+		t.Fatalf("path = %q, want chat completions", path)
+	}
+	if len(resp.Items) != 1 || resp.Items[0].Message == nil || resp.Items[0].Message.Text != "ok" {
+		t.Fatalf("response = %+v", resp.Items)
+	}
+}
+
 func TestNewProviderFromConfigRejectsUnknownProvider(t *testing.T) {
 	if _, err := NewProviderFromConfig(ProviderSpec{Provider: "bogus"}); err == nil {
 		t.Fatal("expected error for unknown provider")
@@ -43,8 +111,8 @@ func TestNewProviderFromConfigSupportsXAI(t *testing.T) {
 	if got := defaultOpenAICompatibleAPIMode(DefaultProviderXAI, false); got != "responses" {
 		t.Fatalf("defaultOpenAICompatibleAPIMode(xai) = %q, want responses", got)
 	}
-	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter, false); got != "responses" {
-		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter) = %q, want responses", got)
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter, false); got != "chat-completions" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter) = %q, want chat-completions", got)
 	}
 	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter, true); got != "chat-completions" {
 		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter with fallbacks) = %q, want chat-completions", got)
