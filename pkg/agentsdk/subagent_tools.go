@@ -53,7 +53,8 @@ type subagentBatchTaskInput struct {
 	IncludeDependencyResults *bool    `json:"include_dependency_results"`
 }
 
-func (t *subagentTool) Name() string { return "subagent" }
+func (t *subagentTool) Name() string                  { return "subagent" }
+func (t *subagentTool) PreserveResultOnTimeout() bool { return true }
 func (t *subagentTool) Description() string {
 	return "Delegate work to specialist sub-agents. Send one task (message) or a dependency DAG of tasks (tasks). mode=sync returns final results in this call; mode=background returns task ids immediately and results are delivered automatically as each task finishes."
 }
@@ -168,6 +169,21 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 			return ToolResult{Content: string(resp)}, nil
 		}
 		task, waitErr := t.registry.WaitForTask(ctx, taskID, params.TimeoutMS)
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			// A synchronous spawn can outlive the host's generic tool-call budget.
+			// The independently managed child is still healthy, so return its live
+			// state and let the parent collect it later instead of misreporting a
+			// wait deadline as a sub-agent failure. If completion raced the deadline,
+			// return the completed result normally.
+			if task != nil && task.IsTerminal() {
+				if delivered, collectErr := t.registry.CollectResult(taskID); collectErr == nil && delivered != nil {
+					task = delivered
+				}
+				failed := task.Status == SubAgentTaskFailed || task.Status == SubAgentTaskCancelled
+				return joinedTaskResult(task, task.Error, failed), nil
+			}
+			return joinedTaskPendingResult(task), nil
+		}
 		if waitErr != nil {
 			return joinedTaskResult(task, fmt.Sprintf("sub-agent wait failed: %v", waitErr), true), nil
 		}
@@ -290,17 +306,36 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 	}
 
 	tasks, waitErr := t.registry.WaitForTasks(ctx, taskIDs, timeoutMS)
+	timedOut := errors.Is(waitErr, context.DeadlineExceeded)
+	if timedOut && !hasActiveTasks(tasks) {
+		// Completion can race the wait context's deadline. Prefer the terminal
+		// snapshot over reporting a timeout when every task actually finished.
+		waitErr = nil
+		timedOut = false
+	}
 	if waitErr == nil {
 		markTasksDelivered(t.registry, taskIDs)
+	} else if timedOut {
+		markTerminalTasksDelivered(t.registry, tasks)
+	}
+	waitError := waitErr
+	if timedOut {
+		waitError = nil
 	}
 	resp, _ := json.MarshalIndent(struct {
 		Tasks        []spawnSummary    `json:"tasks"`
 		Map          map[string]string `json:"task_ids_by_key"`
 		Results      []joinedTaskJSON  `json:"results"`
 		WaitComplete bool              `json:"wait_complete"`
+		TimedOut     bool              `json:"timed_out,omitempty"`
 		Error        string            `json:"error,omitempty"`
-	}{Tasks: summaries, Map: spawned, Results: joinedTaskJSONs(tasks), WaitComplete: waitErr == nil, Error: errorString(waitErr)}, "", "  ")
-	return ToolResult{Content: string(resp), IsError: waitErr != nil || hasFailedTasks(tasks)}, nil
+		Note         string            `json:"note,omitempty"`
+	}{
+		Tasks: summaries, Map: spawned, Results: joinedTaskJSONs(tasks),
+		WaitComplete: waitErr == nil, TimedOut: timedOut, Error: errorString(waitError),
+		Note: noteWhen(timedOut, "wait deadline reached; active managed tasks continue in the background and their results will be delivered when ready"),
+	}, "", "  ")
+	return ToolResult{Content: string(resp), IsError: waitError != nil || hasFailedTasks(tasks)}, nil
 }
 
 // Final-join wiring: the runner blocks parent finalization while managed tasks
@@ -422,7 +457,7 @@ func joinedTaskJSONs(tasks []SubAgentTask) []joinedTaskJSON {
 			TaskID:   task.ID,
 			Agent:    task.AgentName,
 			Status:   string(task.Status),
-			Duration: task.Duration.String(),
+			Duration: subagentTaskDurationString(&task),
 			Result:   task.Result,
 			Error:    task.Error,
 		})
@@ -444,9 +479,37 @@ func joinedTaskResult(task *SubAgentTask, errMsg string, isError bool) ToolResul
 	return ToolResult{Content: string(content), IsError: isError}
 }
 
+func joinedTaskPendingResult(task *SubAgentTask) ToolResult {
+	if task == nil {
+		return ToolResult{Content: "sub-agent wait reached its deadline; the managed task continues in the background"}
+	}
+	payload := struct {
+		joinedTaskJSON
+		WaitComplete bool   `json:"wait_complete"`
+		TimedOut     bool   `json:"timed_out"`
+		Note         string `json:"note"`
+	}{
+		joinedTaskJSON: joinedTaskJSONs([]SubAgentTask{*task})[0],
+		WaitComplete:   false,
+		TimedOut:       true,
+		Note:           "wait deadline reached; the managed task is still active and its result will be delivered when ready",
+	}
+	content, _ := json.MarshalIndent(payload, "", "  ")
+	return ToolResult{Content: string(content)}
+}
+
 func hasFailedTasks(tasks []SubAgentTask) bool {
 	for _, task := range tasks {
 		if task.Status == SubAgentTaskFailed || task.Status == SubAgentTaskCancelled {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActiveTasks(tasks []SubAgentTask) bool {
+	for _, task := range tasks {
+		if !task.IsTerminal() {
 			return true
 		}
 	}
@@ -484,6 +547,17 @@ func markTasksDelivered(registry *SubAgentScheduler, taskIDs []string) {
 	}
 	for _, taskID := range uniqueNonEmptyTaskIDs(taskIDs) {
 		_, _ = registry.CollectResult(taskID)
+	}
+}
+
+func markTerminalTasksDelivered(registry *SubAgentScheduler, tasks []SubAgentTask) {
+	if registry == nil {
+		return
+	}
+	for i := range tasks {
+		if tasks[i].IsTerminal() {
+			_, _ = registry.CollectResult(tasks[i].ID)
+		}
 	}
 }
 
@@ -817,7 +891,8 @@ type subagentWaitTool struct {
 	registry *SubAgentScheduler
 }
 
-func (t *subagentWaitTool) Name() string { return "subagent_wait" }
+func (t *subagentWaitTool) Name() string                  { return "subagent_wait" }
+func (t *subagentWaitTool) PreserveResultOnTimeout() bool { return true }
 func (t *subagentWaitTool) Description() string {
 	return "Block until sub-agent tasks finish, then return their results. Use this instead of polling subagent_status or sleeping in Bash: it wakes the moment tasks finish, so it never overshoots. wait_for=all (default) waits for every watched task; wait_for=any returns as soon as one finishes with a new result. Omit task_ids to wait on all active tasks. timeout_ms caps the wait (timing out is a normal outcome, not an error)."
 }

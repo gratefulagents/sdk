@@ -1967,7 +1967,11 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 		result, err = safeExecuteTool(t, toolCtx, call.Input, runCtx.WorkDir)
 		cancel()
 		if toolCtx.Err() == context.DeadlineExceeded {
-			err = &ToolTimeoutError{ToolName: call.Name, Timeout: time.Duration(timeout) * time.Second}
+			preserver, preserves := t.(ToolTimeoutResultPreserver)
+			preserveResult := preserves && preserver.PreserveResultOnTimeout() && err == nil && !result.IsError
+			if !preserveResult {
+				err = &ToolTimeoutError{ToolName: call.Name, Timeout: time.Duration(timeout) * time.Second}
+			}
 		}
 	} else {
 		result, err = safeExecuteTool(t, execCtx, call.Input, runCtx.WorkDir)
