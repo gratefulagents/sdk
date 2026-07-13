@@ -175,3 +175,60 @@ func TestSecretOutputGuardrail_UnterminatedPEMRedactedToEnd(t *testing.T) {
 		t.Fatalf("key body survived redaction: %+v", res)
 	}
 }
+
+func TestSecretOutputGuardrail_BlocksPairedAWSCredentialBlock(t *testing.T) {
+	// Built by concatenation so this test file never contains a contiguous
+	// signature match itself.
+	keyID := "AKIA" + "IOSFODNN7EXAMPLE"
+	secretKey := "wJalrXUtnFEMI/K7MDENG/bPxRfiCY" + "EXAMPLEKEY"
+	content := "AWS_ACCESS_KEY_ID=" + keyID + "\nAWS_SECRET_ACCESS_KEY=" + secretKey + "\n"
+	gr := BuiltinToolOutputGuardrails()[0]
+	res, err := gr.Fn(nil, nil, stubTool, agentsdk.ToolResult{Content: content})
+	if err != nil {
+		t.Fatalf("guardrail error: %v", err)
+	}
+	if !res.TripwireTriggered {
+		t.Fatal("tripwire not triggered, want whole output blocked for paired credentials")
+	}
+	if res.ContentReplaced {
+		t.Fatal("ContentReplaced = true, want hard block without partial redaction")
+	}
+	out, _ := res.Output.(string)
+	if !strings.Contains(out, "AWS access key") {
+		t.Fatalf("Output = %q, want signature name", out)
+	}
+	if strings.Contains(out, secretKey) || strings.Contains(out, keyID) {
+		t.Fatalf("Output leaked credential material: %q", out)
+	}
+}
+
+func TestSecretOutputGuardrail_BlocksGCPServiceAccountJSON(t *testing.T) {
+	content := `{"type"` + `: "service_account", "project_id": "acme", "private_key_id": "abc123"}`
+	gr := BuiltinToolOutputGuardrails()[0]
+	res, err := gr.Fn(nil, nil, stubTool, agentsdk.ToolResult{Content: content})
+	if err != nil {
+		t.Fatalf("guardrail error: %v", err)
+	}
+	if !res.TripwireTriggered {
+		t.Fatal("tripwire not triggered, want whole output blocked for service-account marker")
+	}
+	if res.ContentReplaced {
+		t.Fatal("ContentReplaced = true, want hard block without partial redaction")
+	}
+	out, _ := res.Output.(string)
+	if !strings.Contains(out, "GCP service-account key") {
+		t.Fatalf("Output = %q, want signature name", out)
+	}
+}
+
+func TestPartialSecretSignatureNamesExist(t *testing.T) {
+	known := make(map[string]bool, len(secretSignatures))
+	for _, sp := range secretSignatures {
+		known[sp.name] = true
+	}
+	for name := range partialSecretSignatures {
+		if !known[name] {
+			t.Fatalf("partialSecretSignatures references unknown signature %q", name)
+		}
+	}
+}

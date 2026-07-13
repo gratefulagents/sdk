@@ -165,6 +165,18 @@ func BuiltinToolInputGuardrails() []agentsdk.ToolInputGuardrail {
 // signature, which only matches the BEGIN header.
 var pemEndMarker = regexp.MustCompile(`-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----`)
 
+// partialSecretSignatures names the signatures whose match is only a marker
+// or fragment of a larger credential block: the companion material (e.g. the
+// AWS secret access key paired with an AKIA/ASIA key ID, or the private-key
+// fields of a GCP service-account JSON) has no independently detectable shape.
+// Redacting just the matched fragment would pass the undetected companion
+// secrets through, so these signatures keep the hard tripwire and block the
+// whole output. Guarded by TestPartialSecretSignatureNamesExist against drift.
+var partialSecretSignatures = map[string]bool{
+	"AWS access key":          true,
+	"GCP service-account key": true,
+}
+
 // redactSecrets replaces every secret-signature match in content with a
 // [REDACTED:<name>] marker. It returns the redacted content, the names of the
 // signatures that matched (in signature order), and the total match count.
@@ -216,6 +228,17 @@ func BuiltinToolOutputGuardrails() []agentsdk.ToolOutputGuardrail {
 		{
 			Name: "detect-secret-in-output",
 			Fn: func(_ *agentsdk.RunContext, _ *agentsdk.Agent, _ agentsdk.Tool, result agentsdk.ToolResult) (*agentsdk.GuardrailResult, error) {
+				// Marker/fragment signatures first: their companion secrets
+				// cannot be detected independently, so partial redaction
+				// would leak them. Fail closed on the whole output.
+				for _, sp := range secretSignatures {
+					if partialSecretSignatures[sp.name] && sp.pattern.MatchString(result.Content) {
+						return &agentsdk.GuardrailResult{
+							Output:            fmt.Sprintf("Potential %s detected in tool output — output blocked: this marker usually travels with companion credentials (e.g. paired secret keys) that cannot be detected independently, so nothing was passed through. If you need the surrounding content, re-read a narrower range that excludes the credential block.", sp.name),
+							TripwireTriggered: true,
+						}, nil
+					}
+				}
 				// Redact matched secrets in place instead of tripping the
 				// tripwire: most hits are source code or fixtures that merely
 				// mention secret-like patterns, and nuking the whole output
