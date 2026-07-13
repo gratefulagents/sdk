@@ -65,7 +65,7 @@ func (t *Tool) InputSchema() json.RawMessage {
 func (t *Tool) IsReadOnly() bool { return false }
 
 func (t *Tool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 
 func (t *Tool) NeedsApproval() bool { return false }

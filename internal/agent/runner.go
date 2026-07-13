@@ -2127,19 +2127,35 @@ func isPauseTool(name string) bool {
 
 // filterByAccess filters tools according to the ToolAccessLevel tier:
 //   - "full" (or empty) → all tools
-//   - "read-only" → read-only tools + control-flow tools
-func filterByAccess(tools []Tool, level ToolAccessLevel, ctx *RunContext) []Tool {
+//   - "read-only" → read-only tools + control-flow tools + exact-name host exceptions
+//
+// Explicitly allowed mutating tools are not adapted to read-only variants and
+// retain IsReadOnly=false. This keeps approval and execution serialization
+// intact while allowing a read-only workspace run to emit narrowly scoped
+// control-plane output such as a pull-request review.
+func filterByAccess(tools []Tool, level ToolAccessLevel, ctx *RunContext, allowedMutatingTools []string) []Tool {
 	level = NormalizeToolAccessLevel(level)
+	allowed := make(map[string]struct{}, len(allowedMutatingTools))
+	for _, name := range allowedMutatingTools {
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+
 	var filtered []Tool
 	for _, t := range tools {
 		if t == nil {
 			continue
 		}
-		t = adaptToolForAccess(t, level)
+		_, mutatingAllowed := allowed[t.Name()]
+		mutatingAllowed = level == ToolAccessLevelReadOnly && mutatingAllowed && !t.IsReadOnly()
+		if !mutatingAllowed {
+			t = adaptToolForAccess(t, level)
+		}
 		if t == nil || !t.IsEnabled(ctx) {
 			continue
 		}
-		if level == ToolAccessLevelReadOnly && !t.IsReadOnly() && !isControlFlowToolInstance(t) {
+		if level == ToolAccessLevelReadOnly && !t.IsReadOnly() && !isControlFlowToolInstance(t) && !mutatingAllowed {
 			continue
 		}
 		filtered = append(filtered, t)
@@ -2148,7 +2164,7 @@ func filterByAccess(tools []Tool, level ToolAccessLevel, ctx *RunContext) []Tool
 }
 
 func prepareToolsForRun(tools []Tool, cfg RunConfig, ctx *RunContext) []Tool {
-	return applyToolPolicy(filterByAccess(tools, cfg.ToolAccessLevel, ctx), cfg.ToolPolicy)
+	return applyToolPolicy(filterByAccess(tools, cfg.ToolAccessLevel, ctx, cfg.AllowedMutatingTools), cfg.ToolPolicy)
 }
 
 func applyToolPolicy(tools []Tool, policy *ToolPolicy) []Tool {

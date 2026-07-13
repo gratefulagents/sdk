@@ -337,6 +337,7 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 		MaxTurns:               3,
 		SubAgentMaxTurns:       2,
 		ToolAccess:             agentsdk.ToolAccessLevelReadOnly,
+		AllowedMutatingTools:   []string{"submit_review"},
 		MaxConcurrentSubAgents: 1,
 		ModeSnapshot: &sdkmode.TemplateSpec{
 			Name:        "review",
@@ -347,11 +348,15 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.AllowedMutatingTools[0] = "changed_after_build"
 	if bundle.Runner == nil || bundle.Agent == nil || bundle.Tracker == nil {
 		t.Fatalf("bundle missing core fields: %+v", bundle)
 	}
 	if bundle.Config.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly {
 		t.Fatalf("ToolAccessLevel = %q", bundle.Config.ToolAccessLevel)
+	}
+	if got := bundle.Config.AllowedMutatingTools; len(got) != 1 || got[0] != "submit_review" {
+		t.Fatalf("AllowedMutatingTools = %v, want [submit_review]", got)
 	}
 	if bundle.Config.MaxTurns != 3 || bundle.Config.SubAgentMaxTurns != 2 {
 		t.Fatalf("run config turns = %d/%d", bundle.Config.MaxTurns, bundle.Config.SubAgentMaxTurns)

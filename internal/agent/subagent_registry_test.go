@@ -283,6 +283,47 @@ func TestSubAgentRegistryConfigurePreservesTrackedTasks(t *testing.T) {
 	}
 }
 
+func TestSubAgentRegistryAsyncSpawnInheritsCurrentTurnReadOnlyClamp(t *testing.T) {
+	model := &mockModel{
+		responses: []*ModelResponse{{
+			Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}},
+		}},
+	}
+	runner := NewRunnerWithModel(model)
+	readTool := &FunctionTool{
+		ToolName:        "read",
+		ToolDescription: "reads state",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		ReadOnly:        true,
+		Fn:              func(context.Context, json.RawMessage) (string, error) { return "read", nil },
+	}
+	writeTool := &FunctionTool{
+		ToolName:        "write",
+		ToolDescription: "writes state",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn:              func(context.Context, json.RawMessage) (string, error) { return "wrote", nil },
+	}
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{
+		Runner:          runner,
+		Agents:          map[string]*Agent{"analyst": {Name: "analyst", Tools: []Tool{readTool, writeTool}}},
+		ToolAccessLevel: ToolAccessLevelFull,
+	})
+	ctx := WithNestedRunConfig(context.Background(), RunConfig{
+		ToolAccessLevel:      ToolAccessLevelReadOnly,
+		AllowedMutatingTools: []string{"write"}, // parent-only exception; children must not inherit it
+	})
+
+	taskID, err := registry.SpawnAsync(ctx, "analyst", "inspect", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForTerminalTask(t, registry, taskID)
+
+	if len(model.requests) != 1 || len(model.requests[0].Tools) != 1 || model.requests[0].Tools[0].Name() != "read" {
+		t.Fatalf("async child model requests = %+v, want only the read tool", model.requests)
+	}
+}
+
 func TestSubAgentRegistryCancelMarksTaskCancelledImmediately(t *testing.T) {
 	model := &mockModel{
 		responses: []*ModelResponse{

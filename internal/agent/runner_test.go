@@ -330,6 +330,71 @@ func TestRunnerToolOutputGuardrailTripwireReturnsToolErrorAndRedactsTrace(t *tes
 	}
 }
 
+func TestRunnerReadOnlyAccessAllowsExplicitMutatingTool(t *testing.T) {
+	model := &mockModel{
+		responses: []*ModelResponse{
+			{
+				Items: []RunItem{
+					{Type: RunItemToolCall, ToolCall: &ToolCallData{
+						ID: "call1", Name: "submit_review", Input: json.RawMessage(`{}`),
+					}},
+				},
+			},
+			{
+				Items: []RunItem{
+					{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}},
+				},
+			},
+		},
+	}
+	var allowedExecuted bool
+	allowed := &FunctionTool{
+		ToolName:        "submit_review",
+		ToolDescription: "submit an external review",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			allowedExecuted = true
+			return "review submitted", nil
+		},
+	}
+	blocked := &FunctionTool{
+		ToolName:        "edit_workspace",
+		ToolDescription: "edit the workspace",
+		Schema:          json.RawMessage(`{"type":"object"}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			return "edited", nil
+		},
+	}
+	runner := NewRunnerWithModel(model)
+	agent := &Agent{Name: "test", Tools: []Tool{allowed, blocked}}
+
+	result, err := runner.Run(context.Background(), agent, nil, RunConfig{
+		ToolAccessLevel:      ToolAccessLevelReadOnly,
+		AllowedMutatingTools: []string{"submit_review"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(model.requests) == 0 || len(model.requests[0].Tools) != 1 || model.requests[0].Tools[0].Name() != "submit_review" {
+		t.Fatalf("read-only model requests = %+v, want only submit_review", model.requests)
+	}
+	if model.requests[0].Tools[0].IsReadOnly() {
+		t.Fatal("allowlisted mutating tool was reclassified as read-only")
+	}
+	if !allowedExecuted {
+		t.Fatal("allowlisted FunctionTool did not execute")
+	}
+	var gotOutput string
+	for _, item := range result.NewItems {
+		if item.Type == RunItemToolOutput && item.ToolOutput != nil && item.ToolOutput.CallID == "call1" {
+			gotOutput = item.ToolOutput.Content
+		}
+	}
+	if gotOutput != "review submitted" {
+		t.Fatalf("tool output = %q, want review submitted", gotOutput)
+	}
+}
+
 func TestRunnerReadOnlyAccessUsesAdaptedToolForRequestAndExecution(t *testing.T) {
 	model := &mockModel{
 		responses: []*ModelResponse{
@@ -1076,6 +1141,32 @@ func TestRunnerCancelledModelCallPreservesPartialResult(t *testing.T) {
 	if got := len(result.RawResponses); got != 2 {
 		t.Errorf("expected 2 raw responses accumulated before cancellation, got %d", got)
 	}
+}
+
+type enabledMutatingTool struct {
+	name          string
+	output        string
+	executed      bool
+	enabledAccess ToolAccessLevel
+}
+
+func (t *enabledMutatingTool) Name() string        { return t.name }
+func (t *enabledMutatingTool) Description() string { return "mutating test tool" }
+func (t *enabledMutatingTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object"}`)
+}
+func (t *enabledMutatingTool) IsReadOnly() bool { return false }
+func (t *enabledMutatingTool) IsEnabled(ctx *RunContext) bool {
+	if ctx != nil {
+		t.enabledAccess = ctx.ToolAccessLevel
+	}
+	return true
+}
+func (t *enabledMutatingTool) NeedsApproval() bool { return false }
+func (t *enabledMutatingTool) TimeoutSeconds() int { return 0 }
+func (t *enabledMutatingTool) Execute(context.Context, json.RawMessage, string) (ToolResult, error) {
+	t.executed = true
+	return ToolResult{Content: t.output}, nil
 }
 
 type accessAdaptingTool struct {

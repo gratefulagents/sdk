@@ -768,6 +768,12 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
 		snap.toolInputGuardrails = nestedCfg.ToolInputGuardrails
 		snap.toolOutputGuardrails = nestedCfg.ToolOutputGuardrails
+		// Configure is session-scoped, but a live mode switch can clamp the
+		// current parent turn further. Async children must inherit that turn's
+		// effective access and may never widen it back to the startup value.
+		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
+			snap.toolAccessLevel = ToolAccessLevelReadOnly
+		}
 	}
 	r.tasks[taskID] = entry
 	r.order = append(r.order, taskID)
