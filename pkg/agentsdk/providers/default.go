@@ -12,6 +12,7 @@ const (
 	DefaultProviderOpenRouter = "openrouter"
 	DefaultProviderGemini     = "gemini"
 	DefaultProviderGroq       = "groq"
+	DefaultProviderXAI        = "xai"
 	DefaultProviderLocal      = "local"
 	DefaultProviderCopilot    = "copilot"
 )

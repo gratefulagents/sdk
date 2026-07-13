@@ -105,6 +105,7 @@ var openAICompatibleProviderNames = []string{
 	DefaultProviderOpenRouter,
 	DefaultProviderGemini,
 	DefaultProviderGroq,
+	DefaultProviderXAI,
 	DefaultProviderLocal,
 }
 
@@ -128,7 +129,7 @@ func NewProviderFromConfig(spec ProviderSpec) (agentsdk.ModelProvider, error) {
 		return newOpenAIProviderFromSpec(spec)
 	case DefaultProviderAnthropic:
 		return sdkanthropic.NewProviderWithConfig(anthropicProviderConfig(spec)), nil
-	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderLocal:
+	case DefaultProviderOpenRouter, DefaultProviderGemini, DefaultProviderGroq, DefaultProviderXAI, DefaultProviderLocal:
 		return newOpenAICompatibleProviderFromSpec(provider, spec), nil
 	case DefaultProviderCopilot:
 		return newCopilotProviderFromSpec(spec), nil
@@ -281,7 +282,7 @@ func newOpenAICompatibleProviderFromSpec(provider string, spec ProviderSpec) age
 		ProviderName:   provider,
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
-		APIMode:        apiModeForProvider(spec, provider, "chat-completions"),
+		APIMode:        apiModeForProvider(spec, provider, defaultOpenAICompatibleAPIMode(provider, len(modelFallbacks) > 0)),
 		AuthMode:       sdkopenai.AuthModeAPIKey,
 		ModelFallbacks: modelFallbacks,
 	})
@@ -676,6 +677,24 @@ func baseURLForProvider(spec ProviderSpec, provider string) string {
 	return ""
 }
 
+// defaultOpenAICompatibleAPIMode selects the provider's preferred request
+// shape. xAI reasoning uses the Responses API's `reasoning` object; its Chat
+// Completions API instead expects `reasoning_effort`. OpenRouter's Responses
+// API Beta supports multiple routed models plus reasoning and tool calling, so
+// prefer it as well. OpenRouter's `models` fallback array is currently a Chat
+// Completions feature, so preserve Chat Completions when fallbacks are enabled.
+func defaultOpenAICompatibleAPIMode(provider string, hasModelFallbacks bool) string {
+	switch normalizeProviderName(provider) {
+	case DefaultProviderXAI:
+		return "responses"
+	case DefaultProviderOpenRouter:
+		if !hasModelFallbacks {
+			return "responses"
+		}
+	}
+	return "chat-completions"
+}
+
 func apiModeForProvider(spec ProviderSpec, provider, fallback string) string {
 	provider = normalizeProviderName(provider)
 	if value := lookupProviderValue(spec.ProviderAPIModes, provider); value != "" {
@@ -709,6 +728,8 @@ func defaultBaseURLForProvider(provider string) string {
 		return "https://generativelanguage.googleapis.com/v1beta/openai"
 	case DefaultProviderGroq:
 		return "https://api.groq.com/openai/v1"
+	case DefaultProviderXAI:
+		return "https://api.x.ai/v1"
 	case DefaultProviderLocal:
 		return "http://localhost:11434/v1"
 	case DefaultProviderCopilot:

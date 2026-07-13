@@ -29,6 +29,31 @@ func TestNewProviderFromConfigSupportsLocal(t *testing.T) {
 	}
 }
 
+func TestNewProviderFromConfigSupportsXAI(t *testing.T) {
+	provider, err := NewProviderFromConfig(ProviderSpec{Provider: DefaultProviderXAI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider == nil {
+		t.Fatal("provider is nil")
+	}
+	if got := defaultBaseURLForProvider(DefaultProviderXAI); got != "https://api.x.ai/v1" {
+		t.Fatalf("defaultBaseURLForProvider(xai) = %q", got)
+	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderXAI, false); got != "responses" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(xai) = %q, want responses", got)
+	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter, false); got != "responses" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter) = %q, want responses", got)
+	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderOpenRouter, true); got != "chat-completions" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(openrouter with fallbacks) = %q, want chat-completions", got)
+	}
+	if got := defaultOpenAICompatibleAPIMode(DefaultProviderGroq, false); got != "chat-completions" {
+		t.Fatalf("defaultOpenAICompatibleAPIMode(groq) = %q, want chat-completions", got)
+	}
+}
+
 func TestNewProviderFromConfigRoutesCopilotWithTokenAndHeaders(t *testing.T) {
 	var gotPath, gotModel string
 	gotHeaders := http.Header{}
