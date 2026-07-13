@@ -23,6 +23,22 @@ type ToolAccessAdapter interface {
 	ToolForAccess(level ToolAccessLevel) Tool
 }
 
+// MutatingToolEnabled reports whether a mutating tool may be considered
+// enabled for the run's access context. The runner's exact-name filter remains
+// the authorization boundary; this helper lets access-aware IsEnabled methods
+// recognize the same host-trusted exception instead of rejecting it early.
+func MutatingToolEnabled(ctx *RunContext, toolName string) bool {
+	if ctx == nil || NormalizeToolAccessLevel(ctx.ToolAccessLevel) != ToolAccessLevelReadOnly {
+		return true
+	}
+	for _, allowed := range ctx.Config.AllowedMutatingTools {
+		if allowed != "" && allowed == toolName {
+			return true
+		}
+	}
+	return false
+}
+
 // ToolResult is the outcome of a tool execution.
 type ToolResult struct {
 	Content     string
@@ -46,15 +62,7 @@ func (t *FunctionTool) Description() string          { return t.ToolDescription 
 func (t *FunctionTool) InputSchema() json.RawMessage { return t.Schema }
 func (t *FunctionTool) IsReadOnly() bool             { return t.ReadOnly }
 func (t *FunctionTool) IsEnabled(ctx *RunContext) bool {
-	if ctx == nil {
-		return true
-	}
-	switch NormalizeToolAccessLevel(ctx.ToolAccessLevel) {
-	case ToolAccessLevelReadOnly:
-		return t.ReadOnly
-	default:
-		return true
-	}
+	return t.ReadOnly || MutatingToolEnabled(ctx, t.Name())
 }
 func (t *FunctionTool) NeedsApproval() bool { return t.Approval }
 func (t *FunctionTool) TimeoutSeconds() int { return t.Timeout }

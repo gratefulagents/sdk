@@ -92,7 +92,7 @@ func (t *AttachRepositoryTool) InputSchema() json.RawMessage {
 
 func (t *AttachRepositoryTool) IsReadOnly() bool { return false }
 func (t *AttachRepositoryTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *AttachRepositoryTool) NeedsApproval() bool { return false }
 func (t *AttachRepositoryTool) TimeoutSeconds() int { return 0 }

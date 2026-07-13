@@ -71,6 +71,35 @@ func TestSubAgentRegistry_H4_AllowsDowngradeOverride(t *testing.T) {
 	}
 }
 
+func TestAgentToolReadOnlyChildDoesNotInheritParentMutatingExceptions(t *testing.T) {
+	model := &mockModel{responses: []*ModelResponse{
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "ok"}}}},
+	}}
+	runner := NewRunnerWithModel(model)
+	readTool := &FunctionTool{
+		ToolName: "read", Schema: json.RawMessage(`{}`), ReadOnly: true,
+		Fn: func(context.Context, json.RawMessage) (string, error) { return "read", nil },
+	}
+	writeTool := &FunctionTool{
+		ToolName: "write", Schema: json.RawMessage(`{}`),
+		Fn: func(context.Context, json.RawMessage) (string, error) { return "wrote", nil },
+	}
+	helper := &Agent{Name: "helper", Tools: []Tool{readTool, writeTool}}
+	tool := helper.AsTool(runner)
+	ctx := WithNestedRunConfig(context.Background(), RunConfig{
+		ToolAccessLevel:      ToolAccessLevelReadOnly,
+		AllowedMutatingTools: []string{"write"}, // parent-only exception
+	})
+
+	result, err := tool.Execute(ctx, json.RawMessage(`{"message":"inspect"}`), t.TempDir())
+	if err != nil || result.IsError {
+		t.Fatalf("agent tool execution = (%+v, %v)", result, err)
+	}
+	if len(model.requests) != 1 || len(model.requests[0].Tools) != 1 || model.requests[0].Tools[0].Name() != "read" {
+		t.Fatalf("synchronous child model requests = %+v, want only the read tool", model.requests)
+	}
+}
+
 // --- M2: sub-agent semaphore matched by name prefix ---
 
 func TestRunner_M2_SemaphoreMatchesAgentToolByType(t *testing.T) {

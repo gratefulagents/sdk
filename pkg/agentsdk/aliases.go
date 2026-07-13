@@ -253,6 +253,7 @@ var (
 	ModeTextVerbositySettings           = agent.ModeTextVerbositySettings
 	MaybeCompactHandoffInput            = agent.MaybeCompactHandoffInput
 	MaybeCompactRunItems                = agent.MaybeCompactRunItems
+	MutatingToolEnabled                 = agent.MutatingToolEnabled
 	MaybeCompactRunItemsForRequest      = agent.MaybeCompactRunItemsForRequest
 	ParseModelPrefix                    = agent.ParseModelPrefix
 	ResolveModelForProvider             = agent.ResolveModelForProvider

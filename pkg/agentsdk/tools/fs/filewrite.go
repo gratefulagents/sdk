@@ -77,7 +77,7 @@ func (t *FileWriteTool) InputSchema() json.RawMessage {
 func (t *FileWriteTool) IsReadOnly() bool { return false }
 
 func (t *FileWriteTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 
 func (t *FileWriteTool) NeedsApproval() bool { return false }

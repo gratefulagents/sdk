@@ -129,7 +129,7 @@ func (t *FileEditTool) InputSchema() json.RawMessage {
 func (t *FileEditTool) IsReadOnly() bool { return false }
 
 func (t *FileEditTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 
 func (t *FileEditTool) NeedsApproval() bool { return false }

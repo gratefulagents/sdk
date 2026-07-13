@@ -98,7 +98,7 @@ func (t *CreatePullRequestTool) InputSchema() json.RawMessage {
 
 func (t *CreatePullRequestTool) IsReadOnly() bool { return false }
 func (t *CreatePullRequestTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *CreatePullRequestTool) NeedsApproval() bool { return false }
 func (t *CreatePullRequestTool) TimeoutSeconds() int { return 0 }
@@ -327,7 +327,7 @@ func (t *CreateIssueTool) InputSchema() json.RawMessage {
 
 func (t *CreateIssueTool) IsReadOnly() bool { return false }
 func (t *CreateIssueTool) IsEnabled(ctx *agentsdk.RunContext) bool {
-	return ctx == nil || ctx.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly
+	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
 func (t *CreateIssueTool) NeedsApproval() bool { return false }
 func (t *CreateIssueTool) TimeoutSeconds() int { return 0 }
