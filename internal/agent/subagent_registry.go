@@ -675,6 +675,8 @@ type taskRunSnapshot struct {
 	workDir                 string
 	toolAccessLevel         ToolAccessLevel
 	toolPolicy              *ToolPolicy
+	retryPolicy             *RetryPolicy
+	modelCallTimeout        time.Duration
 	compactionConfig        CompactionConfig
 	compactionModelResolver CompactionModelResolver
 	maxTurns                int
@@ -768,6 +770,11 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
 		snap.toolInputGuardrails = nestedCfg.ToolInputGuardrails
 		snap.toolOutputGuardrails = nestedCfg.ToolOutputGuardrails
+		// Model calls made by a child must retain the parent's resilience policy.
+		// Without this, provider timeouts that the parent would retry immediately
+		// fail the whole sub-agent instead.
+		snap.retryPolicy = nestedCfg.RetryPolicy
+		snap.modelCallTimeout = nestedCfg.ModelCallTimeout
 		// Configure is session-scoped, but a live mode switch can clamp the
 		// current parent turn further. Async children must inherit that turn's
 		// effective access and may never widen it back to the startup value.
@@ -912,6 +919,8 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			ToolPolicy:              snap.toolPolicy,
 			ToolInputGuardrails:     snap.toolInputGuardrails,
 			ToolOutputGuardrails:    snap.toolOutputGuardrails,
+			RetryPolicy:             snap.retryPolicy,
+			ModelCallTimeout:        snap.modelCallTimeout,
 			CompactionConfig:        snap.compactionConfig,
 			CompactionModelResolver: snap.compactionModelResolver,
 			Trace:                   trace,

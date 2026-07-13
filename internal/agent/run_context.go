@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 // parentCallIDKey is a context key for threading the parent tool call ID
@@ -109,6 +110,8 @@ type NestedRunConfig struct {
 	ToolPolicy                *ToolPolicy
 	ToolInputGuardrails       []ToolInputGuardrail
 	ToolOutputGuardrails      []ToolOutputGuardrail
+	RetryPolicy               *RetryPolicy
+	ModelCallTimeout          time.Duration
 	UntrustedToolOutputs      *bool
 	MaxToolOutputBytes        int
 }
@@ -124,6 +127,8 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 		ToolPolicy:                cfg.ToolPolicy,
 		ToolInputGuardrails:       cfg.ToolInputGuardrails,
 		ToolOutputGuardrails:      cfg.ToolOutputGuardrails,
+		RetryPolicy:               cfg.RetryPolicy,
+		ModelCallTimeout:          cfg.ModelCallTimeout,
 		UntrustedToolOutputs:      cfg.UntrustedToolOutputs,
 		MaxToolOutputBytes:        cfg.MaxToolOutputBytes,
 	})

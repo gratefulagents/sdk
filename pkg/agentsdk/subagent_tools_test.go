@@ -107,6 +107,39 @@ func TestSubagentToolSyncModeWaitsAndReturnsResult(t *testing.T) {
 	}
 }
 
+func TestSubagentToolSyncWaitDeadlineLeavesTaskRunning(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"message":"do it","timeout_ms":25}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("wait deadline must not report a healthy managed task as failed: %s", result.Content)
+	}
+	for _, want := range []string{`"status": "running"`, `"wait_complete": false`, `"timed_out": true`, `still active`} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("content = %s, want %q", result.Content, want)
+		}
+	}
+	if strings.Contains(result.Content, `"duration": "0s"`) {
+		t.Fatalf("active task duration must reflect elapsed wait time: %s", result.Content)
+	}
+
+	close(model.release)
+	if _, err := registry.WaitForUndeliveredResults(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSubagentToolRequiresExactlyOneOfMessageOrTasks(t *testing.T) {
 	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
 		Runner: NewRunnerWithModel(&subagentToolMockModel{}),
@@ -285,6 +318,39 @@ func TestSubagentToolBatchSyncWaitsForWholeGraph(t *testing.T) {
 	// Sync batch results are marked delivered — no duplicate final-join delivery.
 	if tool.HasPendingSubAgentFinalJoin() {
 		t.Fatal("no pending final join expected after sync batch")
+	}
+}
+
+func TestSubagentToolBatchWaitDeadlineLeavesTasksRunning(t *testing.T) {
+	model := &blockingSubagentToolModel{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"worker": {Name: "worker"}},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"timeout_ms": 25,
+		"tasks": [{"key": "review", "message": "do it"}]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("batch wait deadline must not fail active managed tasks: %s", result.Content)
+	}
+	for _, want := range []string{`"status": "running"`, `"wait_complete": false`, `"timed_out": true`, `continue in the background`} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("content = %s, want %q", result.Content, want)
+		}
+	}
+
+	close(model.release)
+	if _, err := registry.WaitForUndeliveredResults(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
