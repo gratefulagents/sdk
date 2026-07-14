@@ -909,6 +909,62 @@ func TestCollectSSEToJSON(t *testing.T) {
 		}
 	})
 
+	t.Run("preserves compaction output when completed output is empty", func(t *testing.T) {
+		sseBody := strings.Join([]string{
+			`data: {"type":"response.created","response":{"id":"resp_compaction","status":"in_progress"}}`,
+			"",
+			`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc_compaction","created_by":"openai"}}`,
+			"",
+			`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc_compaction","created_by":"openai"}}`,
+			"",
+			`data: {"type":"response.completed","response":{"id":"resp_compaction","status":"completed","output":[]}}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n")
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseBody)),
+		}
+
+		synth, err := collectSSEToJSON(resp)
+		if err != nil {
+			t.Fatalf("collectSSEToJSON() error = %v", err)
+		}
+		body, _ := io.ReadAll(synth.Body)
+		var parsed struct {
+			Output []struct {
+				Type             string `json:"type"`
+				ID               string `json:"id"`
+				EncryptedContent string `json:"encrypted_content"`
+				CreatedBy        string `json:"created_by"`
+			} `json:"output"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("response body is not valid JSON: %s", string(body))
+		}
+		if len(parsed.Output) != 1 {
+			t.Fatalf("output = %+v, want one compaction item", parsed.Output)
+		}
+		compaction := parsed.Output[0]
+		if compaction.Type != "compaction" || compaction.ID != "cmp_1" || compaction.EncryptedContent != "enc_compaction" || compaction.CreatedBy != "openai" {
+			t.Fatalf("compaction output = %+v", compaction)
+		}
+
+		var sdkResponse responses.Response
+		if err := json.Unmarshal(body, &sdkResponse); err != nil {
+			t.Fatalf("unmarshal synthetic OpenAI response: %v", err)
+		}
+		message, err := toAnthropicResponseFromResponses(&sdkResponse)
+		if err != nil {
+			t.Fatalf("convert synthetic OpenAI response: %v", err)
+		}
+		if len(message.Content) != 1 || message.Content[0].Type != "compaction" || message.Content[0].ID != "cmp_1" {
+			t.Fatalf("converted content = %+v, want reconstructed compaction block", message.Content)
+		}
+	})
+
 	t.Run("reconstructs function call output from SSE deltas when completed output is empty", func(t *testing.T) {
 		sseBody := strings.Join([]string{
 			`data: {"type":"response.created","response":{"id":"resp_call","status":"in_progress"}}`,
