@@ -804,16 +804,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 		}
 		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents, callActivity, &commitment)
-		if commitment.state.Load() == modelOutputInterrupted {
-			err = errImmediateInput
-			resp = nil
-		}
+		resp, err = settleImmediateInput(immediateCancel, &commitment, resp, err)
 		// context.Cause records the atomic first cancellation winner, avoiding a
 		// race that could relabel parent cancellation as stream inactivity.
 		callCause := context.Cause(callCtx)
 		perCallTimeout := err != nil && errors.Is(callCause, errModelStreamIdleTimeout)
 		immediateInputArrived := err != nil && (errors.Is(callCause, errImmediateInput) || errors.Is(err, errImmediateInput))
-		immediateCancel()
 		callCancel()
 		if thinkingDeltas != nil {
 			thinkingDeltas.Flush()
@@ -1641,6 +1637,19 @@ func (c *modelOutputCommitment) wrap(err error) error {
 		return &streamOutputCommittedError{cause: err}
 	}
 	return err
+}
+
+// settleImmediateInput closes and joins the per-attempt listener before reading
+// its commitment state. That ordering makes the read authoritative: no late
+// steering goroutine can flip an already accepted response afterward.
+func settleImmediateInput(stop context.CancelFunc, commitment *modelOutputCommitment, resp *ModelResponse, err error) (*ModelResponse, error) {
+	if stop != nil {
+		stop()
+	}
+	if commitment != nil && commitment.state.Load() == modelOutputInterrupted {
+		return nil, errImmediateInput
+	}
+	return resp, err
 }
 
 func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents chan<- StreamEvent, activity func(), commitment *modelOutputCommitment) (*ModelResponse, error) {

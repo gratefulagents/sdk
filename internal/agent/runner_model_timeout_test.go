@@ -391,6 +391,29 @@ func TestRunnerReturnsParentCancellationWithoutRetryingModelCall(t *testing.T) {
 	}
 }
 
+func TestSettleImmediateInputWaitsForLateInterruption(t *testing.T) {
+	var commitment modelOutputCommitment
+	listenerDone := make(chan struct{})
+	stop := func() {
+		commitment.interrupt()
+		close(listenerDone)
+	}
+	resp := &ModelResponse{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "stale"}}}}
+
+	gotResp, err := settleImmediateInput(stop, &commitment, resp, nil)
+	if !errors.Is(err, errImmediateInput) {
+		t.Fatalf("settleImmediateInput() error = %v, want errImmediateInput", err)
+	}
+	if gotResp != nil {
+		t.Fatalf("settleImmediateInput() response = %#v, want nil", gotResp)
+	}
+	select {
+	case <-listenerDone:
+	default:
+		t.Fatal("settleImmediateInput returned before listener stopped")
+	}
+}
+
 func TestModelCallIdleContextPreservesParentCancellation(t *testing.T) {
 	parent, parentCancel := context.WithCancel(context.Background())
 	ctx, _, cancel := modelCallIdleContext(parent, time.Second)
