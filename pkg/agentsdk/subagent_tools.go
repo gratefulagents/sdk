@@ -1025,7 +1025,7 @@ type subagentControlTool struct {
 
 func (t *subagentControlTool) Name() string { return "subagent_control" }
 func (t *subagentControlTool) Description() string {
-	return "Steer or stop a running sub-agent task. action=message queues a short steering update the child receives before its next model turn; action=cancel stops the task."
+	return "Steer or stop a running sub-agent task. action=message interrupts an uncommitted model attempt so the child applies the update immediately, or queues it for the next safe boundary after output has begun; action=cancel stops the task."
 }
 func (t *subagentControlTool) IsReadOnly() bool { return false }
 func (t *subagentControlTool) InputSchema() json.RawMessage {
@@ -1038,7 +1038,7 @@ func (t *subagentControlTool) InputSchema() json.RawMessage {
 				"description": "message: queue a steering update for the task. cancel: stop the task."
 			},
 			"task_id": {"type": "string", "description": "Task id to control."},
-			"message": {"type": "string", "description": "Required for action=message: short, specific steering update. Do not resend the whole original task."}
+			"message": {"type": "string", "description": "Required for action=message: short, specific steering update. Interrupts an in-flight model attempt only before it emits output. Do not resend the whole original task."}
 		},
 		"required": ["action", "task_id"]
 	}`)

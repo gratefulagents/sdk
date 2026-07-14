@@ -402,6 +402,27 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 	maxTurns := cfg.EffectiveMaxTurns()
 
+	// finalizeImmediateInput atomically closes input admission, or folds any
+	// steering accepted before that point into history and asks the caller to
+	// continue instead of returning a terminal result.
+	finalizeImmediateInput := func() (bool, error) {
+		if cfg.ImmediateInputFinalizer == nil {
+			return false, nil
+		}
+		items, err := cfg.ImmediateInputFinalizer(ctx)
+		if err != nil {
+			return false, err
+		}
+		if len(items) == 0 {
+			return false, nil
+		}
+		currentInput = append(currentInput, items...)
+		allItems = append(allItems, items...)
+		emitRunItems(ctx, streamEvents, items)
+		pendingCompletion = false
+		return true, nil
+	}
+
 	var inputGuardrailResults []InputGuardrailResult
 	if len(currentAgent.InputGuardrails) > 0 {
 		var err error
@@ -458,23 +479,30 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					continue
 				}
 			}
-			// The budget is exhausted, but the conversation must not be
-			// lost with it: hand the accumulated run state back alongside
-			// the error (both as the result and on the error itself) so
-			// hosts can persist the transcript and continue in a follow-up
-			// run. currentInput is the post-fold history of every completed
-			// turn — replay-safe, no unpaired tool_use.
-			partial := &RunResult{
-				LastAgent:                  currentAgent,
-				NewItems:                   allItems,
-				RawResponses:               allResponses,
-				InputGuardrailResults:      inputGuardrailResults,
-				ToolInputGuardrailResults:  allToolInputResults,
-				ToolOutputGuardrailResults: allToolOutputResults,
-				Usage:                      runCtx.Usage,
-				FinalHistory:               append([]RunItem(nil), currentInput...),
+			if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
+				return nil, finalizeErr
+			} else if continued {
+				maxTurns = turn + 1
+				// The finalizer already drained the queue; skip the normal poll below.
+			} else {
+				// The budget is exhausted, but the conversation must not be
+				// lost with it: hand the accumulated run state back alongside
+				// the error (both as the result and on the error itself) so
+				// hosts can persist the transcript and continue in a follow-up
+				// run. currentInput is the post-fold history of every completed
+				// turn — replay-safe, no unpaired tool_use.
+				partial := &RunResult{
+					LastAgent:                  currentAgent,
+					NewItems:                   allItems,
+					RawResponses:               allResponses,
+					InputGuardrailResults:      inputGuardrailResults,
+					ToolInputGuardrailResults:  allToolInputResults,
+					ToolOutputGuardrailResults: allToolOutputResults,
+					Usage:                      runCtx.Usage,
+					FinalHistory:               append([]RunItem(nil), currentInput...),
+				}
+				return partial, &MaxTurnsExceeded{MaxTurns: maxTurns, PartialResult: partial}
 			}
-			return partial, &MaxTurnsExceeded{MaxTurns: maxTurns, PartialResult: partial}
 		}
 
 		// Approaching the cap: warn the model once so it can wrap up —
@@ -757,6 +785,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// The streamed-run path already forwards reasoning deltas through its
 		// own event channel, so the sink is only installed for blocking runs.
 		var commitment modelOutputCommitment
+		callCtx, immediateCancel := immediateInputContext(callCtx, cfg.ImmediateInputSignal, commitment.interrupt)
 		var thinkingDeltas *thinkingDeltaEmitter
 		if platformHooks := findPlatformHooks(cfg.Hooks); platformHooks != nil {
 			platformHooks.setLLMAttemptID(attemptID)
@@ -766,16 +795,21 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					if chunk == "" {
 						return
 					}
+					if !commitment.markVisible() && !commitment.visible() {
+						return
+					}
 					thinkingDeltas.Chunk(chunk)
 					commitment.providerReasoning.Store(true)
-					commitment.visible.Store(true)
 				})
 			}
 		}
 		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents, callActivity, &commitment)
+		resp, err = settleImmediateInput(immediateCancel, &commitment, resp, err)
 		// context.Cause records the atomic first cancellation winner, avoiding a
 		// race that could relabel parent cancellation as stream inactivity.
-		perCallTimeout := err != nil && errors.Is(context.Cause(callCtx), errModelStreamIdleTimeout)
+		callCause := context.Cause(callCtx)
+		perCallTimeout := err != nil && errors.Is(callCause, errModelStreamIdleTimeout)
+		immediateInputArrived := err != nil && (errors.Is(callCause, errImmediateInput) || errors.Is(err, errImmediateInput))
 		callCancel()
 		if thinkingDeltas != nil {
 			thinkingDeltas.Flush()
@@ -809,6 +843,19 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				tp.OnSpanEnd(genSpan)
 				openGenSpan = nil
 				trace.AddSpan(genSpan)
+			}
+
+			if immediateInputArrived && commitment.state.Load() == modelOutputInterrupted {
+				// Steering supersedes this attempt rather than failing the run. Do not
+				// charge it against the turn or retry budgets: the next iteration polls
+				// and appends the queued input before issuing the replacement request.
+				genData.Status = "interrupted"
+				genSpan.Data = genData
+				exportGenSpan()
+				emitLLMAttemptEvent(cfg.Hooks, attemptEvent("interrupted"))
+				turnRetryAttempt--
+				turn--
+				continue
 			}
 
 			if isContextCancellation(err) && !perCallTimeout {
@@ -1206,6 +1253,22 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
+			// Close immediate-input admission atomically with a final queue check.
+			// Steering accepted before this point wins and gets another turn;
+			// steering racing after it receives a clear finalizing error.
+			if cfg.ImmediateInputFinalizer != nil {
+				currentInput = append(currentInput, newItems...)
+				if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
+					return nil, finalizeErr
+				} else if continued {
+					if turn >= maxTurns-1 {
+						maxTurns++
+					}
+					continue
+				}
+				currentInput = currentInput[:len(currentInput)-len(newItems)]
+			}
+
 			// Record compaction stats and keep the pruned transcript: when
 			// the final response itself carries a provider compaction item,
 			// FinalHistory must reflect the post-compaction state — replaying
@@ -1383,6 +1446,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 
 			if currentAgent.ToolUseBehavior == StopOnFirstTool || shouldStopAtTools(currentAgent, s.toolCalls) {
+				if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
+					return nil, finalizeErr
+				} else if continued {
+					if turn >= maxTurns-1 {
+						maxTurns++
+					}
+					continue
+				}
 				finalOutput := finalOutputFromToolResults(currentAgent, toolResults)
 				var outputGuardrailResults []OutputGuardrailResult
 				if len(currentAgent.OutputGuardrails) > 0 {
@@ -1538,16 +1609,47 @@ func emitContentStreamEvent(ctx context.Context, events chan<- StreamEvent, ev C
 	}
 }
 
+const (
+	modelOutputUncommitted int32 = iota
+	modelOutputVisible
+	modelOutputInterrupted
+)
+
 type modelOutputCommitment struct {
-	visible           atomic.Bool
+	state             atomic.Int32
 	providerReasoning atomic.Bool
 }
 
+func (c *modelOutputCommitment) markVisible() bool {
+	return c != nil && c.state.CompareAndSwap(modelOutputUncommitted, modelOutputVisible)
+}
+
+func (c *modelOutputCommitment) interrupt() bool {
+	return c != nil && c.state.CompareAndSwap(modelOutputUncommitted, modelOutputInterrupted)
+}
+
+func (c *modelOutputCommitment) visible() bool {
+	return c != nil && c.state.Load() == modelOutputVisible
+}
+
 func (c *modelOutputCommitment) wrap(err error) error {
-	if c != nil && c.visible.Load() {
+	if c.visible() {
 		return &streamOutputCommittedError{cause: err}
 	}
 	return err
+}
+
+// settleImmediateInput closes and joins the per-attempt listener before reading
+// its commitment state. That ordering makes the read authoritative: no late
+// steering goroutine can flip an already accepted response afterward.
+func settleImmediateInput(stop context.CancelFunc, commitment *modelOutputCommitment, resp *ModelResponse, err error) (*ModelResponse, error) {
+	if stop != nil {
+		stop()
+	}
+	if commitment != nil && commitment.state.Load() == modelOutputInterrupted {
+		return nil, errImmediateInput
+	}
+	return resp, err
 }
 
 func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents chan<- StreamEvent, activity func(), commitment *modelOutputCommitment) (*ModelResponse, error) {
@@ -1564,6 +1666,9 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 
 	var streamedResp *ModelResponse
 	contextFailure := func() error {
+		if commitment != nil && commitment.state.Load() == modelOutputInterrupted {
+			return errImmediateInput
+		}
 		return commitment.wrap(ctx.Err())
 	}
 	for {
@@ -1597,24 +1702,28 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 		switch ev.Type {
 		case ModelStreamDelta:
 			if streamEvents != nil {
+				if !commitment.markVisible() && !commitment.visible() {
+					return nil, contextFailure()
+				}
 				select {
 				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}:
-					commitment.visible.Store(true)
 				case <-ctx.Done():
 					return nil, contextFailure()
 				}
 			}
 		case ModelStreamReasoningDelta:
+			hasReasoningOutput := (!reasoningAlreadyEmitted && modeldelta.ReasoningSinkFromContext(ctx) != nil && ev.Delta != "") || streamEvents != nil
+			if hasReasoningOutput && !commitment.markVisible() && !commitment.visible() {
+				return nil, contextFailure()
+			}
 			if !reasoningAlreadyEmitted {
 				if sink := modeldelta.ReasoningSinkFromContext(ctx); sink != nil && ev.Delta != "" {
 					sink(ev.Delta)
-					commitment.visible.Store(true)
 				}
 			}
 			if streamEvents != nil {
 				select {
 				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}:
-					commitment.visible.Store(true)
 				case <-ctx.Done():
 					return nil, contextFailure()
 				}

@@ -82,6 +82,8 @@ type subAgentTaskEntry struct {
 	activity                 *SubAgentActivity
 	includeDependencyResults bool
 	queuedMessages           []RunItem
+	messageSignal            chan struct{}
+	acceptingMessages        bool
 	resultDelivered          bool
 }
 
@@ -753,6 +755,8 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		},
 		activity:                 NewSubAgentActivity(),
 		includeDependencyResults: includeDependencyResults,
+		messageSignal:            make(chan struct{}, 1),
+		acceptingMessages:        true,
 		cancel:                   cancel,
 	}
 	snap := taskRunSnapshot{
@@ -865,9 +869,11 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	// Fetch the activity ledger so tool start/end events are tracked while the
 	// task runs and file activity flows into completion records.
 	var activity *SubAgentActivity
+	var messageSignal <-chan struct{}
 	r.mu.Lock()
 	if entry, ok := r.tasks[taskID]; ok {
 		activity = entry.activity
+		messageSignal = entry.messageSignal
 	}
 	r.mu.Unlock()
 
@@ -928,6 +934,10 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			TracingProcessor:        processor,
 			ImmediateInputPoller: func(context.Context) ([]RunItem, error) {
 				return r.drainQueuedMessages(taskID), nil
+			},
+			ImmediateInputSignal: messageSignal,
+			ImmediateInputFinalizer: func(context.Context) ([]RunItem, error) {
+				return r.finalizeOrDrainQueuedMessages(taskID)
 			},
 		},
 	})
@@ -1047,8 +1057,8 @@ func (r *SubAgentRegistry) GetActivity(taskID string, includeRecent bool) (*SubA
 }
 
 // SendMessage queues a parent steering message for an active sub-agent task.
-// The child receives queued messages at the next interruptible runner boundary,
-// before the next model request.
+// If its current model request has not emitted output, the message interrupts
+// and replaces that request; otherwise it is applied at the next safe boundary.
 func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -1061,9 +1071,12 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 		r.mu.Unlock()
 		return fmt.Errorf("task %q not found", taskID)
 	}
-	if entry.task.IsTerminal() {
+	if entry.task.IsTerminal() || !entry.acceptingMessages {
 		status := entry.task.Status
 		r.mu.Unlock()
+		if status == SubAgentTaskRunning {
+			return fmt.Errorf("task %q is finalizing", taskID)
+		}
 		return fmt.Errorf("task %q is already %s", taskID, status)
 	}
 	entry.queuedMessages = append(entry.queuedMessages, RunItem{
@@ -1072,6 +1085,13 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 	})
 	entry.task.MessagesReceived++
 	entry.task.LastParentMessage = Truncate(message, 160)
+	// Publish the queue entry and wake-up under the same lock so the runner
+	// cannot drain the message between those operations and inherit a stale
+	// signal on its replacement request.
+	select {
+	case entry.messageSignal <- struct{}{}:
+	default:
+	}
 	r.mu.Unlock()
 
 	r.signalChange()
@@ -1082,13 +1102,43 @@ func (r *SubAgentRegistry) drainQueuedMessages(taskID string) []RunItem {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok := r.tasks[taskID]
-	if !ok || len(entry.queuedMessages) == 0 {
+	if !ok {
 		return nil
 	}
-	items := make([]RunItem, len(entry.queuedMessages))
-	copy(items, entry.queuedMessages)
+	return drainTaskMessages(entry)
+}
+
+func drainTaskMessages(entry *subAgentTaskEntry) []RunItem {
+	if len(entry.queuedMessages) == 0 {
+		return nil
+	}
+	items := append([]RunItem(nil), entry.queuedMessages...)
 	entry.queuedMessages = nil
+	// If no model call was active (for example while a tool was running), the
+	// coalesced wake-up is still buffered. The poll itself has now observed the
+	// message, so discard that stale signal before the next request starts.
+	select {
+	case <-entry.messageSignal:
+	default:
+	}
 	return items
+}
+
+// finalizeOrDrainQueuedMessages closes the race between accepting steering and
+// returning a final result. Pending messages win and force another turn;
+// otherwise admission closes atomically so later SendMessage calls fail.
+func (r *SubAgentRegistry) finalizeOrDrainQueuedMessages(taskID string) ([]RunItem, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.tasks[taskID]
+	if !ok {
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
+	if items := drainTaskMessages(entry); len(items) > 0 {
+		return items, nil
+	}
+	entry.acceptingMessages = false
+	return nil, nil
 }
 
 // WaitForAny blocks until any task changes state or the timeout expires.

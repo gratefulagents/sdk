@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -600,6 +601,76 @@ func TestSubAgentRegistryWaitsForDependenciesAndInjectsResults(t *testing.T) {
 	for _, want := range []string{"<sub_agent_dependency_results>", firstID, "alpha result"} {
 		if !strings.Contains(secondInput, want) {
 			t.Fatalf("second request input missing %q: %s", want, secondInput)
+		}
+	}
+}
+
+type liveSteeringModel struct {
+	mu       sync.Mutex
+	calls    int
+	requests []ModelRequest
+	started  chan struct{}
+}
+
+func (m *liveSteeringModel) GetResponse(context.Context, ModelRequest) (*ModelResponse, error) {
+	return nil, errors.New("GetResponse should not be called")
+}
+
+func (m *liveSteeringModel) StreamResponse(ctx context.Context, req ModelRequest) (*ModelStream, error) {
+	m.mu.Lock()
+	m.calls++
+	call := m.calls
+	m.requests = append(m.requests, req)
+	m.mu.Unlock()
+	if call == 1 {
+		close(m.started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	resp := &ModelResponse{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "steered result"}}}}
+	events := make(chan ModelStreamEvent, 2)
+	done := make(chan *ModelResponse, 1)
+	events <- ModelStreamEvent{Type: ModelStreamComplete, Response: resp}
+	close(events)
+	done <- resp
+	return NewModelStream(events, done), nil
+}
+
+func (*liveSteeringModel) GetRetryAdvice(error) *ModelRetryAdvice { return nil }
+func (*liveSteeringModel) CalculateCost(Usage) float64            { return 0 }
+func (*liveSteeringModel) Provider() string                       { return "test" }
+
+func TestSubAgentRegistrySendMessageInterruptsInFlightModelAttempt(t *testing.T) {
+	model := &liveSteeringModel{started: make(chan struct{})}
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{
+		Runner: NewRunnerWithModel(model),
+		Agents: map[string]*Agent{"analyst": {Name: "analyst"}},
+	})
+
+	taskID, err := registry.SpawnAsync(context.Background(), "analyst", "start", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-model.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first model attempt did not start")
+	}
+	if err := registry.SendMessage(taskID, "Conclude now with only blocking findings."); err != nil {
+		t.Fatal(err)
+	}
+	waitForTerminalTask(t, registry, taskID)
+
+	model.mu.Lock()
+	requests := append([]ModelRequest(nil), model.requests...)
+	model.mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("model requests = %d, want interrupted attempt plus replacement", len(requests))
+	}
+	secondInput := Items.ExtractText(requests[1].Input)
+	for _, want := range []string{"[PARENT MESSAGE]", "Conclude now with only blocking findings."} {
+		if !strings.Contains(secondInput, want) {
+			t.Fatalf("replacement request input missing %q: %s", want, secondInput)
 		}
 	}
 }
