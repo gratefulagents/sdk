@@ -1177,6 +1177,19 @@ func (m *cancellingModel) GetResponse(ctx context.Context, req ModelRequest) (*M
 	return m.mockModel.GetResponse(ctx, req)
 }
 
+func (m *cancellingModel) StreamResponse(ctx context.Context, req ModelRequest) (*ModelStream, error) {
+	resp, err := m.GetResponse(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	events := make(chan ModelStreamEvent, 1)
+	done := make(chan *ModelResponse, 1)
+	events <- ModelStreamEvent{Type: ModelStreamComplete, Response: resp}
+	close(events)
+	done <- resp
+	return NewModelStream(events, done), nil
+}
+
 // Cancellation mid model call (the common shape of a pod SIGTERM) must also
 // preserve the turns completed before it.
 func TestRunnerCancelledModelCallPreservesPartialResult(t *testing.T) {

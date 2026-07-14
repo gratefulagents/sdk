@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 	"github.com/openai/openai-go/v3/responses"
 )
 
@@ -741,6 +742,12 @@ func TestCollectSSEToJSON(t *testing.T) {
 			"",
 		}, "\n")
 
+		var activityCount atomic.Int32
+		activityCtx := modelactivity.WithSink(context.Background(), func() { activityCount.Add(1) })
+		request, err := http.NewRequestWithContext(activityCtx, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp := &http.Response{
 			Status:     "200 OK",
 			StatusCode: http.StatusOK,
@@ -749,6 +756,7 @@ func TestCollectSSEToJSON(t *testing.T) {
 			ProtoMinor: 1,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body:       io.NopCloser(strings.NewReader(sseBody)),
+			Request:    request,
 		}
 
 		result, err := collectSSEToJSON(resp)
@@ -758,6 +766,9 @@ func TestCollectSSEToJSON(t *testing.T) {
 		body, _ := io.ReadAll(result.Body)
 		if result.StatusCode != 200 {
 			t.Errorf("expected 200, got %d", result.StatusCode)
+		}
+		if activityCount.Load() == 0 {
+			t.Fatal("SSE collection did not report model stream activity")
 		}
 		if result.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("expected application/json, got %s", result.Header.Get("Content-Type"))
@@ -771,6 +782,34 @@ func TestCollectSSEToJSON(t *testing.T) {
 		}
 		if parsed["status"] != "completed" {
 			t.Errorf("expected status=completed, got %v", parsed["status"])
+		}
+	})
+
+	t.Run("forced stream attaches request before reporting activity", func(t *testing.T) {
+		var activityCount atomic.Int32
+		ctx := modelactivity.WithSink(context.Background(), func() { activityCount.Add(1) })
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_activity\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n",
+			)),
+			Request: nil,
+		}
+		result, err := maybeFinalizeCodexResponse(req, resp, true, nil)
+		if err != nil {
+			t.Fatalf("maybeFinalizeCodexResponse() error = %v", err)
+		}
+		defer result.Body.Close()
+		if activityCount.Load() == 0 {
+			t.Fatal("forced SSE collection did not report request-scoped model activity")
+		}
+		if result.Request != req {
+			t.Fatal("forced SSE response did not retain the originating request")
 		}
 	})
 

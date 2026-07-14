@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gratefulagents/sdk/internal/modeldelta"
@@ -745,36 +746,50 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		tp.OnSpanStart(genSpan)
 		openGenSpan = genSpan
 
-		// Call model under a per-attempt timeout so a hung or unresponsive
-		// provider connection cannot freeze the run forever. The timeout is
-		// derived from the run context, so real cancellation still propagates.
+		// Bound inactivity rather than total generation time. Each provider stream
+		// event resets the timer, matching Codex CLI semantics while still bounding
+		// initial request stalls and silent connections.
 		llmStartedAt := time.Now()
-		callCtx, callCancel := modelCallContext(ctx, cfg.ModelCallTimeout)
+		callCtx, callActivity, callCancel := modelCallIdleContext(ctx, cfg.ModelCallTimeout)
 		// Surface reasoning text live while the (blocking) model call is in
 		// flight: transports that stream internally feed a coalescing emitter
 		// which writes assistant_thinking_delta events keyed by attemptID.
 		// The streamed-run path already forwards reasoning deltas through its
 		// own event channel, so the sink is only installed for blocking runs.
+		var commitment modelOutputCommitment
 		var thinkingDeltas *thinkingDeltaEmitter
 		if platformHooks := findPlatformHooks(cfg.Hooks); platformHooks != nil {
 			platformHooks.setLLMAttemptID(attemptID)
 			if streamEvents == nil && platformHooks.EventStream != nil {
 				thinkingDeltas = newThinkingDeltaEmitter(platformHooks.EventStream, attemptID, currentAgent.Name)
-				callCtx = modeldelta.WithReasoningSink(callCtx, thinkingDeltas.Chunk)
+				callCtx = modeldelta.WithReasoningSink(callCtx, func(chunk string) {
+					if chunk == "" {
+						return
+					}
+					thinkingDeltas.Chunk(chunk)
+					commitment.providerReasoning.Store(true)
+					commitment.visible.Store(true)
+				})
 			}
 		}
-		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents)
+		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents, callActivity, &commitment)
+		// context.Cause records the atomic first cancellation winner, avoiding a
+		// race that could relabel parent cancellation as stream inactivity.
+		perCallTimeout := err != nil && errors.Is(context.Cause(callCtx), errModelStreamIdleTimeout)
 		callCancel()
 		if thinkingDeltas != nil {
 			thinkingDeltas.Flush()
 		}
-		// A per-attempt timeout (our derived deadline fired while the parent
-		// run context is still alive) is a transient provider hang, not a user
-		// cancellation: let it flow through the normal retry/fallback path
-		// instead of terminating the run.
-		perCallTimeout := err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
+		// An idle timeout is a transient provider hang, not a user cancellation:
+		// expose deadline semantics to the existing retry/fallback policy while
+		// preserving whether user-visible stream output was already committed.
 		if perCallTimeout {
-			err = fmt.Errorf("model call exceeded per-attempt timeout: %w", err)
+			timeoutErr := fmt.Errorf("model response stream idle for %s: %w", effectiveModelCallTimeout(cfg.ModelCallTimeout), context.DeadlineExceeded)
+			if streamOutputWasCommitted(err) {
+				err = &streamOutputCommittedError{cause: timeoutErr}
+			} else {
+				err = timeoutErr
+			}
 		}
 
 		if err != nil {
@@ -914,8 +929,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
-			// Consult error handler if configured.
-			if cfg.ErrorHandler != nil {
+			// Consult error handler only before any user-visible stream output.
+			// Retrying or continuing after commitment would duplicate that output.
+			if cfg.ErrorHandler != nil && !streamOutputWasCommitted(err) {
 				decision := cfg.ErrorHandler(RunErrorData{Error: err, Agent: currentAgent, Turn: turn})
 				switch decision.Action {
 				case ErrorActionRetry:
@@ -940,7 +956,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
-			if shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
+			if !streamOutputWasCommitted(err) && shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
 				delay := cfg.RetryPolicy.DelayForAttempt(turnRetryAttempt - 1)
 				cappedMS := capRetryAfterMS(delay.Milliseconds())
 				delay = time.Duration(cappedMS) * time.Millisecond
@@ -961,7 +977,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				continue
 			}
 
-			if advice != nil && advice.ShouldRetry && turnRetryAttempt <= maxAdviceRetriesPerTurn {
+			if !streamOutputWasCommitted(err) && advice != nil && advice.ShouldRetry && turnRetryAttempt <= maxAdviceRetriesPerTurn {
 				cappedMS := capRetryAfterMS(int64(advice.RetryAfterMS))
 				if cappedMS <= 0 {
 					// The provider asked for a retry without saying when (e.g.
@@ -1522,59 +1538,96 @@ func emitContentStreamEvent(ctx context.Context, events chan<- StreamEvent, ev C
 	}
 }
 
-func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents chan<- StreamEvent) (*ModelResponse, error) {
-	if streamEvents == nil {
-		return model.GetResponse(ctx, req)
+type modelOutputCommitment struct {
+	visible           atomic.Bool
+	providerReasoning atomic.Bool
+}
+
+func (c *modelOutputCommitment) wrap(err error) error {
+	if c != nil && c.visible.Load() {
+		return &streamOutputCommittedError{cause: err}
 	}
+	return err
+}
+
+func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents chan<- StreamEvent, activity func(), commitment *modelOutputCommitment) (*ModelResponse, error) {
+	// Consume the public streaming interface for both Run and RunStreamed so
+	// built-in and third-party models get identical activity-reset semantics.
 	stream, err := model.StreamResponse(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, commitment.wrap(err)
 	}
+	reasoningAlreadyEmitted := commitment != nil && commitment.providerReasoning.Load()
+	if activity != nil {
+		activity() // response headers / stream establishment are progress
+	}
+
 	var streamedResp *ModelResponse
-	outputCommitted := false
-	for ev := range stream.Events {
+	contextFailure := func() error {
+		return commitment.wrap(ctx.Err())
+	}
+	for {
+		var ev ModelStreamEvent
+		var ok bool
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+			return nil, contextFailure()
+		case ev, ok = <-stream.Events:
+			if !ok {
+				// Preserve ModelStream's existing contract: Final is authoritative
+				// when present, even if a Complete event carried an earlier snapshot.
+				select {
+				case <-ctx.Done():
+					return nil, contextFailure()
+				case finalResp, doneOpen := <-stream.done:
+					if doneOpen && finalResp != nil {
+						streamedResp = finalResp
+					}
+					if streamedResp == nil {
+						streamedResp = &ModelResponse{}
+					}
+					return streamedResp, nil
+				}
+			}
+		}
+
+		if activity != nil {
+			activity()
 		}
 		switch ev.Type {
 		case ModelStreamDelta:
-			outputCommitted = true
-			select {
-			case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}:
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			if streamEvents != nil {
+				select {
+				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}:
+					commitment.visible.Store(true)
+				case <-ctx.Done():
+					return nil, contextFailure()
+				}
 			}
 		case ModelStreamReasoningDelta:
-			select {
-			case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}:
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			if !reasoningAlreadyEmitted {
+				if sink := modeldelta.ReasoningSinkFromContext(ctx); sink != nil && ev.Delta != "" {
+					sink(ev.Delta)
+					commitment.visible.Store(true)
+				}
+			}
+			if streamEvents != nil {
+				select {
+				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}:
+					commitment.visible.Store(true)
+				case <-ctx.Done():
+					return nil, contextFailure()
+				}
 			}
 		case ModelStreamComplete:
 			streamedResp = ev.Response
 		case ModelStreamError:
 			if ev.Error != nil {
-				if outputCommitted {
-					return nil, &streamOutputCommittedError{cause: ev.Error}
-				}
-				return nil, ev.Error
+				return nil, commitment.wrap(ev.Error)
 			}
-			if outputCommitted {
-				return nil, &streamOutputCommittedError{cause: fmt.Errorf("model stream failed")}
-			}
-			return nil, fmt.Errorf("model stream failed")
+			return nil, commitment.wrap(fmt.Errorf("model stream failed"))
 		}
 	}
-	finalResp := stream.Final()
-	if finalResp != nil {
-		streamedResp = finalResp
-	}
-	if streamedResp == nil {
-		streamedResp = &ModelResponse{}
-	}
-	return streamedResp, nil
 }
 
 // emitRunItems forwards run items to the stream without ever blocking past

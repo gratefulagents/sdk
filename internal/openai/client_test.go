@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gratefulagents/sdk/internal/anthropic"
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 	"github.com/openai/openai-go/v3/responses"
 )
 
@@ -686,6 +688,13 @@ func TestShouldFallbackToResponses(t *testing.T) {
 	}
 	if shouldFallbackToResponses(&RequestError{StatusCode: 400, Body: "model not found"}) {
 		t.Fatalf("unexpected fallback for model-not-found")
+	}
+}
+
+func TestNewClientAllowsLongStreamsWithFiniteSafetyCeiling(t *testing.T) {
+	client := NewClient("test-key")
+	if client.httpClient.Timeout != 30*time.Minute {
+		t.Fatalf("http client timeout = %v, want 30m safety ceiling", client.httpClient.Timeout)
 	}
 }
 
@@ -1420,7 +1429,7 @@ func TestResponsesStreamReader_TranslatesToolCallEvents(t *testing.T) {
 }
 
 func TestDrainStreamRejectsEmptyResponse(t *testing.T) {
-	_, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+	_, err := drainStreamToResponse(context.Background(), &StreamReader{events: []anthropic.StreamEvent{
 		{
 			Type: anthropic.EventMessageStart,
 			Message: &anthropic.CreateMessageResponse{
@@ -1437,7 +1446,7 @@ func TestDrainStreamRejectsEmptyResponse(t *testing.T) {
 }
 
 func TestDrainStreamPreservesInputTokensWhenDeltaOmitsThem(t *testing.T) {
-	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+	resp, err := drainStreamToResponse(context.Background(), &StreamReader{events: []anthropic.StreamEvent{
 		{
 			Type: anthropic.EventMessageStart,
 			Message: &anthropic.CreateMessageResponse{
@@ -1486,7 +1495,7 @@ func TestDrainStreamPreservesInputTokensWhenDeltaOmitsThem(t *testing.T) {
 
 func TestDrainStreamPreservesEndTurnFalse(t *testing.T) {
 	keepGoing := false
-	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+	resp, err := drainStreamToResponse(context.Background(), &StreamReader{events: []anthropic.StreamEvent{
 		{
 			Type: anthropic.EventMessageStart,
 			Message: &anthropic.CreateMessageResponse{
@@ -1647,7 +1656,9 @@ func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient("test-key", WithBaseURL(server.URL+"/v1"), WithAPIMode("chat-completions"))
-	stream, err := client.CreateMessageStream(context.Background(), anthropic.CreateMessageRequest{
+	activityCount := 0
+	ctx := modelactivity.WithSink(context.Background(), func() { activityCount++ })
+	stream, err := client.CreateMessageStream(ctx, anthropic.CreateMessageRequest{
 		Model:     "openai/gpt-4o-mini",
 		MaxTokens: 32,
 		Messages: []anthropic.Message{{
@@ -1659,12 +1670,15 @@ func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stream.Close()
-	resp, err := drainStreamToResponse(stream, nil)
+	resp, err := drainStreamToResponse(ctx, stream, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !streamed {
 		t.Fatal("chat stream request did not send stream:true")
+	}
+	if activityCount == 0 {
+		t.Fatal("OpenAI stream response bytes reported no model activity")
 	}
 	if len(resp.Content) != 1 || resp.Content[0].Text != "live" {
 		t.Fatalf("response = %+v", resp.Content)
@@ -1673,7 +1687,9 @@ func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
 
 func TestDrainStreamFeedsReasoningSink(t *testing.T) {
 	var chunks []string
-	resp, err := drainStreamToResponse(&StreamReader{events: []anthropic.StreamEvent{
+	activityCount := 0
+	ctx := modelactivity.WithSink(context.Background(), func() { activityCount++ })
+	resp, err := drainStreamToResponse(ctx, &StreamReader{events: []anthropic.StreamEvent{
 		{
 			Type: anthropic.EventMessageStart,
 			Message: &anthropic.CreateMessageResponse{
@@ -1718,6 +1734,9 @@ func TestDrainStreamFeedsReasoningSink(t *testing.T) {
 	}}, func(text string) { chunks = append(chunks, text) })
 	if err != nil {
 		t.Fatalf("drainStreamToResponse() error = %v", err)
+	}
+	if activityCount == 0 {
+		t.Fatal("stream drain did not report model activity")
 	}
 	if got := strings.Join(chunks, ""); got != "step one, step two" {
 		t.Fatalf("sink received %q, want reasoning text in stream order", got)
