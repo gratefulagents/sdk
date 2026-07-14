@@ -969,6 +969,7 @@ type collectedSSEOutputItem struct {
 	callID           string
 	name             string
 	encryptedContent string
+	createdBy        string
 
 	text             strings.Builder
 	arguments        strings.Builder
@@ -1117,6 +1118,9 @@ func mergeSSECommonFields(item *collectedSSEOutputItem, obj map[string]any) {
 	if encryptedContent, _ := obj["encrypted_content"].(string); encryptedContent != "" {
 		item.encryptedContent = encryptedContent
 	}
+	if createdBy, _ := obj["created_by"].(string); createdBy != "" {
+		item.createdBy = createdBy
+	}
 }
 
 func mergeSSEContentText(item *collectedSSEOutputItem, raw any) {
@@ -1249,6 +1253,21 @@ func collectedSSEOutput(items map[int]*collectedSSEOutputItem) []any {
 				call["status"] = item.status
 			}
 			out = append(out, call)
+		case item.typ == "compaction":
+			if item.encryptedContent == "" {
+				continue
+			}
+			compaction := map[string]any{
+				"type":              "compaction",
+				"encrypted_content": item.encryptedContent,
+			}
+			if item.id != "" {
+				compaction["id"] = item.id
+			}
+			if item.createdBy != "" {
+				compaction["created_by"] = item.createdBy
+			}
+			out = append(out, compaction)
 		case item.typ == "reasoning" || item.reasoningText.Len() > 0 || item.reasoningSummary.Len() > 0 || item.encryptedContent != "":
 			if item.reasoningText.Len() == 0 && item.reasoningSummary.Len() == 0 && item.encryptedContent == "" {
 				continue
