@@ -459,7 +459,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		var err error
 		managerOptions := []sdkmcp.ManagerOption{sdkmcp.WithPermissionMode(mode)}
 		if cfg.CommandSandboxConfig != nil {
-			managerOptions = append(managerOptions, sdkmcp.WithCommandExecutor(sdksandbox.DefaultWithConfig(*cfg.CommandSandboxConfig)))
+			managerOptions = append(managerOptions, sdkmcp.WithCommandSandboxConfig(*cfg.CommandSandboxConfig))
 		}
 		manager, err = buildMCPManager(ctx, cfg, features.value.MCP, managerOptions...)
 		if manager != nil {

@@ -114,8 +114,9 @@ func (m *Manager) ConfigSnapshot() ConfigSnapshot {
 }
 
 type managerOptions struct {
-	permissionMode policy.PermissionMode
-	executor       sandbox.Executor
+	permissionMode       policy.PermissionMode
+	executor             sandbox.Executor
+	commandSandboxConfig *sandbox.Config
 }
 
 // ManagerOption configures MCP subprocess execution.
@@ -132,6 +133,15 @@ func WithPermissionMode(mode policy.PermissionMode) ManagerOption {
 func WithCommandExecutor(executor sandbox.Executor) ManagerOption {
 	return func(opts *managerOptions) {
 		opts.executor = executor
+	}
+}
+
+// WithCommandSandboxConfig sets the sandbox configuration used for MCP stdio
+// subprocesses. The manager always replaces WorkspaceRoot with its trusted
+// workDir; callers cannot redirect the writable workspace through this option.
+func WithCommandSandboxConfig(config sandbox.Config) ManagerOption {
+	return func(opts *managerOptions) {
+		opts.commandSandboxConfig = &config
 	}
 }
 
@@ -165,7 +175,7 @@ func NewManager(ctx context.Context, workDir string, opts ...ManagerOption) (*Ma
 
 // NewManagerFromConfig creates a manager from the provided config.
 func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts ...ManagerOption) (*Manager, error) {
-	options := resolveManagerOptions(opts...)
+	options := resolveManagerOptions(workDir, opts...)
 	m := &Manager{
 		servers:             make(map[string]*serverConn),
 		toolByQualifiedName: make(map[string]ToolDescriptor),
@@ -288,10 +298,9 @@ func filteredEnv(serverName string, cfg ServerConfig) map[string]string {
 	return out
 }
 
-func resolveManagerOptions(opts ...ManagerOption) managerOptions {
+func resolveManagerOptions(workDir string, opts ...ManagerOption) managerOptions {
 	options := managerOptions{
 		permissionMode: policy.PermissionModeWorkspaceWrite,
-		executor:       sandbox.Default(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -299,7 +308,15 @@ func resolveManagerOptions(opts ...ManagerOption) managerOptions {
 		}
 	}
 	if options.executor == nil {
-		options.executor = sandbox.Default()
+		config := sandbox.ConfigFromEnv()
+		if options.commandSandboxConfig != nil {
+			config = *options.commandSandboxConfig
+		}
+		// workDir is supplied by the host and is the manager's trust boundary.
+		// Restricted sandboxes must receive it explicitly rather than inferring a
+		// writable root from an MCP-controlled command working directory.
+		config.WorkspaceRoot = workDir
+		options.executor = sandbox.DefaultWithConfig(config)
 	}
 	options.permissionMode = policy.NormalizePermissionMode(string(options.permissionMode))
 	return options
