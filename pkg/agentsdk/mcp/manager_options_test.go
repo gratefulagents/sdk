@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -64,4 +66,61 @@ func containsArgSequence(args []string, want ...string) bool {
 		}
 	}
 	return false
+}
+
+type recordingExecutor struct {
+	requests []sandbox.Request
+}
+
+func (e *recordingExecutor) Build(_ context.Context, req sandbox.Request) (*exec.Cmd, error) {
+	e.requests = append(e.requests, req)
+	return nil, errors.New("recorded request")
+}
+
+func (*recordingExecutor) Run(context.Context, sandbox.Request) (sandbox.Result, error) {
+	return sandbox.Result{}, nil
+}
+
+func TestConnectStdioServerNetworkAccessAllowlist(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    []ManagerOption
+		server  string
+		allowed bool
+	}{
+		{
+			name:    "allowlisted normalized name",
+			opts:    []ManagerOption{WithNetworkAccessForServers(" opted ")},
+			server:  "opted",
+			allowed: true,
+		},
+		{
+			name:    "unlisted server",
+			opts:    []ManagerOption{WithNetworkAccessForServers("opted")},
+			server:  "unlisted",
+			allowed: false,
+		},
+		{
+			name:    "default",
+			server:  "default",
+			allowed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &recordingExecutor{}
+			opts := resolveManagerOptions(t.TempDir(), append([]ManagerOption{WithCommandExecutor(executor)}, tt.opts...)...)
+			_, err := connectStdioServer(context.Background(), t.TempDir(), tt.server, ServerConfig{Command: "server"}, opts)
+			if err == nil {
+				t.Fatal("connectStdioServer() error = nil, want executor error")
+			}
+			if len(executor.requests) != 1 {
+				t.Fatalf("executor requests = %d, want 1", len(executor.requests))
+			}
+			if got := executor.requests[0].AllowNetwork; got != tt.allowed {
+				t.Errorf("Request.AllowNetwork = %v, want %v", got, tt.allowed)
+			}
+		})
+	}
 }
