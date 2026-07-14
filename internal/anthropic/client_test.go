@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 )
 
 func TestNewClient_Defaults(t *testing.T) {
@@ -19,6 +21,54 @@ func TestNewClient_Defaults(t *testing.T) {
 	}
 	if c.sem == nil {
 		t.Fatalf("NewClient did not initialize semaphore")
+	}
+}
+
+func TestCreateMessageReportsStreamingActivity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_activity","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}`,
+			``,
+			`event: content_block_start`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			``,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+			``,
+			`event: content_block_stop`,
+			`data: {"type":"content_block_stop","index":0}`,
+			``,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`,
+			``,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n")))
+	}))
+	defer srv.Close()
+
+	var activityCount atomic.Int32
+	ctx := modelactivity.WithSink(context.Background(), func() { activityCount.Add(1) })
+	client := NewClient("test-key", WithBaseURL(srv.URL))
+	resp, err := client.CreateMessage(ctx, CreateMessageRequest{
+		Model:     "claude-sonnet-4-5",
+		MaxTokens: 8,
+		Messages: []Message{{
+			Role:    RoleUser,
+			Content: []ContentBlock{NewTextBlock("hello")},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMessage() error = %v", err)
+	}
+	if activityCount.Load() == 0 {
+		t.Fatal("Anthropic stream did not report model activity")
+	}
+	if resp == nil || len(resp.Content) != 1 || resp.Content[0].Text != "ok" {
+		t.Fatalf("CreateMessage() response = %+v, want text ok", resp)
 	}
 }
 

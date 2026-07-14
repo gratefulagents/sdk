@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -764,6 +765,12 @@ func maybeNormalizeCodexResponsesBody(req *http.Request, session *OpenAIAuthSess
 
 func maybeFinalizeCodexResponse(req *http.Request, resp *http.Response, forcedStream bool, session *OpenAIAuthSession) (*http.Response, error) {
 	logCodexErrorBody(req, resp, session)
+	// RoundTripper wrappers finalize forced SSE before net/http attaches the
+	// originating request to the response. Preserve it here so stream activity
+	// reaches the request-scoped inactivity sink while the body is collected.
+	if resp != nil && resp.Request == nil {
+		resp.Request = req
+	}
 	finalResp, err := maybeCollectSSE(resp, forcedStream)
 	if err != nil {
 		return nil, err
@@ -892,6 +899,9 @@ func collectSSEToJSON(resp *http.Response) (*http.Response, error) {
 					// Parse to check event type.
 					var evt collectedSSEEvent
 					if json.Unmarshal(data, &evt) == nil {
+						if resp.Request != nil {
+							modelactivity.Notify(resp.Request.Context())
+						}
 						lastEventType = evt.Type
 						collectSSEOutputEvent(outputItems, evt)
 						// Capture response.completed as the primary source.

@@ -117,6 +117,22 @@ func (m *reasoningSinkModel) GetResponse(ctx context.Context, req ModelRequest) 
 	return m.mockModel.GetResponse(ctx, req)
 }
 
+func (m *reasoningSinkModel) StreamResponse(ctx context.Context, req ModelRequest) (*ModelStream, error) {
+	resp, err := m.mockModel.GetResponse(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	events := make(chan ModelStreamEvent, len(m.chunks)+1)
+	done := make(chan *ModelResponse, 1)
+	for _, chunk := range m.chunks {
+		events <- ModelStreamEvent{Type: ModelStreamReasoningDelta, Delta: chunk}
+	}
+	events <- ModelStreamEvent{Type: ModelStreamComplete, Response: resp}
+	close(events)
+	done <- resp
+	return NewModelStream(events, done), nil
+}
+
 func TestRunnerStreamsThinkingDeltasToEventStream(t *testing.T) {
 	model := &reasoningSinkModel{
 		mockModel: &mockModel{

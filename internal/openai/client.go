@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gratefulagents/sdk/internal/anthropic"
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 	"github.com/gratefulagents/sdk/internal/modeldelta"
 	sdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -30,11 +31,14 @@ import (
 )
 
 const (
-	defaultBaseURL         = "https://api.openai.com/v1"
-	defaultMaxConcurrent   = 2
-	maxRetries             = 3
-	maxRetryAfterSeconds   = 5 * 60
-	defaultHTTPCallTimeout = 5 * time.Minute
+	defaultBaseURL       = "https://api.openai.com/v1"
+	defaultMaxConcurrent = 2
+	maxRetries           = 3
+	maxRetryAfterSeconds = 5 * 60
+	// Keep a generous whole-request safety ceiling for direct client users while
+	// allowing the runner's five-minute activity-resetting idle policy to govern
+	// normal generations. This replaces the old five-minute total-response cap.
+	defaultHTTPCallTimeout = 30 * time.Minute
 	apiModeResponses       = "responses"
 	apiModeChat            = "chat-completions"
 	// maxProviderResponseBytes caps the response body size we read from the
@@ -875,7 +879,7 @@ func (c *Client) createViaResponses(ctx context.Context, params responses.Respon
 	reader := &ResponsesStreamReader{stream: stream}
 	defer reader.Close()
 
-	return drainStreamToResponse(reader, modeldelta.ReasoningSinkFromContext(ctx))
+	return drainStreamToResponse(ctx, reader, modeldelta.ReasoningSinkFromContext(ctx))
 }
 
 func (c *Client) CompactConversation(ctx context.Context, req anthropic.CreateMessageRequest) (*CompactConversationResponse, error) {
@@ -968,7 +972,7 @@ func (c *Client) createViaChatCompletions(ctx context.Context, req anthropic.Cre
 			return nil, err
 		}
 		defer stream.Close()
-		return drainStreamToResponse(stream, modeldelta.ReasoningSinkFromContext(ctx))
+		return drainStreamToResponse(ctx, stream, modeldelta.ReasoningSinkFromContext(ctx))
 	}
 
 	raw, err := c.doChatRequest(ctx, body)
@@ -1750,7 +1754,7 @@ func responseOutputString(output responses.ResponseOutputItemUnionOutput) string
 // createViaResponses so that the non-streaming CreateMessage path still
 // goes through SSE — the Codex backend only delivers output via streaming.
 // A non-nil sink receives reasoning text chunks live as they stream in.
-func drainStreamToResponse(stream messageStream, sink modeldelta.ReasoningSink) (*anthropic.CreateMessageResponse, error) {
+func drainStreamToResponse(ctx context.Context, stream messageStream, sink modeldelta.ReasoningSink) (*anthropic.CreateMessageResponse, error) {
 	resp := &anthropic.CreateMessageResponse{
 		Type: "message",
 		Role: anthropic.RoleAssistant,
@@ -1785,6 +1789,7 @@ func drainStreamToResponse(stream messageStream, sink modeldelta.ReasoningSink) 
 		if err != nil {
 			return nil, fmt.Errorf("streaming response: %w", err)
 		}
+		modelactivity.Notify(ctx)
 
 		switch ev.Type {
 		case anthropic.EventMessageStart:

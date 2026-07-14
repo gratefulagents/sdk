@@ -2,17 +2,23 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 )
 
-// DefaultModelCallTimeout bounds a single model generation attempt when
-// RunConfig.ModelCallTimeout is 0. Five minutes matches Codex CLI's default
-// stream inactivity budget while remaining finite so a hung provider
-// connection cannot freeze a run indefinitely.
+// DefaultModelCallTimeout is the default model stream inactivity budget.
+// Five minutes matches Codex CLI's default stream idle timeout. The timer is
+// reset whenever a provider stream event arrives, so a healthy generation may
+// run longer than five minutes while a silent connection remains bounded.
 const DefaultModelCallTimeout = 5 * time.Minute
 
-// effectiveModelCallTimeout resolves the per-attempt model-call timeout:
+var errModelStreamIdleTimeout = errors.New("model response stream idle timeout")
+
+// effectiveModelCallTimeout resolves the model stream inactivity timeout:
 // 0 uses DefaultModelCallTimeout; a negative value disables the timeout.
 func effectiveModelCallTimeout(d time.Duration) time.Duration {
 	if d < 0 {
@@ -24,15 +30,75 @@ func effectiveModelCallTimeout(d time.Duration) time.Duration {
 	return d
 }
 
-// modelCallContext derives a per-attempt context for a single model call so a
-// hung provider request cannot freeze the run. The returned cancel func must
-// always be called. When the timeout is disabled it returns the parent context
-// unchanged with a no-op cancel.
+// modelCallContext derives a hard deadline for provider operations that do not
+// expose streaming progress, such as context compaction. Normal generation
+// uses modelCallIdleContext instead.
 func modelCallContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if to := effectiveModelCallTimeout(timeout); to > 0 {
 		return context.WithTimeout(ctx, to)
 	}
 	return ctx, func() {}
+}
+
+// modelCallIdleContext derives a context cancelled after timeout elapses with
+// no model stream activity. activity resets the idle timer. Callers classify
+// the winner atomically through context.Cause before invoking cancel.
+func modelCallIdleContext(parent context.Context, timeout time.Duration) (
+	ctx context.Context,
+	activity func(),
+	cancel context.CancelFunc,
+) {
+	to := effectiveModelCallTimeout(timeout)
+	if to <= 0 {
+		ctx, cancel := context.WithCancel(parent)
+		return ctx, func() {}, cancel
+	}
+
+	callCtx, cancelCause := context.WithCancelCause(parent)
+	var stateMu sync.Mutex
+	lastActivity := time.Now()
+	stopped := false
+	var timer *time.Timer
+	var checkIdle func()
+	checkIdle = func() {
+		stateMu.Lock()
+		if stopped || callCtx.Err() != nil {
+			stopped = true
+			stateMu.Unlock()
+			return
+		}
+		if remaining := to - time.Since(lastActivity); remaining > 0 {
+			timer.Reset(remaining)
+			stateMu.Unlock()
+			return
+		}
+		stopped = true
+		stateMu.Unlock()
+		cancelCause(errModelStreamIdleTimeout)
+	}
+	timer = time.AfterFunc(to, checkIdle)
+
+	touch := func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		if stopped || callCtx.Err() != nil {
+			return
+		}
+		lastActivity = time.Now()
+		timer.Reset(to)
+	}
+	stop := func() {
+		stateMu.Lock()
+		if stopped {
+			stateMu.Unlock()
+			return
+		}
+		stopped = true
+		timer.Stop()
+		stateMu.Unlock()
+		cancelCause(context.Canceled)
+	}
+	return modelactivity.WithSink(callCtx, touch), touch, stop
 }
 
 // ImmediateInputPoller injects user messages at runner interruptible boundaries.
@@ -322,13 +388,13 @@ type RunConfig struct {
 	// docs/security.md.
 	UntrustedToolOutputs *bool
 
-	// ModelCallTimeout bounds a single model generation attempt (including the
-	// provider-native compaction call). A hung or unresponsive provider request
-	// is cancelled after this duration so the attempt fails (and is then
-	// retried/fallen-back per policy) instead of freezing the run forever — the
-	// failure mode that previously required a kill -9. The timeout applies
-	// per-attempt, so retries each get a fresh budget. 0 uses
-	// DefaultModelCallTimeout; negative disables the per-call timeout.
+	// ModelCallTimeout is the maximum inactivity interval for a model response
+	// stream. Every provider stream event resets the timer, so healthy generations
+	// may run longer than this duration. Initial request stalls and silent streams
+	// are cancelled and flow through the normal retry/fallback policy. Provider
+	// operations without observable progress, including native compaction, retain
+	// this value as a hard deadline. 0 uses DefaultModelCallTimeout; negative
+	// disables both safeguards.
 	ModelCallTimeout time.Duration
 }
 

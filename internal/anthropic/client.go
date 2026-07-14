@@ -19,6 +19,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 	"github.com/google/uuid"
 
+	"github.com/gratefulagents/sdk/internal/modelactivity"
 	"github.com/gratefulagents/sdk/internal/modeldelta"
 )
 
@@ -259,6 +260,7 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 		var acc sdk.BetaMessage
 		for stream.Next() {
 			event := stream.Current()
+			modelactivity.Notify(ctx)
 			if err := acc.Accumulate(event); err != nil {
 				return err
 			}

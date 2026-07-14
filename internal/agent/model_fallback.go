@@ -78,8 +78,7 @@ func shouldFallbackModelCall(err error, advice *ModelRetryAdvice) bool {
 	if errors.As(err, &behaviorErr) {
 		return false
 	}
-	var committedErr *streamOutputCommittedError
-	if errors.As(err, &committedErr) {
+	if streamOutputWasCommitted(err) {
 		return false
 	}
 	if advice == nil || !advice.ShouldRetry {
@@ -120,6 +119,11 @@ func sameModelID(a, b string) bool {
 
 type streamOutputCommittedError struct {
 	cause error
+}
+
+func streamOutputWasCommitted(err error) bool {
+	var committedErr *streamOutputCommittedError
+	return errors.As(err, &committedErr)
 }
 
 func (e *streamOutputCommittedError) Error() string {
