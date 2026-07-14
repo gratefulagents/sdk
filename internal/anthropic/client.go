@@ -141,7 +141,9 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	}
 
 	sessionID := uuid.New().String()
+	httpClient := &http.Client{Transport: modelactivity.WrapTransport(http.DefaultTransport)}
 	sdkOpts := []option.RequestOption{
+		option.WithHTTPClient(httpClient),
 		option.WithMaxRetries(0), // We handle retries ourselves
 	}
 	// x-app / X-Claude-Code-Session-Id are first-party Anthropic (Claude Code)

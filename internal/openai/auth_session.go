@@ -597,7 +597,7 @@ func newAuthHTTPClient(session *OpenAIAuthSession, timeout time.Duration) *http.
 	if session != nil {
 		transport = &authRoundTripper{base: baseTransport, session: session}
 	}
-	return &http.Client{Timeout: timeout, Transport: transport}
+	return &http.Client{Timeout: timeout, Transport: modelactivity.WrapTransport(transport)}
 }
 
 type authRoundTripper struct {

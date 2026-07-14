@@ -1656,7 +1656,9 @@ func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient("test-key", WithBaseURL(server.URL+"/v1"), WithAPIMode("chat-completions"))
-	stream, err := client.CreateMessageStream(context.Background(), anthropic.CreateMessageRequest{
+	activityCount := 0
+	ctx := modelactivity.WithSink(context.Background(), func() { activityCount++ })
+	stream, err := client.CreateMessageStream(ctx, anthropic.CreateMessageRequest{
 		Model:     "openai/gpt-4o-mini",
 		MaxTokens: 32,
 		Messages: []anthropic.Message{{
@@ -1668,12 +1670,15 @@ func TestCreateMessageStreamUsesLiveChatSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stream.Close()
-	resp, err := drainStreamToResponse(context.Background(), stream, nil)
+	resp, err := drainStreamToResponse(ctx, stream, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !streamed {
 		t.Fatal("chat stream request did not send stream:true")
+	}
+	if activityCount == 0 {
+		t.Fatal("OpenAI stream response bytes reported no model activity")
 	}
 	if len(resp.Content) != 1 || resp.Content[0].Text != "live" {
 		t.Fatalf("response = %+v", resp.Content)
