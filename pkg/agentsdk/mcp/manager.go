@@ -117,6 +117,7 @@ type managerOptions struct {
 	permissionMode       policy.PermissionMode
 	executor             sandbox.Executor
 	commandSandboxConfig *sandbox.Config
+	networkAccessServers map[string]struct{}
 }
 
 // ManagerOption configures MCP subprocess execution.
@@ -133,6 +134,23 @@ func WithPermissionMode(mode policy.PermissionMode) ManagerOption {
 func WithCommandExecutor(executor sandbox.Executor) ManagerOption {
 	return func(opts *managerOptions) {
 		opts.executor = executor
+	}
+}
+
+// WithNetworkAccessForServers permits network access for the named MCP servers.
+// Hosts must only pass names approved by a trusted policy; repository MCP
+// configuration cannot enable network access on its own.
+func WithNetworkAccessForServers(names ...string) ManagerOption {
+	return func(opts *managerOptions) {
+		if opts.networkAccessServers == nil {
+			opts.networkAccessServers = make(map[string]struct{})
+		}
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				opts.networkAccessServers[name] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -680,11 +698,13 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 	// The connect timeout below applies to the handshake only; process
 	// lifetime is owned by the manager (Close/terminateProcess) and the
 	// sandbox's --die-with-parent.
+	_, allowNetwork := opts.networkAccessServers[name]
 	cmd, err := opts.executor.Build(context.WithoutCancel(ctx), sandbox.Request{
 		Argv:           append([]string{command}, args...),
 		WorkDir:        workDir,
 		PermissionMode: opts.permissionMode,
 		Env:            filteredEnv(name, cfg),
+		AllowNetwork:   allowNetwork,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("MCP server %q sandbox: %w", name, err)
