@@ -63,7 +63,7 @@ func TestHelperMCPServer(t *testing.T) {
 func TestConnectStdioServerChildOutlivesConnectReturn(t *testing.T) {
 	t.Parallel()
 
-	opts := resolveManagerOptions(WithCommandExecutor(directExecutor{}))
+	opts := resolveManagerOptions(t.TempDir(), WithCommandExecutor(directExecutor{}))
 	cfg := ServerConfig{
 		Command: os.Args[0],
 		Args:    []string{"-test.run", "^TestHelperMCPServer$"},

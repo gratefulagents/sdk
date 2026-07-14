@@ -2,8 +2,8 @@ package mcp
 
 import (
 	"context"
-	"os/exec"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -70,7 +70,7 @@ func TestErrWithStderr(t *testing.T) {
 func TestConnectStdioServerReportsChildStderr(t *testing.T) {
 	t.Parallel()
 
-	opts := resolveManagerOptions(WithCommandExecutor(directExecutor{}))
+	opts := resolveManagerOptions(t.TempDir(), WithCommandExecutor(directExecutor{}))
 	cfg := ServerConfig{Command: "sh", Args: []string{"-c", "echo boom-traceback >&2; exit 3"}}
 	_, err := connectStdioServer(context.Background(), t.TempDir(), "crashy", cfg, opts)
 	if err == nil {
