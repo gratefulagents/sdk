@@ -16,7 +16,10 @@ import (
 // run longer than five minutes while a silent connection remains bounded.
 const DefaultModelCallTimeout = 5 * time.Minute
 
-var errModelStreamIdleTimeout = errors.New("model response stream idle timeout")
+var (
+	errModelStreamIdleTimeout = errors.New("model response stream idle timeout")
+	errImmediateInput         = errors.New("immediate input arrived")
+)
 
 // effectiveModelCallTimeout resolves the model stream inactivity timeout:
 // 0 uses DefaultModelCallTimeout; a negative value disables the timeout.
@@ -38,6 +41,31 @@ func modelCallContext(ctx context.Context, timeout time.Duration) (context.Conte
 		return context.WithTimeout(ctx, to)
 	}
 	return ctx, func() {}
+}
+
+// immediateInputContext cancels an uncommitted model request when input arrives.
+// A committed stream cannot be safely replayed, so its signal is consumed and
+// the queued input remains available to the poller at the next boundary.
+func immediateInputContext(parent context.Context, signal ImmediateInputSignal, interrupt func() bool) (context.Context, context.CancelFunc) {
+	if signal == nil {
+		return parent, func() {}
+	}
+	ctx, cancelCause := context.WithCancelCause(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ctx.Done():
+		case <-signal:
+			if interrupt == nil || interrupt() {
+				cancelCause(errImmediateInput)
+			}
+		}
+	}()
+	return ctx, func() {
+		cancelCause(context.Canceled)
+		<-done
+	}
 }
 
 // modelCallIdleContext derives a context cancelled after timeout elapses with
@@ -104,6 +132,17 @@ func modelCallIdleContext(parent context.Context, timeout time.Duration) (
 // ImmediateInputPoller injects user messages at runner interruptible boundaries.
 // Returned items should usually be user message RunItems (Agent == nil).
 type ImmediateInputPoller func(context.Context) ([]RunItem, error)
+
+// ImmediateInputSignal optionally wakes an in-flight, still-uncommitted model
+// request when immediate input arrives. The runner cancels that attempt and
+// polls the new input before issuing its replacement request. Once a model has
+// emitted visible output, steering waits for the next normal boundary instead.
+type ImmediateInputSignal <-chan struct{}
+
+// ImmediateInputFinalizer atomically closes immediate-input admission if no
+// input is pending, or returns pending items while leaving admission open so
+// the runner can continue. It is called immediately before a final return.
+type ImmediateInputFinalizer func(context.Context) ([]RunItem, error)
 
 // CompactionModelResolver resolves model-specific compaction thresholds for a
 // (possibly provider-prefixed) model name. It returns tuned trigger/target
@@ -294,6 +333,8 @@ type RunConfig struct {
 	ParentSpanID string
 
 	ImmediateInputPoller      ImmediateInputPoller
+	ImmediateInputSignal      ImmediateInputSignal
+	ImmediateInputFinalizer   ImmediateInputFinalizer
 	CompactionConfig          CompactionConfig
 	CompactionModelResolver   CompactionModelResolver
 	CompactionRecorder        func(tokensBefore, tokensAfter int, summary string)

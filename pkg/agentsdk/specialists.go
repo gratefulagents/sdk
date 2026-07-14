@@ -205,7 +205,7 @@ The SDK will not let you final-answer while background tasks are still active.
 WAITING: When you have nothing left to do but wait for background tasks, call subagent_wait — it blocks and wakes the moment tasks finish, returning their results (wait_for=any returns on the first new result; omit task_ids to wait on everything; timeout_ms caps the wait).
 NEVER wait by sleeping in Bash or by polling subagent_status in a loop: sleeps overshoot and waste turns, subagent_wait cannot.
 
-STEERING: If a running task needs an update, correction, or narrower constraint, subagent_control action="message" queues a parent message for its next model turn; action="cancel" stops it.
+STEERING: If a running task needs an update, correction, or narrower constraint, subagent_control action="message" interrupts an in-flight model attempt before it emits output, or queues the update for the next safe boundary if output has begun. action="cancel" stops the task.
 Keep steering messages short and specific.`)
 		b.WriteString("\n\n")
 	}
