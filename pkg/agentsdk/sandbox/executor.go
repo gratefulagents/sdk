@@ -160,22 +160,24 @@ func ExecutorEnforcesFilesystem(executor Executor, mode policy.PermissionMode) b
 }
 
 // DefaultEnforcesFilesystem reports whether the environment-configured default
-// executor runs write-capable commands inside the enforcing subprocess sandbox
-// (true in worker pods, where GRATEFULAGENTS_COMMAND_SANDBOX=required).
+// executor enforces a per-process filesystem boundary. The default executor
+// relies on its host sandbox (for example, a Kubernetes AgentSandbox), so this
+// is always false and tool-layer command policy remains enabled.
 func DefaultEnforcesFilesystem() bool {
-	return defaultExecutor{config: ConfigFromEnv()}.EnforcesFilesystem(policy.PermissionModeWorkspaceWrite)
+	return false
 }
 
 // Default returns the production command executor with deterministic SDK
-// defaults. Read-only command runs require the subprocess sandbox; local
-// write-capable development falls back to a sanitized process unless
-// sandboxing is explicitly required.
+// defaults. Commands execute directly inside the host-provided sandbox with a
+// sanitized environment. Permission modes remain enforced by the tool policy;
+// they do not create a second, incomplete view of the host toolchain.
 func Default() Executor {
 	return defaultExecutor{config: ConfigFromEnv()}
 }
 
 // DefaultWithConfig returns the production command executor with host-supplied
-// sandbox configuration.
+// environment and PATH configuration. Legacy sandbox mode values are accepted
+// for compatibility but no longer select a same-pod filesystem sandbox.
 func DefaultWithConfig(config Config) Executor {
 	return defaultExecutor{config: config}
 }
@@ -187,27 +189,10 @@ type defaultExecutor struct {
 func (e defaultExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, error) {
 	config := normalizeConfig(e.config)
 	mode := strings.ToLower(strings.TrimSpace(config.Mode))
-	if mode == "" {
-		mode = sandboxModeAuto
-	}
-
-	switch mode {
-	case sandboxModeDisabled:
-		return LocalExecutor{Config: config}.Build(ctx, req)
-	case sandboxModeRequired:
-		return BubblewrapExecutor{Config: config}.Build(ctx, req)
-	case sandboxModeAuto:
-		permissionMode := policy.NormalizePermissionMode(string(req.PermissionMode))
-		if permissionMode != policy.PermissionModeDangerFullAccess || config.RunningInKubernetes {
-			// Every restricted mode requires OS-enforced containment. Bubblewrap
-			// unavailability fails closed; local execution cannot safely enforce a
-			// filesystem permission boundary.
-			return BubblewrapExecutor{Config: config}.Build(ctx, req)
-		}
-		return LocalExecutor{Config: config}.Build(ctx, req)
-	default:
+	if mode != "" && mode != sandboxModeAuto && mode != sandboxModeDisabled && mode != sandboxModeRequired {
 		return nil, fmt.Errorf("unsupported sandbox mode %q", mode)
 	}
+	return LocalExecutor{Config: config}.Build(ctx, req)
 }
 
 func (e defaultExecutor) Run(ctx context.Context, req Request) (Result, error) {
@@ -218,23 +203,10 @@ func (e defaultExecutor) Run(ctx context.Context, req Request) (Result, error) {
 	return runBuiltCommand(ctx, cmd, req.Timeout)
 }
 
-// EnforcesFilesystem mirrors the executor-selection logic in Build: it reports
-// true exactly when a request with the given mode would run under the
-// enforcing bubblewrap sandbox on this platform.
-func (e defaultExecutor) EnforcesFilesystem(mode policy.PermissionMode) bool {
-	config := normalizeConfig(e.config)
-	switch strings.ToLower(strings.TrimSpace(config.Mode)) {
-	case sandboxModeDisabled:
-		return false
-	case sandboxModeRequired:
-		return subprocessSandboxAvailable()
-	default: // auto (or empty)
-		if !subprocessSandboxAvailable() {
-			return false
-		}
-		return config.RunningInKubernetes ||
-			policy.NormalizePermissionMode(string(mode)) != policy.PermissionModeDangerFullAccess
-	}
+// EnforcesFilesystem is false because filesystem containment belongs to the
+// host sandbox, not this subprocess executor.
+func (e defaultExecutor) EnforcesFilesystem(policy.PermissionMode) bool {
+	return false
 }
 
 func normalizeConfig(config Config) Config {
@@ -323,14 +295,11 @@ func envFlag(value string) bool {
 	}
 }
 
-// LocalExecutor is the compatibility fallback. Its child environment is the
-// explicit safe environment (inherited system variables plus configured
-// extras — never arbitrary parent variables), but it does not provide a
-// filesystem or /proc boundary, and therefore CANNOT enforce read-only
-// permission modes. It is advisory-only for non-readonly workloads; requests
-// with PermissionMode == ReadOnly are rejected so that callers cannot
-// silently downgrade an enforcement boundary when no real sandbox executor
-// is available.
+// LocalExecutor runs commands directly inside the host-provided isolation
+// boundary. Its child environment is explicit (inherited system variables plus
+// configured extras, never arbitrary parent variables). Permission modes are
+// enforced by the calling tool policy; this executor deliberately does not
+// construct a second filesystem view that can hide installed toolchains.
 type LocalExecutor struct {
 	Config Config
 }
@@ -338,10 +307,6 @@ type LocalExecutor struct {
 func (e LocalExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, error) {
 	if err := validateRequest(req); err != nil {
 		return nil, err
-	}
-	mode := policy.NormalizePermissionMode(string(req.PermissionMode))
-	if mode == policy.PermissionModeWorkspaceWrite || mode == policy.PermissionModeReadOnly {
-		return nil, errors.New("LocalExecutor cannot enforce restricted permission modes; subprocess sandbox required")
 	}
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = req.WorkDir

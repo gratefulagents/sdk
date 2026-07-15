@@ -23,7 +23,7 @@ In scope:
 - The Go SDK in `pkg/agentsdk/...` and `internal/agent/...`.
 - The `cmd/grateful-agent-run` headless runner.
 - Tool implementations in `pkg/agentsdk/tools/...`.
-- The bubblewrap subprocess sandbox in `pkg/agentsdk/sandbox`.
+- Subprocess environment sanitization and lifecycle controls in `pkg/agentsdk/sandbox`.
 - MCP integration in `pkg/agentsdk/mcp`.
 
 Out of scope (see [docs/security.md](docs/security.md) "Non-goals"):

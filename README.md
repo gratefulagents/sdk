@@ -59,7 +59,7 @@ Each feature links to a focused doc with a runnable example.
 | [Tools](examples/features/tools/README.md) | `FunctionTool`, JSON schemas, approvals, and tool policies. |
 | [Tool registry](examples/features/tools_registry/README.md) | Permission-aware built-in tools: shell, fs, search, git, LSP, web, and more. |
 | [MCP](examples/features/mcp/README.md) | Load `.mcp.json` stdio servers and expose their tools and resources. |
-| [Sandbox](examples/features/sandbox/README.md) | Subprocess execution with a configurable, fail-closed boundary. |
+| [Sandbox](examples/features/sandbox/README.md) | Subprocess execution with sanitized environments, timeouts, and output bounds. |
 | [ChatLoop](examples/features/chatloop/README.md) | Conversation helper for interactive multi-turn sessions. |
 | [Handoffs & sub-agents](examples/features/handoffs_subagents/README.md) | Agent handoffs, `Agent.AsTool`, specialists, and async sub-agent tasks. |
 | [Guardrails](examples/features/guardrails/README.md) | Input/output/tool guardrails with destructive-command and secret rules. |
