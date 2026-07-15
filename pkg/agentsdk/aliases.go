@@ -2,6 +2,12 @@ package agentsdk
 
 import "github.com/gratefulagents/sdk/internal/agent"
 
+type ActionAuditRecord = agent.ActionAuditRecord
+type ActionAuthorization = agent.ActionAuthorization
+type ActionAuthorizer = agent.ActionAuthorizer
+type ActionDecision = agent.ActionDecision
+type ActionRequest = agent.ActionRequest
+type ActionRisk = agent.ActionRisk
 type Agent = agent.Agent
 type AgentMeta = agent.AgentMeta
 type AgentError = agent.AgentError
@@ -143,6 +149,15 @@ type Usage = agent.Usage
 type UserError = agent.UserError
 
 const (
+	ActionDecisionAllow    = agent.ActionDecisionAllow
+	ActionDecisionDeny     = agent.ActionDecisionDeny
+	ActionDecisionAsk      = agent.ActionDecisionAsk
+	ActionDecisionClassify = agent.ActionDecisionClassify
+
+	ActionRiskLow    = agent.ActionRiskLow
+	ActionRiskMedium = agent.ActionRiskMedium
+	ActionRiskHigh   = agent.ActionRiskHigh
+
 	DefaultMaxTurns                = agent.DefaultMaxTurns
 	DefaultMaxToolResultBytes      = agent.DefaultMaxToolResultBytes
 	DefaultSubAgentMaxTurns        = agent.DefaultSubAgentMaxTurns
@@ -245,6 +260,7 @@ var (
 	NewSubAgentActivity                 = agent.NewSubAgentActivity
 	NewSubAgentRegistry                 = agent.NewSubAgentRegistry
 	NewTrace                            = agent.NewTrace
+	NormalizeActionAuthorization        = agent.NormalizeActionAuthorization
 	NormalizeToolAccessLevel            = agent.NormalizeToolAccessLevel
 	NormalizeSubAgentDependencyPolicy   = agent.NormalizeSubAgentDependencyPolicy
 	NormalizeModelIdentity              = agent.NormalizeModelIdentity

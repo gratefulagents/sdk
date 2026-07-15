@@ -376,6 +376,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	activeFallbackModels := map[*Agent]string{}
 	var allToolInputResults []ToolGuardrailResult
 	var allToolOutputResults []ToolGuardrailResult
+	var allActionAuditRecords []ActionAuditRecord
 	// pendingCompletion implements double-confirm completion: the first final
 	// answer triggers a verification turn, only a second consecutive final
 	// answer ends the run (Terminus 2 anti-premature-exit pattern).
@@ -458,6 +459,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			InputGuardrailResults:      inputGuardrailResults,
 			ToolInputGuardrailResults:  allToolInputResults,
 			ToolOutputGuardrailResults: allToolOutputResults,
+			ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 			Usage:                      runCtx.Usage,
 			FinalHistory:               append([]RunItem(nil), currentInput...),
 		}
@@ -498,6 +500,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					InputGuardrailResults:      inputGuardrailResults,
 					ToolInputGuardrailResults:  allToolInputResults,
 					ToolOutputGuardrailResults: allToolOutputResults,
+					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 					Usage:                      runCtx.Usage,
 					FinalHistory:               append([]RunItem(nil), currentInput...),
 				}
@@ -1296,6 +1299,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				OutputGuardrailResults:     outputGuardrailResults,
 				ToolInputGuardrailResults:  allToolInputResults,
 				ToolOutputGuardrailResults: allToolOutputResults,
+				ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 				Usage:                      runCtx.Usage,
 				// The final-output branch returns before this turn's newItems
 				// are folded into currentInput, so the continuation state is
@@ -1361,12 +1365,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		case *toolCallStep:
 			pendingCompletion = false
 			stopGateBlocks = 0
-			toolResults, toolInResults, toolOutResults, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, s.toolCalls, cfg)
+			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
 			}
 			allToolInputResults = append(allToolInputResults, toolInResults...)
 			allToolOutputResults = append(allToolOutputResults, toolOutResults...)
+			allActionAuditRecords = append(allActionAuditRecords, actionAudits...)
 			allItems = append(allItems, toolResults...)
 			emitRunItems(ctx, streamEvents, toolResults)
 			currentInput = append(currentInput, newItems...)
@@ -1436,6 +1441,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					RawResponses:               allResponses,
 					ToolInputGuardrailResults:  allToolInputResults,
 					ToolOutputGuardrailResults: allToolOutputResults,
+					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 					Usage:                      runCtx.Usage,
 					Interruption:               interruptions[0],
 					Interruptions:              interruptions,
@@ -1470,6 +1476,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					RawResponses:               allResponses,
 					ToolInputGuardrailResults:  allToolInputResults,
 					ToolOutputGuardrailResults: allToolOutputResults,
+					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 					OutputGuardrailResults:     outputGuardrailResults,
 					Usage:                      runCtx.Usage,
 					// currentInput already includes this turn's newItems and
@@ -1496,6 +1503,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					RawResponses:               allResponses,
 					ToolInputGuardrailResults:  allToolInputResults,
 					ToolOutputGuardrailResults: allToolOutputResults,
+					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
 					Usage:                      runCtx.Usage,
 					// currentInput already includes this turn's newItems and
 					// tool results (pause tools produce paired outputs).
@@ -1941,7 +1949,7 @@ type toolCallResult struct {
 // executeTools runs all tool calls in parallel and returns the results as RunItems.
 // Order is preserved: results[i] corresponds to calls[i].
 // Matches the OpenAI Agents SDK's _FunctionToolBatchExecutor pattern.
-func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Agent, calls []ToolCallData, cfg RunConfig) ([]RunItem, []ToolGuardrailResult, []ToolGuardrailResult, bool, error) {
+func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Agent, calls []ToolCallData, cfg RunConfig) ([]RunItem, []ToolGuardrailResult, []ToolGuardrailResult, []ActionAuditRecord, bool, error) {
 	tools := prepareToolsForRun(agent.GetAllTools(runCtx), cfg, runCtx)
 	toolMap := make(map[string]Tool, len(tools))
 	for _, t := range tools {
@@ -1949,7 +1957,7 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 		if _, exists := toolMap[name]; exists {
 			// Reject duplicate tool registrations (finding M4) instead of
 			// silently last-write-wins, which can mask hostile shadowing.
-			return nil, nil, nil, false, &AgentError{Message: fmt.Sprintf("duplicate tool registration: %q", name)}
+			return nil, nil, nil, nil, false, &AgentError{Message: fmt.Sprintf("duplicate tool registration: %q", name)}
 		}
 		toolMap[name] = t
 	}
@@ -1964,6 +1972,7 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 		tool Tool
 	}
 	var work []asyncWork
+	var actionAudits []ActionAuditRecord
 
 	for i, call := range calls {
 		t, ok := toolMap[call.Name]
@@ -1973,6 +1982,40 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 				ToolOutput: &ToolOutputData{CallID: call.ID, Content: fmt.Sprintf("unknown tool: %s", call.Name), IsError: true},
 			}}
 			continue
+		}
+		if cfg.ActionAuthorizer != nil {
+			request := ActionRequest{
+				ToolName:   call.Name,
+				Input:      append(json.RawMessage(nil), call.Input...),
+				WorkDir:    cfg.WorkDir,
+				ReadOnly:   t.IsReadOnly(),
+				Provenance: "model-tool-call",
+			}
+			authorization, authErr := cfg.ActionAuthorizer.Authorize(ctx, request)
+			authorization = NormalizeActionAuthorization(authorization, authErr)
+			audit := ActionAuditRecord{Request: request, Authorization: authorization}
+			if authErr != nil {
+				audit.Error = authErr.Error()
+			}
+			actionAudits = append(actionAudits, audit)
+			switch authorization.Decision {
+			case ActionDecisionDeny:
+				reason := strings.TrimSpace(authorization.Reason)
+				if reason == "" {
+					reason = "the action is not permitted by policy"
+				}
+				slots[i] = toolCallResult{item: RunItem{
+					Type: RunItemToolOutput, Agent: agent,
+					ToolOutput: &ToolOutputData{CallID: call.ID, Content: "Action denied: " + reason + ". Respect this boundary and find a safer approach; do not route around it.", IsError: true},
+				}}
+				continue
+			case ActionDecisionAsk:
+				slots[i] = toolCallResult{item: RunItem{
+					Type: RunItemToolApproval, Agent: agent,
+					ToolApproval: &ToolApprovalData{ToolName: call.Name, Input: call.Input, CallID: call.ID},
+				}}
+				continue
+			}
 		}
 		if t.NeedsApproval() {
 			slots[i] = toolCallResult{item: RunItem{
@@ -2061,11 +2104,11 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 			shouldPause = true
 		}
 		if slot.guardrailErr != nil {
-			return results, allInputGuardrails, allOutputGuardrails, shouldPause, slot.guardrailErr
+			return results, allInputGuardrails, allOutputGuardrails, actionAudits, shouldPause, slot.guardrailErr
 		}
 	}
 
-	return results, allInputGuardrails, allOutputGuardrails, shouldPause, nil
+	return results, allInputGuardrails, allOutputGuardrails, actionAudits, shouldPause, nil
 }
 
 // executeSingleTool runs one tool call with guardrails and hooks. Thread-safe.
