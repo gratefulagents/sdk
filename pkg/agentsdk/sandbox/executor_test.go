@@ -538,6 +538,30 @@ func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
 	}
 }
 
+func TestDefaultExecutorRequiredModePreservesWorkspaceBoundary(t *testing.T) {
+	binDir := t.TempDir()
+	bwrap := filepath.Join(binDir, "bwrap")
+	if err := os.WriteFile(bwrap, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	workDir := t.TempDir()
+	cmd, err := DefaultWithConfig(Config{Mode: "required", WorkspaceRoot: workDir}).Build(context.Background(), Request{
+		Argv:           []string{"/bin/true"},
+		WorkDir:        workDir,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if cmd.Path != bwrap {
+		t.Fatalf("command path = %q, want bubblewrap %q", cmd.Path, bwrap)
+	}
+	assertArgSequence(t, cmd.Args, "--ro-bind", "/", "/")
+	assertArgSequence(t, cmd.Args, "--bind", workDir, workDir)
+}
+
 func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {
 	workDir := t.TempDir()
 	_, err := DefaultWithConfig(Config{RunningInKubernetes: true, WorkspaceRoot: workDir}).Build(context.Background(), Request{
