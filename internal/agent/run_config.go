@@ -364,8 +364,9 @@ type RunConfig struct {
 	// It is retained so operator-era callers keep working.
 	ModeInstructions string
 
-	WorkingStateContext string          // durable working-state summary appended to compaction carry-forward
-	ToolAccessLevel     ToolAccessLevel // controls tool access tier (full/read-only)
+	WorkingStateContext string           // durable working-state summary appended to compaction carry-forward
+	ToolAccessLevel     ToolAccessLevel  // controls tool access tier (full/read-only)
+	ActionAuthorizer    ActionAuthorizer // optional provider-neutral action authorization hook
 	// AllowedMutatingTools lists exact tool names that may remain available when
 	// ToolAccessLevel is read-only. The tools keep their mutating classification,
 	// so approval and execution-serialization policies still apply. This is a

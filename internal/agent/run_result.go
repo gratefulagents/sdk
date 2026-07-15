@@ -12,6 +12,7 @@ type RunResult struct {
 	OutputGuardrailResults     []OutputGuardrailResult
 	ToolInputGuardrailResults  []ToolGuardrailResult
 	ToolOutputGuardrailResults []ToolGuardrailResult
+	ActionAuditRecords         []ActionAuditRecord
 	Usage                      Usage
 	Interruption               *Interruption   // non-nil if run was interrupted (e.g. approval gate); first of Interruptions
 	Interruptions              []*Interruption // all pending interruptions from the turn (parallel tool calls can trigger several)

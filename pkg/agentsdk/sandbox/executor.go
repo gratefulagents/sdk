@@ -412,10 +412,9 @@ func BubblewrapArgs(req Request) ([]string, error) {
 // BubblewrapArgsWithConfig returns the bwrap argument vector using explicit
 // sandbox configuration.
 //
-// Filesystem model: a fresh root exposes only runtime/toolchain paths,
-// explicitly configured read-only paths, the workspace, a private /proc and
-// /dev, and ephemeral /tmp. Writes are enabled only for the trusted workspace
-// root and explicitly configured writable paths.
+// Filesystem model: the runtime filesystem is recursively mounted read-only,
+// then virtual system mounts and explicit writable overlays are applied. Writes
+// are limited to /tmp, the workspace, and explicitly configured writable paths.
 func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 	if err := validateRequest(req); err != nil {
 		return nil, err
@@ -460,6 +459,7 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		args = append(args, "--setenv", key, val)
 	}
 
+	args = append(args, "--ro-bind", "/", "/")
 	if procfsMountUsable() {
 		// Fresh pid-namespaced /proc: host process environments are
 		// unreachable and tools that need /proc/self work.
@@ -486,9 +486,6 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		"--dir", "/tmp/home",
 	)
 
-	for _, path := range sandboxReadOnlyPaths(config) {
-		args = append(args, "--ro-bind", path, path)
-	}
 	if !readOnly {
 		writableConfig := config
 		writableConfig.ExtraWritablePaths = append(append([]string(nil), config.ExtraWritablePaths...), req.WritablePaths...)
@@ -501,6 +498,12 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		args = append(args, "--ro-bind", workspaceRoot, workspaceRoot)
 	} else {
 		args = append(args, "--bind", workspaceRoot, workspaceRoot)
+		for _, path := range sandboxProtectedWorkspacePaths(workspaceRoot) {
+			args = append(args, "--ro-bind", path, path)
+		}
+	}
+	for _, path := range sandboxMaskedPaths() {
+		args = append(args, "--tmpfs", path)
 	}
 
 	args = append(args, "--chdir", workDir, "--")
@@ -790,33 +793,59 @@ func existingPaths(paths []string) []string {
 	return out
 }
 
-func sandboxReadOnlyPaths(config Config) []string {
+func sandboxProtectedWorkspacePaths(workspaceRoot string) []string {
 	paths := []string{
-		"/usr", "/bin", "/sbin", "/lib", "/lib64", "/nix/store",
-		"/etc/ssl", "/etc/pki", "/etc/ca-certificates",
-		"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
-		"/etc/passwd", "/etc/group", "/etc/localtime", "/etc/ld.so.cache",
+		".git/config", ".git/hooks", ".codex", ".claude", ".gemini", ".agents",
 	}
-	if config.GOROOT != "" {
-		paths = append(paths, config.GOROOT)
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		candidate := filepath.Join(workspaceRoot, path)
+		if !pathExists(candidate) {
+			continue
+		}
+		candidate = resolveExistingPrefix(candidate)
+		if !isPathWithin(candidate, workspaceRoot) {
+			continue
+		}
+		out = append(out, candidate)
 	}
-	paths = append(paths, config.ExtraReadOnlyPaths...)
+	return out
+}
+
+func sandboxMaskedPaths() []string {
+	paths := []string{
+		"/var/run/secrets/kubernetes.io/serviceaccount",
+		"/run/secrets",
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, path := range []string{
+			".aws", ".azure", ".codex", ".claude", ".config/gcloud", ".config/gh",
+			".docker", ".gemini", ".agents", ".kube", ".ssh",
+		} {
+			paths = append(paths, filepath.Join(home, path))
+		}
+	}
 
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
-		clean := cleanAbsolutePath(path)
-		if clean == "" || clean == string(os.PathSeparator) || !pathExists(clean) {
+		path = cleanAbsolutePath(path)
+		if path == "" || !pathExists(path) {
+			continue
+		}
+		path = resolveExistingPrefix(path)
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
 			continue
 		}
 		covered := false
 		for _, existing := range out {
-			if clean == existing || isPathWithin(clean, existing) {
+			if path == existing || isPathWithin(path, existing) {
 				covered = true
 				break
 			}
 		}
 		if !covered {
-			out = append(out, clean)
+			out = append(out, path)
 		}
 	}
 	return out

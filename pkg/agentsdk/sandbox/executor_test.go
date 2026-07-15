@@ -214,9 +214,10 @@ func TestBubblewrapArgsReadOnlyWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgAbsent(t, args, "--ro-bind", "/", "/")
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
 	assertArgSequence(t, args, "--unshare-net")
 	assertArgSequence(t, args, "--proc", "/proc")
+	assertArgSequenceAfter(t, args, []string{"--ro-bind", "/", "/"}, []string{"--proc", "/proc"})
 	assertArgAbsent(t, args, "--tmpfs", "/proc")
 	assertArgSequence(t, args, "--dev", "/dev")
 	assertArgSequence(t, args, "--tmpfs", "/tmp")
@@ -288,7 +289,7 @@ func TestBubblewrapArgsReadOnlyIgnoresRequestScopedWritablePath(t *testing.T) {
 	assertArgAbsent(t, args, "--bind", resolveExistingPrefix(scratch), resolveExistingPrefix(scratch))
 }
 
-func TestBubblewrapArgsWorkspaceWriteWorkspace(t *testing.T) {
+func TestBubblewrapArgsWorkspaceWriteBindsWorkspaceAfterReadOnlyRoot(t *testing.T) {
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "printf hi > file"},
 		WorkDir:        "/workspace/repo",
@@ -297,11 +298,12 @@ func TestBubblewrapArgsWorkspaceWriteWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgAbsent(t, args, "--ro-bind", "/", "/")
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
 	assertArgSequence(t, args, "--bind", "/workspace", "/workspace")
 	assertArgAbsent(t, args, "--ro-bind", "/workspace", "/workspace")
 	assertArgSequence(t, args, "--tmpfs", "/tmp")
 	assertArgAbsent(t, args, "--bind", "/tmp", "/tmp")
+	assertArgSequenceAfter(t, args, []string{"--ro-bind", "/", "/"}, []string{"--bind", "/workspace", "/workspace"})
 }
 
 func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
@@ -327,23 +329,98 @@ func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
 	assertArgSequence(t, args, "--symlink", "/usr/bin/example-runtime", "/proc/self/exe")
 }
 
-func TestBubblewrapArgsExposeConfiguredReadOnlyPaths(t *testing.T) {
-	toolchain := resolveExistingPrefix(t.TempDir())
-	missing := filepath.Join(t.TempDir(), "does-not-exist")
+func TestBubblewrapArgsReadsArbitraryRuntimeToolchainPathFromReadOnlyRoot(t *testing.T) {
+	runtimeToolchain := filepath.Join(t.TempDir(), "runtime", "toolchain")
+	if err := os.MkdirAll(runtimeToolchain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	args, err := BubblewrapArgsWithConfig(Request{
 		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "true"},
 		WorkDir:        "/workspace/repo",
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
-	}, Config{
-		WorkspaceRoot:      "/workspace",
-		ExtraReadOnlyPaths: []string{toolchain, missing},
-	})
+	}, Config{WorkspaceRoot: "/workspace"})
 	if err != nil {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
-	assertArgAbsent(t, args, "--ro-bind", "/", "/")
-	assertArgSequence(t, args, "--ro-bind", toolchain, toolchain)
-	assertArgAbsent(t, args, "--ro-bind", missing, missing)
+
+	// Runtime locations need no allowlist entry: the recursive root mount makes
+	// every host path readable unless a later mount deliberately masks it.
+	assertArgSequence(t, args, "--ro-bind", "/", "/")
+	assertArgAbsent(t, args, "--ro-bind", runtimeToolchain, runtimeToolchain)
+}
+
+func TestBubblewrapArgsRebindsProtectedWorkspaceMetadataReadOnlyAfterWorkspaceWrite(t *testing.T) {
+	workspace := t.TempDir()
+	protectedPaths := []string{
+		filepath.Join(workspace, ".git", "config"),
+		filepath.Join(workspace, ".git", "hooks"),
+		filepath.Join(workspace, ".codex"),
+		filepath.Join(workspace, ".claude"),
+		filepath.Join(workspace, ".gemini"),
+		filepath.Join(workspace, ".agents"),
+	}
+	for _, path := range protectedPaths {
+		if filepath.Base(path) == "config" {
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("[core]\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: workspace})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+
+	workspace = resolveExistingPrefix(workspace)
+	assertArgSequence(t, args, "--bind", workspace, workspace)
+	for _, path := range protectedPaths {
+		path = resolveExistingPrefix(path)
+		assertArgSequence(t, args, "--ro-bind", path, path)
+		assertArgSequenceAfter(t, args, []string{"--bind", workspace, workspace}, []string{"--ro-bind", path, path})
+	}
+}
+
+func TestBubblewrapArgsMasksSensitiveHomeCredentialDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	maskedPath := filepath.Join(home, ".ssh")
+	if err := os.Mkdir(maskedPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+	if resolvedHome != home {
+		t.Skipf("UserHomeDir() = %q, cannot deterministically exercise HOME-based mask", resolvedHome)
+	}
+
+	workspace := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: workspace})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+
+	maskedPath = resolveExistingPrefix(maskedPath)
+	assertArgSequence(t, args, "--tmpfs", maskedPath)
+	assertArgSequenceAfter(t, args, []string{"--ro-bind", "/", "/"}, []string{"--tmpfs", maskedPath})
 }
 
 func TestBubblewrapArgsReadOnlyIgnoresConfiguredWritablePaths(t *testing.T) {
@@ -608,18 +685,43 @@ func runtimeHasBubblewrap() bool {
 func assertArgSequence(t *testing.T, args []string, want ...string) {
 	t.Helper()
 	for i := 0; i <= len(args)-len(want); i++ {
-		match := true
-		for j := range want {
-			if args[i+j] != want[j] {
-				match = false
-				break
-			}
-		}
-		if match {
+		if argSequenceAt(args, i, want) {
 			return
 		}
 	}
 	t.Fatalf("args missing sequence %q in:\n%s", strings.Join(want, " "), strings.Join(args, " "))
+}
+
+func argSequenceAt(args []string, index int, want []string) bool {
+	if index < 0 || index+len(want) > len(args) {
+		return false
+	}
+	for j := range want {
+		if args[index+j] != want[j] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertArgSequenceAfter(t *testing.T, args, first, second []string) {
+	t.Helper()
+	firstEnd := -1
+	for i := 0; i <= len(args)-len(first); i++ {
+		if argSequenceAt(args, i, first) {
+			firstEnd = i + len(first)
+			break
+		}
+	}
+	if firstEnd == -1 {
+		t.Fatalf("args missing first sequence %q in:\n%s", strings.Join(first, " "), strings.Join(args, " "))
+	}
+	for i := firstEnd; i <= len(args)-len(second); i++ {
+		if argSequenceAt(args, i, second) {
+			return
+		}
+	}
+	t.Fatalf("args missing second sequence %q after %q in:\n%s", strings.Join(second, " "), strings.Join(first, " "), strings.Join(args, " "))
 }
 
 func assertArgAbsent(t *testing.T, args []string, want ...string) {
