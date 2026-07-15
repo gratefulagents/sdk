@@ -330,7 +330,9 @@ func (t *Tool) executor() sandbox.Executor {
 	if t.Executor != nil {
 		return t.Executor
 	}
-	return sandbox.DefaultWithConfig(sandbox.ConfigFromEnv())
+	config := sandbox.ConfigFromEnv()
+	config.Mode = "required"
+	return sandbox.DefaultWithConfig(config)
 }
 
 func findChromeBinary() string {

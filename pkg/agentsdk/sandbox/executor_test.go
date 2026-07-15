@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -438,60 +439,125 @@ func TestBubblewrapArgsIncludesConfiguredWritableScratchPaths(t *testing.T) {
 }
 
 func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
-	for _, executor := range []Executor{
-		DefaultWithConfig(Config{Mode: "required"}),
-		DefaultWithConfig(Config{Mode: "disabled"}),
-		DefaultWithConfig(Config{RunningInKubernetes: true}),
-		Default(),
-		LocalExecutor{},
-	} {
-		if ExecutorEnforcesFilesystem(executor, policy.PermissionModeWorkspaceWrite) {
-			t.Fatalf("%T must not report per-process filesystem enforcement", executor)
-		}
+	wantEnforcing := subprocessSandboxAvailable()
+
+	if got := ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "required"}), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("required mode enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "disabled"}), policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("disabled mode must not report enforcement")
+	}
+	if got := ExecutorEnforcesFilesystem(DefaultWithConfig(Config{RunningInKubernetes: true}), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("auto+kubernetes enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if got := ExecutorEnforcesFilesystem(Default(), policy.PermissionModeReadOnly); got != wantEnforcing {
+		t.Fatalf("auto read-only enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if got := ExecutorEnforcesFilesystem(Default(), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
+		t.Fatalf("auto workspace-write enforcement = %v, want %v", got, wantEnforcing)
+	}
+	if ExecutorEnforcesFilesystem(LocalExecutor{}, policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("LocalExecutor must not report enforcement")
 	}
 }
 
-func TestDefaultExecutorRunsRestrictedModesDirectly(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		mode policy.PermissionMode
-	}{
-		{name: "read-only", mode: policy.PermissionModeReadOnly},
-		{name: "workspace-write", mode: policy.PermissionModeWorkspaceWrite},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			workDir := t.TempDir()
-			result, err := DefaultWithConfig(Config{Mode: "required", RunningInKubernetes: true, WorkspaceRoot: workDir}).Run(context.Background(), Request{
-				Argv:           []string{"bash", "--noprofile", "--norc", "-c", "printf direct"},
-				WorkDir:        workDir,
-				PermissionMode: tc.mode,
-				Timeout:        time.Second,
-			})
-			if err != nil {
-				t.Fatalf("Run() error = %v", err)
-			}
-			if result.Output != "direct" {
-				t.Fatalf("Run() output = %q, want direct", result.Output)
-			}
-		})
+func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {
+	workDir := t.TempDir()
+	_, err := DefaultWithConfig(Config{RunningInKubernetes: true, WorkspaceRoot: workDir}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        workDir,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	})
+	if err == nil && runtimeHasBubblewrap() {
+		return
+	}
+	if err == nil {
+		t.Fatal("Build() unexpectedly succeeded without bubblewrap")
+	}
+	if !strings.Contains(err.Error(), "subprocess sandbox") {
+		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
 	}
 }
 
-func TestLocalExecutorRunsRestrictedModesWithSafeEnv(t *testing.T) {
-	t.Setenv("DATABASE_URL", "postgres://secret")
-	for _, mode := range []policy.PermissionMode{policy.PermissionModeReadOnly, policy.PermissionModeWorkspaceWrite} {
-		result, err := (LocalExecutor{}).Run(context.Background(), Request{
-			Argv:           []string{"bash", "--noprofile", "--norc", "-c", "printf '%s' \"${DATABASE_URL:-unset}\""},
-			WorkDir:        t.TempDir(),
-			PermissionMode: mode,
-			Timeout:        time.Second,
-		})
-		if err != nil {
-			t.Fatalf("Run(%s) error = %v", mode, err)
+func TestDefaultExecutorRequiresSandboxForReadOnlyAuto(t *testing.T) {
+	workDir := t.TempDir()
+	_, err := DefaultWithConfig(Config{WorkspaceRoot: workDir}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        workDir,
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		if runtimeHasBubblewrap() {
+			return
 		}
-		if result.Output != "unset" {
-			t.Fatalf("Run(%s) leaked environment: %q", mode, result.Output)
-		}
+		t.Fatal("Build() error = nil, want subprocess sandbox failure")
+	}
+	if !strings.Contains(err.Error(), "subprocess sandbox") {
+		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
+	}
+}
+
+func TestLocalExecutorRejectsWorkspaceWrite(t *testing.T) {
+	_, err := LocalExecutor{}.Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	})
+	if err == nil || !strings.Contains(err.Error(), "restricted") {
+		t.Fatalf("LocalExecutor.Build(WorkspaceWrite) error = %v, want refusal", err)
+	}
+}
+
+func TestLocalExecutorRejectsReadOnly(t *testing.T) {
+	_, err := LocalExecutor{}.Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		t.Fatal("LocalExecutor.Build(ReadOnly) error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "read-only") && !strings.Contains(err.Error(), "subprocess sandbox") {
+		t.Fatalf("LocalExecutor.Build(ReadOnly) error = %v, want refusal mentioning sandbox/read-only", err)
+	}
+}
+
+func TestDefaultExecutorDisabledModeRejectsReadOnly(t *testing.T) {
+	_, err := DefaultWithConfig(Config{Mode: "disabled"}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		t.Fatal("disabled mode silently accepted ReadOnly request; want non-nil error")
+	}
+}
+
+func TestDefaultExecutorDisabledModeUnsafeOptInStillRejectsReadOnly(t *testing.T) {
+	_, err := DefaultWithConfig(Config{Mode: "disabled", AllowUnsafeReadOnlyLocal: true}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		t.Fatal("unsafe compatibility flag bypassed restricted-mode containment")
+	}
+}
+
+func TestDefaultExecutorAutoModeReadOnlyFailsClosedWithoutOptIn(t *testing.T) {
+	if subprocessSandboxAvailable() {
+		t.Skip("enforcing sandbox available on this platform; the fail-closed path is for non-linux dev hosts")
+	}
+	_, err := DefaultWithConfig(Config{Mode: "auto"}).Build(context.Background(), Request{
+		Argv:           []string{"true"},
+		WorkDir:        t.TempDir(),
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err == nil {
+		t.Fatal("Build() error = nil; read-only must fail closed without an enforcing sandbox")
+	}
+	if !strings.Contains(err.Error(), "subprocess sandbox") {
+		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
 	}
 }
 
@@ -532,6 +598,11 @@ func TestWorkspaceRootForRejectsSymlinkEscape(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "outside configured workspace root") {
 		t.Fatalf("BubblewrapArgs() error = %v, want symlink escape refusal", err)
 	}
+}
+
+func runtimeHasBubblewrap() bool {
+	_, err := exec.LookPath("bwrap")
+	return err == nil
 }
 
 func assertArgSequence(t *testing.T, args []string, want ...string) {
