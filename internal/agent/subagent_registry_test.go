@@ -843,6 +843,137 @@ func TestSubAgentRegistryConcurrentConfigureAndSpawn(t *testing.T) {
 	<-done
 }
 
+func TestSubAgentRegistrySchedulerCheckpointRestore(t *testing.T) {
+	startedAt := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
+	source := NewSubAgentRegistry(SubAgentRegistryConfig{})
+	source.tasks = map[string]*subAgentTaskEntry{
+		"task_completed": {
+			task: SubAgentTask{
+				ID: "task_completed", AgentName: "writer", Status: SubAgentTaskCompleted,
+				Message: "write", StartedAt: startedAt, Duration: time.Second,
+				Result: "finished", ToolCount: 3, Tokens: 42, DependsOn: []string{"task_failed"},
+				DependencyPolicy: SubAgentDependencyAllTerminal, MessagesReceived: 2,
+				LastParentMessage: "continue",
+			},
+			includeDependencyResults: true,
+			resultDelivered:          true,
+		},
+		"task_failed": {
+			task: SubAgentTask{
+				ID: "task_failed", AgentName: "reviewer", Status: SubAgentTaskFailed,
+				Message: "review", StartedAt: startedAt.Add(time.Second), Duration: 2 * time.Second,
+				Error: "review failed", ToolCount: 1, Tokens: 8,
+			},
+			resultDelivered: false,
+		},
+		"task_cancelled": {
+			task: SubAgentTask{
+				ID: "task_cancelled", AgentName: "planner", Status: SubAgentTaskCancelled,
+				Message: "plan", StartedAt: startedAt.Add(2 * time.Second), Duration: 3 * time.Second,
+				Result: "partial plan", Error: "cancelled", ToolCount: 2, Tokens: 12,
+			},
+			resultDelivered: false,
+		},
+		"task_pending": {
+			task: SubAgentTask{
+				ID: "task_pending", AgentName: "worker", Status: SubAgentTaskPending,
+				Message: "queue", StartedAt: startedAt.Add(3 * time.Second),
+			},
+		},
+		"task_waiting": {
+			task: SubAgentTask{
+				ID: "task_waiting", AgentName: "worker", Status: SubAgentTaskWaiting,
+				Message: "wait", StartedAt: startedAt.Add(4 * time.Second), WaitingOn: []string{"task_pending"},
+			},
+			includeDependencyResults: true,
+		},
+		"task_running": {
+			task: SubAgentTask{
+				ID: "task_running", AgentName: "worker", Status: SubAgentTaskRunning,
+				Message: "work", StartedAt: startedAt.Add(5 * time.Second), WaitingOn: []string{"task_waiting"},
+			},
+		},
+	}
+	source.order = []string{"task_completed", "task_failed", "task_cancelled", "task_pending", "task_waiting", "task_running"}
+
+	encoded, err := json.Marshal(source.SchedulerCheckpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint SubAgentSchedulerCheckpoint
+	if err := json.Unmarshal(encoded, &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := NewSubAgentRegistry(SubAgentRegistryConfig{})
+	if err := restored.RestoreSchedulerCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks := restored.ListTasks()
+	if len(tasks) != 6 {
+		t.Fatalf("restored task count = %d, want 6", len(tasks))
+	}
+	for i, want := range []string{"task_completed", "task_failed", "task_cancelled", "task_pending", "task_waiting", "task_running"} {
+		if tasks[i].ID != want {
+			t.Fatalf("restored order = %v, want task %q at index %d", tasks, want, i)
+		}
+	}
+	if got := tasks[0]; got.Status != SubAgentTaskCompleted || got.Result != "finished" || got.Error != "" || got.AgentName != "writer" || got.MessagesReceived != 2 || got.LastParentMessage != "continue" {
+		t.Fatalf("completed task not preserved: %+v", got)
+	}
+	if got := tasks[1]; got.Status != SubAgentTaskFailed || got.Error != "review failed" || got.ToolCount != 1 || got.Tokens != 8 {
+		t.Fatalf("failed task not preserved: %+v", got)
+	}
+	if got := tasks[2]; got.Status != SubAgentTaskCancelled || got.Result != "partial plan" || got.Error != "cancelled" || got.ToolCount != 2 || got.Tokens != 12 {
+		t.Fatalf("cancelled task not preserved: %+v", got)
+	}
+	for _, task := range tasks[3:] {
+		if task.Status != SubAgentTaskFailed || task.Error != subAgentRuntimeRestartError || len(task.WaitingOn) != 0 {
+			t.Fatalf("active task was not restored as restart tombstone: %+v", task)
+		}
+	}
+	if pending := restored.PendingResultTaskIDs(); strings.Join(pending, ",") != "task_failed,task_cancelled,task_pending,task_waiting,task_running" {
+		t.Fatalf("pending result task IDs = %v, want restored undelivered terminal tasks", pending)
+	}
+	if task, err := restored.WaitForTask(context.Background(), "task_running", 1); err != nil || task.Status != SubAgentTaskFailed {
+		t.Fatalf("wait on restart tombstone = %+v, %v", task, err)
+	}
+	if task, firstDelivery, err := restored.CollectResultIfUndelivered("task_completed"); err != nil || firstDelivery || task.Result != "finished" {
+		t.Fatalf("completed delivery state not preserved: task=%+v first=%v err=%v", task, firstDelivery, err)
+	}
+	if task, firstDelivery, err := restored.CollectResultIfUndelivered("task_failed"); err != nil || !firstDelivery || task.Error != "review failed" {
+		t.Fatalf("failed delivery state not preserved: task=%+v first=%v err=%v", task, firstDelivery, err)
+	}
+}
+
+func TestSubAgentRegistryRestoreSchedulerCheckpointRejectsNonFreshAndDuplicateIDs(t *testing.T) {
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{})
+	registry.tasks["existing"] = &subAgentTaskEntry{task: SubAgentTask{ID: "existing", Status: SubAgentTaskCompleted}}
+	registry.order = []string{"existing"}
+	checkpoint := SubAgentSchedulerCheckpoint{Records: []SubAgentSchedulerCheckpointRecord{{
+		Task: SubAgentTask{ID: "task_1", Status: SubAgentTaskCompleted},
+	}}}
+	if err := registry.RestoreSchedulerCheckpoint(checkpoint); err == nil || !strings.Contains(err.Error(), "empty registry") {
+		t.Fatalf("restore into non-fresh registry error = %v", err)
+	}
+	if task, err := registry.GetStatus("existing"); err != nil || task.Status != SubAgentTaskCompleted {
+		t.Fatalf("non-fresh registry was changed: task=%+v err=%v", task, err)
+	}
+
+	fresh := NewSubAgentRegistry(SubAgentRegistryConfig{})
+	duplicate := SubAgentSchedulerCheckpoint{Records: []SubAgentSchedulerCheckpointRecord{
+		{Task: SubAgentTask{ID: "task_1", Status: SubAgentTaskCompleted}},
+		{Task: SubAgentTask{ID: "task_1", Status: SubAgentTaskFailed}},
+	}}
+	if err := fresh.RestoreSchedulerCheckpoint(duplicate); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate checkpoint error = %v", err)
+	}
+	if len(fresh.ListTasks()) != 0 {
+		t.Fatalf("duplicate checkpoint partially restored tasks: %+v", fresh.ListTasks())
+	}
+}
+
 func TestSubAgentRegistryBroadcastWakesAllWaiters(t *testing.T) {
 	registry := NewSubAgentRegistry(SubAgentRegistryConfig{})
 	registry.tasks["task_wait"] = &subAgentTaskEntry{
