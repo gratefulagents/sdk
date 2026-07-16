@@ -2209,6 +2209,12 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 
 	fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
 	fireAgentHook(agent.Hooks, func(h AgentHooks) { h.OnToolEnd(&toolRunCtx, agent, t, call, result) })
+	if errorHook, ok := cfg.Hooks.(ToolEndErrorHook); ok {
+		if err := errorHook.OnToolEndError(&toolRunCtx, agent, t, call, result); err != nil {
+			res.guardrailErr = fmt.Errorf("post-tool hook failed: %w", err)
+			result = ToolResult{Content: res.guardrailErr.Error(), IsError: true}
+		}
+	}
 
 	// Cap the model-facing output. Hooks, traces, and the event stream above
 	// received the raw content; only the conversation item is truncated so one

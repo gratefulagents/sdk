@@ -101,6 +101,7 @@ type RunErrorDetails = agent.RunErrorDetails
 type RunErrorHandler = agent.RunErrorHandler
 type RunErrorHandlerResult = agent.RunErrorHandlerResult
 type RunHooks = agent.RunHooks
+type ToolEndErrorHook = agent.ToolEndErrorHook
 type RunItem = agent.RunItem
 type RunItemType = agent.RunItemType
 type RunResult = agent.RunResult
