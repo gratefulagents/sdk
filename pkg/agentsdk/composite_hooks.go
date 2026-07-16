@@ -54,6 +54,17 @@ func (c *CompositeHooks) OnToolEnd(ctx *RunContext, a *Agent, tool Tool, call To
 	}
 }
 
+func (c *CompositeHooks) OnToolEndError(ctx *RunContext, a *Agent, tool Tool, call ToolCallData, result ToolResult) error {
+	for _, h := range c.hooks {
+		if errorHook, ok := h.(ToolEndErrorHook); ok {
+			if err := errorHook.OnToolEndError(ctx, a, tool, call, result); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (c *CompositeHooks) OnLLMStart(ctx *RunContext, a *Agent) {
 	for _, h := range c.hooks {
 		h.OnLLMStart(ctx, a)

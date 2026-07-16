@@ -75,6 +75,20 @@ func (t *SubAgentTask) IsTerminal() bool {
 	return t.Status == SubAgentTaskCompleted || t.Status == SubAgentTaskFailed || t.Status == SubAgentTaskCancelled
 }
 
+// SubAgentSchedulerCheckpoint is a JSON-marshalable snapshot of scheduler state.
+type SubAgentSchedulerCheckpoint struct {
+	Records []SubAgentSchedulerCheckpointRecord `json:"records"`
+}
+
+// SubAgentSchedulerCheckpointRecord preserves a task and its result delivery state.
+type SubAgentSchedulerCheckpointRecord struct {
+	Task                     SubAgentTask `json:"task"`
+	ResultDelivered          bool         `json:"result_delivered"`
+	IncludeDependencyResults bool         `json:"include_dependency_results"`
+}
+
+const subAgentRuntimeRestartError = "sub-agent runtime restarted before this task completed; spawn a new sub-agent task to retry it"
+
 // subAgentTaskEntry is the internal mutable entry tracked by the registry.
 type subAgentTaskEntry struct {
 	task                     SubAgentTask
@@ -1010,6 +1024,78 @@ func subAgentTaskSnapshot(entry *subAgentTaskEntry) SubAgentTask {
 		task.CurrentStep, task.LastTool, task.FilesWritten = entry.activity.BriefStatus()
 	}
 	return task
+}
+
+func cloneSubAgentTask(task SubAgentTask) SubAgentTask {
+	task.DependsOn = append([]string(nil), task.DependsOn...)
+	task.WaitingOn = append([]string(nil), task.WaitingOn...)
+	return task
+}
+
+// SchedulerCheckpoint returns a durable snapshot of every scheduler task in spawn order.
+func (r *SubAgentRegistry) SchedulerCheckpoint() SubAgentSchedulerCheckpoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	checkpoint := SubAgentSchedulerCheckpoint{
+		Records: make([]SubAgentSchedulerCheckpointRecord, 0, len(r.order)),
+	}
+	for _, id := range r.order {
+		entry, ok := r.tasks[id]
+		if !ok {
+			continue
+		}
+		checkpoint.Records = append(checkpoint.Records, SubAgentSchedulerCheckpointRecord{
+			Task:                     cloneSubAgentTask(subAgentTaskSnapshot(entry)),
+			ResultDelivered:          entry.resultDelivered,
+			IncludeDependencyResults: entry.includeDependencyResults,
+		})
+	}
+	return checkpoint
+}
+
+// RestoreSchedulerCheckpoint restores a checkpoint into an empty registry.
+// Tasks that were active when checkpointed cannot resume in a new runtime and
+// are restored as failed tombstones.
+func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedulerCheckpoint) error {
+	restored := make(map[string]*subAgentTaskEntry, len(checkpoint.Records))
+	order := make([]string, 0, len(checkpoint.Records))
+	for _, record := range checkpoint.Records {
+		task := cloneSubAgentTask(record.Task)
+		if task.ID == "" {
+			return fmt.Errorf("scheduler checkpoint contains a task with no ID")
+		}
+		if _, exists := restored[task.ID]; exists {
+			return fmt.Errorf("scheduler checkpoint contains duplicate task ID %q", task.ID)
+		}
+		switch task.Status {
+		case SubAgentTaskCompleted, SubAgentTaskFailed, SubAgentTaskCancelled:
+		case SubAgentTaskPending, SubAgentTaskWaiting, SubAgentTaskRunning:
+			task.Status = SubAgentTaskFailed
+			task.Error = subAgentRuntimeRestartError
+			task.WaitingOn = nil
+		default:
+			return fmt.Errorf("scheduler checkpoint task %q has unknown status %q", task.ID, task.Status)
+		}
+		restored[task.ID] = &subAgentTaskEntry{
+			task:                     task,
+			includeDependencyResults: record.IncludeDependencyResults,
+			messageSignal:            make(chan struct{}, 1),
+			resultDelivered:          record.ResultDelivered,
+		}
+		order = append(order, task.ID)
+	}
+
+	r.mu.Lock()
+	if len(r.tasks) != 0 {
+		r.mu.Unlock()
+		return fmt.Errorf("scheduler checkpoint can only be restored into an empty registry")
+	}
+	r.tasks = restored
+	r.order = order
+	r.mu.Unlock()
+	r.signalChange()
+	return nil
 }
 
 // GetStatus returns the current status of a task.

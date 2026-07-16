@@ -12,6 +12,13 @@ type RunHooks interface {
 	OnLLMEnd(ctx *RunContext, agent *Agent, response *ModelResponse)
 }
 
+// ToolEndErrorHook is an optional extension for post-tool durability or
+// security work that must fail execution when it cannot complete. Existing
+// RunHooks remain source-compatible and observational.
+type ToolEndErrorHook interface {
+	OnToolEndError(ctx *RunContext, agent *Agent, tool Tool, call ToolCallData, result ToolResult) error
+}
+
 // AgentHooks defines per-agent lifecycle callbacks.
 type AgentHooks interface {
 	OnStart(ctx *RunContext, agent *Agent)
