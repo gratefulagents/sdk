@@ -1737,6 +1737,18 @@ func TestRunnerContextCancellation(t *testing.T) {
 	}
 }
 
+func TestRunnerToolEndErrorHookAbortsRun(t *testing.T) {
+	model := &mockModel{responses: []*ModelResponse{{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call1", Name: "write", Input: json.RawMessage(`{}`)}}}}}}
+	tool := &FunctionTool{ToolName: "write", ToolDescription: "mutates", Schema: json.RawMessage(`{"type":"object"}`), Fn: func(context.Context, json.RawMessage) (string, error) { return "written", nil }}
+	hooks := &testRunHooks{onToolEndError: func(*RunContext, *Agent, Tool, ToolCallData, ToolResult) error {
+		return errors.New("checkpoint unavailable")
+	}}
+	_, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test", Tools: []Tool{tool}}, nil, RunConfig{Hooks: hooks})
+	if err == nil || !strings.Contains(err.Error(), "checkpoint unavailable") {
+		t.Fatalf("Run error = %v, want fail-closed checkpoint error", err)
+	}
+}
+
 func TestRunnerHooksAreCalled(t *testing.T) {
 	model := &mockModel{
 		responses: []*ModelResponse{
@@ -2453,13 +2465,14 @@ func (p *captureTracingProcessor) functionOutputContains(needle string) bool {
 
 // testRunHooks is a test implementation of RunHooks with configurable callbacks.
 type testRunHooks struct {
-	onAgentStart func(*RunContext, *Agent)
-	onAgentEnd   func(*RunContext, *Agent, any)
-	onHandoff    func(*RunContext, *Agent, *Agent)
-	onToolStart  func(*RunContext, *Agent, Tool, ToolCallData)
-	onToolEnd    func(*RunContext, *Agent, Tool, ToolCallData, ToolResult)
-	onLLMStart   func(*RunContext, *Agent)
-	onLLMEnd     func(*RunContext, *Agent, *ModelResponse)
+	onAgentStart   func(*RunContext, *Agent)
+	onToolEndError func(*RunContext, *Agent, Tool, ToolCallData, ToolResult) error
+	onAgentEnd     func(*RunContext, *Agent, any)
+	onHandoff      func(*RunContext, *Agent, *Agent)
+	onToolStart    func(*RunContext, *Agent, Tool, ToolCallData)
+	onToolEnd      func(*RunContext, *Agent, Tool, ToolCallData, ToolResult)
+	onLLMStart     func(*RunContext, *Agent)
+	onLLMEnd       func(*RunContext, *Agent, *ModelResponse)
 }
 
 func (h *testRunHooks) OnAgentStart(ctx *RunContext, a *Agent) {
@@ -2486,6 +2499,12 @@ func (h *testRunHooks) OnToolEnd(ctx *RunContext, a *Agent, tool Tool, call Tool
 	if h.onToolEnd != nil {
 		h.onToolEnd(ctx, a, tool, call, r)
 	}
+}
+func (h *testRunHooks) OnToolEndError(ctx *RunContext, a *Agent, tool Tool, call ToolCallData, r ToolResult) error {
+	if h.onToolEndError != nil {
+		return h.onToolEndError(ctx, a, tool, call, r)
+	}
+	return nil
 }
 func (h *testRunHooks) OnLLMStart(ctx *RunContext, a *Agent) {
 	if h.onLLMStart != nil {
