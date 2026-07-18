@@ -546,8 +546,10 @@ func TestCalibrationDoesNotDoubleCountInclusiveCacheUsage(t *testing.T) {
 					{
 						Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call1", Name: "echo", Input: json.RawMessage(`"hi"`)}}},
 						// Warm request: nearly the whole prompt is cached.
-						// input already includes the cached tokens.
-						Usage: Usage{InputTokens: 130_000, CacheReadTokens: 125_000},
+						// input already includes the cached tokens and matches
+						// the prompt-side estimate (~100K items + small tool
+						// overhead), so a correct calibration stays ≈1.0.
+						Usage: Usage{InputTokens: 101_000, CacheReadTokens: 96_000},
 					},
 					{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
 				},
@@ -566,10 +568,11 @@ func TestCalibrationDoesNotDoubleCountInclusiveCacheUsage(t *testing.T) {
 		{Type: RunItemMessage, Message: &MessageOutput{Text: bigText}},
 	}, RunConfig{
 		MaxTurns: 5,
-		// Estimate ≈125K (items ~100K + ~25K request overhead) stays under
-		// the 145K trigger. The old double-count made actual≈255K vs
-		// estimate≈125K → calibration ≈1.5 → effective trigger ≈95K →
-		// spurious provider compaction on the next turn.
+		// Prompt-side estimate ≈101K (items ~100K + tool overhead) matches
+		// actual usage → calibration ≈1.0 and the effective trigger stays at
+		// 145K, above the turn-2 estimate. The old double-count made
+		// actual≈197K vs estimate≈101K → calibration ≈1.5 → effective
+		// trigger ≈97K → spurious provider compaction on the next turn.
 		CompactionConfig: CompactionConfig{Enabled: true, TriggerTokens: 145_000, TargetTokens: 70_000},
 	})
 	if err != nil {

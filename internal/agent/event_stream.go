@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -183,13 +184,22 @@ func NewChildEventStream(parent *EventStream, taskID string) *EventStream {
 type contentEventBroadcaster struct {
 	mu            sync.Mutex
 	nextID        int
-	subs          map[int]chan ContentEvent
+	subs          map[int]*contentEventSubscriber
 	subagentTypes map[string]string
+}
+
+// contentEventSubscriber pairs a subscriber channel with a count of events
+// dropped while its buffer was full, so drops surface as a synthetic
+// events_dropped marker instead of a silent gap (e.g. tool_start without the
+// matching tool_end).
+type contentEventSubscriber struct {
+	ch      chan ContentEvent
+	dropped int64
 }
 
 func newContentEventBroadcaster() *contentEventBroadcaster {
 	return &contentEventBroadcaster{
-		subs:          map[int]chan ContentEvent{},
+		subs:          map[int]*contentEventSubscriber{},
 		subagentTypes: map[string]string{},
 	}
 }
@@ -207,7 +217,7 @@ func (b *contentEventBroadcaster) subscribe(buffer int) (<-chan ContentEvent, fu
 	b.mu.Lock()
 	id := b.nextID
 	b.nextID++
-	b.subs[id] = ch
+	b.subs[id] = &contentEventSubscriber{ch: ch}
 	b.mu.Unlock()
 	var once sync.Once
 	unsubscribe := func() {
@@ -215,7 +225,7 @@ func (b *contentEventBroadcaster) subscribe(buffer int) (<-chan ContentEvent, fu
 			b.mu.Lock()
 			if sub, ok := b.subs[id]; ok {
 				delete(b.subs, id)
-				close(sub)
+				close(sub.ch)
 			}
 			b.mu.Unlock()
 		})
@@ -256,9 +266,24 @@ func (b *contentEventBroadcaster) broadcast(ev ContentEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, sub := range b.subs {
+		if sub.dropped > 0 {
+			marker := ContentEvent{
+				Timestamp: time.Now().UTC(),
+				Type:      "events_dropped",
+				Message:   fmt.Sprintf("%d events dropped (slow subscriber)", sub.dropped),
+			}
+			select {
+			case sub.ch <- marker:
+				sub.dropped = 0
+			default:
+				sub.dropped++ // the current event is dropped too
+				continue
+			}
+		}
 		select {
-		case sub <- ev:
+		case sub.ch <- ev:
 		default:
+			sub.dropped++
 		}
 	}
 }

@@ -24,12 +24,15 @@ func WithRecommendedHandoffInstructions(instructions string) string {
 // every tool call and tool output item from the history handed to the receiving
 // agent. This keeps the target agent focused on the conversation without
 // inheriting potentially large or irrelevant tool-call noise from the prior
-// agent. Pass it via WithInputFilter.
+// agent. Reasoning and approval items are dropped too: some providers reject
+// reasoning blocks whose sibling tool call was removed. Pass it via
+// WithInputFilter.
 func RemoveAllToolsHandoffInputFilter(input []RunItem, _ []RunItem) []RunItem {
 	filtered := make([]RunItem, 0, len(input))
 	for _, item := range input {
 		switch item.Type {
-		case RunItemToolCall, RunItemToolOutput, RunItemHandoffCall, RunItemHandoffOutput:
+		case RunItemToolCall, RunItemToolOutput, RunItemHandoffCall, RunItemHandoffOutput,
+			RunItemReasoning, RunItemToolApproval:
 			continue
 		default:
 			filtered = append(filtered, item)

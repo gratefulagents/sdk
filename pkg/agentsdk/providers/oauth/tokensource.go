@@ -114,8 +114,8 @@ func (s *AnthropicFileTokenSource) reloadIfChangedLocked() {
 	if s.path == "" {
 		return
 	}
-	info, err := os.Stat(s.path)
-	if err == nil && s.loaded && info.ModTime().Equal(s.fileModTime) && info.Size() == s.fileSize {
+	info, statErr := os.Stat(s.path)
+	if statErr == nil && s.loaded && info.ModTime().Equal(s.fileModTime) && info.Size() == s.fileSize {
 		return
 	}
 	raw, err := os.ReadFile(s.path)
@@ -128,9 +128,16 @@ func (s *AnthropicFileTokenSource) reloadIfChangedLocked() {
 	}
 	s.auth = auth
 	s.loaded = true
-	if info, err := os.Stat(s.path); err == nil {
+	// Cache the signature captured *before* the read: if the file rotated
+	// between stat and read, the stale signature forces a harmless re-read on
+	// the next call, whereas re-stating here could pair the new file's
+	// signature with the old contents and suppress reloads until Invalidate.
+	if statErr == nil {
 		s.fileModTime = info.ModTime()
 		s.fileSize = info.Size()
+	} else {
+		s.fileModTime = time.Time{}
+		s.fileSize = 0
 	}
 	// A rotated file supersedes any previous rejection.
 	if strings.TrimSpace(auth.AccessToken) != s.badToken {

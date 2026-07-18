@@ -90,16 +90,27 @@ func SubAgentStreamEventFromContentEvent(ev ContentEvent) (*SubAgentStreamEvent,
 type StreamedRunResult struct {
 	Events <-chan StreamEvent
 	done   chan *RunResult
-	mu     sync.Mutex
-	err    error
+
+	// resultOnce/result make FinalResult idempotent: only the first call
+	// receives from done, later calls return the cached result instead of
+	// nil from the closed channel.
+	resultOnce sync.Once
+	result     *RunResult
+
+	mu  sync.Mutex
+	err error
 }
 
 // FinalResult blocks until the run completes and returns the result.
+// It is safe to call multiple times; every call returns the same result.
 func (s *StreamedRunResult) FinalResult() *RunResult {
 	if s == nil {
 		return nil
 	}
-	return <-s.done
+	s.resultOnce.Do(func() {
+		s.result = <-s.done
+	})
+	return s.result
 }
 
 // Err returns the terminal error from a streamed run, if any. Call it after

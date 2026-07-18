@@ -52,6 +52,13 @@ const (
 // single misbehaving advice value can't stall the run for hours. See finding M1.
 const maxRetryAfterMS = int64(5 * 60 * 1000) // 5 minutes
 
+// fallbackPrimaryReprobeTurns is the number of successful model calls on an
+// active fallback model after which the runner retries the primary model, so
+// a transient failure (rate limit, quota blip) does not permanently downgrade
+// a long run. A still-failing primary costs one failed attempt before the
+// fallback re-engages.
+const fallbackPrimaryReprobeTurns = 3
+
 // capRetryAfterMS returns the retry delay clamped to maxRetryAfterMS. It logs
 // when capping is applied so operators can detect runaway advice values.
 func capRetryAfterMS(requestedMS int64) int64 {
@@ -102,6 +109,20 @@ func isSubAgentTool(t Tool) bool {
 		default:
 			return false
 		}
+	}
+}
+
+// unwrapPolicyTool strips policy wrappers so type-based capability probes
+// (the sub-agent join/poll interfaces below) see the inner tool. Without
+// this, a ToolPolicy timeout would silently disable the sub-agent final-join
+// safety net, mirroring the isSubAgentTool unwrap above.
+func unwrapPolicyTool(t Tool) Tool {
+	for {
+		w, ok := t.(*policyToolWrapper)
+		if !ok {
+			return t
+		}
+		t = w.inner
 	}
 }
 
@@ -374,6 +395,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// would exhaust the retry budget after MaxRetries successful turns.
 	var turnRetryAttempt int
 	activeFallbackModels := map[*Agent]string{}
+	// fallbackSuccessTurns counts successful model calls while a fallback is
+	// active; after fallbackPrimaryReprobeTurns the fallback is cleared so the
+	// next turn re-probes the primary model instead of staying downgraded for
+	// the rest of the run after a transient blip.
+	fallbackSuccessTurns := map[*Agent]int{}
 	var allToolInputResults []ToolGuardrailResult
 	var allToolOutputResults []ToolGuardrailResult
 	var allActionAuditRecords []ActionAuditRecord
@@ -536,6 +562,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			} else if len(immediateItems) > 0 {
 				currentInput = append(currentInput, immediateItems...)
 				allItems = append(allItems, immediateItems...)
+				emitRunItems(ctx, streamEvents, immediateItems)
+				// Steering interrupts a completion-confirmation bounce the
+				// same way finalizeImmediateInput does.
+				pendingCompletion = false
 			}
 		}
 
@@ -647,7 +677,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 				after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
 				runCtx.Usage.Add(compactResult.Usage)
-				recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
+				recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
 				if cfg.CompactionRecorder != nil {
 					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
 				}
@@ -660,7 +690,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					if compactionCfg.UseLLMSummary {
 						rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
 						runCtx.Usage.Add(usage)
-						recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
+						recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, usage)
 						if llmOK {
 							compactedItems = rebuilt
 						}
@@ -807,6 +837,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 		}
 		resp, err := r.callModel(callCtx, activeModel, modelRequest, streamEvents, callActivity, &commitment)
+		supersededResp := resp
 		resp, err = settleImmediateInput(immediateCancel, &commitment, resp, err)
 		// context.Cause records the atomic first cancellation winner, avoiding a
 		// race that could relabel parent cancellation as stream inactivity.
@@ -852,6 +883,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				// Steering supersedes this attempt rather than failing the run. Do not
 				// charge it against the turn or retry budgets: the next iteration polls
 				// and appends the queued input before issuing the replacement request.
+				// The provider still billed a completed-but-discarded response, so its
+				// usage is booked before the response is dropped.
+				if supersededResp != nil && supersededResp.Usage != (Usage{}) {
+					runCtx.Usage.Add(supersededResp.Usage)
+					recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, supersededResp.Usage)
+				}
 				genData.Status = "interrupted"
 				genSpan.Data = genData
 				exportGenSpan()
@@ -908,7 +945,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
 					runCtx.Usage.Add(compactResult.Usage)
-					recordCompactionUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
+					recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
 					if cfg.CompactionRecorder != nil {
 						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
 					}
@@ -930,7 +967,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					if forcedCfg.UseLLMSummary {
 						rebuilt, usage, llmOK := applyLLMSummaryToPlan(ctx, activeModel, modelName, plan, cfg.ModelCallTimeout)
 						runCtx.Usage.Add(usage)
-						recordCompactionUsage(cfg.Hooks, activeModel, modelName, usage)
+						recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, usage)
 						if llmOK {
 							compactedItems = rebuilt
 						}
@@ -957,6 +994,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if r.provider != nil && shouldFallbackModelCall(err, advice) {
 				if fallbackModel, ok := nextFallbackModel(primaryModelName, requestedModelName, effectiveFallbackModels(currentAgent, cfg)); ok {
 					activeFallbackModels[currentAgent] = fallbackModel
+					fallbackSuccessTurns[currentAgent] = 0
 					reason := fallbackReason(advice)
 					if reason == "" {
 						reason = genData.FailureKind
@@ -1008,6 +1046,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 			if !streamOutputWasCommitted(err) && shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
 				delay := cfg.RetryPolicy.DelayForAttempt(turnRetryAttempt - 1)
+				// A provider-directed delay (e.g. 429 Retry-After) is on the
+				// provider's clock: never retry sooner than it asked for.
+				if advice != nil && advice.RetryAfterMS > delay.Milliseconds() {
+					delay = time.Duration(advice.RetryAfterMS) * time.Millisecond
+				}
 				cappedMS := capRetryAfterMS(delay.Milliseconds())
 				delay = time.Duration(cappedMS) * time.Millisecond
 				genData.RetryScheduled = true
@@ -1060,6 +1103,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		costUSD, costKnown := estimateModelCost(activeModel, resp.Usage)
 		turnRetryAttempt = 0
+		if activeFallbackModels[currentAgent] != "" {
+			fallbackSuccessTurns[currentAgent]++
+			if fallbackSuccessTurns[currentAgent] >= fallbackPrimaryReprobeTurns {
+				log.Printf("[runner] fallback model %q stable for %d turns; re-probing primary %q", requestedModelName, fallbackSuccessTurns[currentAgent], primaryModelName)
+				delete(activeFallbackModels, currentAgent)
+				delete(fallbackSuccessTurns, currentAgent)
+			}
+		}
 		resp.CostUSD = costUSD
 		resp.CostKnown = costKnown
 		genData.PromptTokens = int64(resp.Usage.InputTokens)
@@ -1119,7 +1170,17 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// billed as such), so a one-sided clamp let overcounting histories
 		// compact at half the real window.
 		if actual := resp.ContextTokens; actual > 0 {
-			if sentEstimate := estimateRunItemsTokens(requestInput) + requestOverheadTokens; sentEstimate > 0 {
+			// resp.ContextTokens is prompt-side only: it can never include the
+			// output reserve or the safety buffer baked into
+			// requestOverheadTokens. Leaving them in the denominator biases
+			// the ratio low, and since the trigger is DIVIDED by the
+			// calibration, that systematically delays compaction past the
+			// headroom the trigger was designed to keep.
+			promptOverheadTokens := requestOverheadTokens - outputReserveTokens(settings) - requestSafetyBufferTokens
+			if promptOverheadTokens < 0 {
+				promptOverheadTokens = 0
+			}
+			if sentEstimate := estimateRunItemsTokens(requestInput) + promptOverheadTokens; sentEstimate > 0 {
 				ratio := float64(actual) / float64(sentEstimate)
 				blended := 0.5*estimateCalibration + 0.5*ratio
 				estimateCalibration = math.Max(0.5, math.Min(2.5, blended))
@@ -1156,7 +1217,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 
 		// Classify the response.
-		step := classifyResponse(newItems, currentAgent)
+		step := classifyResponse(newItems, currentAgent, runCtx)
 
 		switch s := step.(type) {
 		case *finalOutputStep:
@@ -1180,6 +1241,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if len(joinItems) > 0 {
 				currentInput = append(currentInput, newItems...)
 				currentInput = append(currentInput, joinItems...)
+				currentInput = recordAndPruneResponseCompaction(currentInput)
 				allItems = append(allItems, joinItems...)
 				emitRunItems(ctx, streamEvents, joinItems)
 				if turn >= maxTurns-1 {
@@ -1200,6 +1262,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 				currentInput = append(currentInput, newItems...)
 				currentInput = append(currentInput, confirmItem)
+				currentInput = recordAndPruneResponseCompaction(currentInput)
 				allItems = append(allItems, confirmItem)
 				emitRunItems(ctx, streamEvents, []RunItem{confirmItem})
 				if turn >= maxTurns-1 {
@@ -1222,6 +1285,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					currentInput = append(currentInput, newItems...)
 					currentInput = append(currentInput, gateItem)
+					currentInput = recordAndPruneResponseCompaction(currentInput)
 					allItems = append(allItems, gateItem)
 					emitRunItems(ctx, streamEvents, []RunItem{gateItem})
 					if turn >= maxTurns-1 {
@@ -1246,6 +1310,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					currentInput = append(currentInput, newItems...)
 					currentInput = append(currentInput, verifyItem)
+					currentInput = recordAndPruneResponseCompaction(currentInput)
 					allItems = append(allItems, verifyItem)
 					emitRunItems(ctx, streamEvents, []RunItem{verifyItem})
 					pendingCompletion = false
@@ -1264,6 +1329,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
 					return nil, finalizeErr
 				} else if continued {
+					currentInput = recordAndPruneResponseCompaction(currentInput)
 					if turn >= maxTurns-1 {
 						maxTurns++
 					}
@@ -1365,7 +1431,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		case *toolCallStep:
 			pendingCompletion = false
 			stopGateBlocks = 0
-			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, s.toolCalls, cfg)
+			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, tools, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
 			}
@@ -1539,6 +1605,12 @@ func (r *Runner) RunStreamed(ctx context.Context, agent *Agent, input []RunItem,
 		defer close(done)
 		var unsubscribe func()
 		var contentForwardDone chan struct{}
+		// forwardStop unblocks the content forwarder after the run finishes:
+		// consumers that only wait on FinalResult stop draining Events, so a
+		// send guarded only by ctx.Done() would block the forwarder — and the
+		// join below — forever, leaking both goroutines and never closing
+		// Events.
+		forwardStop := make(chan struct{})
 		if es := streamedRunEventStream(r, cfg); es != nil {
 			contentEvents, unsub := es.Subscribe(256)
 			unsubscribe = unsub
@@ -1546,7 +1618,7 @@ func (r *Runner) RunStreamed(ctx context.Context, agent *Agent, input []RunItem,
 			go func() {
 				defer close(contentForwardDone)
 				for ev := range contentEvents {
-					if !emitContentStreamEvent(ctx, events, ev) {
+					if !emitContentStreamEvent(ctx, events, ev, forwardStop) {
 						return
 					}
 				}
@@ -1556,6 +1628,7 @@ func (r *Runner) RunStreamed(ctx context.Context, agent *Agent, input []RunItem,
 			if unsubscribe != nil {
 				unsubscribe()
 			}
+			close(forwardStop)
 			if contentForwardDone != nil {
 				<-contentForwardDone
 			}
@@ -1598,7 +1671,7 @@ func streamedRunEventStream(r *Runner, cfg RunConfig) *EventStream {
 	return nil
 }
 
-func emitContentStreamEvent(ctx context.Context, events chan<- StreamEvent, ev ContentEvent) bool {
+func emitContentStreamEvent(ctx context.Context, events chan<- StreamEvent, ev ContentEvent, stop <-chan struct{}) bool {
 	content := ev
 	streamEvent := StreamEvent{
 		Type:    StreamEventContent,
@@ -1614,6 +1687,15 @@ func emitContentStreamEvent(ctx context.Context, events chan<- StreamEvent, ev C
 		return true
 	case <-ctx.Done():
 		return false
+	case <-stop:
+		// The run is over; make a last non-blocking attempt so an active
+		// consumer still sees the event, then give up instead of blocking.
+		select {
+		case events <- streamEvent:
+			return true
+		default:
+			return false
+		}
 	}
 }
 
@@ -1668,6 +1750,10 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 		return nil, commitment.wrap(err)
 	}
 	reasoningAlreadyEmitted := commitment != nil && commitment.providerReasoning.Load()
+	// modelFedReasoningSink tracks whether this loop itself fed the context
+	// sink; the sink sets providerReasoning, so re-checks below must ignore
+	// the flag once we caused it ourselves.
+	modelFedReasoningSink := false
 	if activity != nil {
 		activity() // response headers / stream establishment are progress
 	}
@@ -1720,6 +1806,13 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 				}
 			}
 		case ModelStreamReasoningDelta:
+			// Re-check the dedup flag per event: a transport that feeds the
+			// context sink internally sets providerReasoning only after the
+			// stream starts, so the snapshot alone would let both paths run
+			// and duplicate thinking deltas for this attempt.
+			if !reasoningAlreadyEmitted && !modelFedReasoningSink && commitment != nil && commitment.providerReasoning.Load() {
+				reasoningAlreadyEmitted = true
+			}
 			hasReasoningOutput := (!reasoningAlreadyEmitted && modeldelta.ReasoningSinkFromContext(ctx) != nil && ev.Delta != "") || streamEvents != nil
 			if hasReasoningOutput && !commitment.markVisible() && !commitment.visible() {
 				return nil, contextFailure()
@@ -1727,6 +1820,7 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 			if !reasoningAlreadyEmitted {
 				if sink := modeldelta.ReasoningSinkFromContext(ctx); sink != nil && ev.Delta != "" {
 					sink(ev.Delta)
+					modelFedReasoningSink = true
 				}
 			}
 			if streamEvents != nil {
@@ -1768,7 +1862,7 @@ func emitRunItems(ctx context.Context, events chan<- StreamEvent, items []RunIte
 func collectSubAgentFinalJoinItems(ctx context.Context, tools []Tool) ([]RunItem, error) {
 	var joined []RunItem
 	for _, tool := range tools {
-		provider, ok := tool.(subAgentFinalJoinProvider)
+		provider, ok := unwrapPolicyTool(tool).(subAgentFinalJoinProvider)
 		if !ok {
 			continue
 		}
@@ -1786,7 +1880,7 @@ func collectSubAgentFinalJoinItems(ctx context.Context, tools []Tool) ([]RunItem
 func pollSubAgentResultItems(tools []Tool) []RunItem {
 	var items []RunItem
 	for _, tool := range tools {
-		poller, ok := tool.(subAgentResultPoller)
+		poller, ok := unwrapPolicyTool(tool).(subAgentResultPoller)
 		if !ok {
 			continue
 		}
@@ -1797,7 +1891,7 @@ func pollSubAgentResultItems(tools []Tool) []RunItem {
 
 func hasPendingSubAgentFinalJoin(tools []Tool) bool {
 	for _, tool := range tools {
-		provider, ok := tool.(subAgentFinalJoinStateProvider)
+		provider, ok := unwrapPolicyTool(tool).(subAgentFinalJoinStateProvider)
 		if !ok {
 			continue
 		}
@@ -1849,7 +1943,7 @@ func finalOutputText(output any) string {
 }
 
 // classifyResponse determines what the model wants to do: final output, handoff, or tool calls.
-func classifyResponse(items []RunItem, agent *Agent) responseStep {
+func classifyResponse(items []RunItem, agent *Agent, runCtx *RunContext) responseStep {
 	var toolCalls []ToolCallData
 	var hasText bool
 	var lastText string
@@ -1859,9 +1953,18 @@ func classifyResponse(items []RunItem, agent *Agent) responseStep {
 		case RunItemToolCall:
 			if item.ToolCall != nil {
 				for _, h := range agent.Handoffs {
-					if h.ToolName == item.ToolCall.Name {
-						return &handoffStep{handoff: h, target: h.Agent}
+					if h.ToolName != item.ToolCall.Name {
+						continue
 					}
+					// A disabled handoff must not be triggerable: the model can
+					// re-emit a handoff tool name it saw earlier in history even
+					// though filterByAccess hid the tool from this request. Fall
+					// through to normal tool handling (unknown tool -> error
+					// output) instead of transferring.
+					if h.IsEnabledFn != nil && !h.IsEnabledFn(runCtx) {
+						continue
+					}
+					return &handoffStep{handoff: h, target: h.Agent}
 				}
 				toolCalls = append(toolCalls, *item.ToolCall)
 			}
@@ -1948,9 +2051,10 @@ type toolCallResult struct {
 
 // executeTools runs all tool calls in parallel and returns the results as RunItems.
 // Order is preserved: results[i] corresponds to calls[i].
+// tools must be the turn's prepared tool slice (the exact list the model was
+// shown) so execution cannot diverge from what was offered.
 // Matches the OpenAI Agents SDK's _FunctionToolBatchExecutor pattern.
-func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Agent, calls []ToolCallData, cfg RunConfig) ([]RunItem, []ToolGuardrailResult, []ToolGuardrailResult, []ActionAuditRecord, bool, error) {
-	tools := prepareToolsForRun(agent.GetAllTools(runCtx), cfg, runCtx)
+func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Agent, tools []Tool, calls []ToolCallData, cfg RunConfig) ([]RunItem, []ToolGuardrailResult, []ToolGuardrailResult, []ActionAuditRecord, bool, error) {
 	toolMap := make(map[string]Tool, len(tools))
 	for _, t := range tools {
 		name := t.Name()
@@ -2171,7 +2275,11 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 		toolCtx, cancel := context.WithTimeout(execCtx, time.Duration(timeout)*time.Second)
 		result, err = safeExecuteTool(t, toolCtx, call.Input, runCtx.WorkDir)
 		cancel()
-		if toolCtx.Err() == context.DeadlineExceeded {
+		// Attribute the deadline to the per-tool budget only when the parent
+		// context is still alive; otherwise the run-level deadline (or an
+		// idle-model cancellation) expired and blaming the tool would record
+		// a false "tool timed out" in model-facing history.
+		if toolCtx.Err() == context.DeadlineExceeded && execCtx.Err() == nil {
 			preserver, preserves := t.(ToolTimeoutResultPreserver)
 			preserveResult := preserves && preserver.PreserveResultOnTimeout() && err == nil && !result.IsError
 			if !preserveResult {
@@ -2527,7 +2635,11 @@ func fireRunHook(hooks RunHooks, fn func(RunHooks)) {
 	if hooks == nil {
 		return
 	}
-	defer func() { _ = recover() }()
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[runner] WARN: run hook panicked (recovered): %v", rec)
+		}
+	}()
 	fn(hooks)
 }
 
@@ -2539,13 +2651,14 @@ func emitLLMAttemptEvent(hooks RunHooks, event ContentEvent) {
 	platformHooks.EventStream.EmitLLMAttempt(event)
 }
 
-// recordCompactionUsage books model usage consumed by history compaction
-// (provider-side compaction or LLM-summary calls) on the platform tracker.
-// These calls bypass OnLLMEnd, so without this the usage would reach
-// RunResult.Usage but never the run-level tracker totals (cost caps, session
-// metrics) — and for subagent runs, whose completion no longer re-adds
-// RunResult.Usage to the parent tracker, it would be lost entirely.
-func recordCompactionUsage(hooks RunHooks, model Model, modelName string, usage Usage) {
+// recordOutOfBandUsage books model usage that bypasses OnLLMEnd — history
+// compaction calls (provider-side compaction or LLM-summary calls) and
+// steering-superseded responses — on the platform tracker. Without this the
+// usage would reach RunResult.Usage but never the run-level tracker totals
+// (cost caps, session metrics) — and for subagent runs, whose completion no
+// longer re-adds RunResult.Usage to the parent tracker, it would be lost
+// entirely.
+func recordOutOfBandUsage(hooks RunHooks, model Model, modelName string, usage Usage) {
 	if usage == (Usage{}) {
 		return
 	}
@@ -2915,6 +3028,24 @@ func repairToolPairsForModelInput(items, reference []RunItem) []RunItem {
 	indexToolPairReferences(refCalls, refOutputs, reference)
 	indexToolPairReferences(refCalls, refOutputs, items)
 
+	// In-flight tool calls have no output ANYWHERE yet but will get one later
+	// this run (approval-pending interruptions, host histories persisted
+	// mid-turn). Dropping them here would orphan the eventual tool_output.
+	pendingApprovalIDs := map[string]struct{}{}
+	for _, list := range [][]RunItem{reference, items} {
+		for _, item := range list {
+			if item.Type == RunItemToolApproval && item.ToolApproval != nil && item.ToolApproval.CallID != "" {
+				pendingApprovalIDs[item.ToolApproval.CallID] = struct{}{}
+			}
+		}
+	}
+	lastOutputIdx := -1
+	for idx, item := range items {
+		if item.Type == RunItemToolOutput && item.ToolOutput != nil {
+			lastOutputIdx = idx
+		}
+	}
+
 	currentCalls := map[string]struct{}{}
 	currentOutputs := map[string]struct{}{}
 	for _, item := range items {
@@ -2933,7 +3064,7 @@ func repairToolPairsForModelInput(items, reference []RunItem) []RunItem {
 	out := make([]RunItem, 0, len(items))
 	emittedCalls := map[string]struct{}{}
 	emittedOutputs := map[string]struct{}{}
-	for _, item := range items {
+	for idx, item := range items {
 		switch item.Type {
 		case RunItemToolCall:
 			if item.ToolCall == nil || item.ToolCall.ID == "" {
@@ -2945,7 +3076,12 @@ func repairToolPairsForModelInput(items, reference []RunItem) []RunItem {
 			}
 			if _, paired := currentOutputs[id]; !paired {
 				if _, ok := refOutputs[id]; !ok {
-					continue
+					// Keep calls awaiting approval and calls in the trailing
+					// (not-yet-executed) region: their outputs arrive later.
+					_, pendingApproval := pendingApprovalIDs[id]
+					if !pendingApproval && idx <= lastOutputIdx {
+						continue
+					}
 				}
 			}
 			out = append(out, item)
@@ -3188,7 +3324,11 @@ func fireAgentHook(hooks AgentHooks, fn func(AgentHooks)) {
 	if hooks == nil {
 		return
 	}
-	defer func() { _ = recover() }()
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("[runner] WARN: agent hook panicked (recovered): %v", rec)
+		}
+	}()
 	fn(hooks)
 }
 

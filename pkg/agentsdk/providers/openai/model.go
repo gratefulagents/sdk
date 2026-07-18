@@ -240,7 +240,7 @@ func (m *OpenAIModel) StreamResponse(ctx context.Context, req agentsdk.ModelRequ
 	if err != nil {
 		return nil, err
 	}
-	return wrapAnthropicStyleStream(stream), nil
+	return wrapAnthropicStyleStream(ctx, stream), nil
 }
 
 func (m *OpenAIModel) GetRetryAdvice(err error) *agentsdk.ModelRetryAdvice {
@@ -419,8 +419,10 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 				// remnant of the history pruned behind it, so down-convert it
 				// to a plaintext assistant summary when the producing
 				// provider supplied one instead of silently severing the
-				// conversation.
-				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin == "anthropic" {
+				// conversation. Any stamped non-openai origin is foreign —
+				// not just "anthropic" — otherwise gateway-stamped blobs are
+				// sent verbatim, 400, and get stripped outright.
+				if origin := strings.ToLower(strings.TrimSpace(item.Compaction.CreatedBy)); origin != "" && origin != "openai" {
 					if summary := strings.TrimSpace(item.Compaction.Content); summary != "" {
 						msgs = append(msgs, internalanthropic.Message{
 							Role:    internalanthropic.RoleAssistant,
@@ -695,7 +697,7 @@ type anthropicStyleStream interface {
 
 // wrapAnthropicStyleStream wraps any Anthropic-style stream (from either provider)
 // into a agentsdk.ModelStream.
-func wrapAnthropicStyleStream(stream anthropicStyleStream) *agentsdk.ModelStream {
+func wrapAnthropicStyleStream(ctx context.Context, stream anthropicStyleStream) *agentsdk.ModelStream {
 	events := make(chan agentsdk.ModelStreamEvent, 64)
 	done := make(chan *agentsdk.ModelResponse, 1)
 
@@ -704,15 +706,30 @@ func wrapAnthropicStyleStream(stream anthropicStyleStream) *agentsdk.ModelStream
 		defer close(done)
 		defer stream.Close()
 
+		// send delivers an event unless the consumer is gone (context
+		// cancelled); without this an abandoned stream would park the
+		// goroutine on a full channel forever and leak the response body.
+		send := func(ev agentsdk.ModelStreamEvent) bool {
+			select {
+			case events <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		assembler := internalanthropic.NewStreamAssembler()
 
 		for {
 			evt, err := stream.Next()
 			if err != nil {
-				if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
+				// Only a clean io.EOF finalizes the stream; wrapped read
+				// failures (e.g. unexpected EOF from a dropped connection)
+				// must surface as errors, not truncated "successful" turns.
+				if errors.Is(err, io.EOF) {
 					break
 				}
-				events <- agentsdk.ModelStreamEvent{Type: agentsdk.ModelStreamError, Error: err}
+				send(agentsdk.ModelStreamEvent{Type: agentsdk.ModelStreamError, Error: err})
 				done <- nil
 				return
 			}
@@ -722,14 +739,20 @@ func wrapAnthropicStyleStream(stream anthropicStyleStream) *agentsdk.ModelStream
 				if evt.Delta != nil {
 					switch evt.Delta.Type {
 					case "text_delta":
-						events <- agentsdk.ModelStreamEvent{
+						if !send(agentsdk.ModelStreamEvent{
 							Type:  agentsdk.ModelStreamDelta,
 							Delta: evt.Delta.Text,
+						}) {
+							done <- nil
+							return
 						}
 					case "thinking_delta":
-						events <- agentsdk.ModelStreamEvent{
+						if !send(agentsdk.ModelStreamEvent{
 							Type:  agentsdk.ModelStreamReasoningDelta,
 							Delta: evt.Delta.Thinking,
+						}) {
+							done <- nil
+							return
 						}
 					}
 				}

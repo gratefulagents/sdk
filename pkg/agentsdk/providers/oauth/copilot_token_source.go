@@ -79,7 +79,12 @@ func (s *CopilotTokenSource) Token(ctx context.Context) (string, error) {
 	}
 
 	s.lastAttempt = now
-	updated, err := RefreshCopilotToken(ctx, s.auth, s.cfg)
+	// Run the exchange detached from the request context: one cancelled
+	// request must not abort the shared token exchange and trip the failure
+	// cooldown for every other caller.
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	updated, err := RefreshCopilotToken(refreshCtx, s.auth, s.cfg)
 	if err != nil {
 		s.lastErr = err
 		if fallback, ok := s.unexpiredTokenLocked(now); ok {

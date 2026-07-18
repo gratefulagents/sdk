@@ -31,6 +31,9 @@ func WithReasoningSink(ctx context.Context, sink ReasoningSink) context.Context 
 // ReasoningSinkFromContext extracts the reasoning sink installed by
 // WithReasoningSink, or nil when the call has no live reasoning consumer.
 func ReasoningSinkFromContext(ctx context.Context) ReasoningSink {
+	if ctx == nil {
+		return nil
+	}
 	sink, _ := ctx.Value(ctxKey{}).(ReasoningSink)
 	return sink
 }

@@ -349,7 +349,10 @@ func summarizeCompactedMessages(items []RunItem, bulletLimit int) string {
 	toolNames := summarizeToolsMentioned(items)
 	fileBullets := summarizeReferencedPaths(items, 8)
 	currentWork := inferCurrentWork(items)
-	timelineBullets := summarizeKeyTimeline(items, 0)
+	// Bound the timeline: one bullet per removed item over a multi-thousand
+	// item history is a tens-of-thousands-of-tokens "summary" — mechanically
+	// valid but terrible compression. Keep only the most recent entries.
+	timelineBullets := summarizeKeyTimeline(items, maxInt(bulletLimit*10, 20))
 
 	lines := []string{
 		"Conversation summary:",
@@ -397,6 +400,12 @@ func summarizeCompactedHistoryTerse(items []RunItem, bulletLimit int) string {
 	}
 	if files := summarizeReferencedPaths(items, minInt(bulletLimit, 2)); len(files) > 0 {
 		lines = append(lines, "Files: "+strings.Join(files, ", ")+".")
+	}
+	// Never erase previously compacted context outright: the terse path is
+	// reached exactly on re-compaction of already-dense histories, where the
+	// prior summary is the only memory of everything compacted before.
+	if existing := latestExistingCompactionSummary(items); existing != "" {
+		lines = append(lines, "Previously compacted context: "+truncateLine(existing, 600))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -916,18 +925,47 @@ func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recent
 }
 
 func buildCompactedRunItems(items []RunItem, protected map[int]struct{}, summary string) []RunItem {
+	// The summary is an assistant-role item. If it would become the very
+	// first message (nothing protected precedes the first unprotected index)
+	// while a preserved plain user message follows, defer insertion until
+	// after that user message: Anthropic-style APIs require the message list
+	// to start with a user turn.
+	firstUnprotected, firstProtected := -1, -1
+	for idx := range items {
+		if _, ok := protected[idx]; ok {
+			if firstProtected < 0 {
+				firstProtected = idx
+			}
+		} else if firstUnprotected < 0 {
+			firstUnprotected = idx
+		}
+	}
+	deferUntil := -1
+	if firstUnprotected >= 0 && firstProtected > firstUnprotected {
+		first := items[firstProtected]
+		if first.Type == RunItemMessage && first.Message != nil && first.Agent == nil {
+			deferUntil = firstProtected
+		}
+	}
+
 	result := make([]RunItem, 0, len(protected)+1)
 	summaryInserted := false
+	insertSummary := func() {
+		result = append(result, RunItem{
+			Type:    RunItemMessage,
+			Agent:   &Agent{Name: "context-summary"},
+			Message: &MessageOutput{Text: summary},
+		})
+		summaryInserted = true
+	}
 	for idx := 0; idx < len(items); idx++ {
 		if _, ok := protected[idx]; ok {
 			result = append(result, cloneRunItem(items[idx]))
-		} else if !summaryInserted {
-			result = append(result, RunItem{
-				Type:    RunItemMessage,
-				Agent:   &Agent{Name: "context-summary"},
-				Message: &MessageOutput{Text: summary},
-			})
-			summaryInserted = true
+			if idx == deferUntil && !summaryInserted {
+				insertSummary()
+			}
+		} else if !summaryInserted && idx > deferUntil {
+			insertSummary()
 		}
 	}
 	return result

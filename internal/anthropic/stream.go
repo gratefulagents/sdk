@@ -2,7 +2,8 @@ package anthropic
 
 import (
 	"encoding/json"
-	"strings"
+	"errors"
+	"io"
 )
 
 // CollectResponse reads all streaming events and assembles a complete CreateMessageResponse.
@@ -13,8 +14,10 @@ func (r *StreamReader) CollectResponse() (*CreateMessageResponse, error) {
 	for {
 		event, err := r.Next()
 		if err != nil {
-			// Check for our sentinel EOF.
-			if strings.Contains(err.Error(), "EOF") {
+			// Only a clean io.EOF ends the stream successfully. A mid-stream
+			// failure (e.g. io.ErrUnexpectedEOF from a dropped connection)
+			// must surface as an error, not a silently truncated response.
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return nil, err
@@ -32,16 +35,19 @@ func (r *StreamReader) CollectResponse() (*CreateMessageResponse, error) {
 type StreamAssembler struct {
 	resp          CreateMessageResponse
 	currentBlocks []ContentBlock
-	builders      []*blockAssembler
+	builders      map[int]*blockAssembler
 }
 
 func NewStreamAssembler() *StreamAssembler {
-	return &StreamAssembler{}
+	return &StreamAssembler{builders: make(map[int]*blockAssembler)}
 }
 
 func (a *StreamAssembler) Add(event StreamEvent) {
 	if a == nil {
 		return
+	}
+	if a.builders == nil {
+		a.builders = make(map[int]*blockAssembler)
 	}
 	switch event.Type {
 	case EventMessageStart:
@@ -54,7 +60,7 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 
 	case EventContentBlockStart:
 		if event.ContentBlock != nil {
-			a.builders = append(a.builders, &blockAssembler{
+			a.builders[event.Index] = &blockAssembler{
 				blockType:        event.ContentBlock.Type,
 				id:               event.ContentBlock.ID,
 				name:             event.ContentBlock.Name,
@@ -64,12 +70,11 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 				content:          event.ContentBlock.Content,
 				createdBy:        event.ContentBlock.CreatedBy,
 				encryptedContent: event.ContentBlock.EncryptedContent,
-			})
+			}
 		}
 
 	case EventContentBlockDelta:
-		if event.Delta != nil && len(a.builders) > 0 {
-			b := a.builders[len(a.builders)-1]
+		if b := a.builders[event.Index]; event.Delta != nil && b != nil {
 			switch event.Delta.Type {
 			case "text_delta":
 				b.text += event.Delta.Text
@@ -92,9 +97,11 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 		}
 
 	case EventContentBlockStop:
-		if len(a.builders) > 0 {
-			b := a.builders[len(a.builders)-1]
+		// A stop only applies to a still-open builder at that index; a
+		// duplicated stop is ignored instead of appending the block twice.
+		if b := a.builders[event.Index]; b != nil {
 			a.currentBlocks = append(a.currentBlocks, b.build())
+			delete(a.builders, event.Index)
 		}
 
 	case EventMessageDelta:

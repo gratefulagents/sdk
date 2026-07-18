@@ -80,7 +80,7 @@ func DetectUserInputPause(items []RunItem, finalText string) UserInputPause {
 			}
 		case "present_plan":
 			question, actions := ExtractPresentPlanData(item.ToolCall.Input)
-			if question == "" {
+			if question == "" || (looksLikeRawJSONObject(question) && strings.TrimSpace(finalText) != "") {
 				question = strings.TrimSpace(finalText)
 			}
 			if question == "" {

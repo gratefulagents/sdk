@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -79,7 +80,7 @@ func (s *InMemoryStore) Store(_ context.Context, namespace, content string, tags
 	s.memories = append(s.memories, mem)
 	s.mu.Unlock()
 
-	out := mem
+	out := cloneMemory(mem)
 	return &out, nil
 }
 
@@ -95,19 +96,22 @@ func (s *InMemoryStore) Search(_ context.Context, namespace, query string, tags 
 	}
 
 	query = strings.ToLower(query)
+	terms := uniqueNonEmptyTerms(strings.Fields(query))
 	out := s.filter(namespace, tags)
 	scored := out[:0]
 	for _, mem := range out {
 		content := strings.ToLower(mem.Content)
+		matched := 0
+		for _, term := range terms {
+			if strings.Contains(content, term) {
+				matched++
+			}
+		}
+		// Distinct-term matches are capped below the exact-phrase score so
+		// many partial hits can never outrank an exact match.
+		mem.Similarity = math.Min(0.9, 0.25*float64(matched))
 		if strings.Contains(content, query) {
 			mem.Similarity = 1
-			scored = append(scored, mem)
-			continue
-		}
-		for _, term := range strings.Fields(query) {
-			if strings.Contains(content, term) {
-				mem.Similarity += 0.25
-			}
 		}
 		if mem.Similarity > 0 {
 			scored = append(scored, mem)
@@ -180,6 +184,22 @@ func hasAnyTag(actual, wanted []string) bool {
 		}
 	}
 	return false
+}
+
+func uniqueNonEmptyTerms(terms []string) []string {
+	seen := make(map[string]struct{}, len(terms))
+	out := terms[:0]
+	for _, term := range terms {
+		if term == "" {
+			continue
+		}
+		if _, ok := seen[term]; ok {
+			continue
+		}
+		seen[term] = struct{}{}
+		out = append(out, term)
+	}
+	return out
 }
 
 func cloneMemory(mem Memory) Memory {

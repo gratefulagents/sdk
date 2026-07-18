@@ -25,9 +25,28 @@ func estimateRunResultCost(result *RunResult, fallbackModel Model) (float64, boo
 
 	var costUSD float64
 	costKnown := true
+	var responsesUsage Usage
 	for _, response := range result.RawResponses {
 		costUSD += response.CostUSD
 		if !response.CostKnown {
+			costKnown = false
+		}
+		responsesUsage.Add(response.Usage)
+	}
+	// Compaction calls (provider-side or LLM-summary) add usage to
+	// result.Usage without appending to RawResponses; estimate that residual
+	// so the summed cost matches the reported usage.
+	residual := Usage{
+		Requests:          max(result.Usage.Requests-responsesUsage.Requests, 0),
+		InputTokens:       max(result.Usage.InputTokens-responsesUsage.InputTokens, 0),
+		OutputTokens:      max(result.Usage.OutputTokens-responsesUsage.OutputTokens, 0),
+		CacheReadTokens:   max(result.Usage.CacheReadTokens-responsesUsage.CacheReadTokens, 0),
+		CacheCreateTokens: max(result.Usage.CacheCreateTokens-responsesUsage.CacheCreateTokens, 0),
+	}
+	if residual.TotalTokens() > 0 || residual.CacheReadTokens > 0 || residual.CacheCreateTokens > 0 {
+		residualCost, residualKnown := estimateModelCost(fallbackModel, residual)
+		costUSD += residualCost
+		if !residualKnown {
 			costKnown = false
 		}
 	}

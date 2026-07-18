@@ -136,6 +136,12 @@ func RefreshAnthropicTokens(ctx context.Context, auth AnthropicAuth, cfg Refresh
 	now := refreshNow(cfg)
 	if tokenResp.ExpiresIn > 0 {
 		auth.ExpiresAt = now.Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	} else {
+		// The endpoint omitted expires_in: clear the old (typically already
+		// past) expiry instead of serializing it back, which would keep
+		// AnthropicNeedsRefresh true and burn a single-use refresh token on
+		// every Token() call.
+		auth.ExpiresAt = time.Time{}
 	}
 	if email := strings.TrimSpace(tokenResp.Account.EmailAddress); email != "" {
 		auth.Email = email

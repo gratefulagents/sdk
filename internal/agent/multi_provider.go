@@ -2,7 +2,9 @@ package agent
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 )
 
 // MultiProvider dispatches model requests to registered providers by prefix.
@@ -13,6 +15,7 @@ import (
 //	"openai/gpt-4.1"             → OpenAIProvider with model "gpt-4.1"
 //	"gpt-4.1"                    → default provider (openai) with model "gpt-4.1"
 type MultiProvider struct {
+	mu            sync.RWMutex
 	providers     map[string]ModelProvider
 	defaultPrefix string
 }
@@ -28,34 +31,47 @@ func NewMultiProvider(defaultPrefix string) *MultiProvider {
 
 // Register adds a provider under the given prefix.
 func (mp *MultiProvider) Register(prefix string, p ModelProvider) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
 	mp.providers[prefix] = p
 }
 
 // GetModel parses the model name for a provider prefix and delegates to the
-// appropriate registered provider.
+// appropriate registered provider. Names whose first "/" segment is not a
+// registered provider prefix are rejected; model IDs that themselves contain
+// "/" must be double-prefixed (e.g. "openrouter/anthropic/claude-...").
 func (mp *MultiProvider) GetModel(name string) (Model, error) {
 	prefix, modelName := ParseModelPrefix(name)
 	if prefix == "" {
 		prefix = mp.defaultPrefix
-		modelName = name
 	}
+	mp.mu.RLock()
 	p, ok := mp.providers[prefix]
 	if !ok {
 		known := make([]string, 0, len(mp.providers))
 		for k := range mp.providers {
 			known = append(known, k)
 		}
+		mp.mu.RUnlock()
+		sort.Strings(known)
 		return nil, &AgentError{
 			Message: fmt.Sprintf("unknown model provider prefix %q (known: %s)", prefix, strings.Join(known, ", ")),
 		}
 	}
+	mp.mu.RUnlock()
 	return p.GetModel(modelName)
 }
 
 // Close releases resources for all registered providers.
 func (mp *MultiProvider) Close() error {
-	var firstErr error
+	mp.mu.RLock()
+	providers := make([]ModelProvider, 0, len(mp.providers))
 	for _, p := range mp.providers {
+		providers = append(providers, p)
+	}
+	mp.mu.RUnlock()
+	var firstErr error
+	for _, p := range providers {
 		if err := p.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -72,14 +88,19 @@ type ModelNameNormalizer interface {
 
 // NormalizeModelName strips the provider prefix only when it routes to a
 // registered provider, preserving model IDs that contain "/" as part of the
-// ID (e.g. "openrouter/anthropic/claude-..." → "anthropic/claude-...", while
-// an unregistered "anthropic/claude-..." prefix stays intact).
+// ID (e.g. "openrouter/anthropic/claude-..." → "anthropic/claude-...").
+// Names with an unregistered prefix are returned unchanged, but note GetModel
+// rejects them: slashed model IDs are only routable when double-prefixed with
+// a registered provider.
 func (mp *MultiProvider) NormalizeModelName(name string) string {
 	prefix, bare := ParseModelPrefix(name)
 	if prefix == "" || bare == "" {
 		return name
 	}
-	if _, ok := mp.providers[prefix]; ok {
+	mp.mu.RLock()
+	_, ok := mp.providers[prefix]
+	mp.mu.RUnlock()
+	if ok {
 		return bare
 	}
 	return name

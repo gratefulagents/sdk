@@ -197,7 +197,7 @@ func (m *AnthropicModel) StreamResponse(ctx context.Context, req agentsdk.ModelR
 			return nil, err
 		}
 	}
-	return m.wrapStream(stream), nil
+	return m.wrapStream(ctx, stream), nil
 }
 
 func (m *AnthropicModel) GetRetryAdvice(err error) *agentsdk.ModelRetryAdvice {
@@ -621,7 +621,7 @@ func (m *AnthropicModel) convertResponse(resp *internalanthropic.CreateMessageRe
 	}
 }
 
-func (m *AnthropicModel) wrapStream(reader *internalanthropic.StreamReader) *agentsdk.ModelStream {
+func (m *AnthropicModel) wrapStream(ctx context.Context, reader *internalanthropic.StreamReader) *agentsdk.ModelStream {
 	events := make(chan agentsdk.ModelStreamEvent, 64)
 	done := make(chan *agentsdk.ModelResponse, 1)
 
@@ -630,15 +630,30 @@ func (m *AnthropicModel) wrapStream(reader *internalanthropic.StreamReader) *age
 		defer close(done)
 		defer reader.Close()
 
+		// send delivers an event unless the consumer is gone (context
+		// cancelled); without this an abandoned stream would park the
+		// goroutine on a full channel forever and leak the response body.
+		send := func(ev agentsdk.ModelStreamEvent) bool {
+			select {
+			case events <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		assembler := internalanthropic.NewStreamAssembler()
 
 		for {
 			evt, err := reader.Next()
 			if err != nil {
-				if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF") {
+				// Only a clean io.EOF finalizes the stream; wrapped read
+				// failures (e.g. unexpected EOF from a dropped connection)
+				// must surface as errors, not truncated "successful" turns.
+				if errors.Is(err, io.EOF) {
 					break
 				}
-				events <- agentsdk.ModelStreamEvent{Type: agentsdk.ModelStreamError, Error: err}
+				send(agentsdk.ModelStreamEvent{Type: agentsdk.ModelStreamError, Error: err})
 				done <- nil
 				return
 			}
@@ -648,14 +663,20 @@ func (m *AnthropicModel) wrapStream(reader *internalanthropic.StreamReader) *age
 				if evt.Delta != nil {
 					switch evt.Delta.Type {
 					case "text_delta":
-						events <- agentsdk.ModelStreamEvent{
+						if !send(agentsdk.ModelStreamEvent{
 							Type:  agentsdk.ModelStreamDelta,
 							Delta: evt.Delta.Text,
+						}) {
+							done <- nil
+							return
 						}
 					case "thinking_delta":
-						events <- agentsdk.ModelStreamEvent{
+						if !send(agentsdk.ModelStreamEvent{
 							Type:  agentsdk.ModelStreamReasoningDelta,
 							Delta: evt.Delta.Thinking,
+						}) {
+							done <- nil
+							return
 						}
 					}
 				}

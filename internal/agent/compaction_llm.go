@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -120,7 +121,15 @@ func flattenRunItemsForSummary(items []RunItem, maxChars int) string {
 			if item.Agent == nil {
 				role = "user"
 			}
-			fmt.Fprintf(&b, "[%s] %s\n\n", role, truncateForTranscript(item.Message.Text, 2000))
+			limit := 2000
+			// A prior compaction summary is the only memory of everything
+			// compacted before it: truncating it like an ordinary message
+			// would erode accumulated context by ~2k chars per generation.
+			if item.Agent != nil && item.Agent.Name == "context-summary" &&
+				strings.HasPrefix(strings.TrimSpace(item.Message.Text), "[COMPACTED HISTORY SUMMARY]") {
+				limit = 16000
+			}
+			fmt.Fprintf(&b, "[%s] %s\n\n", role, truncateForTranscript(item.Message.Text, limit))
 		case RunItemReasoning:
 			if item.Reasoning == nil || strings.TrimSpace(item.Reasoning.Text) == "" {
 				continue
@@ -146,9 +155,12 @@ func flattenRunItemsForSummary(items []RunItem, maxChars int) string {
 	}
 	transcript := b.String()
 	if maxChars > 0 && len(transcript) > maxChars {
-		head := maxChars / 3
-		tail := maxChars - head
-		transcript = transcript[:head] + "\n\n[... transcript truncated ...]\n\n" + transcript[len(transcript)-tail:]
+		head := backUpToRuneStart(transcript, maxChars/3)
+		tailStart := len(transcript) - (maxChars - maxChars/3)
+		for tailStart < len(transcript) && !utf8.RuneStart(transcript[tailStart]) {
+			tailStart++
+		}
+		transcript = transcript[:head] + "\n\n[... transcript truncated ...]\n\n" + transcript[tailStart:]
 	}
 	return transcript
 }
@@ -158,5 +170,5 @@ func truncateForTranscript(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + " …[truncated]"
+	return s[:backUpToRuneStart(s, maxLen)] + " …[truncated]"
 }

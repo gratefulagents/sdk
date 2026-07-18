@@ -13,11 +13,16 @@ func NormalizeModelIdentity(raw string, provider string) ModelIdentity {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	canonical := trimmed
 	if p, bare := ParseModelPrefix(trimmed); bare != "" {
-		if provider == "" {
-			provider = strings.ToLower(strings.TrimSpace(p))
-		}
-		canonical = trimmed
-		if provider != "" && !strings.HasPrefix(strings.ToLower(trimmed), provider+"/") {
+		if p != "" {
+			// Raw already carries a routing prefix: keep it as the canonical
+			// identity (lowercased for comparability) instead of fabricating
+			// one from the wire-protocol provider name.
+			prefix := strings.ToLower(p)
+			if provider == "" {
+				provider = prefix
+			}
+			canonical = prefix + "/" + bare
+		} else if provider != "" {
 			canonical = provider + "/" + bare
 		}
 	}

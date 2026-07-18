@@ -512,6 +512,37 @@ func (m *copilotModel) UsageInputIncludesCacheTokens() bool {
 	return false
 }
 
+// EstimateCost forwards the wrapped model's provider-aware cost estimate,
+// which (like the other optional capabilities) does not tunnel through the
+// embedded interface value. When the wrapped model lacks it, fall back to
+// CalculateCost exactly like the agent runtime does for plain models.
+func (m *copilotModel) EstimateCost(usage agentsdk.Usage) (float64, bool) {
+	type costEstimator interface {
+		EstimateCost(agentsdk.Usage) (float64, bool)
+	}
+	if estimator, ok := m.Model.(costEstimator); ok {
+		return estimator.EstimateCost(usage)
+	}
+	return m.Model.CalculateCost(usage), true
+}
+
+// SupportsContextCompaction forwards the wrapped model's compaction capability.
+func (m *copilotModel) SupportsContextCompaction() bool {
+	if compactor, ok := m.Model.(agentsdk.ContextCompactor); ok {
+		return compactor.SupportsContextCompaction()
+	}
+	return false
+}
+
+// CompactContext forwards provider-side compaction to the wrapped model.
+func (m *copilotModel) CompactContext(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.CompactionResult, error) {
+	req.Model = normalizeCopilotModelName(req.Model)
+	if compactor, ok := m.Model.(agentsdk.ContextCompactor); ok {
+		return compactor.CompactContext(ctx, req)
+	}
+	return nil, fmt.Errorf("model does not support context compaction")
+}
+
 func normalizeCopilotModelName(name string) string {
 	if prefix, bare := agentsdk.ParseModelPrefix(name); strings.EqualFold(strings.TrimSpace(prefix), DefaultProviderCopilot) {
 		return strings.TrimSpace(bare)

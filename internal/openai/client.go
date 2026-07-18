@@ -697,7 +697,11 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 			r.markStopped(idx)
 		}
 
-	case "response.completed":
+	case "response.completed", "response.incomplete":
+		// response.incomplete is the terminal event for truncated responses
+		// (e.g. max_output_tokens); it carries the same Response payload as
+		// response.completed and must not be dropped, or the stream ends with
+		// no stop reason and no final usage.
 		// Determine stop reason from the completed response.
 		stopReason := anthropic.StopReasonEndTurn
 		for _, item := range evt.Response.Output {
@@ -727,6 +731,20 @@ func (r *ResponsesStreamReader) translateEvent(evt responses.ResponseStreamEvent
 		r.emit(anthropic.StreamEvent{Type: anthropic.EventMessageStop})
 	case "response.failed":
 		r.err = responseFailedError(&evt.Response)
+	case "error":
+		// In-band SSE error union event: terminal for the stream.
+		msg := strings.TrimSpace(evt.Message)
+		if msg == "" {
+			msg = "responses stream reported an error event"
+		}
+		if code := strings.TrimSpace(evt.Code); code != "" {
+			msg = code + ": " + msg
+		}
+		r.err = &RequestError{
+			StatusCode: http.StatusBadGateway,
+			Body:       msg,
+			API:        "responses_stream",
+		}
 	}
 }
 
@@ -842,17 +860,24 @@ func (c *Client) CreateMessageStream(ctx context.Context, req anthropic.CreateMe
 			return nil, err
 		}
 
-		// Acquire semaphore for the streaming call setup.
-		select {
-		case c.sem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		// Retry transient stream-setup failures (429/5xx) the same way the
+		// non-streaming path does; doWithRetry also handles the concurrency
+		// semaphore around setup. Failed streams are closed so their response
+		// bodies are not leaked across retries.
+		var reader *ResponsesStreamReader
+		err = c.doWithRetry(ctx, func(ctx context.Context) error {
+			stream := c.sdk.Responses.NewStreaming(ctx, responseParams)
+			if streamErr := stream.Err(); streamErr != nil {
+				_ = stream.Close()
+				return withRequestContext(mapSDKError(streamErr), "responses_stream", responsesURLForBase(c.baseURL))
+			}
+			reader = &ResponsesStreamReader{stream: stream}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-
-		stream := c.sdk.Responses.NewStreaming(ctx, responseParams)
-		<-c.sem
-
-		return &ResponsesStreamReader{stream: stream}, nil
+		return reader, nil
 	}
 
 	// Chat Completions providers, including OpenRouter, support SSE. Stream the
@@ -1765,6 +1790,7 @@ func drainStreamToResponse(ctx context.Context, stream messageStream, sink model
 		typ              string // "text", "tool_use", "thinking"
 		id               string
 		name             string
+		signature        string
 		encryptedContent string
 		textBuf          strings.Builder
 		inputBuf         strings.Builder
@@ -1805,6 +1831,7 @@ func drainStreamToResponse(ctx context.Context, stream messageStream, sink model
 				b.typ = ev.ContentBlock.Type
 				b.id = ev.ContentBlock.ID
 				b.name = ev.ContentBlock.Name
+				b.signature = ev.ContentBlock.Signature
 				b.encryptedContent = ev.ContentBlock.EncryptedContent
 			}
 
@@ -1828,6 +1855,8 @@ func drainStreamToResponse(ctx context.Context, stream messageStream, sink model
 							sink(ev.Delta.Text)
 						}
 					}
+				case "signature_delta":
+					b.signature += ev.Delta.Signature
 				case "reasoning_encrypted_content":
 					b.encryptedContent = ev.Delta.EncryptedContent
 				case "compaction_encrypted_content":
@@ -1876,12 +1905,13 @@ func drainStreamToResponse(ctx context.Context, stream messageStream, sink model
 		case "text":
 			resp.Content = append(resp.Content, anthropic.NewTextBlock(b.textBuf.String()))
 		case "tool_use":
-			resp.Content = append(resp.Content, anthropic.NewToolUseBlock(b.id, b.name, json.RawMessage(b.inputBuf.String())))
+			resp.Content = append(resp.Content, anthropic.NewToolUseBlock(b.id, b.name, normalizeArguments(b.inputBuf.String())))
 		case "thinking":
 			resp.Content = append(resp.Content, anthropic.ContentBlock{
 				Type:             "thinking",
 				ID:               b.id,
 				Thinking:         b.thinkingBuf.String(),
+				Signature:        b.signature,
 				EncryptedContent: b.encryptedContent,
 			})
 		case "compaction":
@@ -2003,35 +2033,63 @@ func shouldFallbackToResponses(err error) bool {
 		strings.Contains(body, "not found")
 }
 
-func parseRetryAfterSeconds(h map[string][]string) int {
-	for _, key := range []string{"Retry-After-Ms", "Retry-After", "retry-after-ms", "retry-after"} {
-		vals := h[key]
-		if len(vals) == 0 {
-			continue
-		}
-		raw := strings.TrimSpace(vals[0])
-		if raw == "" {
-			continue
-		}
-		if key == "Retry-After-Ms" || key == "retry-after-ms" {
-			if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
-				secs := ms / 1000
-				if secs == 0 {
-					secs = 1
-				}
-				return secs
+// parseRetryAfterSeconds honors Retry-After-Ms (milliseconds) and the standard
+// Retry-After header, which may be delta-seconds or an HTTP date.
+func parseRetryAfterSeconds(h http.Header) int {
+	if raw := strings.TrimSpace(h.Get("Retry-After-Ms")); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			secs := ms / 1000
+			if secs == 0 {
+				secs = 1
 			}
+			return secs
 		}
-		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+	}
+	raw := strings.TrimSpace(h.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs > 0 {
+			return secs
+		}
+		return 0
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		if secs := int(time.Until(t).Seconds()); secs > 0 {
 			return secs
 		}
 	}
 	return 0
 }
 
+const (
+	// rateLimitBaseBackoff is the first-retry delay for 429 responses that
+	// carry no Retry-After header. Rate limits recover on the provider's
+	// clock, so the generic 1s ladder just wastes attempts.
+	rateLimitBaseBackoff = 5 * time.Second
+	// rateLimitMaxBackoff caps the headerless rate-limit backoff.
+	rateLimitMaxBackoff = 60 * time.Second
+)
+
+// rateLimitBackoff returns the headerless 429 backoff for a 0-indexed attempt:
+// rateLimitBaseBackoff doubling per attempt plus up to 50% jitter, capped at
+// rateLimitMaxBackoff.
+func rateLimitBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := rateLimitBaseBackoff << uint(attempt)
+	if delay > rateLimitMaxBackoff {
+		delay = rateLimitMaxBackoff
+	}
+	return delay + time.Duration(rand.Int63n(int64(delay/2)+1))
+}
+
 func (c *Client) doWithRetry(ctx context.Context, fn func(context.Context) error) error {
+	sleptForRetry := false
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
+		if attempt > 0 && !sleptForRetry {
 			baseDelay := time.Duration(1<<uint(attempt-1)) * time.Second
 			jitter := time.Duration(rand.Int63n(int64(baseDelay / 2)))
 			select {
@@ -2040,6 +2098,7 @@ func (c *Client) doWithRetry(ctx context.Context, fn func(context.Context) error
 			case <-time.After(baseDelay + jitter):
 			}
 		}
+		sleptForRetry = false
 
 		select {
 		case c.sem <- struct{}{}:
@@ -2072,16 +2131,22 @@ func (c *Client) doWithRetry(ctx context.Context, fn func(context.Context) error
 			return reqErr
 		}
 		retryAfter := capRetryAfterSeconds(reqErr.retryAfter)
+		delay := time.Duration(retryAfter) * time.Second
+		if delay == 0 && reqErr.StatusCode == http.StatusTooManyRequests {
+			// A headerless 429 still gets a rate-limit-scale backoff.
+			delay = rateLimitBackoff(attempt)
+		}
 		if reqErr.StatusCode == http.StatusTooManyRequests {
 			log.Printf("[openai] 429 api=%s url=%s retry_after_seconds=%d attempt=%d/%d body=%s", reqErr.API, reqErr.Endpoint, retryAfter, attempt+1, maxRetries+1, sanitizeLogBody(reqErr.Body))
 		}
 
-		if retryAfter > 0 {
+		if delay > 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(retryAfter) * time.Second):
+			case <-time.After(delay):
 			}
+			sleptForRetry = true
 		}
 	}
 	return fmt.Errorf("max retries exceeded")
@@ -2428,6 +2493,10 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 		case anthropic.RoleUser:
 			var textParts []string
 			var imageParts []map[string]any
+			// Tool results are collected separately and emitted before any
+			// accumulated user text: strict chat APIs reject "tool" messages
+			// that do not immediately follow the assistant "tool_calls" turn.
+			var toolMsgs []chatMessage
 			// flushUser emits pending text/images as one user message: a plain
 			// string when text-only, or multipart content when images exist.
 			flushUser := func() {
@@ -2471,19 +2540,18 @@ func toChatMessages(req anthropic.CreateMessageRequest) ([]chatMessage, error) {
 						},
 					})
 				case "tool_result":
-					flushUser()
-
 					content := block.Content
 					if content == "" {
 						content = "(no output)"
 					}
-					msgs = append(msgs, chatMessage{
+					toolMsgs = append(toolMsgs, chatMessage{
 						Role:       "tool",
 						ToolCallID: block.ToolUseID,
 						Content:    content,
 					})
 				}
 			}
+			msgs = append(msgs, toolMsgs...)
 			flushUser()
 
 		case anthropic.RoleAssistant:
@@ -2710,10 +2778,20 @@ func responseToEvents(resp *anthropic.CreateMessageResponse) []anthropic.StreamE
 	})
 
 	for i, block := range resp.Content {
-		start := anthropic.ContentBlock{Type: block.Type}
-		if block.Type == "tool_use" {
-			start.ID = block.ID
-			start.Name = block.Name
+		// Carry all block-start metadata so the downstream assembler can
+		// round-trip reasoning IDs, encrypted content, phases, and compaction
+		// provenance. Signature is intentionally replayed via signature_delta
+		// below rather than duplicated here. Accumulated payloads (text,
+		// thinking, tool input) are replayed as deltas.
+		start := anthropic.ContentBlock{
+			Type:             block.Type,
+			ID:               block.ID,
+			Name:             block.Name,
+			Phase:            block.Phase,
+			Data:             block.Data,
+			Content:          block.Content,
+			CreatedBy:        block.CreatedBy,
+			EncryptedContent: block.EncryptedContent,
 		}
 		events = append(events, anthropic.StreamEvent{
 			Type:         anthropic.EventContentBlockStart,
@@ -2773,6 +2851,7 @@ func responseToEvents(resp *anthropic.CreateMessageResponse) []anthropic.StreamE
 		Delta: &anthropic.DeltaBlock{
 			Type:       "message_delta",
 			StopReason: string(resp.StopReason),
+			EndTurn:    resp.EndTurn,
 		},
 		Usage: &anthropic.Usage{
 			InputTokens:              resp.Usage.InputTokens,

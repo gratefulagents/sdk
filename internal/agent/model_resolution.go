@@ -8,8 +8,9 @@ const (
 	defaultAnthropicModel = "claude-sonnet-4-6"
 )
 
-// ResolveModelForProvider maps short aliases and provider-incompatible model names
-// to sensible defaults for the selected provider.
+// ResolveModelForProvider maps short aliases (small/medium/large) and the
+// empty model name to concrete defaults for the selected provider. Other
+// names pass through trimmed; providers reject incompatible model IDs.
 //
 // Prefer using MultiProvider.GetModel() which handles this internally.
 // This function is kept for call sites that need resolution without constructing a Model.
@@ -30,7 +31,8 @@ func ResolveModelForProvider(model, provider string) string {
 }
 
 func resolveAnthropicModel(model string) string {
-	switch strings.ToLower(strings.TrimSpace(model)) {
+	trimmed := strings.TrimSpace(model)
+	switch strings.ToLower(trimmed) {
 	case "":
 		return defaultAnthropicModel
 	case "medium":
@@ -40,14 +42,22 @@ func resolveAnthropicModel(model string) string {
 	case "small":
 		return "claude-haiku-4-5"
 	default:
-		return model
+		return trimmed
 	}
 }
 
 func resolveOpenAIModel(model string) string {
 	trimmed := strings.TrimSpace(model)
-	if trimmed == "" {
+	switch strings.ToLower(trimmed) {
+	case "":
 		return ""
+	case "medium":
+		return "gpt-5.6-terra"
+	case "large":
+		return "gpt-5.6-sol"
+	case "small":
+		return "gpt-5.6-luna"
+	default:
+		return trimmed
 	}
-	return trimmed
 }

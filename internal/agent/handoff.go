@@ -35,7 +35,7 @@ type HandoffOption func(*Handoff)
 func NewHandoff(target *Agent, opts ...HandoffOption) *Handoff {
 	h := &Handoff{
 		Agent:    target,
-		ToolName: fmt.Sprintf("transfer_to_%s", target.Name),
+		ToolName: "transfer_to_" + safeAgentToolName(target.Name),
 	}
 	if target.HandoffDescription != "" {
 		h.Description = target.HandoffDescription

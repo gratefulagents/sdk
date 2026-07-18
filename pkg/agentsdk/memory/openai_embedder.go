@@ -85,9 +85,12 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxEmbeddingResponseBody))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxEmbeddingResponseBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	if len(respBody) > maxEmbeddingResponseBody {
+		return nil, fmt.Errorf("embedding response exceeds %d bytes", maxEmbeddingResponseBody)
 	}
 
 	if resp.StatusCode != http.StatusOK {

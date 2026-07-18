@@ -390,6 +390,21 @@ func (r *chatStreamReader) translateChunk(chunk chatCompletionChunk) {
 	// invariant even when arguments stream across chunks or arrive after text.
 	for _, tc := range delta.ToolCalls {
 		acc := r.toolAccs[tc.Index]
+		if acc != nil && tc.ID != "" && acc.id != "" && tc.ID != acc.id {
+			// Some gateways reuse a provider index for a second tool call.
+			// Move the finished accumulator to a synthetic (negative) key so
+			// the new call gets a fresh one instead of merging into it.
+			synth := -(len(r.toolOrder) + 1)
+			r.toolAccs[synth] = acc
+			for i := len(r.toolOrder) - 1; i >= 0; i-- {
+				if r.toolOrder[i] == tc.Index {
+					r.toolOrder[i] = synth
+					break
+				}
+			}
+			delete(r.toolAccs, tc.Index)
+			acc = nil
+		}
 		if acc == nil {
 			acc = &chatStreamToolAcc{}
 			r.toolAccs[tc.Index] = acc

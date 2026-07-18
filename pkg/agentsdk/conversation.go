@@ -40,7 +40,7 @@ func BuildConversationTail(messages []ConversationMessage, state WorkingState, e
 			continue
 		}
 		content := strings.TrimSpace(msg.Content)
-		if content == "" {
+		if content == "" && len(msg.Images) == 0 {
 			continue
 		}
 		msg.Content = TruncateContextText(content, DefaultContextMessageCharLimit)
@@ -54,7 +54,7 @@ func BuildConversationTail(messages []ConversationMessage, state WorkingState, e
 	for _, msg := range filtered {
 		item := RunItem{
 			Type:    RunItemMessage,
-			Message: &MessageOutput{Text: msg.Content},
+			Message: &MessageOutput{Text: msg.Content, Images: msg.Images},
 		}
 		switch msg.Role {
 		case "assistant":
@@ -120,7 +120,7 @@ func DeriveWorkingStateGoal(rawReply, effectivePrompt string) string {
 		if effectivePrompt != "" {
 			return effectivePrompt
 		}
-	case strings.HasPrefix(lower, "deny:"), strings.HasPrefix(lower, "request changes:"), strings.HasPrefix(lower, "request_changes:"):
+	case strings.HasPrefix(lower, "approve:"), strings.HasPrefix(lower, "deny:"), strings.HasPrefix(lower, "request changes:"), strings.HasPrefix(lower, "request_changes:"):
 		if effectivePrompt != "" {
 			return effectivePrompt
 		}
@@ -296,22 +296,32 @@ func leadingSkippableCursor(messages []UserMessage, consumedImmediate map[int64]
 }
 
 // CollectImmediateRunItems converts unconsumed immediate user messages to run
-// items and marks them consumed.
+// items and marks them consumed. The returned cursor only advances over
+// leading messages that are safe to skip on a future load (blank messages and
+// consumed immediates); it stops at the first pending message — e.g. a queued
+// message — so feeding the cursor back into LoadMessages never drops input.
 func CollectImmediateRunItems(messages []UserMessage, consumedImmediate map[int64]struct{}) ([]RunItem, int64) {
 	var (
 		items      []RunItem
 		lastCursor int64
 	)
+	advancing := true
 	for _, msg := range messages {
-		lastCursor = msg.ID
+		content := strings.TrimSpace(msg.Content)
+		if content == "" && len(msg.Images) == 0 {
+			if advancing {
+				lastCursor = msg.ID
+			}
+			continue
+		}
 		if msg.Mode != UserMessageModeImmediate {
+			advancing = false
 			continue
 		}
 		if _, seen := consumedImmediate[msg.ID]; seen {
-			continue
-		}
-		content := strings.TrimSpace(msg.Content)
-		if content == "" && len(msg.Images) == 0 {
+			if advancing {
+				lastCursor = msg.ID
+			}
 			continue
 		}
 		consumedImmediate[msg.ID] = struct{}{}
@@ -319,6 +329,9 @@ func CollectImmediateRunItems(messages []UserMessage, consumedImmediate map[int6
 			Type:    RunItemMessage,
 			Message: &MessageOutput{Text: content, Images: msg.Images},
 		})
+		if advancing {
+			lastCursor = msg.ID
+		}
 	}
 	return items, lastCursor
 }

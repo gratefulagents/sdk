@@ -511,16 +511,34 @@ func TruncateBytes(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n-3] + "..."
+	if n <= 3 {
+		return s[:backUpToRuneStart(s, n)]
+	}
+	return s[:backUpToRuneStart(s, n-3)] + "..."
+}
+
+// backUpToRuneStart returns the largest cut ≤ n that does not split a UTF-8
+// rune. n must satisfy 0 <= n < len(s).
+func backUpToRuneStart(s string, n int) int {
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return n
 }
 
 // Truncate trims whitespace, replaces newlines with spaces, and truncates to n runes.
 func Truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\n", " ")
+	if n <= 0 {
+		return s
+	}
 	runes := []rune(s)
 	if len(runes) <= n {
 		return s
+	}
+	if n <= 3 {
+		return string(runes[:n])
 	}
 	return string(runes[:n-3]) + "..."
 }
@@ -534,19 +552,12 @@ func truncateMiddleBytes(s string, n int) string {
 	}
 	const marker = "\n…[elided]…\n"
 	if n <= len(marker) {
-		end := n
-		for end > 0 && !utf8.ValidString(s[:end]) {
-			end--
-		}
-		return s[:end]
+		return s[:backUpToRuneStart(s, n)]
 	}
 	keep := n - len(marker)
-	headEnd := keep * 2 / 3
-	for headEnd > 0 && !utf8.ValidString(s[:headEnd]) {
-		headEnd--
-	}
+	headEnd := backUpToRuneStart(s, keep*2/3)
 	tailStart := len(s) - (keep - headEnd)
-	for tailStart < len(s) && !utf8.ValidString(s[tailStart:]) {
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
 		tailStart++
 	}
 	return s[:headEnd] + marker + s[tailStart:]

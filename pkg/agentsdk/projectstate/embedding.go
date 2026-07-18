@@ -104,6 +104,12 @@ func rankHybrid(query string, candidates []Memory, queryVec []float32, vectors m
 				denseNorm = math.Max(0, cosineSimilarity(queryVec, vec))
 			}
 		}
+		// No relevance signal at all: pinned/recency boosts amplify relevance,
+		// they must not manufacture it, or recall pads the limit with
+		// query-irrelevant memories.
+		if lexNorm == 0 && denseNorm == 0 {
+			continue
+		}
 		score := cfg.LexicalWeight*lexNorm + cfg.DenseWeight*denseNorm
 		if mem.Kind == MemoryKindPinned {
 			score += cfg.PinnedBoost

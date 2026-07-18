@@ -7,23 +7,32 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
 
 // CompactionMetadataResolver fetches provider model metadata once and uses it
-// to derive SDK compaction defaults for OpenAI-compatible models.
+// to derive SDK compaction defaults for OpenAI-compatible models. A failed
+// fetch (e.g. a cancelled first caller or a transient network error) is
+// retried after a cooldown instead of being cached for the process lifetime.
 type CompactionMetadataResolver struct {
 	baseURL string
 	session *AuthSession
 
-	once sync.Once
-	byID map[string]ModelMetadata
-	err  error
+	fetchMu     sync.Mutex
+	fetched     bool
+	byID        map[string]ModelMetadata
+	lastErr     error
+	lastAttempt time.Time
 
 	mu     sync.Mutex
 	logged map[string]struct{}
 }
+
+// compactionMetadataRetryCooldown throttles re-fetch attempts after a failed
+// model-metadata fetch.
+const compactionMetadataRetryCooldown = 30 * time.Second
 
 func NewCompactionMetadataResolver(baseURL string, session ...*AuthSession) *CompactionMetadataResolver {
 	var authSession *AuthSession
@@ -41,25 +50,48 @@ func (r *CompactionMetadataResolver) Lookup(ctx context.Context, model string) (
 	if r == nil {
 		return ModelMetadata{}, false
 	}
-	r.once.Do(func() {
-		if r.session == nil {
-			r.err = fmt.Errorf("OpenAI auth session is required")
-			return
-		}
-		r.byID, r.err = FetchModelMetadataByID(ctx, r.baseURL, r.session)
-	})
-	if r.err != nil {
-		r.LogOnce("fetch-error", "WARN: failed to fetch OpenAI model metadata for compaction: %v", r.err)
+	byID, err := r.metadataByID(ctx)
+	if err != nil {
+		r.LogOnce("fetch-error", "WARN: failed to fetch OpenAI model metadata for compaction: %v", err)
 		return ModelMetadata{}, false
 	}
 
 	for _, key := range modelMetadataLookupKeys(model) {
-		if meta, ok := r.byID[key]; ok {
+		if meta, ok := byID[key]; ok {
 			return meta, true
 		}
 	}
 	r.LogOnce("missing:"+strings.ToLower(strings.TrimSpace(model)), "WARN: provider model metadata did not include %q; using conservative compaction defaults", model)
 	return ModelMetadata{}, false
+}
+
+// metadataByID returns the cached metadata map, fetching it on first use and
+// re-attempting failed fetches after compactionMetadataRetryCooldown.
+func (r *CompactionMetadataResolver) metadataByID(ctx context.Context) (map[string]ModelMetadata, error) {
+	r.fetchMu.Lock()
+	defer r.fetchMu.Unlock()
+	if r.fetched {
+		return r.byID, r.lastErr
+	}
+	if r.session == nil {
+		// No credentials will ever appear on this resolver; don't retry.
+		r.fetched = true
+		r.lastErr = fmt.Errorf("OpenAI auth session is required")
+		return nil, r.lastErr
+	}
+	if r.lastErr != nil && time.Since(r.lastAttempt) < compactionMetadataRetryCooldown {
+		return nil, r.lastErr
+	}
+	r.lastAttempt = time.Now()
+	byID, err := FetchModelMetadataByID(ctx, r.baseURL, r.session)
+	if err != nil {
+		r.lastErr = err
+		return nil, err
+	}
+	r.byID = byID
+	r.lastErr = nil
+	r.fetched = true
+	return r.byID, nil
 }
 
 func (r *CompactionMetadataResolver) LogOnce(key, format string, args ...any) {
