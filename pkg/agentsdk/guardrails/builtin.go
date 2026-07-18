@@ -177,6 +177,16 @@ var partialSecretSignatures = map[string]bool{
 	"GCP service-account key": true,
 }
 
+// RedactSecrets replaces every canonical secret-signature match in content
+// with a [REDACTED:<name>] marker. It returns the redacted content, the names
+// of the signatures that matched (in signature order), and the total match
+// count. This is the canonical SDK secret detector; other packages that
+// persist model or tool content (for example the trace store) should reuse it
+// instead of maintaining a parallel pattern list.
+func RedactSecrets(content string) (string, []string, int) {
+	return redactSecrets(content)
+}
+
 // redactSecrets replaces every secret-signature match in content with a
 // [REDACTED:<name>] marker. It returns the redacted content, the names of the
 // signatures that matched (in signature order), and the total match count.

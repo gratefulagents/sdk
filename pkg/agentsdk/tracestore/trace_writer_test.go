@@ -139,7 +139,8 @@ func TestTraceWriterMirrorsGenerationSnapshotsToLLMCalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tw := NewTraceWriter(store)
+	// Raw content capture requires the explicit full-capture opt-in.
+	tw := NewTraceWriterWithOptions(store, TraceWriterOptions{Capture: CaptureFull})
 	if err := tw.InitRun(RunMetadata{RunID: "run-1", StartedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}

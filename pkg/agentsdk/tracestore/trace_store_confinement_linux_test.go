@@ -151,8 +151,15 @@ func TestFilesystemTraceStoreReplacesHardlinkedAppendTargetWithoutChangingOutsid
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(inside) != "outside\n{\"inside\":true}\n" {
+	if string(inside) != "{\"inside\":true}\n" {
 		t.Fatalf("inside trace = %q", inside)
+	}
+	rotated, err := os.ReadFile(filepath.Join(root, "traces", "run-1", "events.jsonl.001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rotated) != "outside\n" {
+		t.Fatalf("rotated hardlinked chunk = %q, want original contents", rotated)
 	}
 }
 

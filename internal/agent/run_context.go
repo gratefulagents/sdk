@@ -36,6 +36,9 @@ func WithParentCallID(ctx context.Context, id string) context.Context {
 
 // ParentCallIDFromContext extracts the parent tool call ID, if any.
 func ParentCallIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
 	if v, ok := ctx.Value(parentCallIDKey{}).(string); ok {
 		return v
 	}

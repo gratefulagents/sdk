@@ -17,8 +17,7 @@ import (
 )
 
 const (
-	resolveConfinement      = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS
-	maxTraceAppendFileBytes = 64 << 20
+	resolveConfinement = unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS
 )
 
 func initializeFilesystemRoot(root string) (string, int, error) {
@@ -147,51 +146,99 @@ func (s *FilesystemTraceStore) createRunDir(runID string, metadata []byte) error
 	return nil
 }
 
+// appendTrace appends data to a category file in O(len(data)) using an
+// O_APPEND descriptor, instead of rewriting the whole file per record. When
+// the active chunk would exceed the per-file limit it is rotated to
+// "<name>.NNN" and a fresh chunk is started; once every rotation slot is
+// used, appends fail with ErrTraceCategoryFull.
 func (s *FilesystemTraceStore) appendTrace(runID, name string, data []byte) error {
+	if int64(len(data)) > s.maxAppendFileBytes {
+		return fmt.Errorf("append %s (%d bytes): %w", name, len(data), ErrTraceEventTooLarge)
+	}
 	runFD, err := s.openRun(runID)
 	if err != nil {
 		return fmt.Errorf("open run dir: %w", err)
 	}
 	defer unix.Close(runFD)
 
-	var existing []byte
-	fd, err := openBeneath(runFD, name, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
-	if err == nil {
-		file := os.NewFile(uintptr(fd), name)
-		info, statErr := file.Stat()
-		if statErr != nil {
-			_ = file.Close()
-			return fmt.Errorf("stat trace file: %w", statErr)
+	for {
+		fd, err := openBeneath(runFD, name,
+			unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return fmt.Errorf("open trace file: %w", err)
 		}
-		if !info.Mode().IsRegular() {
-			_ = file.Close()
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			unix.Close(fd)
+			return fmt.Errorf("stat trace file: %w", err)
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFREG {
+			unix.Close(fd)
 			return fmt.Errorf("trace file must be a regular file")
 		}
-		if info.Size() > maxTraceAppendFileBytes {
-			_ = file.Close()
-			return fmt.Errorf("trace file exceeds %d-byte append limit", maxTraceAppendFileBytes)
+		if st.Nlink != 1 {
+			// Never write through a hardlinked target: rotate it aside and
+			// continue in a fresh, single-link chunk.
+			unix.Close(fd)
+			if err := s.rotateTraceFile(runFD, name); err != nil {
+				return err
+			}
+			continue
 		}
-		existing, err = io.ReadAll(io.LimitReader(file, maxTraceAppendFileBytes+1))
-		_ = file.Close()
-		if err != nil {
-			return fmt.Errorf("read trace file: %w", err)
+		if st.Size+int64(len(data)) > s.maxAppendFileBytes {
+			unix.Close(fd)
+			if err := s.rotateTraceFile(runFD, name); err != nil {
+				return err
+			}
+			continue
 		}
-		if len(existing) > maxTraceAppendFileBytes {
-			return fmt.Errorf("trace file exceeds %d-byte append limit", maxTraceAppendFileBytes)
+		created := st.Size == 0
+		remaining := data
+		for len(remaining) > 0 {
+			n, writeErr := unix.Write(fd, remaining)
+			if writeErr != nil {
+				unix.Close(fd)
+				return fmt.Errorf("append trace: %w", writeErr)
+			}
+			remaining = remaining[n:]
 		}
-	} else if !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("open trace file: %w", err)
+		if err := unix.Fdatasync(fd); err != nil {
+			unix.Close(fd)
+			return fmt.Errorf("sync trace file: %w", err)
+		}
+		unix.Close(fd)
+		if created {
+			if err := unix.Fsync(runFD); err != nil {
+				return fmt.Errorf("sync run directory: %w", err)
+			}
+		}
+		return nil
 	}
-	if len(existing)+len(data) > maxTraceAppendFileBytes {
-		return fmt.Errorf("trace file exceeds %d-byte append limit", maxTraceAppendFileBytes)
+}
+
+// rotateTraceFile renames the active chunk to the first free "<name>.NNN"
+// slot. Rotation slots bound total per-category storage to
+// (maxRotations+1) x maxAppendFileBytes.
+func (s *FilesystemTraceStore) rotateTraceFile(runFD int, name string) error {
+	for i := 1; i <= s.maxRotations; i++ {
+		rotated := fmt.Sprintf("%s.%03d", name, i)
+		fd, err := openBeneath(runFD, rotated, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+		if err == nil {
+			unix.Close(fd)
+			continue
+		}
+		if !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("probe rotated trace file: %w", err)
+		}
+		if err := unix.Renameat(runFD, name, runFD, rotated); err != nil {
+			return fmt.Errorf("rotate trace file: %w", err)
+		}
+		if err := unix.Fsync(runFD); err != nil {
+			return fmt.Errorf("sync run directory: %w", err)
+		}
+		return nil
 	}
-	combined := make([]byte, 0, len(existing)+len(data))
-	combined = append(combined, existing...)
-	combined = append(combined, data...)
-	if err := atomicWriteAt(runFD, name, combined); err != nil {
-		return fmt.Errorf("append trace: %w", err)
-	}
-	return nil
+	return fmt.Errorf("append %s: %w", name, ErrTraceCategoryFull)
 }
 
 func (s *FilesystemTraceStore) writeFile(runID, relPath string, data []byte) error {
