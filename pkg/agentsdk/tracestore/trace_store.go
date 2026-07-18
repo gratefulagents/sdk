@@ -2,11 +2,41 @@ package tracestore
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+)
+
+// Storage bounds enforced by the store. They keep a single runaway event,
+// category, or file from exhausting disk on long-running workloads.
+const (
+	// defaultMaxTraceEventBytes bounds a single AppendTrace record.
+	defaultMaxTraceEventBytes = 1 << 20 // 1 MiB
+	// defaultMaxTraceAppendFileBytes bounds one append-category chunk before
+	// it is rotated.
+	defaultMaxTraceAppendFileBytes = 64 << 20 // 64 MiB
+	// defaultMaxTraceWriteFileBytes bounds a single WriteFile payload.
+	defaultMaxTraceWriteFileBytes = 16 << 20 // 16 MiB
+	// defaultMaxTraceRotations bounds how many rotated chunks a category may
+	// accumulate before further appends fail with ErrTraceCategoryFull.
+	defaultMaxTraceRotations = 4
+)
+
+// Sentinel errors that let callers distinguish quota exhaustion (data was
+// intentionally not persisted) from unexpected I/O failures.
+var (
+	// ErrTraceEventTooLarge reports that a single record exceeded the
+	// per-event byte limit.
+	ErrTraceEventTooLarge = errors.New("trace event exceeds per-event byte limit")
+	// ErrTraceCategoryFull reports that an append category has exhausted its
+	// active chunk and all rotation slots.
+	ErrTraceCategoryFull = errors.New("trace category exceeds storage quota")
+	// ErrTraceFileTooLarge reports that a WriteFile payload exceeded the
+	// per-file byte limit.
+	ErrTraceFileTooLarge = errors.New("trace file exceeds per-file byte limit")
 )
 
 // RunMetadata describes a single evaluation/observation run.
@@ -53,9 +83,14 @@ type ScoreMetrics struct {
 type TraceStore interface {
 	// CreateRunDir initialises a run directory and writes metadata.json.
 	CreateRunDir(runID string, metadata RunMetadata) (string, error)
-	// AppendTrace appends a single NDJSON line to a category file (e.g. "llm_calls").
+	// AppendTrace appends a single NDJSON line to a category file (e.g.
+	// "llm_calls"). Appends are O(len(data)); when the active chunk would
+	// exceed the per-file quota it is rotated to "<category>.jsonl.NNN".
+	// Returns ErrTraceEventTooLarge for oversized records and
+	// ErrTraceCategoryFull once every rotation slot is used.
 	AppendTrace(runID string, category string, data []byte) error
-	// WriteFile writes arbitrary data to a path relative to the run directory.
+	// WriteFile writes arbitrary data to a path relative to the run
+	// directory. Returns ErrTraceFileTooLarge for oversized payloads.
 	WriteFile(runID string, relPath string, data []byte) error
 	// WriteScore writes score.json into the run directory.
 	WriteScore(runID string, score Score) error
@@ -82,6 +117,13 @@ type FilesystemTraceStore struct {
 	root   string
 	rootFD int
 	mu     sync.Mutex
+
+	// Quotas. Set to defaults by NewFilesystemTraceStore; tests may lower
+	// them to exercise limit behavior.
+	maxEventBytes      int
+	maxAppendFileBytes int64
+	maxWriteFileBytes  int
+	maxRotations       int
 }
 
 // NewFilesystemTraceStore creates a store rooted at the given directory.
@@ -90,7 +132,14 @@ func NewFilesystemTraceStore(root string) (*FilesystemTraceStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FilesystemTraceStore{root: canonicalRoot, rootFD: rootFD}, nil
+	return &FilesystemTraceStore{
+		root:               canonicalRoot,
+		rootFD:             rootFD,
+		maxEventBytes:      defaultMaxTraceEventBytes,
+		maxAppendFileBytes: defaultMaxTraceAppendFileBytes,
+		maxWriteFileBytes:  defaultMaxTraceWriteFileBytes,
+		maxRotations:       defaultMaxTraceRotations,
+	}, nil
 }
 
 func (s *FilesystemTraceStore) tracesDir() string {
@@ -134,6 +183,9 @@ func (s *FilesystemTraceStore) AppendTrace(runID string, category string, data [
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		data = append(data, '\n')
 	}
+	if len(data) > s.maxEventBytes {
+		return fmt.Errorf("append %s (%d bytes): %w", safeCategory, len(data), ErrTraceEventTooLarge)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -150,6 +202,9 @@ func (s *FilesystemTraceStore) WriteFile(runID string, relPath string, data []by
 	safeRelPath, err := safeTraceRelPath(relPath)
 	if err != nil {
 		return err
+	}
+	if len(data) > s.maxWriteFileBytes {
+		return fmt.Errorf("write %s (%d bytes): %w", safeRelPath, len(data), ErrTraceFileTooLarge)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

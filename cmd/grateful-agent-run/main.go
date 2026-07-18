@@ -68,13 +68,14 @@ type cliConfig struct {
 	AllowPrivateNetworkURLs bool
 	TerminalBenchCompliance bool
 
-	Output      string
-	EventLog    string
-	TraceRoot   string
-	RunID       string
-	TaskID      string
-	CandidateID string
-	Mode        string
+	Output       string
+	EventLog     string
+	TraceRoot    string
+	TraceCapture string
+	RunID        string
+	TaskID       string
+	CandidateID  string
+	Mode         string
 }
 
 type outputEnvelope struct {
@@ -166,12 +167,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		if runID == "" {
 			runID = defaultRunID()
 		}
+		var capture tracestore.CaptureMode
+		switch strings.ToLower(strings.TrimSpace(cfg.TraceCapture)) {
+		case "", string(tracestore.CaptureMetadata):
+			capture = tracestore.CaptureMetadata
+		case string(tracestore.CaptureFull):
+			capture = tracestore.CaptureFull
+		default:
+			return fmt.Errorf("invalid trace capture policy %q: use %q or %q", cfg.TraceCapture, tracestore.CaptureMetadata, tracestore.CaptureFull)
+		}
 		traceStore, err = tracestore.NewFilesystemTraceStore(cfg.TraceRoot)
 		if err != nil {
 			return fmt.Errorf("create trace store: %w", err)
 		}
 		defer traceStore.Close()
-		traceWriter = tracestore.NewTraceWriter(traceStore)
+		traceWriter = tracestore.NewTraceWriterWithOptions(traceStore, tracestore.TraceWriterOptions{Capture: capture})
 	}
 
 	bundle, err := buildBundle(ctx, cfg, workDir, eventFile, traceWriter)
@@ -371,6 +381,7 @@ func parseConfig(args []string) (cliConfig, []string, error) {
 		TerminalBenchCompliance:  envBool("GRATEFUL_TB_COMPLIANCE", false),
 		Output:                   envOr("GRATEFUL_OUTPUT", "text"),
 		TraceRoot:                envOr("GRATEFUL_TRACE_ROOT", ""),
+		TraceCapture:             envOr("GRATEFUL_TRACE_CAPTURE", string(tracestore.CaptureMetadata)),
 		CandidateID:              envOr("GRATEFUL_CANDIDATE_ID", ""),
 		Mode:                     envOr("GRATEFUL_MODE", "eval"),
 	}
@@ -421,6 +432,7 @@ func parseConfig(args []string) (cliConfig, []string, error) {
 	fs.StringVar(&cfg.Output, "output", cfg.Output, "output format: text or json")
 	fs.StringVar(&cfg.EventLog, "event-log", cfg.EventLog, "write session event JSONL to this file")
 	fs.StringVar(&cfg.TraceRoot, "trace-root", cfg.TraceRoot, "write trace artifacts under this root")
+	fs.StringVar(&cfg.TraceCapture, "trace-capture", cfg.TraceCapture, "trace capture policy: metadata (default, content digests only) or full (raw prompts/tool I/O, high-trust roots only)")
 	fs.StringVar(&cfg.RunID, "run-id", cfg.RunID, "trace run id")
 	fs.StringVar(&cfg.TaskID, "task-id", cfg.TaskID, "evaluation task id")
 	fs.StringVar(&cfg.CandidateID, "candidate-id", cfg.CandidateID, "evaluation candidate id")
