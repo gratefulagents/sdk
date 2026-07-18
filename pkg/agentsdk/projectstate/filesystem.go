@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -164,24 +165,54 @@ func (b *fsBackend) ensureDirs() error {
 
 func (b *fsBackend) acquireLock(ctx context.Context) (func(), error) {
 	lockPath := filepath.Join(b.stateDir, "locks", "state.lock")
+	token := newID("lock")
 	for {
 		f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err == nil {
-			_, _ = fmt.Fprintf(f, "pid=%d\ntime=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+			_, _ = fmt.Fprintf(f, "pid=%d\ntoken=%s\ntime=%s\n", os.Getpid(), token, time.Now().UTC().Format(time.RFC3339Nano))
 			_ = f.Close()
-			return func() { _ = os.Remove(lockPath) }, nil
+			return func() { releaseProjectStateLock(lockPath, token) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("acquire project state lock: %w", err)
 		}
 		if staleProjectStateLock(lockPath) {
-			_ = os.Remove(lockPath)
+			breakStaleProjectStateLock(lockPath)
 			continue
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// breakStaleProjectStateLock removes a stale lock by atomically renaming it
+// aside first. Removing in place would let two waiters both observe staleness
+// and one of them delete the other's freshly created lock; the rename can only
+// succeed for one waiter.
+func breakStaleProjectStateLock(lockPath string) {
+	stale := lockPath + ".stale-" + newID("break")
+	if err := os.Rename(lockPath, stale); err == nil {
+		_ = os.Remove(stale)
+	}
+}
+
+// releaseProjectStateLock removes the lock only if it still carries our token,
+// so a holder whose stale lock was broken and re-acquired by someone else does
+// not delete the new holder's lock.
+func releaseProjectStateLock(lockPath, token string) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "token="); ok {
+			if strings.TrimSpace(value) == token {
+				_ = os.Remove(lockPath)
+			}
+			return
 		}
 	}
 }
@@ -240,22 +271,46 @@ func (b *fsBackend) loadEvents() ([]Event, error) {
 	}
 	defer f.Close()
 	var events []Event
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	reader := bufio.NewReaderSize(f, 64*1024)
+	// A parse failure on the final line is tolerated as a torn write from a
+	// crash mid-append; anything followed by more data is real corruption.
+	// A torn tail is truncated away before returning so the next append
+	// cannot glue a fresh event onto the malformed bytes (which would lose
+	// the new event or brick the store on the following load).
+	var (
+		tornErr  error
+		offset   int64 // bytes consumed so far
+		validLen int64 // file length ending at the last parseable line
+	)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		offset += int64(len(line))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			if tornErr != nil {
+				return nil, tornErr
+			}
+			var ev Event
+			if err := json.Unmarshal(trimmed, &ev); err != nil {
+				tornErr = fmt.Errorf("parse event: %w", err)
+			} else {
+				events = append(events, ev)
+				validLen = offset
+			}
+		} else if tornErr == nil {
+			validLen = offset
 		}
-		var ev Event
-		if err := json.Unmarshal(line, &ev); err != nil {
-			return nil, fmt.Errorf("parse event: %w", err)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("scan events: %w", readErr)
 		}
-		events = append(events, ev)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan events: %w", err)
+	if tornErr != nil {
+		if err := os.Truncate(path, validLen); err != nil {
+			return nil, fmt.Errorf("truncate torn event tail: %w", err)
+		}
 	}
 	return events, nil
 }
@@ -273,6 +328,9 @@ func (b *fsBackend) appendEvent(ev Event) error {
 	defer f.Close()
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		return fmt.Errorf("append event: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync events: %w", err)
 	}
 	return nil
 }
@@ -315,36 +373,83 @@ func (b *fsBackend) snapshot(st *state) error {
 func (b *fsBackend) readEmbeddings() (map[string]embeddingRecord, error) {
 	b.embedMu.Lock()
 	defer b.embedMu.Unlock()
-	path := filepath.Join(b.stateDir, "indexes", embeddingsFileName)
-	data, err := os.ReadFile(path)
+	cache, err := b.readEmbeddingCacheLocked()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]embeddingRecord{}, nil
-		}
 		return nil, err
-	}
-	var cache embeddingCache
-	if err := json.Unmarshal(data, &cache); err != nil {
-		// A corrupt derived cache should not break recall; rebuild lazily.
-		return map[string]embeddingRecord{}, nil
-	}
-	if cache.Vectors == nil {
-		cache.Vectors = map[string]embeddingRecord{}
 	}
 	return cache.Vectors, nil
 }
 
-// writeEmbeddings atomically persists the vector cache.
-func (b *fsBackend) writeEmbeddings(records map[string]embeddingRecord, model string) error {
+func (b *fsBackend) readEmbeddingCacheLocked() (embeddingCache, error) {
+	path := filepath.Join(b.stateDir, "indexes", embeddingsFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return embeddingCache{Vectors: map[string]embeddingRecord{}}, nil
+		}
+		return embeddingCache{}, err
+	}
+	var cache embeddingCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		// A corrupt derived cache should not break recall; rebuild lazily.
+		return embeddingCache{Vectors: map[string]embeddingRecord{}}, nil
+	}
+	if cache.Vectors == nil {
+		cache.Vectors = map[string]embeddingRecord{}
+	}
+	return cache, nil
+}
+
+// upsertEmbeddings merges the given records into the cache file. The re-read
+// and write happen under embedMu so concurrent cachers in this process cannot
+// clobber each other's vectors.
+func (b *fsBackend) upsertEmbeddings(records map[string]embeddingRecord, model string) error {
 	b.embedMu.Lock()
 	defer b.embedMu.Unlock()
+	cache, err := b.readEmbeddingCacheLocked()
+	if err != nil {
+		return err
+	}
+	for id, rec := range records {
+		cache.Vectors[id] = rec
+	}
+	return b.writeEmbeddingCacheLocked(cache.Vectors, model)
+}
+
+// deleteEmbeddings removes cached vectors for the given memory ids.
+func (b *fsBackend) deleteEmbeddings(ids []string) error {
+	b.embedMu.Lock()
+	defer b.embedMu.Unlock()
+	cache, err := b.readEmbeddingCacheLocked()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, id := range ids {
+		if _, ok := cache.Vectors[id]; ok {
+			delete(cache.Vectors, id)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return b.writeEmbeddingCacheLocked(cache.Vectors, cache.Model)
+}
+
+func (b *fsBackend) writeEmbeddingCacheLocked(records map[string]embeddingRecord, model string) error {
 	cache := embeddingCache{
 		SchemaVersion: SchemaVersion,
 		Model:         model,
 		UpdatedAt:     time.Now().UTC(),
 		Vectors:       records,
 	}
-	return writeJSONAtomic(filepath.Join(b.stateDir, "indexes", embeddingsFileName), cache)
+	// Compact JSON: the vector cache is machine-only and can reach megabytes.
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", embeddingsFileName, err)
+	}
+	return writeFileAtomic(filepath.Join(b.stateDir, "indexes", embeddingsFileName), append(data, '\n'))
 }
 
 func writeJSONAtomic(path string, value any) error {
@@ -352,7 +457,10 @@ func writeJSONAtomic(path string, value any) error {
 	if err != nil {
 		return fmt.Errorf("marshal %s: %w", filepath.Base(path), err)
 	}
-	data = append(data, '\n')
+	return writeFileAtomic(path, append(data, '\n'))
+}
+
+func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)

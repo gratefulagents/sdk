@@ -39,7 +39,8 @@ func newThinkingDeltaEmitter(es *EventStream, attemptID, agentName string) *thin
 // Chunk buffers a reasoning text chunk, flushing when the flush interval has
 // elapsed or the buffer is large. The first chunk flushes immediately (zero
 // lastFlush) so the UI flips to live reasoning without waiting a full period.
-// Safe for concurrent use, though transports deliver chunks sequentially.
+// Race-free under concurrent use, but flush emission order is only guaranteed
+// when callers serialize; transports deliver chunks sequentially.
 func (e *thinkingDeltaEmitter) Chunk(text string) {
 	if text == "" {
 		return

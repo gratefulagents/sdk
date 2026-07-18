@@ -448,7 +448,12 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		bundle.Tools = append(bundle.Tools, projectStateTools(cfg, features.value.ProjectState)...)
 	}
 	if features.value.Tools.ExtraTools {
-		bundle.Tools = append(bundle.Tools, cfg.ExtraTools...)
+		for _, tool := range cfg.ExtraTools {
+			if tool == nil {
+				continue
+			}
+			bundle.Tools = append(bundle.Tools, tool)
+		}
 	}
 	if features.value.Tools.VisionAnalyzer {
 		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
@@ -1303,6 +1308,9 @@ func cloneStringMap(values map[string]string) map[string]string {
 func toolNames(tools []agentsdk.Tool) []string {
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
 		names = append(names, tool.Name())
 	}
 	return names

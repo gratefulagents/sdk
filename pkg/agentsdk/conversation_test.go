@@ -118,8 +118,11 @@ func TestCollectImmediateRunItemsPreservesOrderAndCursor(t *testing.T) {
 	consumed := map[int64]struct{}{}
 
 	items, cursor := CollectImmediateRunItems(messages, consumed)
-	if cursor != 22 {
-		t.Fatalf("cursor = %d, want 22", cursor)
+	// The queued message (ID 20) is still pending, so the cursor must not
+	// advance past it: feeding the cursor back into LoadMessages would
+	// otherwise drop the queued input.
+	if cursor != 0 {
+		t.Fatalf("cursor = %d, want 0 (queued message 20 must remain pending)", cursor)
 	}
 	if len(items) != 2 {
 		t.Fatalf("len(items) = %d, want 2", len(items))

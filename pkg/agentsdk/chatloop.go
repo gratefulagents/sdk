@@ -80,6 +80,12 @@ type RunStatusSink interface {
 }
 
 // ConfigSource supplies dynamic host configuration without leaking platform types.
+//
+// ChatLoop applies PermissionMode, ModeSnapshot (read-only tool-access clamp
+// and turn constraints), GuardrailRules, ModeDirective, and HandoffHistory in
+// prepareRun. RoleCatalog is surfaced for hosts that build specialist tools
+// (e.g. via BuildSpecialistToolsFromCatalog in a PlatformToolFactory); ChatLoop
+// does not consume it directly.
 type ConfigSource interface {
 	PermissionMode(ctx context.Context) (PermissionMode, error)
 	ModeSnapshot(ctx context.Context) (*sdkmode.TemplateSpec, error)
@@ -132,6 +138,16 @@ func NewChatLoop(opts ChatLoopOptions) *ChatLoop {
 	return &ChatLoop{opts: opts}
 }
 
+// Cursor returns the loop's current session-store position. After Run it
+// reflects the messages already consumed, so hosts can persist it and later
+// loops (or a rebuilt ChatLoop) do not re-feed the same messages.
+func (l *ChatLoop) Cursor() Cursor {
+	if l == nil {
+		return Cursor{}
+	}
+	return l.opts.Cursor
+}
+
 // Run executes a host-backed chat loop.
 //
 // The loop can resume after SDK tool approvals. Hosts still own their platform
@@ -163,6 +179,8 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 	history := append([]RunItem(nil), inputItems...)
 	var allNewItems []RunItem
 	var allResponses []ModelResponse
+	var allToolInputResults []ToolGuardrailResult
+	var allToolOutputResults []ToolGuardrailResult
 	var totalUsage Usage
 	maxResumes := l.opts.MaxResumes
 	if maxResumes <= 0 {
@@ -176,6 +194,8 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		}
 		allNewItems = append(allNewItems, result.NewItems...)
 		allResponses = append(allResponses, result.RawResponses...)
+		allToolInputResults = append(allToolInputResults, result.ToolInputGuardrailResults...)
+		allToolOutputResults = append(allToolOutputResults, result.ToolOutputGuardrailResults...)
 		totalUsage.Add(result.Usage)
 		if len(result.FinalHistory) > 0 {
 			// Adopt the runner's post-run conversation state: mid-run
@@ -187,14 +207,28 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		}
 		if l.opts.SessionStore != nil {
 			if err := l.opts.SessionStore.AppendRunItems(ctx, result.NewItems); err != nil {
-				combined := combineLoopResult(result, allNewItems, allResponses, totalUsage)
+				combined := combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
 				return combined, fmt.Errorf("append run items: %w", err)
 			}
 		}
 
-		combined := combineLoopResult(result, allNewItems, allResponses, totalUsage)
+		combined := combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
 		if result.IsInterrupted() {
 			if l.opts.ApprovalGate == nil {
+				// No gate can resolve the pending calls: pair each dangling
+				// tool_use with a denied approval and error output so the
+				// persisted history stays replayable.
+				denied := denyPendingInterruptions(result.AllInterruptions(), "tool call denied: no approval gate configured")
+				if len(denied) > 0 {
+					allNewItems = append(allNewItems, denied...)
+					if l.opts.SessionStore != nil {
+						if err := l.opts.SessionStore.AppendRunItems(ctx, denied); err != nil {
+							combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+							return combined, fmt.Errorf("append denied approval items: %w", err)
+						}
+					}
+					combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+				}
 				return l.finalize(ctx, combined)
 			}
 			if resumes >= maxResumes {
@@ -205,9 +239,15 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			// paired output before the next model call.
 			var items []RunItem
 			var resolveErr error
+			var pauseRequested bool
 			for _, pending := range result.AllInterruptions() {
-				resolved, err := l.resolveToolApproval(ctx, &agent, runCfg, pending)
+				resolved, inputResults, outputResults, shouldPause, err := l.resolveToolApproval(ctx, &agent, runCfg, pending)
 				items = append(items, resolved...)
+				allToolInputResults = append(allToolInputResults, inputResults...)
+				allToolOutputResults = append(allToolOutputResults, outputResults...)
+				if shouldPause {
+					pauseRequested = true
+				}
 				if err != nil {
 					resolveErr = err
 					break
@@ -219,13 +259,28 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			}
 			if len(items) > 0 && l.opts.SessionStore != nil {
 				if err := l.opts.SessionStore.AppendRunItems(ctx, items); err != nil {
-					combined = combineLoopResult(result, allNewItems, allResponses, totalUsage)
+					combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
 					return combined, fmt.Errorf("append approval items: %w", err)
 				}
 			}
+			combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
 			if resolveErr != nil {
-				combined = combineLoopResult(result, allNewItems, allResponses, totalUsage)
 				return combined, resolveErr
+			}
+			if pauseRequested {
+				// An approved tool requested a pause (ToolResult.ShouldPause);
+				// hand control back to the host like the runner's own pause
+				// path instead of immediately resuming another model call.
+				// The approvals were resolved above, so the interrupted
+				// result's pending state must not leak: clear the
+				// interruption fields and adopt the loop's history (which
+				// includes the resolved approval + tool output items) so
+				// hosts neither re-prompt for the same approval nor replay
+				// an unpaired tool call.
+				combined.Interruption = nil
+				combined.Interruptions = nil
+				combined.FinalHistory = append([]RunItem(nil), history...)
+				return l.finalize(ctx, combined)
 			}
 			continue
 		}
@@ -261,8 +316,28 @@ func (l *ChatLoop) prepareRun(ctx context.Context) (Agent, RunConfig, error) {
 			if len(errs) > 0 {
 				return Agent{}, RunConfig{}, fmt.Errorf("compile guardrail rules: %w", errors.Join(errs...))
 			}
-			runCfg.ToolInputGuardrails = append(runCfg.ToolInputGuardrails, inputGuardrails...)
-			runCfg.ToolOutputGuardrails = append(runCfg.ToolOutputGuardrails, outputGuardrails...)
+			// Copy before appending: runCfg shares slice headers with
+			// l.opts.RunConfig, and appending in place could write into a
+			// host-owned backing array shared across loops or Run calls.
+			runCfg.ToolInputGuardrails = append(append([]ToolInputGuardrail(nil), runCfg.ToolInputGuardrails...), inputGuardrails...)
+			runCfg.ToolOutputGuardrails = append(append([]ToolOutputGuardrail(nil), runCfg.ToolOutputGuardrails...), outputGuardrails...)
+		}
+		if snapshot, err := l.opts.ConfigSource.ModeSnapshot(ctx); err != nil {
+			return Agent{}, RunConfig{}, fmt.Errorf("load mode snapshot: %w", err)
+		} else if snapshot != nil {
+			// A read-only mode clamps tool access regardless of what the
+			// permission mode granted (mirrors runtime/builder enforcement).
+			if NormalizeToolAccessLevel(ToolAccessLevel(snapshot.ToolAccess)) == ToolAccessLevelReadOnly {
+				runCfg.ToolAccessLevel = ToolAccessLevelReadOnly
+			}
+			if snapshot.Constraints != nil {
+				if runCfg.MaxTurns == 0 && snapshot.Constraints.MaxTurns > 0 {
+					runCfg.MaxTurns = snapshot.Constraints.MaxTurns
+				}
+				if runCfg.SubAgentMaxTurns == 0 && snapshot.Constraints.SubAgentMaxTurns > 0 {
+					runCfg.SubAgentMaxTurns = snapshot.Constraints.SubAgentMaxTurns
+				}
+			}
 		}
 	}
 
@@ -300,18 +375,28 @@ func (l *ChatLoop) loadInputItems(ctx context.Context) ([]RunItem, error) {
 		if limit <= 0 {
 			limit = 50
 		}
-		messages, _, err := l.opts.SessionStore.LoadMessages(ctx, l.opts.Cursor, limit)
-		if err != nil {
-			return nil, fmt.Errorf("load session messages: %w", err)
-		}
-		for _, msg := range messages {
-			if strings.TrimSpace(msg.Content) == "" {
-				continue
+		// Drain the store page by page so messages beyond one page are not
+		// silently dropped; the advancing cursor is kept on the loop so a
+		// later Run does not re-feed already consumed messages.
+		for {
+			messages, next, err := l.opts.SessionStore.LoadMessages(ctx, l.opts.Cursor, limit)
+			if err != nil {
+				return nil, fmt.Errorf("load session messages: %w", err)
 			}
-			inputItems = append(inputItems, RunItem{
-				Type:    RunItemMessage,
-				Message: &MessageOutput{Text: msg.Content},
-			})
+			for _, msg := range messages {
+				if strings.TrimSpace(msg.Content) == "" && len(msg.Images) == 0 {
+					continue
+				}
+				inputItems = append(inputItems, RunItem{
+					Type:    RunItemMessage,
+					Message: &MessageOutput{Text: msg.Content, Images: msg.Images},
+				})
+			}
+			cursorAdvanced := next != l.opts.Cursor
+			l.opts.Cursor = next
+			if len(messages) < limit || !cursorAdvanced {
+				break
+			}
 		}
 	}
 	return inputItems, nil
@@ -410,17 +495,30 @@ func normalizeGuardrailRuleAction(rule GuardrailRule) (string, error) {
 	}
 }
 
+// matchToolPattern matches a tool name against a glob-style pattern where
+// each "*" matches any (possibly empty) substring. Patterns like "*sql*" and
+// "mcp_*_write" are handled correctly instead of silently matching nothing.
 func matchToolPattern(name, pattern string) bool {
-	if pattern == "*" {
-		return true
+	segments := strings.Split(pattern, "*")
+	if len(segments) == 1 {
+		return name == pattern
 	}
-	if strings.HasSuffix(pattern, "*") {
-		return strings.HasPrefix(name, strings.TrimSuffix(pattern, "*"))
+	if !strings.HasPrefix(name, segments[0]) {
+		return false
 	}
-	if strings.HasPrefix(pattern, "*") {
-		return strings.HasSuffix(name, strings.TrimPrefix(pattern, "*"))
+	rest := name[len(segments[0]):]
+	last := segments[len(segments)-1]
+	for _, seg := range segments[1 : len(segments)-1] {
+		if seg == "" {
+			continue
+		}
+		idx := strings.Index(rest, seg)
+		if idx < 0 {
+			return false
+		}
+		rest = rest[idx+len(seg):]
 	}
-	return name == pattern
+	return strings.HasSuffix(rest, last)
 }
 
 func (l *ChatLoop) finalize(ctx context.Context, result *RunResult) (*RunResult, error) {
@@ -437,9 +535,9 @@ func (l *ChatLoop) finalize(ctx context.Context, result *RunResult) (*RunResult,
 	return result, nil
 }
 
-func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg RunConfig, pending *Interruption) ([]RunItem, error) {
+func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg RunConfig, pending *Interruption) ([]RunItem, []ToolGuardrailResult, []ToolGuardrailResult, bool, error) {
 	if pending == nil {
-		return nil, nil
+		return nil, nil, nil, false, nil
 	}
 	approved, reason, err := l.opts.ApprovalGate.ApproveTool(ctx, ToolApprovalRequest{
 		ToolName: pending.ToolName,
@@ -447,7 +545,7 @@ func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg Ru
 		Reason:   "tool approval required",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("approve tool %q: %w", pending.ToolName, err)
+		return nil, nil, nil, false, fmt.Errorf("approve tool %q: %w", pending.ToolName, err)
 	}
 	items := []RunItem{{
 		Type: RunItemToolApproval,
@@ -471,9 +569,9 @@ func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg Ru
 				IsError: true,
 			},
 		})
-		return items, nil
+		return items, nil, nil, false, nil
 	}
-	item, _, _, _, err := l.opts.Runner.ExecuteApprovedTool(ctx, agent, ToolCallData{
+	item, inputResults, outputResults, shouldPause, err := l.opts.Runner.ExecuteApprovedTool(ctx, agent, ToolCallData{
 		ID:    pending.ToolCallID,
 		Name:  pending.ToolName,
 		Input: cloneRawMessage(pending.ToolInput),
@@ -481,16 +579,51 @@ func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg Ru
 	if item.ToolOutput != nil {
 		items = append(items, item)
 	}
-	return items, err
+	return items, inputResults, outputResults, shouldPause, err
 }
 
-func combineLoopResult(result *RunResult, newItems []RunItem, responses []ModelResponse, usage Usage) *RunResult {
+// denyPendingInterruptions synthesizes denied approval + error output pairs
+// for pending tool calls that cannot be approved (no ApprovalGate). Without
+// the paired outputs, persisted history would end with dangling tool_use
+// items that providers reject on replay.
+func denyPendingInterruptions(pending []*Interruption, reason string) []RunItem {
+	var items []RunItem
+	for _, p := range pending {
+		if p == nil {
+			continue
+		}
+		items = append(items,
+			RunItem{
+				Type: RunItemToolApproval,
+				ToolApproval: &ToolApprovalData{
+					ToolName: p.ToolName,
+					Input:    cloneRawMessage(p.ToolInput),
+					CallID:   p.ToolCallID,
+					Approved: false,
+				},
+			},
+			RunItem{
+				Type: RunItemToolOutput,
+				ToolOutput: &ToolOutputData{
+					CallID:  p.ToolCallID,
+					Content: reason,
+					IsError: true,
+				},
+			},
+		)
+	}
+	return items
+}
+
+func combineLoopResult(result *RunResult, newItems []RunItem, responses []ModelResponse, toolInputResults, toolOutputResults []ToolGuardrailResult, usage Usage) *RunResult {
 	if result == nil {
 		return nil
 	}
 	combined := *result
 	combined.NewItems = append([]RunItem(nil), newItems...)
 	combined.RawResponses = append([]ModelResponse(nil), responses...)
+	combined.ToolInputGuardrailResults = append([]ToolGuardrailResult(nil), toolInputResults...)
+	combined.ToolOutputGuardrailResults = append([]ToolGuardrailResult(nil), toolOutputResults...)
 	combined.Usage = usage
 	return &combined
 }

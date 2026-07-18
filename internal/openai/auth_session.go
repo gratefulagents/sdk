@@ -499,8 +499,16 @@ func (s *OpenAIAuthSession) promptCacheCredentialScope() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// oauthAccessTokenExpiryLead refreshes a JWT access token shortly before its
+// exp claim so requests are not sent with an about-to-expire (or expired)
+// token, which would cost a failed 401 round trip per request.
+const oauthAccessTokenExpiryLead = 5 * time.Minute
+
 func shouldRefreshOAuthAccessToken(accessToken string, lastRefresh time.Time, now time.Time) bool {
 	if strings.TrimSpace(accessToken) == "" {
+		return true
+	}
+	if exp, ok := accessTokenExpiry(accessToken); ok && !now.Add(oauthAccessTokenExpiryLead).Before(exp) {
 		return true
 	}
 	if !lastRefresh.IsZero() && (lastRefresh.Before(now.Add(-oauthRefreshInterval)) || lastRefresh.Equal(now.Add(-oauthRefreshInterval))) {
@@ -863,10 +871,53 @@ func collectSSEToJSON(resp *http.Response) (*http.Response, error) {
 	buf := make([]byte, 0, 4096)
 	remainder := make([]byte, 0, 512)
 
+	// processLine handles one SSE line and reports whether the stream signaled
+	// completion via "[DONE]". Spec-legal "data:" prefixes without a following
+	// space are accepted.
+	processLine := func(line []byte) (streamDone bool) {
+		line = bytes.TrimRight(line, "\r")
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			return false
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return true
+		}
+		if len(data) == 0 {
+			return false
+		}
+		eventCount++
+		// Parse to check event type.
+		var evt collectedSSEEvent
+		if json.Unmarshal(data, &evt) == nil {
+			if resp.Request != nil {
+				modelactivity.Notify(resp.Request.Context())
+			}
+			lastEventType = evt.Type
+			collectSSEOutputEvent(outputItems, evt)
+			// Capture response.completed as the primary source.
+			if evt.Type == "response.completed" && len(evt.Response) > 0 {
+				completedData = []byte(evt.Response)
+			}
+			// Also capture the latest response from ANY event that
+			// carries one, as a fallback. The openai-oauth reference
+			// impl does this for robustness.
+			if len(evt.Response) > 0 {
+				latestResponseData = []byte(evt.Response)
+			}
+			// Log error events for diagnostics.
+			if evt.Type == "error" {
+				log.Printf("[openai] SSE error event: %s", sanitizeLogBody(string(data)))
+			}
+		}
+		return false
+	}
+
 	// Read the stream in chunks and parse SSE events.
 	tmp := make([]byte, 8192)
 	totalRead := 0
-	for {
+	streamDone := false
+	for !streamDone {
 		n, readErr := resp.Body.Read(tmp)
 		if n > 0 {
 			totalRead += n
@@ -877,7 +928,7 @@ func collectSSEToJSON(resp *http.Response) (*http.Response, error) {
 			remainder = remainder[:0]
 
 			// Process complete lines.
-			for {
+			for !streamDone {
 				idx := bytes.IndexByte(buf, '\n')
 				if idx < 0 {
 					remainder = append(remainder, buf...)
@@ -886,51 +937,21 @@ func collectSSEToJSON(resp *http.Response) (*http.Response, error) {
 				}
 				line := buf[:idx]
 				buf = buf[idx+1:]
-
-				line = bytes.TrimRight(line, "\r")
-
-				if bytes.HasPrefix(line, []byte("data: ")) {
-					data := line[6:]
-					if bytes.Equal(data, []byte("[DONE]")) {
-						// Stream finished.
-						goto done
-					}
-					eventCount++
-					// Parse to check event type.
-					var evt collectedSSEEvent
-					if json.Unmarshal(data, &evt) == nil {
-						if resp.Request != nil {
-							modelactivity.Notify(resp.Request.Context())
-						}
-						lastEventType = evt.Type
-						collectSSEOutputEvent(outputItems, evt)
-						// Capture response.completed as the primary source.
-						if evt.Type == "response.completed" && len(evt.Response) > 0 {
-							completedData = []byte(evt.Response)
-						}
-						// Also capture the latest response from ANY event that
-						// carries one, as a fallback. The openai-oauth reference
-						// impl does this for robustness.
-						if len(evt.Response) > 0 {
-							latestResponseData = []byte(evt.Response)
-						}
-						// Log error events for diagnostics.
-						if evt.Type == "error" {
-							log.Printf("[openai] SSE error event: %s", sanitizeLogBody(string(data)))
-						}
-					}
-				}
+				streamDone = processLine(line)
 			}
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
 				return nil, fmt.Errorf("reading SSE stream: %w", readErr)
 			}
+			// Flush a final event whose line lacked a trailing newline.
+			if !streamDone && len(remainder) > 0 {
+				processLine(remainder)
+			}
 			break
 		}
 	}
 
-done:
 	// Prefer response.completed data, fall back to latest response from any event.
 	responseData := completedData
 	if responseData == nil {

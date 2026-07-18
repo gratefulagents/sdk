@@ -253,10 +253,10 @@ func (c CompactionConfig) normalized() CompactionConfig {
 		c.TriggerTokens = 180000
 	}
 	if c.TargetTokens <= 0 {
-		c.TargetTokens = c.TriggerTokens / 2
+		c.TargetTokens = maxInt(1, c.TriggerTokens/2)
 	}
 	if c.TargetTokens >= c.TriggerTokens {
-		c.TargetTokens = c.TriggerTokens / 2
+		c.TargetTokens = maxInt(1, c.TriggerTokens/2)
 	}
 	if c.PreserveRecentItems <= 0 {
 		c.PreserveRecentItems = 12

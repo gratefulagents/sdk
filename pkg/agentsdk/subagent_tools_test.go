@@ -148,6 +148,10 @@ func TestSubagentToolPreservesPendingResultThroughRunnerToolPolicyTimeout(t *tes
 			ID: "spawn-review", Name: "subagent", Input: json.RawMessage(`{"agent_name":"worker","message":"review"}`),
 		}}}},
 		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent continued"}}}},
+		// The final-join safety net now survives the tool policy wrapper:
+		// the runner delivers the joined sub-agent result and asks the
+		// parent for one more turn before finishing.
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent continued"}}}},
 	}}
 	childModel := &blockingSubagentToolModel{started: make(chan struct{}), release: make(chan struct{})}
 	runner := NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{

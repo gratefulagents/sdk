@@ -138,6 +138,25 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 		})
 	}
 
+	// Convert tool choice.
+	if r.ToolChoice != nil {
+		switch r.ToolChoice.Type {
+		case "auto":
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAuto: &sdk.BetaToolChoiceAutoParam{}}
+		case "any":
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAny: &sdk.BetaToolChoiceAnyParam{}}
+		case "tool":
+			params.ToolChoice = sdk.BetaToolChoiceParamOfTool(r.ToolChoice.Name)
+		case "none":
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfNone: &sdk.BetaToolChoiceNoneParam{}}
+		}
+	}
+
+	// Convert request metadata.
+	if r.Metadata != nil && r.Metadata.UserID != "" {
+		params.Metadata = sdk.BetaMetadataParam{UserID: sdk.String(r.Metadata.UserID)}
+	}
+
 	// Convert thinking config.
 	if r.Thinking != nil {
 		switch r.Thinking.Type {

@@ -108,6 +108,12 @@ func ResolveRoleModeRouting(
 			if level := normalizeModeReasoningLevel(override.ReasoningLevel); level != "" {
 				resolved.ReasoningLevel = string(level)
 				resolved.ModelSettings = resolved.ModelSettings.Merge(ModeReasoningSettings(level))
+				if level == ReasoningNone {
+					// Merge ignores zero values, so an explicit "none" must
+					// clear any thinking budget inherited from mode defaults;
+					// otherwise budget-driven providers keep thinking enabled.
+					resolved.ModelSettings.ThinkingBudget = 0
+				}
 			}
 			if verbosity := normalizeModeTextVerbosity(override.TextVerbosity); verbosity != "" {
 				resolved.TextVerbosity = string(verbosity)

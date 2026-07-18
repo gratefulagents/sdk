@@ -42,7 +42,7 @@ func (s ModelSettings) Merge(other ModelSettings) ModelSettings {
 		merged.TextVerbosity = other.TextVerbosity
 	}
 	if len(other.StopSequences) > 0 {
-		merged.StopSequences = other.StopSequences
+		merged.StopSequences = append([]string(nil), other.StopSequences...)
 	}
 	return merged
 }

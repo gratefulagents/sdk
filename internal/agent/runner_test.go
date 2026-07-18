@@ -1652,7 +1652,7 @@ func TestRunnerEmitsLLMAttemptEvents_SuccessFailureRetry(t *testing.T) {
 	if len(attempts) != 4 {
 		t.Fatalf("expected 4 llm_attempt events, got %d", len(attempts))
 	}
-	if attempts[0].LLMAttempt != 1 || attempts[0].Status != "started" || attempts[0].AttemptStatus != "started" || attempts[0].LLMScope != "top_level" || attempts[0].RequestedModel != "openai/gpt-5.4" || attempts[0].ResolvedModel != "openai/gpt-5.4" || attempts[0].CanonicalModel != "mock/gpt-5.4" || attempts[0].Model != "mock/gpt-5.4" || attempts[0].Provider != "mock" {
+	if attempts[0].LLMAttempt != 1 || attempts[0].Status != "started" || attempts[0].AttemptStatus != "started" || attempts[0].LLMScope != "top_level" || attempts[0].RequestedModel != "openai/gpt-5.4" || attempts[0].ResolvedModel != "openai/gpt-5.4" || attempts[0].CanonicalModel != "openai/gpt-5.4" || attempts[0].Model != "openai/gpt-5.4" || attempts[0].Provider != "mock" {
 		t.Fatalf("unexpected first attempt event: %+v", attempts[0])
 	}
 	if attempts[0].ToolUseID == "" {

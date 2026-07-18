@@ -395,14 +395,11 @@ func TestSubAgentRegistryCancelMarksTaskCancelledImmediately(t *testing.T) {
 		t.Fatal("timed out waiting for blocking tool to observe cancellation")
 	}
 
-	// Wait for the spawn goroutine to finish writing the cancellation event
-	// before reading the buffer (bytes.Buffer is not safe for concurrent use).
+	// Cancel marks the task terminal immediately, but the single completion
+	// event (with real usage) is written when the spawn goroutine unwinds.
+	// Poll the (concurrency-safe) buffer for the event itself.
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		t, _ := registry.GetStatus(taskID)
-		if t.IsTerminal() {
-			break
-		}
+	for !strings.Contains(events.String(), `"status":"cancelled"`) {
 		if time.Now().After(deadline) {
 			break
 		}

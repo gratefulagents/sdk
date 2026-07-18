@@ -2,7 +2,9 @@ package projectstate
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 func activeTask(st *state, opts PrimeOptions) *Task {
@@ -69,30 +71,22 @@ func memoriesForPrime(st *state, limit int) (pinned, recent []Memory) {
 	}
 	sortMemoriesForPrime(pinned)
 	sortMemoriesForPrime(recent)
-	if limit > 0 && len(pinned) > limit {
-		pinned = pinned[:limit]
-	}
-	remaining := limit
-	if remaining > 0 {
-		remaining -= len(pinned)
-	}
-	if remaining <= 0 {
-		remaining = limit
-	}
-	if remaining > 0 && len(recent) > remaining {
-		recent = recent[:remaining]
+	if limit > 0 {
+		if len(pinned) > limit {
+			pinned = pinned[:limit]
+		}
+		remaining := limit - len(pinned)
+		if len(recent) > remaining {
+			recent = recent[:remaining]
+		}
 	}
 	return pinned, recent
 }
 
 func sortMemoriesForPrime(memories []Memory) {
-	for i := 0; i < len(memories); i++ {
-		for j := i + 1; j < len(memories); j++ {
-			if memories[j].UpdatedAt.After(memories[i].UpdatedAt) {
-				memories[i], memories[j] = memories[j], memories[i]
-			}
-		}
-	}
+	sort.SliceStable(memories, func(i, j int) bool {
+		return memories[i].UpdatedAt.After(memories[j].UpdatedAt)
+	})
 }
 
 func writeTaskLine(b *strings.Builder, task Task) {
@@ -119,8 +113,12 @@ func memorySuffix(mem Memory) string {
 
 func oneLine(value string, max int) string {
 	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
-	if max > 0 && len(value) > max {
-		return value[:max-3] + "..."
+	if max <= 3 || len(value) <= max {
+		return value
 	}
-	return value
+	cut := max - 3
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "..."
 }

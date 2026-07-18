@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// embedWriteTimeout bounds the best-effort embedding call on the memory write
+// path so an unreachable provider cannot stall UpsertMemory for the embedder's
+// full HTTP timeout.
+const embedWriteTimeout = 5 * time.Second
 
 // backend abstracts durable persistence for the projectstate engine. The engine
 // keeps all storage-agnostic logic (event sourcing, task/memory/session
@@ -31,8 +37,11 @@ type backend interface {
 	lock(ctx context.Context) (func(), error)
 	// readEmbeddings loads the cached vectors keyed by memory id.
 	readEmbeddings() (map[string]embeddingRecord, error)
-	// writeEmbeddings persists the full vector cache.
-	writeEmbeddings(records map[string]embeddingRecord, model string) error
+	// upsertEmbeddings merges the given records into the durable vector cache
+	// without clobbering records written concurrently by other callers.
+	upsertEmbeddings(records map[string]embeddingRecord, model string) error
+	// deleteEmbeddings removes cached vectors for the given memory ids.
+	deleteEmbeddings(ids []string) error
 	// close releases backend resources.
 	close() error
 }
@@ -333,8 +342,14 @@ func (s *engine) UpsertMemory(ctx context.Context, in UpsertMemoryInput) (*Memor
 	}
 	if out != nil {
 		// Best-effort: caching the embedding must never fail the write. A
-		// missing vector is backfilled lazily on the next recall.
-		_ = s.cacheMemoryEmbedding(ctx, out.ID, out.Content)
+		// missing vector is backfilled lazily on the next recall. Bound the
+		// embedding call so a dead provider cannot stall the write path for
+		// the full HTTP client timeout.
+		embedCtx, cancel := context.WithTimeout(ctx, embedWriteTimeout)
+		if err := s.cacheMemoryEmbedding(embedCtx, out.ID, out.Content); err != nil {
+			log.Printf("projectstate: caching embedding for memory %s failed (will backfill on recall): %v", out.ID, err)
+		}
+		cancel()
 	}
 	return out, err
 }
@@ -391,14 +406,20 @@ func (s *engine) ListMemories(ctx context.Context, filter MemoryFilter) ([]Memor
 }
 
 func (s *engine) DeleteMemory(ctx context.Context, id string) error {
-	return s.mutate(ctx, "memory.deleted", func(st *state, now time.Time) (any, error) {
-		id = strings.TrimSpace(id)
+	id = strings.TrimSpace(id)
+	err := s.mutate(ctx, "memory.deleted", func(st *state, now time.Time) (any, error) {
 		if _, ok := st.memories[id]; !ok {
 			return nil, fmt.Errorf("memory %q not found", id)
 		}
 		delete(st.memories, id)
 		return memoryDeletedPayload{ID: id, At: now}, nil
 	})
+	if err != nil {
+		return err
+	}
+	// Best-effort cache prune; a leftover orphan vector only wastes space.
+	_ = s.backend.deleteEmbeddings([]string{id})
+	return nil
 }
 
 func (s *engine) SaveSessionSummary(ctx context.Context, summary SessionSummary) (*SessionSummary, error) {
@@ -791,46 +812,50 @@ type memoryDeletedPayload struct {
 
 // readEmbeddings loads the cached vectors via the backend.
 func (s *engine) readEmbeddings() (map[string]embeddingRecord, error) {
-return s.backend.readEmbeddings()
+	return s.backend.readEmbeddings()
 }
 
-// writeEmbeddings persists the cached vectors via the backend.
-func (s *engine) writeEmbeddings(records map[string]embeddingRecord) error {
-model := ""
-if s.embedder != nil {
-model = s.embedder.Model()
-}
-return s.backend.writeEmbeddings(records, model)
+// upsertEmbeddings merges the given records into the durable cache via the
+// backend. Callers pass only the records they changed so concurrent writers
+// (upsert path vs. recall backfill) cannot clobber each other's vectors.
+func (s *engine) upsertEmbeddings(records map[string]embeddingRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	model := ""
+	if s.embedder != nil {
+		model = s.embedder.Model()
+	}
+	return s.backend.upsertEmbeddings(records, model)
 }
 
 // cacheMemoryEmbedding embeds a single memory's content and persists it. It is
 // best-effort: embedding failures are returned but callers on the write path
 // ignore them so storing a memory never fails because the embedder is down.
 func (s *engine) cacheMemoryEmbedding(ctx context.Context, id, content string) error {
-if s.embedder == nil || id == "" || content == "" {
-return nil
-}
-records, err := s.readEmbeddings()
-if err != nil {
-return err
-}
-if rec, ok := records[id]; ok && rec.fresh(content, s.embedder.Model()) {
-return nil
-}
-vecs, err := s.embedder.Embed(ctx, []string{content})
-if err != nil {
-return err
-}
-if len(vecs) != 1 || len(vecs[0]) == 0 {
-return nil
-}
-records[id] = embeddingRecord{
-Hash:   hashContent(content),
-Model:  s.embedder.Model(),
-Dims:   len(vecs[0]),
-Vector: vecs[0],
-}
-return s.writeEmbeddings(records)
+	if s.embedder == nil || id == "" || content == "" {
+		return nil
+	}
+	records, err := s.readEmbeddings()
+	if err != nil {
+		return err
+	}
+	if rec, ok := records[id]; ok && rec.fresh(content, s.embedder.Model()) {
+		return nil
+	}
+	vecs, err := s.embedder.Embed(ctx, []string{content})
+	if err != nil {
+		return err
+	}
+	if len(vecs) != 1 || len(vecs[0]) == 0 {
+		return nil
+	}
+	return s.upsertEmbeddings(map[string]embeddingRecord{id: {
+		Hash:   hashContent(content),
+		Model:  s.embedder.Model(),
+		Dims:   len(vecs[0]),
+		Vector: vecs[0],
+	}})
 }
 
 // ensureEmbeddings returns a memoryID -> vector map for the given memories,
@@ -838,50 +863,53 @@ return s.writeEmbeddings(records)
 // Backfill failures degrade gracefully: whatever vectors already exist are
 // returned so recall can still use them alongside the lexical signal.
 func (s *engine) ensureEmbeddings(ctx context.Context, memories []Memory) map[string][]float32 {
-vectors := map[string][]float32{}
-if s.embedder == nil {
-return vectors
-}
-records, err := s.readEmbeddings()
-if err != nil {
-records = map[string]embeddingRecord{}
-}
-model := s.embedder.Model()
+	vectors := map[string][]float32{}
+	if s.embedder == nil {
+		return vectors
+	}
+	records, err := s.readEmbeddings()
+	if err != nil {
+		records = map[string]embeddingRecord{}
+	}
+	model := s.embedder.Model()
 
-var missingIDs []string
-var missingText []string
-for _, mem := range memories {
-if rec, ok := records[mem.ID]; ok && rec.fresh(mem.Content, model) {
-vectors[mem.ID] = rec.Vector
-continue
-}
-if mem.Content == "" {
-continue
-}
-missingIDs = append(missingIDs, mem.ID)
-missingText = append(missingText, mem.Content)
-}
+	var missingIDs []string
+	var missingText []string
+	for _, mem := range memories {
+		if rec, ok := records[mem.ID]; ok && rec.fresh(mem.Content, model) {
+			vectors[mem.ID] = rec.Vector
+			continue
+		}
+		if mem.Content == "" {
+			continue
+		}
+		missingIDs = append(missingIDs, mem.ID)
+		missingText = append(missingText, mem.Content)
+	}
 
-if len(missingText) == 0 {
-return vectors
-}
-vecs, err := s.embedder.Embed(ctx, missingText)
-if err != nil || len(vecs) != len(missingText) {
-// Backfill failed; return whatever we already had cached.
-return vectors
-}
-for i, id := range missingIDs {
-if len(vecs[i]) == 0 {
-continue
-}
-records[id] = embeddingRecord{
-Hash:   hashContent(missingText[i]),
-Model:  model,
-Dims:   len(vecs[i]),
-Vector: vecs[i],
-}
-vectors[id] = vecs[i]
-}
-_ = s.writeEmbeddings(records)
-return vectors
+	if len(missingText) == 0 {
+		return vectors
+	}
+	vecs, err := s.embedder.Embed(ctx, missingText)
+	if err != nil || len(vecs) != len(missingText) {
+		// Backfill failed; return whatever we already had cached.
+		return vectors
+	}
+	refreshed := make(map[string]embeddingRecord, len(missingIDs))
+	for i, id := range missingIDs {
+		if len(vecs[i]) == 0 {
+			continue
+		}
+		refreshed[id] = embeddingRecord{
+			Hash:   hashContent(missingText[i]),
+			Model:  model,
+			Dims:   len(vecs[i]),
+			Vector: vecs[i],
+		}
+		vectors[id] = vecs[i]
+	}
+	if err := s.upsertEmbeddings(refreshed); err != nil {
+		log.Printf("projectstate: persisting backfilled embeddings failed: %v", err)
+	}
+	return vectors
 }

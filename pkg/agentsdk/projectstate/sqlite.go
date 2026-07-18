@@ -251,9 +251,14 @@ func (b *sqliteBackend) loadEvents() ([]Event, error) {
 }
 
 func (b *sqliteBackend) appendEvent(ev Event) error {
+	// The seq computed by the engine can collide when another process appended
+	// events after our state load (lock() is a no-op for SQLite). Assigning
+	// seq atomically inside the INSERT keeps concurrent writers from failing
+	// on the (project_id, seq) primary key.
 	_, err := b.db.Exec(
-		fmt.Sprintf(`INSERT INTO %s (project_id, seq, event_id, run_id, actor, ts, type, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, b.eventsTable),
-		b.projectID, ev.Seq, ev.EventID, nullString(ev.RunID), nullString(ev.Actor), ev.Time.UTC().UnixNano(), ev.Type, []byte(ev.Payload),
+		fmt.Sprintf(`INSERT INTO %s (project_id, seq, event_id, run_id, actor, ts, type, payload)
+			SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ? FROM %s WHERE project_id = ?`, b.eventsTable, b.eventsTable),
+		b.projectID, ev.EventID, nullString(ev.RunID), nullString(ev.Actor), ev.Time.UTC().UnixNano(), ev.Type, []byte(ev.Payload), b.projectID,
 	)
 	if err != nil {
 		return fmt.Errorf("append event: %w", err)
@@ -289,16 +294,19 @@ func (b *sqliteBackend) readEmbeddings() (map[string]embeddingRecord, error) {
 	return out, rows.Err()
 }
 
-func (b *sqliteBackend) writeEmbeddings(records map[string]embeddingRecord, _ string) error {
+// upsertEmbeddings merges the given records via per-row upserts so concurrent
+// writers (upsert path vs. recall backfill, possibly in other processes) never
+// wipe each other's vectors.
+func (b *sqliteBackend) upsertEmbeddings(records map[string]embeddingRecord, _ string) error {
 	tx, err := b.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE project_id = ?`, b.embedTable), b.projectID); err != nil {
-		return fmt.Errorf("clear embeddings: %w", err)
-	}
-	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO %s (project_id, memory_id, hash, model, dims, vector) VALUES (?, ?, ?, ?, ?, ?)`, b.embedTable))
+	stmt, err := tx.Prepare(fmt.Sprintf(
+		`INSERT INTO %s (project_id, memory_id, hash, model, dims, vector) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, memory_id) DO UPDATE SET hash = excluded.hash, model = excluded.model, dims = excluded.dims, vector = excluded.vector`,
+		b.embedTable))
 	if err != nil {
 		return err
 	}
@@ -308,7 +316,27 @@ func (b *sqliteBackend) writeEmbeddings(records map[string]embeddingRecord, _ st
 			continue
 		}
 		if _, err := stmt.Exec(b.projectID, id, rec.Hash, rec.Model, rec.Dims, encodeVector(rec.Vector)); err != nil {
-			return fmt.Errorf("insert embedding: %w", err)
+			return fmt.Errorf("upsert embedding: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// deleteEmbeddings removes cached vectors for the given memory ids.
+func (b *sqliteBackend) deleteEmbeddings(ids []string) error {
+	tx, err := b.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(fmt.Sprintf(`DELETE FROM %s WHERE project_id = ? AND memory_id = ?`, b.embedTable))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.Exec(b.projectID, id); err != nil {
+			return fmt.Errorf("delete embedding: %w", err)
 		}
 	}
 	return tx.Commit()

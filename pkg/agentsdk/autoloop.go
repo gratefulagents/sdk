@@ -55,7 +55,7 @@ func (t *AutoTracker) Update(newItems []RunItem) {
 		if item.Type == RunItemToolOutput && item.ToolOutput != nil && item.ToolOutput.IsError {
 			msg := item.ToolOutput.Content
 			if len(msg) > 200 {
-				msg = msg[:200]
+				msg = truncateTitle(msg, 200)
 			}
 			turnErrors = append(turnErrors, msg)
 		}
@@ -119,36 +119,36 @@ func (t *AutoTracker) consecutiveSameError() (int, string) {
 // (tool name + input), so ordinary exploration - reading several different
 // files, or alternating grep/read across distinct targets - is not mistaken for
 // a loop. The returned slice contains the tool names of the detected cycle for
-// human-readable reporting.
-func (t *AutoTracker) detectRepetitiveCycle() (bool, []string) {
+// human-readable reporting, and the count is the number of verified
+// consecutive repetitions at the end of the buffer (at least 2 when detected).
+func (t *AutoTracker) detectRepetitiveCycle() (bool, []string, int) {
 	if t == nil {
-		return false, nil
+		return false, nil, 0
 	}
 	sigs := t.recentToolSignatures
 	names := t.recentToolCalls
 	if len(sigs) != len(names) {
-		return false, nil
+		return false, nil, 0
 	}
 	for cycleLen := 2; cycleLen <= 3; cycleLen++ {
-		needed := cycleLen * 2
-		if len(sigs) < needed {
+		if len(sigs) < cycleLen*2 {
 			continue
 		}
-		tailSigs := sigs[len(sigs)-needed:]
-		tailNames := names[len(names)-needed:]
-		cycle := tailSigs[:cycleLen]
-		match := true
-		for i := 0; i < needed; i++ {
-			if tailSigs[i] != cycle[i%cycleLen] {
-				match = false
+		cycle := sigs[len(sigs)-cycleLen:]
+		matched := 0
+		for i := len(sigs) - 1; i >= 0; i-- {
+			offset := len(sigs) - 1 - i
+			if sigs[i] != cycle[cycleLen-1-offset%cycleLen] {
 				break
 			}
+			matched++
 		}
-		if match {
-			return true, tailNames[:cycleLen]
+		repetitions := matched / cycleLen
+		if repetitions >= 2 {
+			return true, names[len(names)-cycleLen:], repetitions
 		}
 	}
-	return false, nil
+	return false, nil, 0
 }
 
 // toolCallSignature returns a compact, argument-aware identity for a tool call
@@ -187,12 +187,11 @@ func (t *AutoTracker) CheckCircuitBreakers() CircuitBreakerResult {
 			Reason:  fmt.Sprintf("Agent stuck - same error repeated %d times: %s", errCount, truncateTitle(errMsg, 100)),
 		}
 	}
-	if cycling, cycle := t.detectRepetitiveCycle(); cycling {
-		cycleCount := len(t.recentToolCalls) / len(cycle)
-		if cycleCount >= defaultCBMaxRepeatedCycle/len(cycle) {
+	if cycling, cycle, repetitions := t.detectRepetitiveCycle(); cycling {
+		if repetitions >= defaultCBMaxRepeatedCycle/len(cycle) {
 			return CircuitBreakerResult{
 				Tripped: true,
-				Reason:  fmt.Sprintf("Agent stuck in tool loop - pattern [%s] repeated %d times", strings.Join(cycle, "->"), cycleCount),
+				Reason:  fmt.Sprintf("Agent stuck in tool loop - pattern [%s] repeated %d times", strings.Join(cycle, "->"), repetitions),
 			}
 		}
 	}
@@ -209,7 +208,7 @@ func BuildSmartNudge(t *AutoTracker, phase string) string {
 		phaseHint = fmt.Sprintf(" You are in the %s phase.", phase)
 	}
 
-	if cycling, cycle := t.detectRepetitiveCycle(); cycling {
+	if cycling, cycle, _ := t.detectRepetitiveCycle(); cycling {
 		return fmt.Sprintf("[SYSTEM] Detected repetitive tool pattern: [%s]. You appear stuck in a loop. Step back, reassess your approach, and try something fundamentally different. If the current subtask is blocked, skip it and move on to other work.%s",
 			strings.Join(cycle, " -> "), autonomousFinishGuidance())
 	}
@@ -233,13 +232,16 @@ func autonomousFinishGuidance() string {
 	return " Finish is a hard stop, not a progress report: if you named any backlog item, TODO, follow-up, remaining risk, or next step, call a tool for the top item now. Call finish only when no actionable work remains or a concrete external blocker prevents useful tool progress."
 }
 
+// truncateTitle trims s to at most maxLen runes (not bytes) so multi-byte
+// UTF-8 characters are never split mid-sequence.
 func truncateTitle(s string, maxLen int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
 	if maxLen <= 3 {
-		return s[:maxLen]
+		return string(runes[:maxLen])
 	}
-	return s[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
 }

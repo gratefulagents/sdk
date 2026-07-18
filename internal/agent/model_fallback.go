@@ -22,7 +22,7 @@ func nextFallbackModel(primary, current string, fallbacks []string) (string, boo
 		return "", false
 	}
 	current = strings.TrimSpace(current)
-	idx := 0
+	idx := -1
 	for i, model := range chain {
 		if sameModelID(model, current) {
 			idx = i
@@ -30,7 +30,7 @@ func nextFallbackModel(primary, current string, fallbacks []string) (string, boo
 		}
 	}
 	for _, model := range chain[idx+1:] {
-		if strings.TrimSpace(model) != "" {
+		if strings.TrimSpace(model) != "" && !sameModelID(model, current) {
 			return model, true
 		}
 	}
@@ -96,15 +96,22 @@ func fallbackReason(advice *ModelRetryAdvice) string {
 		return ""
 	}
 	if code, err := strconv.Atoi(reason); err == nil {
-		if code == 429 {
+		switch code {
+		case 429:
 			return "rate_limit"
+		case 402:
+			return "quota"
+		case 503, 529:
+			return "overloaded"
 		}
 		return ""
 	}
 	switch {
-	case strings.Contains(reason, "rate_limit"), strings.Contains(reason, "too_many_requests"):
+	case strings.Contains(reason, "rate_limit"), strings.Contains(reason, "too_many_requests"), strings.Contains(reason, "too many requests"):
 		return "rate_limit"
-	case strings.Contains(reason, "quota"), strings.Contains(reason, "billing"), strings.Contains(reason, "subscription"):
+	case strings.Contains(reason, "overloaded"):
+		return "overloaded"
+	case strings.Contains(reason, "quota"), strings.Contains(reason, "billing"), strings.Contains(reason, "subscription"), strings.Contains(reason, "credit"):
 		return "quota"
 	case strings.Contains(reason, "limit_exceeded"), strings.Contains(reason, "exhausted"):
 		return "quota"

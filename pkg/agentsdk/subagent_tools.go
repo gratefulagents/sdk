@@ -169,9 +169,10 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 			return ToolResult{Content: string(resp)}, nil
 		}
 		task, waitErr := t.registry.WaitForTask(ctx, taskID, params.TimeoutMS)
-		if errors.Is(waitErr, context.DeadlineExceeded) {
-			// A synchronous spawn can outlive the host's generic tool-call budget.
-			// The independently managed child is still healthy, so return its live
+		if errors.Is(waitErr, context.DeadlineExceeded) || errors.Is(waitErr, context.Canceled) {
+			// A synchronous spawn can outlive the host's generic tool-call budget
+			// or the parent turn itself (context cancelled). The independently
+			// managed child is still healthy either way, so return its live
 			// state and let the parent collect it later instead of misreporting a
 			// wait deadline as a sub-agent failure. If completion raced the deadline,
 			// return the completed result normally.
@@ -214,6 +215,18 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 		}
 		if strings.TrimSpace(task.Message) == "" {
 			return ToolResult{Content: fmt.Sprintf("tasks[%d].message is required", i), IsError: true}, nil
+		}
+		agentName := strings.TrimSpace(task.AgentName)
+		if agentName == "" {
+			agentName = t.defaultAgent
+		}
+		if agentName == "" {
+			return ToolResult{Content: fmt.Sprintf("tasks[%d].agent_name is required (no default agent configured)", i), IsError: true}, nil
+		}
+		// Pre-validate every node before spawning anything: a mid-batch spawn
+		// failure would strand already-launched siblings.
+		if !t.registry.HasAgent(agentName) {
+			return ToolResult{Content: fmt.Sprintf("tasks[%d] (%q): unknown agent %q", i, key, agentName), IsError: true}, nil
 		}
 		byKey[key] = i
 	}
@@ -280,7 +293,20 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 				IncludeDependencyResults: task.IncludeDependencyResults,
 			})
 			if err != nil {
-				return ToolResult{Content: fmt.Sprintf("failed to spawn task %q: %v", key, err), IsError: true}, nil
+				// Cancel already-spawned siblings so a mid-batch failure does
+				// not leave a half-launched DAG running in the background, and
+				// tell the model exactly what was rolled back.
+				cancelled := make([]string, 0, len(spawned))
+				for _, spawnedID := range taskIDs {
+					if cancelErr := t.registry.Cancel(spawnedID); cancelErr == nil {
+						cancelled = append(cancelled, spawnedID)
+					}
+				}
+				msg := fmt.Sprintf("failed to spawn task %q: %v", key, err)
+				if len(cancelled) > 0 {
+					msg += fmt.Sprintf("; cancelled already-spawned sibling task(s): %s", strings.Join(cancelled, ", "))
+				}
+				return ToolResult{Content: msg, IsError: true}, nil
 			}
 			spawned[key] = taskID
 			taskIDs = append(taskIDs, taskID)

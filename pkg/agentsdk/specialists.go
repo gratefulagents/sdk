@@ -44,10 +44,13 @@ type SpecialistBuildResult struct {
 
 // FilterToolsByAccess returns the subset of tools matching the given access level.
 // Tools that implement ToolAccessAdapter may substitute a safer implementation
-// for read-only access before filtering.
+// for read-only access before filtering. The access string is normalized first
+// ("read_only", "Readonly", typos, ... — unknown values fail closed to
+// read-only) so an unnormalized catalog role can never receive the full tool
+// set by accident.
 func FilterToolsByAccess(allTools []Tool, accessLevel string) []Tool {
-	switch accessLevel {
-	case "read-only", "analysis":
+	switch NormalizeToolAccessLevel(ToolAccessLevel(accessLevel)) {
+	case ToolAccessLevelReadOnly:
 		var filtered []Tool
 		for _, t := range allTools {
 			if adapter, ok := t.(ToolAccessAdapter); ok {

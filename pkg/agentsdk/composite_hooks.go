@@ -1,5 +1,7 @@
 package agentsdk
 
+import "errors"
+
 // CompositeHooks fans out RunHooks calls to multiple implementations.
 // This allows hosts to observe lifecycle events with several independent sinks.
 type CompositeHooks struct {
@@ -54,15 +56,18 @@ func (c *CompositeHooks) OnToolEnd(ctx *RunContext, a *Agent, tool Tool, call To
 	}
 }
 
+// OnToolEndError fans out to every wrapped hook so later observability sinks
+// still see the event when an earlier hook fails; errors are aggregated.
 func (c *CompositeHooks) OnToolEndError(ctx *RunContext, a *Agent, tool Tool, call ToolCallData, result ToolResult) error {
+	var errs []error
 	for _, h := range c.hooks {
 		if errorHook, ok := h.(ToolEndErrorHook); ok {
 			if err := errorHook.OnToolEndError(ctx, a, tool, call, result); err != nil {
-				return err
+				errs = append(errs, err)
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (c *CompositeHooks) OnLLMStart(ctx *RunContext, a *Agent) {

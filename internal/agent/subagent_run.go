@@ -118,10 +118,19 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 	// Without this, models guess wrong absolute paths, get "outside workspace"
 	// errors on reads, and incorrectly conclude they lack write tools.
 	childAgent := spec.Agent.Clone()
+	contextSuffix := ""
 	if spec.RunConfig.WorkDir != "" {
-		childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildWorkspaceContext(spec.RunConfig.WorkDir, spec.RunConfig.ToolAccessLevel)
+		contextSuffix += "\n\n" + BuildWorkspaceContext(spec.RunConfig.WorkDir, spec.RunConfig.ToolAccessLevel)
 	}
-	childAgent.Instructions = childAgent.Instructions + "\n\n" + BuildSubAgentBudgetContext(spec.RunConfig.MaxTurns)
+	contextSuffix += "\n\n" + BuildSubAgentBudgetContext(spec.RunConfig.MaxTurns)
+	childAgent.Instructions = childAgent.Instructions + contextSuffix
+	// GetInstructions prefers InstructionsFn, so dynamic-instruction agents
+	// must have the context appended to the function output too.
+	if origFn := childAgent.InstructionsFn; origFn != nil {
+		childAgent.InstructionsFn = func(ctx *RunContext, a *Agent) string {
+			return origFn(ctx, a) + contextSuffix
+		}
+	}
 
 	cfg := spec.RunConfig
 	cfg.PromptCacheKey = spec.TaskID

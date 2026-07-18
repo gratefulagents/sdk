@@ -31,13 +31,29 @@ func DefaultRetryPolicy() RetryPolicy {
 }
 
 // DelayForAttempt calculates the backoff delay for a given retry attempt (0-indexed).
+// Partially-populated policies are normalized: an unset Multiplier or
+// MaxDelayMS would otherwise collapse every later delay to 0 ms and hot-loop
+// retries against a failing provider. An explicit InitialDelayMS <= 0 keeps
+// meaning "retry immediately".
 func (p *RetryPolicy) DelayForAttempt(attempt int) time.Duration {
-	if attempt <= 0 {
-		return time.Duration(p.Backoff.InitialDelayMS) * time.Millisecond
+	initial := p.Backoff.InitialDelayMS
+	if initial <= 0 {
+		return 0
 	}
-	delay := float64(p.Backoff.InitialDelayMS) * math.Pow(p.Backoff.Multiplier, float64(attempt))
-	if delay > float64(p.Backoff.MaxDelayMS) {
-		delay = float64(p.Backoff.MaxDelayMS)
+	if attempt <= 0 {
+		return time.Duration(initial) * time.Millisecond
+	}
+	multiplier := p.Backoff.Multiplier
+	if multiplier < 1 {
+		multiplier = 2.0
+	}
+	maxDelayMS := p.Backoff.MaxDelayMS
+	if maxDelayMS <= 0 {
+		maxDelayMS = 30000
+	}
+	delay := float64(initial) * math.Pow(multiplier, float64(attempt))
+	if delay > float64(maxDelayMS) {
+		delay = float64(maxDelayMS)
 	}
 	return time.Duration(delay) * time.Millisecond
 }

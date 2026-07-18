@@ -67,7 +67,25 @@ func (t *agentTool) Description() string {
 }
 func (t *agentTool) IsReadOnly() bool {
 	// A sub-agent tool is read-only if all its tools are read-only.
+	return t.isReadOnly(map[*Agent]bool{})
+}
+
+// isReadOnly walks nested agent-as-tool wrappers with a visited set so
+// mutually referencing agents (A includes B.AsTool, B includes A.AsTool)
+// cannot recurse forever. An already-visited agent is treated as read-only
+// here: its own mutating tools are checked by the frame that first visited it.
+func (t *agentTool) isReadOnly(visited map[*Agent]bool) bool {
+	if visited[t.agent] {
+		return true
+	}
+	visited[t.agent] = true
 	for _, tool := range t.agent.Tools {
+		if nested, ok := tool.(*agentTool); ok {
+			if !nested.isReadOnly(visited) {
+				return false
+			}
+			continue
+		}
 		if !tool.IsReadOnly() {
 			return false
 		}
@@ -157,6 +175,11 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		runConfig.ToolOutputGuardrails = nestedCfg.ToolOutputGuardrails
 		runConfig.UntrustedToolOutputs = nestedCfg.UntrustedToolOutputs
 		runConfig.MaxToolOutputBytes = nestedCfg.MaxToolOutputBytes
+		// Model calls made by a child must retain the parent's resilience
+		// policy; without these, a provider timeout the parent would retry
+		// fails the whole sub-agent tool call instead.
+		runConfig.RetryPolicy = nestedCfg.RetryPolicy
+		runConfig.ModelCallTimeout = nestedCfg.ModelCallTimeout
 		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
 			childToolAccess = ToolAccessLevelReadOnly
 		}
@@ -173,7 +196,7 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		FallbackHooks: t.runner.DefaultHooks,
 		RunConfig:     runConfig,
 	}
-	if platformHooks, ok := t.runner.DefaultHooks.(*PlatformHooks); ok && platformHooks != nil && platformHooks.Tracker != nil {
+	if platformHooks, ok := t.runner.DefaultHooks.(*PlatformHooks); ok && platformHooks != nil && (platformHooks.Tracker != nil || platformHooks.EventStream != nil) {
 		spec.TaskID = "task_" + uuid.NewString()
 		spec.Tracker = platformHooks.Tracker
 		spec.EventStream = platformHooks.EventStream

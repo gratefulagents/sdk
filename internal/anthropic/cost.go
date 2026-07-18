@@ -1,5 +1,10 @@
 package anthropic
 
+import (
+	"regexp"
+	"strings"
+)
+
 // ModelPricing holds per-million-token prices in USD.
 type ModelPricing struct {
 	InputPerMillion         float64
@@ -30,9 +35,41 @@ var modelPricing = map[string]ModelPricing{
 	},
 }
 
+// modelDateSuffix matches trailing release-date suffixes such as "-20251101".
+var modelDateSuffix = regexp.MustCompile(`-\d{8}$`)
+
+// pricingForModel resolves pricing for real-world model identifiers, which are
+// commonly gateway-prefixed ("anthropic/claude-…") and date-suffixed
+// ("claude-opus-4-6-20251101"). After normalization it falls back to matching
+// the model family (opus/sonnet/haiku) so e.g. an older opus release is billed
+// at opus rather than sonnet rates.
+func pricingForModel(model string) (ModelPricing, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if _, bare, ok := strings.Cut(model, "/"); ok && bare != "" {
+		model = bare
+	}
+	if pricing, ok := modelPricing[model]; ok {
+		return pricing, true
+	}
+	model = modelDateSuffix.ReplaceAllString(model, "")
+	if pricing, ok := modelPricing[model]; ok {
+		return pricing, true
+	}
+	for family, key := range map[string]string{
+		"opus":   "claude-opus-4-6",
+		"sonnet": "claude-sonnet-4-6",
+		"haiku":  "claude-haiku-4-5",
+	} {
+		if strings.Contains(model, family) {
+			return modelPricing[key], true
+		}
+	}
+	return ModelPricing{}, false
+}
+
 // CalculateCost returns the cost in USD for a given model and usage.
 func CalculateCost(model string, usage Usage) float64 {
-	pricing, ok := modelPricing[model]
+	pricing, ok := pricingForModel(model)
 	if !ok {
 		// Fallback to sonnet pricing.
 		pricing = modelPricing["claude-sonnet-4-6"]

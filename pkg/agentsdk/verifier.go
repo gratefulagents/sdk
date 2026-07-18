@@ -21,9 +21,39 @@ VERDICT: APPROVED — only if you could not find any substantive problem.
 VERDICT: REJECTED — followed by a numbered list of concrete, actionable problems.
 Do not reject for style, phrasing, or hypothetical concerns you did not verify.`
 
-// criticVerdictApproved is matched (case-insensitively) in the critic's reply
-// to detect approval.
-const criticVerdictApproved = "VERDICT: APPROVED"
+// criticVerdictInconclusive is returned as feedback when the critic produced
+// no usable verdict (empty reply, exhausted turn budget, or no verdict line).
+// The verifier runs once per finalization attempt, so this costs at most one
+// extra round instead of silently approving.
+const criticVerdictInconclusive = "The independent verifier did not return a usable verdict. Re-check your answer against the original task requirements, verify your claims, and provide your final answer again."
+
+// criticVerdictApproves parses the critic's reply for verdict lines. Only a
+// line that is exactly "VERDICT: APPROVED" (anchored, case-insensitive,
+// optional trailing period) counts as approval, and it must be the last
+// verdict line with no rejection anywhere — quoting the rubric or discussing
+// the verdict format cannot approve. The second return reports whether any
+// verdict line was found at all.
+func criticVerdictApproves(reply string) (approved bool, found bool) {
+	sawRejected := false
+	lastApproved := false
+	for _, line := range strings.Split(reply, "\n") {
+		upper := strings.ToUpper(strings.TrimSpace(line))
+		if !strings.HasPrefix(upper, "VERDICT:") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(upper, "VERDICT:"))
+		switch {
+		case rest == "APPROVED" || rest == "APPROVED.":
+			found = true
+			lastApproved = true
+		case strings.HasPrefix(rest, "REJECTED"):
+			found = true
+			lastApproved = false
+			sawRejected = true
+		}
+	}
+	return lastApproved && !sawRejected, found
+}
 
 // NewCriticVerifier builds a RunConfig.FinalAnswerVerifier backed by a
 // read-only critic sub-agent that attempts to refute the candidate final
@@ -63,11 +93,12 @@ Review the candidate final answer against the original task. Verify its claims w
 			return "", err
 		}
 		verdict := result.FinalText()
-		if strings.Contains(strings.ToUpper(verdict), criticVerdictApproved) {
+		approved, found := criticVerdictApproves(verdict)
+		if approved {
 			return "", nil
 		}
-		if strings.TrimSpace(verdict) == "" {
-			return "", nil
+		if !found || strings.TrimSpace(verdict) == "" {
+			return criticVerdictInconclusive, nil
 		}
 		return verdict, nil
 	}

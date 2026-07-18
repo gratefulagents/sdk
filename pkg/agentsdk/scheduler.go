@@ -41,6 +41,11 @@ func NewSubAgentScheduler(cfg SubAgentSchedulerConfig) *SubAgentScheduler {
 
 // ConfigureSubAgentScheduler refreshes host/runtime wiring for an existing
 // scheduler while preserving already tracked async tasks.
+//
+// Security-relevant fields are sticky: an empty ToolAccessLevel and nil
+// ToolPolicy/Tracker/EventStream(s) keep the scheduler's current values, so a
+// partial config can never silently escalate future sub-agents to full access
+// or disable approvals, progress tracking, or event emission.
 func ConfigureSubAgentScheduler(s *SubAgentScheduler, cfg SubAgentSchedulerConfig) {
 	if s == nil {
 		return
