@@ -271,6 +271,15 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 				// An approved tool requested a pause (ToolResult.ShouldPause);
 				// hand control back to the host like the runner's own pause
 				// path instead of immediately resuming another model call.
+				// The approvals were resolved above, so the interrupted
+				// result's pending state must not leak: clear the
+				// interruption fields and adopt the loop's history (which
+				// includes the resolved approval + tool output items) so
+				// hosts neither re-prompt for the same approval nor replay
+				// an unpaired tool call.
+				combined.Interruption = nil
+				combined.Interruptions = nil
+				combined.FinalHistory = append([]RunItem(nil), history...)
 				return l.finalize(ctx, combined)
 			}
 			continue

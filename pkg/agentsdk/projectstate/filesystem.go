@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -270,29 +271,46 @@ func (b *fsBackend) loadEvents() ([]Event, error) {
 	}
 	defer f.Close()
 	var events []Event
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 16*1024*1024)
+	reader := bufio.NewReaderSize(f, 64*1024)
 	// A parse failure on the final line is tolerated as a torn write from a
 	// crash mid-append; anything followed by more data is real corruption.
-	var tornErr error
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	// A torn tail is truncated away before returning so the next append
+	// cannot glue a fresh event onto the malformed bytes (which would lose
+	// the new event or brick the store on the following load).
+	var (
+		tornErr  error
+		offset   int64 // bytes consumed so far
+		validLen int64 // file length ending at the last parseable line
+	)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		offset += int64(len(line))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			if tornErr != nil {
+				return nil, tornErr
+			}
+			var ev Event
+			if err := json.Unmarshal(trimmed, &ev); err != nil {
+				tornErr = fmt.Errorf("parse event: %w", err)
+			} else {
+				events = append(events, ev)
+				validLen = offset
+			}
+		} else if tornErr == nil {
+			validLen = offset
 		}
-		if tornErr != nil {
-			return nil, tornErr
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("scan events: %w", readErr)
 		}
-		var ev Event
-		if err := json.Unmarshal(line, &ev); err != nil {
-			tornErr = fmt.Errorf("parse event: %w", err)
-			continue
-		}
-		events = append(events, ev)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan events: %w", err)
+	if tornErr != nil {
+		if err := os.Truncate(path, validLen); err != nil {
+			return nil, fmt.Errorf("truncate torn event tail: %w", err)
+		}
 	}
 	return events, nil
 }

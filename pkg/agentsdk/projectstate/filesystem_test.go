@@ -129,3 +129,58 @@ func TestProjectStateLockWithDeadPIDIsStale(t *testing.T) {
 		t.Fatal("dead-pid lock was not considered stale")
 	}
 }
+
+func TestFilesystemStoreTruncatesTornEventTailBeforeNewWrites(t *testing.T) {
+	ctx := context.Background()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	open := func() *FilesystemStore {
+		store, err := NewFilesystemStore(FilesystemOptions{
+			StateDir:  stateDir,
+			ProjectID: "test-project",
+			WorkDir:   t.TempDir(),
+			Actor:     "tester",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+
+	store := open()
+	if _, err := store.CreateTask(ctx, CreateTaskInput{Title: "before crash"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash mid-append: a malformed, newline-less final record.
+	eventsPath := filepath.Join(stateDir, eventsFileName)
+	f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"type":"task_created","pay`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh store must drop the torn tail, truncate it away, and keep
+	// accepting durable writes.
+	store = open()
+	if _, err := store.CreateTask(ctx, CreateTaskInput{Title: "after crash"}); err != nil {
+		t.Fatal(err)
+	}
+
+	store = open()
+	tasks, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titles := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		titles = append(titles, task.Title)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("tasks after torn-tail recovery = %v, want [before crash, after crash]", titles)
+	}
+}
