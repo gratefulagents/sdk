@@ -389,7 +389,8 @@ func (t *BashStartTool) Execute(ctx context.Context, input json.RawMessage, work
 	if t.Manager != nil {
 		executor = t.Manager.executor
 	}
-	if blocked, reason := (&BashTool{Executor: executor, GitRemoteWrites: t.GitRemoteWrites}).commandBlocked(mode, in.Command); blocked {
+	policyTool := &BashTool{Executor: executor, GitRemoteWrites: t.GitRemoteWrites}
+	if blocked, reason := policyTool.commandBlocked(mode, in.Command); blocked {
 		return agentsdk.ToolResult{Content: reason, IsError: true}, nil
 	}
 	id, err := t.Manager.start(ctx, in, workDir, mode)

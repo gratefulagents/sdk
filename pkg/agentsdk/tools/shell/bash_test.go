@@ -67,7 +67,7 @@ func TestGitRemoteWritesDisabledBlocksBashPushes(t *testing.T) {
 		&WorkspaceWriteBashTool{BashTool: BashTool{Executor: executor, GitRemoteWrites: policy.GitRemoteWritesDisabled}},
 		&BashTool{Executor: executor, GitRemoteWrites: policy.GitRemoteWritesDisabled},
 	} {
-		for _, command := range []string{"git push origin feature", "git push origin main"} {
+		for _, command := range []string{"git push origin feature", "git push origin main", "git -c alias.publish=push publish origin feature", "git -c alias.publish='!git push' publish origin feature"} {
 			result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":"`+command+`"}`), t.TempDir())
 			if err != nil {
 				t.Fatal(err)

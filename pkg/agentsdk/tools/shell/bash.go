@@ -348,7 +348,8 @@ func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (b
 	}
 	fsEnforced := sandbox.ExecutorEnforcesFilesystem(executor, mode)
 	if policy.NormalizeGitRemoteWrites(t.GitRemoteWrites) == policy.GitRemoteWritesDisabled && !fsEnforced {
-		return true, "Command blocked: GitRemoteWrites=disabled requires an enforcing command sandbox so Git credentials remain unavailable to subprocesses"
+		return true, "Command blocked: GitRemoteWrites=disabled requires an enforcing command sandbox " +
+			"so Git credentials remain unavailable to subprocesses"
 	}
 	return isCommandBlockedForGitRemoteWrites(mode, t.GitRemoteWrites, command, fsEnforced)
 }
@@ -371,7 +372,12 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 	return isCommandBlockedForGitRemoteWrites(mode, policy.GitRemoteWritesEnabled, command, fsEnforced)
 }
 
-func isCommandBlockedForGitRemoteWrites(mode policy.PermissionMode, gitRemoteWrites policy.GitRemoteWrites, command string, fsEnforced bool) (bool, string) {
+func isCommandBlockedForGitRemoteWrites(
+	mode policy.PermissionMode,
+	gitRemoteWrites policy.GitRemoteWrites,
+	command string,
+	fsEnforced bool,
+) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
 	dynamicReason := restrictedShellSyntaxReason(command)
 
@@ -403,7 +409,8 @@ func isCommandBlockedForGitRemoteWrites(mode policy.PermissionMode, gitRemoteWri
 
 	// Git policy.
 	for _, argv := range gitInvocations(command) {
-		if policy.NormalizeGitRemoteWrites(gitRemoteWrites) == policy.GitRemoteWritesDisabled && gitSubcommand(argv) == "push" {
+		remoteWritesDisabled := policy.NormalizeGitRemoteWrites(gitRemoteWrites) == policy.GitRemoteWritesDisabled
+		if remoteWritesDisabled && (gitSubcommand(argv) == "push" || gitAliasExpandsToPush(argv)) {
 			return true, "Command blocked: git push is disabled by the GitRemoteWrites policy"
 		}
 		if readOnly {

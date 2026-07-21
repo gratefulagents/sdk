@@ -154,7 +154,10 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&search.GlobTool{},
 			&search.GrepTool{},
 			&lsp.Tool{},
-			&shell.WorkspaceWriteBashTool{BashTool: shell.BashTool{Executor: r.bashExecutor(), GitRemoteWrites: r.gitRemoteWrites}},
+			&shell.WorkspaceWriteBashTool{BashTool: shell.BashTool{
+				Executor:        r.bashExecutor(),
+				GitRemoteWrites: r.gitRemoteWrites,
+			}},
 			&fs.WorkspaceWriteFileTool{},
 			&fs.WorkspaceEditTool{},
 		}
@@ -167,7 +170,10 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&lsp.Tool{},
 		}
 		if !r.permissionMode.AllowsWriteTools() {
-			allTools = append(allTools, &shell.ReadOnlyBashTool{BashTool: shell.BashTool{Executor: r.bashExecutor(), GitRemoteWrites: r.gitRemoteWrites}})
+			allTools = append(allTools, &shell.ReadOnlyBashTool{BashTool: shell.BashTool{
+				Executor:        r.bashExecutor(),
+				GitRemoteWrites: r.gitRemoteWrites,
+			}})
 		} else {
 			allTools = append(allTools,
 				&shell.BashTool{Executor: r.bashExecutor(), GitRemoteWrites: r.gitRemoteWrites},
@@ -192,7 +198,9 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 		r.Register(&shell.BashPollTool{Manager: manager})
 		r.Register(&shell.BashKillTool{Manager: manager})
 	}
-	if r.interactiveTerminal && r.permissionMode == policy.PermissionModeDangerFullAccess && r.gitRemoteWrites == policy.GitRemoteWritesEnabled {
+	if r.interactiveTerminal &&
+		r.permissionMode == policy.PermissionModeDangerFullAccess &&
+		r.gitRemoteWrites == policy.GitRemoteWritesEnabled {
 		manager := shell.NewTerminalManager(r.bashExecutor())
 		r.terminalManager = manager
 		r.Register(&shell.TerminalTool{Manager: manager, Mode: r.permissionMode, GitRemoteWrites: r.gitRemoteWrites})

@@ -656,6 +656,34 @@ func gitSubcommand(argv []string) string {
 	return ""
 }
 
+func gitAliasExpandsToPush(argv []string) bool {
+	subcommand := gitSubcommand(argv)
+	if subcommand == "" {
+		return false
+	}
+	aliasKey := "alias." + subcommand
+	for i := 1; i+1 < len(argv); i++ {
+		if argv[i] != "-c" {
+			continue
+		}
+		key, expansion, ok := strings.Cut(argv[i+1], "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), aliasKey) {
+			continue
+		}
+		expansion = strings.TrimSpace(expansion)
+		if shellExpansion, found := strings.CutPrefix(expansion, "!"); found {
+			expansion = strings.TrimSpace(shellExpansion)
+		}
+		fields := strings.Fields(expansion)
+		directPush := len(fields) > 0 && (fields[0] == "push" || fields[0] == "git-push")
+		shellPush := len(fields) > 1 && fields[0] == "git" && fields[1] == "push"
+		if directPush || shellPush {
+			return true
+		}
+	}
+	return false
+}
+
 func gitSubcommandArgs(argv []string) []string {
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
