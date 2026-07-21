@@ -460,6 +460,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 	if features.value.Tools.VisionAnalyzer {
 		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
 	}
+	bundle.Tools = filterGitRemoteWriteTools(bundle.Tools, cfg.GitRemoteWrites)
 
 	if features.value.MCP.Enabled && features.value.MCP.hasServerSelection() && features.value.MCP.hasToolSelection() {
 		var manager *sdkmcp.Manager
@@ -471,6 +472,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		manager, err = buildMCPManager(ctx, cfg, features.value.MCP, managerOptions...)
 		if manager != nil {
 			bundle.Tools = append(bundle.Tools, filterMCPTools(sdkmcp.BuildTools(manager), features.value.MCP)...)
+			bundle.Tools = filterGitRemoteWriteTools(bundle.Tools, cfg.GitRemoteWrites)
 			bundle.MCPServers = manager.ConnectedServerNames()
 			bundle.Closers = append(bundle.Closers, manager)
 		}
@@ -948,6 +950,20 @@ func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {
 	add(features.Status, "subagent_status")
 	add(features.Control, "subagent_control")
 	return names
+}
+
+func filterGitRemoteWriteTools(tools []agentsdk.Tool, mode policy.GitRemoteWrites) []agentsdk.Tool {
+	if policy.NormalizeGitRemoteWrites(mode) != policy.GitRemoteWritesDisabled {
+		return tools
+	}
+	out := make([]agentsdk.Tool, 0, len(tools))
+	for _, tool := range tools {
+		if tool == nil || sdktools.WritesGitRemote(tool) {
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
 }
 
 func filterNamedTools(tools []agentsdk.Tool, allowed map[string]bool) []agentsdk.Tool {

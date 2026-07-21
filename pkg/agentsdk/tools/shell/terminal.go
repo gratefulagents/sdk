@@ -346,7 +346,8 @@ func (t *TerminalTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TerminalTool) IsReadOnly() bool { return false }
+func (t *TerminalTool) IsReadOnly() bool      { return false }
+func (t *TerminalTool) WritesGitRemote() bool { return true }
 func (t *TerminalTool) IsEnabled(ctx *agentsdk.RunContext) bool {
 	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }

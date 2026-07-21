@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,6 +45,19 @@ func TestBashToolAccessAdapterRetainsGitRemoteWrites(t *testing.T) {
 	}
 	if adapted.GitRemoteWrites != policy.GitRemoteWritesDisabled {
 		t.Fatalf("adapted GitRemoteWrites = %q, want disabled", adapted.GitRemoteWrites)
+	}
+}
+
+func TestGitRemoteWritesDisabledFailsClosedWithoutEnforcingSandbox(t *testing.T) {
+	tool := &BashTool{Executor: &captureExecutor{enforces: false}, GitRemoteWrites: policy.GitRemoteWritesDisabled}
+	for _, command := range []string{
+		"echo safe",
+		`python -c 'import subprocess; subprocess.check_call(["git", "push", "origin", "HEAD"])'`,
+	} {
+		result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":`+strconv.Quote(command)+`}`), t.TempDir())
+		if err != nil || !result.IsError || !strings.Contains(result.Content, "enforcing command sandbox") {
+			t.Fatalf("%q result = %+v err=%v, want fail-closed sandbox error", command, result, err)
+		}
 	}
 }
 

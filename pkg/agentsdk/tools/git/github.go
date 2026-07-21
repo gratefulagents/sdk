@@ -96,7 +96,8 @@ func (t *CreatePullRequestTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *CreatePullRequestTool) IsReadOnly() bool { return false }
+func (t *CreatePullRequestTool) IsReadOnly() bool      { return false }
+func (t *CreatePullRequestTool) WritesGitRemote() bool { return true }
 func (t *CreatePullRequestTool) IsEnabled(ctx *agentsdk.RunContext) bool {
 	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }

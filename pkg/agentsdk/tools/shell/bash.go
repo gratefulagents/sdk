@@ -346,7 +346,11 @@ func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (b
 	if executor == nil {
 		executor = sandbox.Default()
 	}
-	return isCommandBlockedForGitRemoteWrites(mode, t.GitRemoteWrites, command, sandbox.ExecutorEnforcesFilesystem(executor, mode))
+	fsEnforced := sandbox.ExecutorEnforcesFilesystem(executor, mode)
+	if policy.NormalizeGitRemoteWrites(t.GitRemoteWrites) == policy.GitRemoteWritesDisabled && !fsEnforced {
+		return true, "Command blocked: GitRemoteWrites=disabled requires an enforcing command sandbox so Git credentials remain unavailable to subprocesses"
+	}
+	return isCommandBlockedForGitRemoteWrites(mode, t.GitRemoteWrites, command, fsEnforced)
 }
 
 // IsCommandBlockedForMode is the public entry point for the Bash tools'

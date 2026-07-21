@@ -33,6 +33,13 @@ type ToolAccessAdapter interface {
 	ToolForAccess(level ToolAccessLevel) Tool
 }
 
+// GitRemoteWriteTool identifies tools that can mutate a Git remote. Registries
+// and runtime builders use this capability to remove such tools when the host
+// disables Git remote writes.
+type GitRemoteWriteTool interface {
+	WritesGitRemote() bool
+}
+
 // MutatingToolEnabled reports whether a mutating tool may be considered
 // enabled for the run's access context. The runner's exact-name filter remains
 // the authorization boundary; this helper lets access-aware IsEnabled methods

@@ -241,6 +241,9 @@ func (r *Registry) Register(tool agentsdk.Tool) {
 	if tool == nil {
 		return
 	}
+	if r.gitRemoteWrites == policy.GitRemoteWritesDisabled && WritesGitRemote(tool) {
+		return
+	}
 	if !r.permissionMode.AllowsWriteTools() {
 		if adapter, ok := tool.(agentsdk.ToolAccessAdapter); ok {
 			if adapted := adapter.ToolForAccess(agentsdk.ToolAccessLevelReadOnly); adapted != nil {
@@ -254,6 +257,19 @@ func (r *Registry) Register(tool agentsdk.Tool) {
 		}
 	}
 	r.tools[tool.Name()] = tool
+}
+
+// WritesGitRemote reports whether a tool declares or is known to have Git
+// remote side effects.
+func WritesGitRemote(tool agentsdk.Tool) bool {
+	if capable, ok := tool.(agentsdk.GitRemoteWriteTool); ok && capable.WritesGitRemote() {
+		return true
+	}
+	switch tool.Name() {
+	case "git_push", "create_pull_request", "Terminal":
+		return true
+	}
+	return false
 }
 
 func isRegistryControlFlowTool(name string) bool {

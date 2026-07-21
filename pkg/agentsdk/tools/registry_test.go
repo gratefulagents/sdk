@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
@@ -182,6 +183,15 @@ func TestGitRemoteWritesDisabledConfiguresShellAndOmitsTerminal(t *testing.T) {
 	)
 	if r.Get("Terminal") != nil {
 		t.Fatalf("Terminal registered with GitRemoteWrites disabled; names=%v", r.Names())
+	}
+	for _, tool := range []agentsdk.Tool{
+		&shell.TerminalTool{},
+		sdkgit.NewCreatePullRequestTool(nil, nil),
+	} {
+		r.Register(tool)
+		if r.Get(tool.Name()) != nil {
+			t.Fatalf("late registration retained Git remote-write tool %q", tool.Name())
+		}
 	}
 	bash, ok := r.Get("Bash").(*shell.BashTool)
 	if !ok || bash.GitRemoteWrites != policy.GitRemoteWritesDisabled {
