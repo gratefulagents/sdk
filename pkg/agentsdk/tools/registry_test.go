@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
@@ -169,6 +170,44 @@ func TestInteractiveTerminalRequiresDangerFullAccess(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithPermissionMode(policy.PermissionModeDangerFullAccess), WithInteractiveTerminal())
 	if r.Get("Terminal") == nil {
 		t.Fatal("danger-full-access registry missing Terminal")
+	}
+}
+
+func TestGitRemoteWritesDisabledConfiguresShellAndOmitsTerminal(t *testing.T) {
+	r := NewRegistry(
+		t.TempDir(),
+		WithPermissionMode(policy.PermissionModeDangerFullAccess),
+		WithGitRemoteWrites(policy.GitRemoteWritesDisabled),
+		WithAsyncShellTools(),
+		WithInteractiveTerminal(),
+	)
+	if r.Get("Terminal") != nil {
+		t.Fatalf("Terminal registered with GitRemoteWrites disabled; names=%v", r.Names())
+	}
+	for _, tool := range []agentsdk.Tool{
+		&shell.TerminalTool{},
+		sdkgit.NewCreatePullRequestTool(nil, nil),
+	} {
+		r.Register(tool)
+		if r.Get(tool.Name()) != nil {
+			t.Fatalf("late registration retained Git remote-write tool %q", tool.Name())
+		}
+	}
+	bash, ok := r.Get("Bash").(*shell.BashTool)
+	if !ok || bash.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("Bash = %#v, want GitRemoteWrites disabled", r.Get("Bash"))
+	}
+	start, ok := r.Get("BashStart").(*shell.BashStartTool)
+	if !ok || start.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("BashStart = %#v, want GitRemoteWrites disabled", r.Get("BashStart"))
+	}
+	result, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), r.WorkDir())
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+		t.Fatalf("Bash push result = %+v err=%v, want GitRemoteWrites refusal", result, err)
+	}
+	result, err = start.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), r.WorkDir())
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+		t.Fatalf("BashStart push result = %+v err=%v, want GitRemoteWrites refusal", result, err)
 	}
 }
 

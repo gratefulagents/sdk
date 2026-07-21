@@ -318,8 +318,9 @@ func (s *terminalSession) snapshot(output string, dropped bool) terminalSnapshot
 // workflows one-shot Bash cannot handle: TUIs (vim, less, htop), debuggers,
 // REPLs, ssh prompts, and long-lived foreground processes.
 type TerminalTool struct {
-	Manager *TerminalManager
-	Mode    policy.PermissionMode
+	Manager         *TerminalManager
+	Mode            policy.PermissionMode
+	GitRemoteWrites policy.GitRemoteWrites
 }
 
 func (t *TerminalTool) Name() string { return "Terminal" }
@@ -345,7 +346,8 @@ func (t *TerminalTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *TerminalTool) IsReadOnly() bool { return false }
+func (t *TerminalTool) IsReadOnly() bool      { return false }
+func (t *TerminalTool) WritesGitRemote() bool { return true }
 func (t *TerminalTool) IsEnabled(ctx *agentsdk.RunContext) bool {
 	return agentsdk.MutatingToolEnabled(ctx, t.Name())
 }
@@ -353,6 +355,9 @@ func (t *TerminalTool) NeedsApproval() bool { return false }
 func (t *TerminalTool) TimeoutSeconds() int { return 0 }
 
 func (t *TerminalTool) Execute(ctx context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
+	if policy.NormalizeGitRemoteWrites(t.GitRemoteWrites) == policy.GitRemoteWritesDisabled {
+		return agentsdk.ToolResult{Content: "Terminal is unavailable when GitRemoteWrites is disabled", IsError: true}, nil
+	}
 	mode := t.Mode
 	if mode == "" {
 		mode = policy.PermissionModeDangerFullAccess

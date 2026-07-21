@@ -26,6 +26,7 @@ type Registry struct {
 	tools                   map[string]agentsdk.Tool
 	workDir                 string
 	permissionMode          policy.PermissionMode
+	gitRemoteWrites         policy.GitRemoteWrites
 	signals                 bool
 	allowMutating           map[string]struct{}
 	browser                 bool
@@ -51,6 +52,10 @@ func WithReadOnlyTools() RegistryOption {
 
 func WithPermissionMode(mode policy.PermissionMode) RegistryOption {
 	return func(r *Registry) { r.permissionMode = policy.NormalizePermissionMode(string(mode)) }
+}
+
+func WithGitRemoteWrites(value policy.GitRemoteWrites) RegistryOption {
+	return func(r *Registry) { r.gitRemoteWrites = policy.NormalizeGitRemoteWrites(value) }
 }
 
 func WithSignalTools() RegistryOption {
@@ -126,9 +131,10 @@ func WithAllowedMutatingTools(names ...string) RegistryOption {
 // NewRegistry creates a registry with the default SDK tool set.
 func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	r := &Registry{
-		tools:          make(map[string]agentsdk.Tool),
-		workDir:        workDir,
-		permissionMode: policy.PermissionModeWorkspaceWrite,
+		tools:           make(map[string]agentsdk.Tool),
+		workDir:         workDir,
+		permissionMode:  policy.PermissionModeWorkspaceWrite,
+		gitRemoteWrites: policy.GitRemoteWritesEnabled,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -148,7 +154,10 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&search.GlobTool{},
 			&search.GrepTool{},
 			&lsp.Tool{},
-			&shell.WorkspaceWriteBashTool{BashTool: shell.BashTool{Executor: r.bashExecutor()}},
+			&shell.WorkspaceWriteBashTool{BashTool: shell.BashTool{
+				Executor:        r.bashExecutor(),
+				GitRemoteWrites: r.gitRemoteWrites,
+			}},
 			&fs.WorkspaceWriteFileTool{},
 			&fs.WorkspaceEditTool{},
 		}
@@ -161,10 +170,13 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&lsp.Tool{},
 		}
 		if !r.permissionMode.AllowsWriteTools() {
-			allTools = append(allTools, &shell.ReadOnlyBashTool{BashTool: shell.BashTool{Executor: r.bashExecutor()}})
+			allTools = append(allTools, &shell.ReadOnlyBashTool{BashTool: shell.BashTool{
+				Executor:        r.bashExecutor(),
+				GitRemoteWrites: r.gitRemoteWrites,
+			}})
 		} else {
 			allTools = append(allTools,
-				&shell.BashTool{Executor: r.bashExecutor()},
+				&shell.BashTool{Executor: r.bashExecutor(), GitRemoteWrites: r.gitRemoteWrites},
 				&fs.FileWriteTool{},
 				&fs.FileEditTool{},
 			)
@@ -182,14 +194,16 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	if r.asyncShell && r.permissionMode.AllowsWriteTools() {
 		manager := shell.NewAsyncManager(r.bashExecutor())
 		r.asyncShellManager = manager
-		r.Register(&shell.BashStartTool{Manager: manager, Mode: r.permissionMode})
+		r.Register(&shell.BashStartTool{Manager: manager, Mode: r.permissionMode, GitRemoteWrites: r.gitRemoteWrites})
 		r.Register(&shell.BashPollTool{Manager: manager})
 		r.Register(&shell.BashKillTool{Manager: manager})
 	}
-	if r.interactiveTerminal && r.permissionMode == policy.PermissionModeDangerFullAccess {
+	if r.interactiveTerminal &&
+		r.permissionMode == policy.PermissionModeDangerFullAccess &&
+		r.gitRemoteWrites == policy.GitRemoteWritesEnabled {
 		manager := shell.NewTerminalManager(r.bashExecutor())
 		r.terminalManager = manager
-		r.Register(&shell.TerminalTool{Manager: manager, Mode: r.permissionMode})
+		r.Register(&shell.TerminalTool{Manager: manager, Mode: r.permissionMode, GitRemoteWrites: r.gitRemoteWrites})
 	}
 	if r.thinkTool {
 		r.Register(&signal.ThinkTool{})
@@ -235,6 +249,9 @@ func (r *Registry) Register(tool agentsdk.Tool) {
 	if tool == nil {
 		return
 	}
+	if r.gitRemoteWrites == policy.GitRemoteWritesDisabled && WritesGitRemote(tool) {
+		return
+	}
 	if !r.permissionMode.AllowsWriteTools() {
 		if adapter, ok := tool.(agentsdk.ToolAccessAdapter); ok {
 			if adapted := adapter.ToolForAccess(agentsdk.ToolAccessLevelReadOnly); adapted != nil {
@@ -248,6 +265,19 @@ func (r *Registry) Register(tool agentsdk.Tool) {
 		}
 	}
 	r.tools[tool.Name()] = tool
+}
+
+// WritesGitRemote reports whether a tool declares or is known to have Git
+// remote side effects.
+func WritesGitRemote(tool agentsdk.Tool) bool {
+	if capable, ok := tool.(agentsdk.GitRemoteWriteTool); ok && capable.WritesGitRemote() {
+		return true
+	}
+	switch tool.Name() {
+	case "git_push", "create_pull_request", "Terminal":
+		return true
+	}
+	return false
 }
 
 func isRegistryControlFlowTool(name string) bool {

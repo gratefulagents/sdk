@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -32,6 +33,69 @@ func TestBashToolForAccessDowngradesToReadOnly(t *testing.T) {
 		}
 		if !adapted.IsReadOnly() {
 			t.Fatalf("adapted %T should be read-only", adapted)
+		}
+	}
+}
+
+func TestBashToolAccessAdapterRetainsGitRemoteWrites(t *testing.T) {
+	tool := &BashTool{GitRemoteWrites: policy.GitRemoteWritesDisabled}
+	adapted, ok := tool.ToolForAccess(agentsdk.ToolAccessLevelReadOnly).(*ReadOnlyBashTool)
+	if !ok {
+		t.Fatalf("adapted tool = %T, want *ReadOnlyBashTool", tool.ToolForAccess(agentsdk.ToolAccessLevelReadOnly))
+	}
+	if adapted.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("adapted GitRemoteWrites = %q, want disabled", adapted.GitRemoteWrites)
+	}
+}
+
+func TestGitRemoteWritesDisabledFailsClosedWithoutEnforcingSandbox(t *testing.T) {
+	tool := &BashTool{Executor: &captureExecutor{enforces: false}, GitRemoteWrites: policy.GitRemoteWritesDisabled}
+	for _, command := range []string{
+		"echo safe",
+		`python -c 'import subprocess; subprocess.check_call(["git", "push", "origin", "HEAD"])'`,
+	} {
+		result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":`+strconv.Quote(command)+`}`), t.TempDir())
+		if err != nil || !result.IsError || !strings.Contains(result.Content, "enforcing command sandbox") {
+			t.Fatalf("%q result = %+v err=%v, want fail-closed sandbox error", command, result, err)
+		}
+	}
+}
+
+func TestGitRemoteWritesDisabledBlocksBashPushes(t *testing.T) {
+	executor := &captureExecutor{enforces: true}
+	for _, tool := range []agentsdk.Tool{
+		&WorkspaceWriteBashTool{BashTool: BashTool{Executor: executor, GitRemoteWrites: policy.GitRemoteWritesDisabled}},
+		&BashTool{Executor: executor, GitRemoteWrites: policy.GitRemoteWritesDisabled},
+	} {
+		for _, command := range []string{"git push origin feature", "git push origin main", "git -c alias.publish=push publish origin feature", "git -c alias.publish='!git push' publish origin feature"} {
+			result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":"`+command+`"}`), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+				t.Fatalf("%T %q result = %+v, want GitRemoteWrites refusal", tool, command, result)
+			}
+		}
+		for _, command := range []string{"git commit -m local", "git fetch origin", "git pull origin feature"} {
+			result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":"`+command+`"}`), t.TempDir())
+			if err != nil || result.IsError {
+				t.Fatalf("%T %q result = %+v err=%v, want allowed", tool, command, result, err)
+			}
+		}
+	}
+}
+
+func TestGitRemoteWritesDisabledBlocksBashStartPushes(t *testing.T) {
+	for _, mode := range []policy.PermissionMode{policy.PermissionModeWorkspaceWrite, policy.PermissionModeDangerFullAccess} {
+		manager := NewAsyncManager(&captureExecutor{enforces: true})
+		t.Cleanup(func() { _ = manager.Close() })
+		tool := &BashStartTool{Manager: manager, Mode: mode, GitRemoteWrites: policy.GitRemoteWritesDisabled}
+		result, err := tool.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+			t.Fatalf("BashStart %s result = %+v, want GitRemoteWrites refusal", mode, result)
 		}
 	}
 }

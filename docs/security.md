@@ -145,6 +145,21 @@ it remains active as defense in depth for advisory local execution. Git
 policy (protected-branch pushes, per-mode git denylists) applies in all
 cases because the sandbox cannot contain remote-side effects.
 
+### Git remote-write policy
+
+Hosts can set `runtime.Config.GitRemoteWrites` to
+`policy.GitRemoteWritesDisabled` to fail closed on remote Git mutation. The
+zero value normalizes to `policy.GitRemoteWritesEnabled` for compatibility.
+When disabled, known Git remote-write tools are removed, Bash and BashStart
+reject `git push` in every permission mode, and the uninspectable interactive
+Terminal tool is not registered. Because parsing arbitrary shell syntax cannot
+be a security boundary, Bash and BashStart fail closed entirely unless their
+executor enforces the command sandbox. The bubblewrap sandbox masks host GitHub
+and SSH credentials from subprocesses, so indirect invocations cannot obtain a
+write identity. Local Git commits and remote read operations such as fetch and
+pull remain available in that sandbox, subject to the normal permission-mode
+policy. MCP servers remain governed separately by the host's MCP policy.
+
 ### Subprocess lifecycle
 
 Long-running tools (shell, sandboxed exec, MCP children) run in a dedicated

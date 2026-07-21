@@ -133,6 +133,7 @@ type Tool = agent.Tool
 type ToolCallData = agent.ToolCallData
 type ToolAccessLevel = agent.ToolAccessLevel
 type ToolAccessAdapter = agent.ToolAccessAdapter
+type GitRemoteWriteTool = agent.GitRemoteWriteTool
 type ToolOutputData = agent.ToolOutputData
 type ToolApprovalData = agent.ToolApprovalData
 type ToolGuardrailResult = agent.ToolGuardrailResult

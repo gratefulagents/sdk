@@ -95,6 +95,14 @@ func TestTerminalToolRejectsRestrictedModes(t *testing.T) {
 	}
 }
 
+func TestTerminalToolRejectsDisabledGitRemoteWrites(t *testing.T) {
+	tool := &TerminalTool{GitRemoteWrites: policy.GitRemoteWritesDisabled}
+	res, err := tool.Execute(context.Background(), json.RawMessage(`{"op":"list"}`), t.TempDir())
+	if err != nil || !res.IsError || !strings.Contains(res.Content, "GitRemoteWrites") {
+		t.Fatalf("result = %+v err=%v, want GitRemoteWrites refusal", res, err)
+	}
+}
+
 func TestTerminalToolUnknownSessionAndOps(t *testing.T) {
 	tool, workDir := newTestTerminalTool(t)
 	res, err := tool.Execute(context.Background(), json.RawMessage(`{"op":"send","session_id":"nope","keystrokes":"x"}`), workDir)
