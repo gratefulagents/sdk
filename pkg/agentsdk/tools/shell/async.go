@@ -342,8 +342,9 @@ func (j *asyncJob) consumeNewOutput() (string, bool) {
 
 // BashStartTool starts a long-running shell command in the background.
 type BashStartTool struct {
-	Manager *AsyncManager
-	Mode    policy.PermissionMode
+	Manager         *AsyncManager
+	Mode            policy.PermissionMode
+	GitRemoteWrites policy.GitRemoteWrites
 }
 
 func (t *BashStartTool) Name() string { return "BashStart" }
@@ -388,7 +389,7 @@ func (t *BashStartTool) Execute(ctx context.Context, input json.RawMessage, work
 	if t.Manager != nil {
 		executor = t.Manager.executor
 	}
-	if blocked, reason := (&BashTool{Executor: executor}).commandBlocked(mode, in.Command); blocked {
+	if blocked, reason := (&BashTool{Executor: executor, GitRemoteWrites: t.GitRemoteWrites}).commandBlocked(mode, in.Command); blocked {
 		return agentsdk.ToolResult{Content: reason, IsError: true}, nil
 	}
 	id, err := t.Manager.start(ctx, in, workDir, mode)

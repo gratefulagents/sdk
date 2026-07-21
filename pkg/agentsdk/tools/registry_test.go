@@ -172,6 +172,35 @@ func TestInteractiveTerminalRequiresDangerFullAccess(t *testing.T) {
 	}
 }
 
+func TestGitRemoteWritesDisabledConfiguresShellAndOmitsTerminal(t *testing.T) {
+	r := NewRegistry(
+		t.TempDir(),
+		WithPermissionMode(policy.PermissionModeDangerFullAccess),
+		WithGitRemoteWrites(policy.GitRemoteWritesDisabled),
+		WithAsyncShellTools(),
+		WithInteractiveTerminal(),
+	)
+	if r.Get("Terminal") != nil {
+		t.Fatalf("Terminal registered with GitRemoteWrites disabled; names=%v", r.Names())
+	}
+	bash, ok := r.Get("Bash").(*shell.BashTool)
+	if !ok || bash.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("Bash = %#v, want GitRemoteWrites disabled", r.Get("Bash"))
+	}
+	start, ok := r.Get("BashStart").(*shell.BashStartTool)
+	if !ok || start.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("BashStart = %#v, want GitRemoteWrites disabled", r.Get("BashStart"))
+	}
+	result, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), r.WorkDir())
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+		t.Fatalf("Bash push result = %+v err=%v, want GitRemoteWrites refusal", result, err)
+	}
+	result, err = start.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), r.WorkDir())
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+		t.Fatalf("BashStart push result = %+v err=%v, want GitRemoteWrites refusal", result, err)
+	}
+}
+
 func TestNewRegistryAsyncShellTools(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithAsyncShellTools())
 	want := []string{"BashKill", "BashPoll", "BashStart"}

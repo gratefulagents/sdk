@@ -3,6 +3,7 @@ package policy
 // RuntimePolicy is the resolved runtime surface exposed to an agent session.
 type RuntimePolicy struct {
 	PermissionMode    PermissionMode
+	GitRemoteWrites   GitRemoteWrites
 	EnableMCP         bool
 	EnableHooks       bool
 	EnablePlugins     bool
@@ -14,5 +15,6 @@ type RuntimePolicy struct {
 // optional runtime features.
 func (p RuntimePolicy) Normalize() RuntimePolicy {
 	p.PermissionMode = NormalizePermissionMode(string(p.PermissionMode))
+	p.GitRemoteWrites = NormalizeGitRemoteWrites(p.GitRemoteWrites)
 	return p
 }

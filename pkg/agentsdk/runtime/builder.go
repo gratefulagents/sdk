@@ -92,6 +92,7 @@ type Config struct {
 	// available when ToolAccess is read-only.
 	AllowedMutatingTools []string
 	PermissionMode       policy.PermissionMode
+	GitRemoteWrites      policy.GitRemoteWrites
 	CommandSandboxConfig *sdksandbox.Config
 	Features             *Features
 
@@ -423,6 +424,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 	if features.value.Tools.hasRegistryTools() {
 		registryOptions := []sdktools.RegistryOption{
 			sdktools.WithPermissionMode(mode),
+			sdktools.WithGitRemoteWrites(cfg.GitRemoteWrites),
 			sdktools.WithPrivateNetworkURLs(cfg.AllowPrivateNetworkURLs),
 		}
 		if cfg.CommandSandboxConfig != nil {
@@ -829,6 +831,7 @@ func (cfg Config) normalized() Config {
 		}
 	}
 	cfg.ToolAccess = agentsdk.NormalizeToolAccessLevel(cfg.ToolAccess)
+	cfg.GitRemoteWrites = policy.NormalizeGitRemoteWrites(cfg.GitRemoteWrites)
 	if cfg.PermissionMode == "" {
 		cfg.PermissionMode = permissionModeFromAccess(cfg.ToolAccess)
 	}

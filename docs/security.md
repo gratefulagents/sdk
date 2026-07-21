@@ -145,6 +145,16 @@ it remains active as defense in depth for advisory local execution. Git
 policy (protected-branch pushes, per-mode git denylists) applies in all
 cases because the sandbox cannot contain remote-side effects.
 
+### Git remote-write policy
+
+Hosts can set `runtime.Config.GitRemoteWrites` to
+`policy.GitRemoteWritesDisabled` to fail closed on remote Git mutation. The
+zero value normalizes to `policy.GitRemoteWritesEnabled` for compatibility.
+When disabled, Bash and BashStart reject `git push` in every permission mode,
+and the uninspectable interactive Terminal tool is not registered. Local Git
+commits and remote read operations such as fetch and pull remain available
+subject to the normal permission-mode policy.
+
 ### Subprocess lifecycle
 
 Long-running tools (shell, sandboxed exec, MCP children) run in a dedicated

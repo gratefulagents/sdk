@@ -30,7 +30,8 @@ const (
 
 // BashTool executes shell commands.
 type BashTool struct {
-	Executor sandbox.Executor
+	Executor        sandbox.Executor
+	GitRemoteWrites policy.GitRemoteWrites
 }
 
 type bashInput struct {
@@ -80,12 +81,18 @@ func (t *BashTool) TimeoutSeconds() int { return 0 }
 
 func (t *BashTool) ToolForAccess(level agentsdk.ToolAccessLevel) agentsdk.Tool {
 	if level == agentsdk.ToolAccessLevelReadOnly {
-		return &ReadOnlyBashTool{BashTool: BashTool{Executor: t.Executor}}
+		return &ReadOnlyBashTool{BashTool: *t}
 	}
 	return t
 }
 
 func (t *BashTool) Execute(ctx context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
+	var in bashInput
+	if err := json.Unmarshal(input, &in); err == nil {
+		if blocked, reason := t.commandBlocked(policy.PermissionModeDangerFullAccess, in.Command); blocked {
+			return agentsdk.ToolResult{Content: reason, IsError: true}, nil
+		}
+	}
 	return t.execute(ctx, input, workDir, policy.PermissionModeDangerFullAccess)
 }
 
@@ -339,7 +346,7 @@ func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (b
 	if executor == nil {
 		executor = sandbox.Default()
 	}
-	return isCommandBlockedForMode(mode, command, sandbox.ExecutorEnforcesFilesystem(executor, mode))
+	return isCommandBlockedForGitRemoteWrites(mode, t.GitRemoteWrites, command, sandbox.ExecutorEnforcesFilesystem(executor, mode))
 }
 
 // IsCommandBlockedForMode is the public entry point for the Bash tools'
@@ -357,6 +364,10 @@ func IsCommandBlockedForMode(mode policy.PermissionMode, command string) (bool, 
 }
 
 func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnforced bool) (bool, string) {
+	return isCommandBlockedForGitRemoteWrites(mode, policy.GitRemoteWritesEnabled, command, fsEnforced)
+}
+
+func isCommandBlockedForGitRemoteWrites(mode policy.PermissionMode, gitRemoteWrites policy.GitRemoteWrites, command string, fsEnforced bool) (bool, string) {
 	readOnly, workspaceWrite := modeIsRestricted(mode)
 	dynamicReason := restrictedShellSyntaxReason(command)
 
@@ -388,6 +399,9 @@ func isCommandBlockedForMode(mode policy.PermissionMode, command string, fsEnfor
 
 	// Git policy.
 	for _, argv := range gitInvocations(command) {
+		if policy.NormalizeGitRemoteWrites(gitRemoteWrites) == policy.GitRemoteWritesDisabled && gitSubcommand(argv) == "push" {
+			return true, "Command blocked: git push is disabled by the GitRemoteWrites policy"
+		}
 		if readOnly {
 			if blocked, sub := isReadOnlyGitDenied(argv); blocked {
 				return true, fmt.Sprintf("Command blocked in %s mode: git %s is not allowed%s", mode, sub, gitDenialHint(sub))

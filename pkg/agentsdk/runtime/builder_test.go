@@ -205,6 +205,35 @@ func TestBuildToolBundleWiresCommandSandboxConfig(t *testing.T) {
 	}
 }
 
+func TestBuildToolBundleWiresGitRemoteWrites(t *testing.T) {
+	cfg := Config{
+		WorkDir:         t.TempDir(),
+		EnableTools:     true,
+		GitRemoteWrites: policy.GitRemoteWritesDisabled,
+	}
+	bundle, err := BuildToolBundle(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bash *shell.WorkspaceWriteBashTool
+	for _, tool := range bundle.Tools {
+		if typed, ok := tool.(*shell.WorkspaceWriteBashTool); ok {
+			bash = typed
+			break
+		}
+	}
+	if bash == nil || bash.GitRemoteWrites != policy.GitRemoteWritesDisabled {
+		t.Fatalf("Bash = %#v, want GitRemoteWrites disabled", bash)
+	}
+	result, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"git push origin feature"}`), cfg.WorkDir)
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "GitRemoteWrites") {
+		t.Fatalf("Bash push result = %+v err=%v, want GitRemoteWrites refusal", result, err)
+	}
+	if got := (Config{}).normalized().GitRemoteWrites; got != policy.GitRemoteWritesEnabled {
+		t.Fatalf("zero-value GitRemoteWrites = %q, want enabled", got)
+	}
+}
+
 func TestBuildToolBundleIncludesProjectStateTools(t *testing.T) {
 	bundle, err := BuildToolBundle(context.Background(), Config{
 		WorkDir:             t.TempDir(),
