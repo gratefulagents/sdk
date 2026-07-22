@@ -11,6 +11,7 @@ type SubAgentSchedulerConfig struct {
 	EventStream             *EventStream
 	EventWriter             *EventStream
 	WorkDir                 string
+	ToolOutputDir           string
 	ToolAccessLevel         ToolAccessLevel
 	ToolPolicy              *ToolPolicy
 	CompactionConfig        CompactionConfig
@@ -31,6 +32,7 @@ func NewSubAgentScheduler(cfg SubAgentSchedulerConfig) *SubAgentScheduler {
 		Tracker:                 cfg.Tracker,
 		EventStream:             eventStream,
 		WorkDir:                 cfg.WorkDir,
+		ToolOutputDir:           cfg.ToolOutputDir,
 		ToolAccessLevel:         cfg.ToolAccessLevel,
 		ToolPolicy:              cfg.ToolPolicy,
 		CompactionConfig:        cfg.CompactionConfig,
@@ -61,6 +63,7 @@ func ConfigureSubAgentScheduler(s *SubAgentScheduler, cfg SubAgentSchedulerConfi
 		Tracker:                 cfg.Tracker,
 		EventStream:             eventStream,
 		WorkDir:                 cfg.WorkDir,
+		ToolOutputDir:           cfg.ToolOutputDir,
 		ToolAccessLevel:         cfg.ToolAccessLevel,
 		ToolPolicy:              cfg.ToolPolicy,
 		CompactionConfig:        cfg.CompactionConfig,

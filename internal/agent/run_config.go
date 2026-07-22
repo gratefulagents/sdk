@@ -313,7 +313,11 @@ type RunConfig struct {
 	// separate runs. Empty scopes keys to the shared trace ID; callers should set
 	// the same non-secret value only when cross-run cache reuse is intended.
 	PromptCacheNamespace string
-	toolOutputSpillDir   string
+	// ToolOutputDir is the parent directory for private, per-run tool-output
+	// spill directories. Empty uses the OS temporary directory. Spill files are
+	// removed when the run returns and are disabled for read-only runs.
+	ToolOutputDir      string
+	toolOutputSpillDir string
 	// TracingDisabled suppresses the spans the runner itself emits
 	// (generation, function, handoff, trace lifecycle) for this run. It does
 	// NOT affect spans emitted by a ProgressTracker wired via

@@ -653,6 +653,7 @@ func TestBuildRunConfigHonorsHostOverrides(t *testing.T) {
 		Provider:                  "multi",
 		Model:                     "gpt-test",
 		WorkDir:                   "/repo",
+		ToolOutputDir:             "/tool-output",
 		ActiveMode:                "ultrawork",
 		ModelSettings:             &settings,
 		MaxTurns:                  7,
@@ -677,7 +678,7 @@ func TestBuildRunConfigHonorsHostOverrides(t *testing.T) {
 	if runCfg.MaxTurns != 7 || runCfg.SubAgentMaxTurns != 3 || runCfg.MaxConcurrentSubAgents != 2 {
 		t.Fatalf("turn config = %+v", runCfg)
 	}
-	if runCfg.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly || runCfg.WorkingStateContext != "working state" || runCfg.AdditionalInstructions != "mode instructions" {
+	if runCfg.ToolAccessLevel != agentsdk.ToolAccessLevelReadOnly || runCfg.WorkingStateContext != "working state" || runCfg.AdditionalInstructions != "mode instructions" || runCfg.ToolOutputDir != "/tool-output" {
 		t.Fatalf("context config = %+v", runCfg)
 	}
 	if runCfg.Trace != trace || runCfg.ParentSpanID != "parent-span" {

@@ -281,6 +281,7 @@ type SubAgentRegistry struct {
 	tracker           *ProgressTracker
 	eventStream       *EventStream
 	workDir           string
+	toolOutputDir     string
 
 	// RunConfig fields inherited from the parent orchestrator.
 	toolAccessLevel         ToolAccessLevel
@@ -298,6 +299,7 @@ type SubAgentRegistryConfig struct {
 	Tracker                 *ProgressTracker
 	EventStream             *EventStream
 	WorkDir                 string
+	ToolOutputDir           string
 	ToolAccessLevel         ToolAccessLevel
 	ToolPolicy              *ToolPolicy
 	CompactionConfig        CompactionConfig
@@ -316,6 +318,7 @@ func NewSubAgentRegistry(cfg SubAgentRegistryConfig) *SubAgentRegistry {
 		tracker:                 cfg.Tracker,
 		eventStream:             cfg.EventStream,
 		workDir:                 cfg.WorkDir,
+		toolOutputDir:           cfg.ToolOutputDir,
 		toolAccessLevel:         NormalizeToolAccessLevel(cfg.ToolAccessLevel),
 		toolPolicy:              cfg.ToolPolicy,
 		compactionConfig:        cfg.CompactionConfig,
@@ -381,6 +384,7 @@ func (r *SubAgentRegistry) Configure(cfg SubAgentRegistryConfig) {
 	if cfg.WorkDir != "" {
 		r.workDir = cfg.WorkDir
 	}
+	r.toolOutputDir = cfg.ToolOutputDir
 	// Security-relevant fields only change when explicitly set: a partial
 	// config must never escalate future sub-agents (an empty access level
 	// normalizes to full and a nil policy disables approval requirements).
@@ -712,6 +716,7 @@ type taskRunSnapshot struct {
 	tracker                 *ProgressTracker
 	eventStream             *EventStream
 	workDir                 string
+	toolOutputDir           string
 	toolAccessLevel         ToolAccessLevel
 	toolPolicy              *ToolPolicy
 	retryPolicy             *RetryPolicy
@@ -810,6 +815,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		tracker:                 r.tracker,
 		eventStream:             r.eventStream,
 		workDir:                 r.workDir,
+		toolOutputDir:           r.toolOutputDir,
 		toolAccessLevel:         r.toolAccessLevel,
 		toolPolicy:              r.toolPolicy,
 		compactionConfig:        r.compactionConfig,
@@ -822,6 +828,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		snap.toolOutputGuardrails = nestedCfg.ToolOutputGuardrails
 		snap.untrustedToolOutputs = nestedCfg.UntrustedToolOutputs
 		snap.maxToolOutputBytes = nestedCfg.MaxToolOutputBytes
+		snap.toolOutputDir = nestedCfg.ToolOutputDir
 		snap.handoffHistory = nestedCfg.HandoffHistory
 		snap.compactionRecorder = nestedCfg.CompactionRecorder
 		snap.compactionFailureReporter = nestedCfg.CompactionFailureReporter
@@ -986,6 +993,7 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			MaxTurns:                  snap.maxTurns,
 			SubAgentMaxTurns:          snap.maxTurns,
 			WorkDir:                   snap.workDir,
+			ToolOutputDir:             snap.toolOutputDir,
 			ToolAccessLevel:           childToolAccess,
 			ToolPolicy:                snap.toolPolicy,
 			ToolInputGuardrails:       snap.toolInputGuardrails,

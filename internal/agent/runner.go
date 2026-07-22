@@ -250,6 +250,8 @@ func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call Too
 		return RunItem{}, nil, nil, false, fmt.Errorf("agent is nil")
 	}
 	cfg.ToolAccessLevel = NormalizeToolAccessLevel(cfg.ToolAccessLevel)
+	cleanupToolOutput := prepareToolOutputSpill(&cfg)
+	defer cleanupToolOutput()
 
 	runCtx := newRunContext(ctx, cfg)
 	runCtx.ToolAccessLevel = cfg.ToolAccessLevel
@@ -345,16 +347,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		cacheNamespace = trace.ID
 	}
 	cfg.PromptCacheKey = promptCacheWireKey(cacheNamespace, logicalCacheKey)
-	if !cfg.IsReadOnly() && strings.TrimSpace(cfg.WorkDir) != "" {
-		if workDir, absErr := filepath.Abs(cfg.WorkDir); absErr == nil {
-			if resolvedWorkDir, resolveErr := filepath.EvalSymlinks(workDir); resolveErr == nil {
-				if spillDir, mkdirErr := os.MkdirTemp(resolvedWorkDir, ".gratefulagents-tool-output-"); mkdirErr == nil {
-					cfg.toolOutputSpillDir = spillDir
-					defer os.RemoveAll(spillDir)
-				}
-			}
-		}
-	}
+	cleanupToolOutput := prepareToolOutputSpill(&cfg)
+	defer cleanupToolOutput()
 	defer func() {
 		if ownTrace {
 			trace.Finish()
@@ -2366,6 +2360,51 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 func promptCacheWireKey(namespace, logical string) string {
 	sum := sha256.Sum256([]byte(namespace + "\x00" + logical))
 	return hex.EncodeToString(sum[:])
+}
+
+// prepareToolOutputSpill creates an isolated per-run spill directory outside
+// the working tree. It fails closed when either path cannot be resolved or the
+// selected temporary parent points at or beneath WorkDir.
+func prepareToolOutputSpill(cfg *RunConfig) func() {
+	if cfg == nil || cfg.IsReadOnly() {
+		return func() {}
+	}
+	spillParent := strings.TrimSpace(cfg.ToolOutputDir)
+	if spillParent == "" {
+		spillParent = os.TempDir()
+	}
+	resolvedParent, err := resolveExistingDir(spillParent)
+	if err != nil {
+		return func() {}
+	}
+	if workDir := strings.TrimSpace(cfg.WorkDir); workDir != "" {
+		resolvedWorkDir, err := resolveExistingDir(workDir)
+		if err != nil || pathWithin(resolvedWorkDir, resolvedParent) {
+			return func() {}
+		}
+	}
+	spillDir, err := os.MkdirTemp(resolvedParent, ".gratefulagents-tool-output-")
+	if err != nil {
+		return func() {}
+	}
+	cfg.toolOutputSpillDir = spillDir
+	return func() {
+		_ = os.RemoveAll(spillDir)
+		cfg.toolOutputSpillDir = ""
+	}
+}
+
+func resolveExistingDir(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
+}
+
+func pathWithin(parent, candidate string) bool {
+	relative, err := filepath.Rel(parent, candidate)
+	return err == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))))
 }
 
 func spillToolOutput(cfg RunConfig, output string) (string, bool) {
