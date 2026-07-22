@@ -233,7 +233,14 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 	}, nil
 }
 
+// RequestHeaders returns authentication headers for clients that send requests
+// themselves. It proactively refreshes opaque OAuth tokens using last_refresh
+// because direct consumers do not necessarily have a 401 retry transport.
 func (s *OpenAIAuthSession) RequestHeaders(ctx context.Context) (map[string]string, error) {
+	return s.requestHeaders(ctx, true)
+}
+
+func (s *OpenAIAuthSession) requestHeaders(ctx context.Context, proactiveRefresh bool) (map[string]string, error) {
 	if s == nil {
 		return nil, fmt.Errorf("auth session is required")
 	}
@@ -245,7 +252,7 @@ func (s *OpenAIAuthSession) RequestHeaders(ctx context.Context) (map[string]stri
 	}
 	switch s.mode {
 	case AuthModeOAuth:
-		if err := s.ensureOAuthAccessToken(ctx); err != nil {
+		if err := s.ensureOAuthAccessToken(ctx, proactiveRefresh); err != nil {
 			return nil, err
 		}
 		s.oauth.mu.Lock()
@@ -308,7 +315,7 @@ func (s *OpenAIAuthSession) Refresh(ctx context.Context) error {
 	return err
 }
 
-func (s *OpenAIAuthSession) ensureOAuthAccessToken(ctx context.Context) error {
+func (s *OpenAIAuthSession) ensureOAuthAccessToken(ctx context.Context, proactiveRefresh bool) error {
 	if s == nil || s.mode != AuthModeOAuth || s.oauth == nil {
 		return nil
 	}
@@ -318,7 +325,7 @@ func (s *OpenAIAuthSession) ensureOAuthAccessToken(ctx context.Context) error {
 	lastRefresh := s.oauth.lastRefresh
 	s.oauth.mu.Unlock()
 
-	if shouldRefreshOAuthAccessToken(accessToken, lastRefresh, time.Now()) && refreshToken != "" {
+	if shouldRefreshOAuthAccessToken(accessToken, lastRefresh, time.Now(), proactiveRefresh) && refreshToken != "" {
 		if err := s.Refresh(ctx); err != nil {
 			return err
 		}
@@ -429,7 +436,7 @@ func (s *OpenAIAuthSession) NeedsRefresh() bool {
 	if strings.TrimSpace(s.oauth.refreshToken) == "" {
 		return false
 	}
-	return shouldRefreshOAuthAccessToken(s.oauth.accessToken, s.oauth.lastRefresh, time.Now())
+	return shouldRefreshOAuthAccessToken(s.oauth.accessToken, s.oauth.lastRefresh, time.Now(), true)
 }
 
 func (s *OpenAIAuthSession) RefreshAndSerialize(ctx context.Context, accountIDOverride string) ([]byte, error) {
@@ -499,17 +506,28 @@ func (s *OpenAIAuthSession) promptCacheCredentialScope() string {
 	return hex.EncodeToString(sum[:])
 }
 
-func shouldRefreshOAuthAccessToken(accessToken string, _ time.Time, now time.Time) bool {
+// oauthAccessTokenExpiryLead gives direct clients time to finish a request
+// before a JWT expires. Retrying transports deliberately do not use this lead.
+const oauthAccessTokenExpiryLead = 5 * time.Minute
+
+func shouldRefreshOAuthAccessToken(accessToken string, lastRefresh, now time.Time, proactive bool) bool {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
 		return true
 	}
-	// Use a cached access token until it actually expires. last_refresh is only
-	// advisory and can lag behind when another logged-in process rotates the
-	// single-use refresh-token chain. Opaque tokens are likewise tried first;
-	// authRoundTripper refreshes and retries once after a real provider 401.
 	if exp, ok := accessTokenExpiry(accessToken); ok {
+		if proactive {
+			return !now.Add(oauthAccessTokenExpiryLead).Before(exp)
+		}
 		return !exp.After(now)
+	}
+	// Opaque tokens have no locally inspectable expiry. Direct RequestHeaders
+	// consumers need the age fallback because they may not retry a 401. The SDK
+	// auth transport disables it and instead refreshes after a real provider 401,
+	// avoiding unnecessary rotation of a single-use refresh-token chain.
+	if proactive && !lastRefresh.IsZero() {
+		refreshAt := now.Add(-oauthRefreshInterval)
+		return !lastRefresh.After(refreshAt)
 	}
 	return false
 }
@@ -1371,7 +1389,7 @@ func isChatGPTBackendHost(host string) bool {
 }
 
 func applyAuthHeaders(req *http.Request, session *OpenAIAuthSession) error {
-	headers, err := session.RequestHeaders(req.Context())
+	headers, err := session.requestHeaders(req.Context(), false)
 	if err != nil {
 		return err
 	}
