@@ -83,6 +83,7 @@ GRATEFUL_LIVE_TESTS=skip go test ./examples/features/...
 ## Documentation
 
 - [Architecture](docs/architecture.md) — package boundaries and runtime flow.
+- [Competitive analysis](docs/competitive-analysis.md) — comparison with leading agent SDKs and a prioritized roadmap.
 - [Security model](docs/security.md) — threat model and shipped defenses. Read before exposing tools to untrusted input.
 - [Development](docs/development.md) — local workflow and the live-test matrix.
 - [Feature inventory](examples/features/README.md) — full list of feature examples.
