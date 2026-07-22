@@ -40,7 +40,7 @@ func TestRefreshOpenAIAuthJSON(t *testing.T) {
 		})},
 	}
 	oldRefresh := now.Add(-OpenAIRefreshMaxAge - time.Hour).UTC().Format(time.RFC3339Nano)
-	raw := []byte(`{"tokens":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"acct"},"last_refresh":"` + oldRefresh + `"}`)
+	raw := []byte(`{"tokens":{"access_token":"` + openAIJWTExpiringAt(now.Add(-time.Minute)) + `","refresh_token":"old-refresh","account_id":"acct"},"last_refresh":"` + oldRefresh + `"}`)
 
 	updated, changed, err := RefreshOpenAIAuthJSON(context.Background(), raw, "", cfg)
 	if err != nil {

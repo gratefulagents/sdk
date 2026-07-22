@@ -117,7 +117,9 @@ func fetchModelMetadataOnce(ctx context.Context, endpoint string, session *OpenA
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	headers, err := session.RequestHeaders(ctx)
+	// This call site performs its own refresh-and-retry on 401, so send a
+	// cached token first rather than proactively rotating opaque credentials.
+	headers, err := session.requestHeaders(ctx, false)
 	if err != nil {
 		return nil, err
 	}

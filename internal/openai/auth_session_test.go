@@ -224,6 +224,80 @@ func TestOAuthAuthSessionRequestHeadersIncludesAccountAndBeta(t *testing.T) {
 	}
 }
 
+func TestOAuthAuthTransportUsesCachedAccessTokenDespiteOldLastRefresh(t *testing.T) {
+	now := time.Now()
+	for name, accessToken := range map[string]string{
+		"unexpired JWT": jwtWithAccountID("acct-1", now.Add(time.Minute).Unix()),
+		"opaque token":  "opaque-access-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			refreshCalls := 0
+			refreshServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				refreshCalls++
+				http.Error(w, "refresh should not be called", http.StatusUnauthorized)
+			}))
+			defer refreshServer.Close()
+
+			session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+				AuthJSON:      []byte(`{"tokens":{"access_token":"` + accessToken + `","refresh_token":"already-used","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`),
+				TokenEndpoint: refreshServer.URL,
+			})
+			if err != nil {
+				t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+			}
+			transport := &authRoundTripper{
+				session: session,
+				base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if got := req.Header.Get("Authorization"); got != "Bearer "+accessToken {
+						t.Fatalf("Authorization = %q, want cached access token", got)
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+				}),
+			}
+			req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip() error = %v", err)
+			}
+			_ = resp.Body.Close()
+			if refreshCalls != 0 {
+				t.Fatalf("refresh calls = %d, want 0", refreshCalls)
+			}
+		})
+	}
+}
+
+func TestOAuthAuthSessionRequestHeadersRefreshesOldOpaqueToken(t *testing.T) {
+	refreshCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"fresh-access","refresh_token":"fresh-refresh"}`))
+	}))
+	defer server.Close()
+
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSON:      []byte(`{"tokens":{"access_token":"opaque-access","refresh_token":"old-refresh","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`),
+		TokenEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+	}
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer fresh-access" {
+		t.Fatalf("Authorization = %q, want refreshed access token", got)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+	}
+}
+
 func TestOAuthAuthSessionRefreshSingleflight(t *testing.T) {
 	var refreshCalls atomic.Int32
 	var scopes []string
