@@ -17,7 +17,7 @@ func TestPartialProgressTail(t *testing.T) {
 		{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "c1", Name: "echo"}},
 		{Type: RunItemToolOutput, ToolOutput: &ToolOutputData{CallID: "c1", Content: "ok"}},
 		{Type: RunItemMessage, Message: &MessageOutput{Text: "latest finding: root cause in loop.go"}},
-		{Type: RunItemMessage, Message: &MessageOutput{Text: "[SYSTEM] Turn budget warning: wrap up"}},
+		{Type: RunItemMessage, Message: &MessageOutput{Text: "[SYSTEM] internal notice"}},
 	}}
 	if got := partialProgressTail(result); got != "latest finding: root cause in loop.go" {
 		t.Errorf("expected last non-system assistant text, got %q", got)
