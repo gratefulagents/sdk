@@ -73,8 +73,9 @@ type Config struct {
 	FallbackModels []string
 
 	WorkDir string
-	// ToolOutputDir is the parent directory for private per-run tool-output
-	// spill directories. Empty uses the OS temporary directory.
+	// ToolOutputDir is the caller-managed parent directory for private per-run
+	// tool-output spill directories that must remain available across runs.
+	// Empty uses OS temporary storage and removes spills when each run returns.
 	ToolOutputDir string
 	AgentName     string
 	Instructions  string

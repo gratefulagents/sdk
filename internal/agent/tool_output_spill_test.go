@@ -42,7 +42,7 @@ func TestSpillToolOutputDisabledWithoutRunTempDirAndForReadOnly(t *testing.T) {
 	}
 }
 
-func TestRunnerToolOutputSpillUsesConfiguredRootAndIsCleanedOnReturn(t *testing.T) {
+func TestRunnerToolOutputSpillUsesConfiguredRootAndPersistsAfterReturn(t *testing.T) {
 	model := &mockModel{responses: []*ModelResponse{
 		{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "call-1", Name: "large", Input: json.RawMessage(`{}`)}}}},
 		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "done"}}}},
@@ -89,8 +89,12 @@ func TestRunnerToolOutputSpillUsesConfiguredRootAndIsCleanedOnReturn(t *testing.
 	if rel, err := filepath.Rel(workDir, path); err != nil || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
 		t.Fatalf("spill hint path = %q, want outside workspace %q", path, workDir)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("spill path remains after Run: %v", err)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read retained spill after Run: %v", err)
+	}
+	if string(got) != strings.Repeat("界", 1000) {
+		t.Fatal("retained spill did not preserve the full tool output")
 	}
 }
 
@@ -175,8 +179,12 @@ func TestExecuteApprovedToolUsesConfiguredOutputRoot(t *testing.T) {
 	if !pathWithin(outputRoot, path) {
 		t.Fatalf("spill path = %q, want beneath %q", path, outputRoot)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("spill path remains after approved tool returns: %v", err)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read retained spill after approved tool returns: %v", err)
+	}
+	if string(got) != strings.Repeat("approved output ", 100) {
+		t.Fatal("retained approved-tool spill did not preserve the full output")
 	}
 }
 

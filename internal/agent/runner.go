@@ -2363,14 +2363,16 @@ func promptCacheWireKey(namespace, logical string) string {
 }
 
 // prepareToolOutputSpill creates an isolated per-run spill directory outside
-// the working tree. It fails closed when either path cannot be resolved or the
-// selected temporary parent points at or beneath WorkDir.
+// the working tree. Explicit parents are caller-managed and retained across
+// runs; default OS-temporary spills are removed on return. It fails closed when
+// either path cannot be resolved or the selected parent is beneath WorkDir.
 func prepareToolOutputSpill(cfg *RunConfig) func() {
 	if cfg == nil || cfg.IsReadOnly() {
 		return func() {}
 	}
 	spillParent := strings.TrimSpace(cfg.ToolOutputDir)
-	if spillParent == "" {
+	callerManaged := spillParent != ""
+	if !callerManaged {
 		spillParent = os.TempDir()
 	}
 	resolvedParent, err := resolveExistingDir(spillParent)
@@ -2389,7 +2391,9 @@ func prepareToolOutputSpill(cfg *RunConfig) func() {
 	}
 	cfg.toolOutputSpillDir = spillDir
 	return func() {
-		_ = os.RemoveAll(spillDir)
+		if !callerManaged {
+			_ = os.RemoveAll(spillDir)
+		}
 		cfg.toolOutputSpillDir = ""
 	}
 }
