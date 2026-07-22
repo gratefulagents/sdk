@@ -117,6 +117,7 @@ type NestedRunConfig struct {
 	ModelCallTimeout          time.Duration
 	UntrustedToolOutputs      *bool
 	MaxToolOutputBytes        int
+	ToolOutputDir             string
 }
 
 func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
@@ -134,6 +135,7 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 		ModelCallTimeout:          cfg.ModelCallTimeout,
 		UntrustedToolOutputs:      cfg.UntrustedToolOutputs,
 		MaxToolOutputBytes:        cfg.MaxToolOutputBytes,
+		ToolOutputDir:             cfg.ToolOutputDir,
 	})
 }
 

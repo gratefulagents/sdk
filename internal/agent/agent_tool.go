@@ -175,6 +175,7 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		runConfig.ToolOutputGuardrails = nestedCfg.ToolOutputGuardrails
 		runConfig.UntrustedToolOutputs = nestedCfg.UntrustedToolOutputs
 		runConfig.MaxToolOutputBytes = nestedCfg.MaxToolOutputBytes
+		runConfig.ToolOutputDir = nestedCfg.ToolOutputDir
 		// Model calls made by a child must retain the parent's resilience
 		// policy; without these, a provider timeout the parent would retry
 		// fails the whole sub-agent tool call instead.

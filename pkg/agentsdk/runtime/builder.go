@@ -72,12 +72,16 @@ type Config struct {
 	// such as "anthropic/claude-sonnet-4-6" or "copilot/gpt-4.1".
 	FallbackModels []string
 
-	WorkDir      string
-	AgentName    string
-	Instructions string
-	ActiveMode   string
-	ModeSnapshot *sdkmode.TemplateSpec
-	RoleCatalog  agentsdk.RoleCatalog
+	WorkDir string
+	// ToolOutputDir is the caller-managed parent directory for private per-run
+	// tool-output spill directories that must remain available across runs.
+	// Empty uses OS temporary storage and removes spills when each run returns.
+	ToolOutputDir string
+	AgentName     string
+	Instructions  string
+	ActiveMode    string
+	ModeSnapshot  *sdkmode.TemplateSpec
+	RoleCatalog   agentsdk.RoleCatalog
 
 	Reasoning              string
 	Verbosity              string
@@ -696,6 +700,7 @@ func attachAsyncSubAgentTools(cfg Config, state *SessionState, runner *agentsdk.
 		Tracker:                 tracker,
 		EventStream:             eventStream,
 		WorkDir:                 cfg.WorkDir,
+		ToolOutputDir:           cfg.ToolOutputDir,
 		ToolAccessLevel:         cfg.ToolAccess,
 		ToolPolicy:              toolPolicy(cfg),
 		CompactionConfig:        runCompactionConfig(cfg),
@@ -752,6 +757,7 @@ func BuildRunConfig(cfg Config, hooks agentsdk.RunHooks) agentsdk.RunConfig {
 		ToolInputGuardrails:    toolInputGuardrails(cfg),
 		ToolOutputGuardrails:   toolOutputGuardrails(cfg),
 		WorkDir:                cfg.WorkDir,
+		ToolOutputDir:          cfg.ToolOutputDir,
 		RetryPolicy:            retryPolicy(cfg),
 		AdditionalInstructions: additionalInstructions(cfg),
 		WorkingStateContext:    firstNonEmpty(cfg.WorkingStateText, "Runtime state is maintained by the host adapter."),
