@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -289,7 +290,6 @@ func OpenAINeedsRefresh(authJSON []byte, now time.Time) (bool, error) {
 			AccessToken  string `json:"access_token"`
 			RefreshToken string `json:"refresh_token"`
 		} `json:"tokens"`
-		LastRefresh string `json:"last_refresh"`
 	}
 	if err := json.Unmarshal(authJSON, &parsed); err != nil {
 		return false, fmt.Errorf("parse openai oauth json: %w", err)
@@ -297,14 +297,56 @@ func OpenAINeedsRefresh(authJSON []byte, now time.Time) (bool, error) {
 	if strings.TrimSpace(parsed.Tokens.RefreshToken) == "" {
 		return false, nil
 	}
-	if strings.TrimSpace(parsed.Tokens.AccessToken) == "" {
+	accessToken := strings.TrimSpace(parsed.Tokens.AccessToken)
+	if accessToken == "" {
 		return true, nil
 	}
-	lastRefresh := parseTime(parsed.LastRefresh)
-	if lastRefresh.IsZero() {
-		return false, nil
+	// A cached access token is authoritative while it remains usable. In
+	// particular, do not rotate a single-use refresh token merely because the
+	// advisory last_refresh timestamp is old: another logged-in process may
+	// already have advanced that refresh-token chain. Opaque tokens are tried
+	// first and refreshed only after the provider rejects them with 401.
+	if expiry, ok := openAIAccessTokenExpiry(accessToken); ok {
+		return !expiry.After(now), nil
 	}
-	return !lastRefresh.After(now.Add(-OpenAIRefreshMaxAge)), nil
+	return false, nil
+}
+
+func openAIAccessTokenExpiry(accessToken string) (time.Time, bool) {
+	parts := strings.Split(strings.TrimSpace(accessToken), ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var claims map[string]any
+	if err := decoder.Decode(&claims); err != nil {
+		return time.Time{}, false
+	}
+	expiresAt, ok := claims["exp"]
+	if !ok {
+		return time.Time{}, false
+	}
+	switch value := expiresAt.(type) {
+	case json.Number:
+		unix, err := value.Int64()
+		if err != nil {
+			return time.Time{}, false
+		}
+		return time.Unix(unix, 0), true
+	case string:
+		unix, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return time.Unix(unix, 0), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 func firstNonEmpty(values ...string) string {

@@ -499,20 +499,17 @@ func (s *OpenAIAuthSession) promptCacheCredentialScope() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// oauthAccessTokenExpiryLead refreshes a JWT access token shortly before its
-// exp claim so requests are not sent with an about-to-expire (or expired)
-// token, which would cost a failed 401 round trip per request.
-const oauthAccessTokenExpiryLead = 5 * time.Minute
-
-func shouldRefreshOAuthAccessToken(accessToken string, lastRefresh time.Time, now time.Time) bool {
-	if strings.TrimSpace(accessToken) == "" {
+func shouldRefreshOAuthAccessToken(accessToken string, _ time.Time, now time.Time) bool {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
 		return true
 	}
-	if exp, ok := accessTokenExpiry(accessToken); ok && !now.Add(oauthAccessTokenExpiryLead).Before(exp) {
-		return true
-	}
-	if !lastRefresh.IsZero() && (lastRefresh.Before(now.Add(-oauthRefreshInterval)) || lastRefresh.Equal(now.Add(-oauthRefreshInterval))) {
-		return true
+	// Use a cached access token until it actually expires. last_refresh is only
+	// advisory and can lag behind when another logged-in process rotates the
+	// single-use refresh-token chain. Opaque tokens are likewise tried first;
+	// authRoundTripper refreshes and retries once after a real provider 401.
+	if exp, ok := accessTokenExpiry(accessToken); ok {
+		return !exp.After(now)
 	}
 	return false
 }

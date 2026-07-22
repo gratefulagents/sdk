@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strconv"
 	"testing"
@@ -170,27 +171,41 @@ func TestCopilotAPIBaseURLFromToken(t *testing.T) {
 	}
 }
 
-func TestOpenAINeedsRefreshUsesLastRefreshAge(t *testing.T) {
+func TestOpenAINeedsRefreshUsesCachedTokenUntilExpired(t *testing.T) {
 	now := time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC)
-	old := now.Add(-OpenAIRefreshMaxAge).UTC().Format(time.RFC3339Nano)
-	authJSON := []byte(`{"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":"` + old + `"}`)
+	old := now.Add(-OpenAIRefreshMaxAge - time.Hour).UTC().Format(time.RFC3339Nano)
+
+	for name, accessToken := range map[string]string{
+		"unexpired JWT": openAIJWTExpiringAt(now.Add(time.Minute)),
+		"opaque token":  "opaque-access-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			authJSON := []byte(`{"tokens":{"access_token":"` + accessToken + `","refresh_token":"refresh"},"last_refresh":"` + old + `"}`)
+			needs, err := OpenAINeedsRefresh(authJSON, now)
+			if err != nil {
+				t.Fatalf("OpenAINeedsRefresh() error = %v", err)
+			}
+			if needs {
+				t.Fatal("OpenAINeedsRefresh() = true for a cached usable token")
+			}
+		})
+	}
+
+	expired := openAIJWTExpiringAt(now)
+	authJSON := []byte(`{"tokens":{"access_token":"` + expired + `","refresh_token":"refresh"}}`)
 	needs, err := OpenAINeedsRefresh(authJSON, now)
 	if err != nil {
 		t.Fatalf("OpenAINeedsRefresh() error = %v", err)
 	}
 	if !needs {
-		t.Fatal("OpenAINeedsRefresh at max age = false, want true")
+		t.Fatal("OpenAINeedsRefresh() = false for an expired access token")
 	}
+}
 
-	fresh := now.Add(-OpenAIRefreshMaxAge + time.Minute).UTC().Format(time.RFC3339Nano)
-	authJSON = []byte(`{"tokens":{"access_token":"access","refresh_token":"refresh"},"last_refresh":"` + fresh + `"}`)
-	needs, err = OpenAINeedsRefresh(authJSON, now)
-	if err != nil {
-		t.Fatalf("OpenAINeedsRefresh() error = %v", err)
-	}
-	if needs {
-		t.Fatal("OpenAINeedsRefresh before max age = true, want false")
-	}
+func openAIJWTExpiringAt(expiry time.Time) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":` + strconv.FormatInt(expiry.Unix(), 10) + `}`))
+	return header + "." + payload + "."
 }
 
 func TestAnthropicNeedsRefreshAdaptiveLead(t *testing.T) {

@@ -224,6 +224,41 @@ func TestOAuthAuthSessionRequestHeadersIncludesAccountAndBeta(t *testing.T) {
 	}
 }
 
+func TestOAuthAuthSessionUsesCachedAccessTokenDespiteOldLastRefresh(t *testing.T) {
+	now := time.Now()
+	for name, accessToken := range map[string]string{
+		"unexpired JWT": jwtWithAccountID("acct-1", now.Add(time.Minute).Unix()),
+		"opaque token":  "opaque-access-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			refreshCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				refreshCalls++
+				http.Error(w, "refresh should not be called", http.StatusUnauthorized)
+			}))
+			defer server.Close()
+
+			session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+				AuthJSON:      []byte(`{"tokens":{"access_token":"` + accessToken + `","refresh_token":"already-used","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`),
+				TokenEndpoint: server.URL,
+			})
+			if err != nil {
+				t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+			}
+			headers, err := session.RequestHeaders(context.Background())
+			if err != nil {
+				t.Fatalf("RequestHeaders() error = %v", err)
+			}
+			if got := headers["Authorization"]; got != "Bearer "+accessToken {
+				t.Fatalf("Authorization = %q, want cached access token", got)
+			}
+			if refreshCalls != 0 {
+				t.Fatalf("refresh calls = %d, want 0", refreshCalls)
+			}
+		})
+	}
+}
+
 func TestOAuthAuthSessionRefreshSingleflight(t *testing.T) {
 	var refreshCalls atomic.Int32
 	var scopes []string
