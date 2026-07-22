@@ -227,7 +227,6 @@ const (
 var (
 	BuildLLMRequestSnapshot             = agent.BuildLLMRequestSnapshot
 	BuildLLMResponseSnapshot            = agent.BuildLLMResponseSnapshot
-	BuildRunBudgetContext               = agent.BuildRunBudgetContext
 	BuildSubAgentBudgetContext          = agent.BuildSubAgentBudgetContext
 	BuildSubAgentDependencyContext      = agent.BuildSubAgentDependencyContext
 	BuildSubAgentMonitorContext         = agent.BuildSubAgentMonitorContext

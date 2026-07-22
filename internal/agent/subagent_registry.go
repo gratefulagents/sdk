@@ -1857,17 +1857,3 @@ If your deliverable is large (long reports, generated code listings, full logs),
 Always state in your final message: what you did, the key findings/decisions, file paths you created or modified, and anything still unresolved.
 </result_contract>`, maxTurns)
 }
-
-// BuildRunBudgetContext tells the top-level agent how large its runner budget
-// is without using sub-agent language.
-func BuildRunBudgetContext(maxTurns int) string {
-	cfg := RunConfig{MaxTurns: maxTurns}
-	maxTurns = cfg.EffectiveMaxTurns()
-	return fmt.Sprintf(`<run_budget>
-Turn budget: %d LLM turns for this top-level run.
-A turn is one model response, not one tool call. Tool calls happen inside a turn.
-This is a hard ceiling, not a target. Do not try to use the full budget.
-Finish as soon as the requested outcome is complete and verified.
-You will receive a [SYSTEM] turn-budget warning shortly before the budget runs out: when it appears, persist anything that must survive (commit and push work in progress, record durable notes/tasks), then deliver your best final answer from what you already have.
-</run_budget>`, maxTurns)
-}

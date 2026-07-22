@@ -65,23 +65,6 @@ func TestBuildSubAgentBudgetContext(t *testing.T) {
 	}
 }
 
-func TestBuildRunBudgetContext(t *testing.T) {
-	ctx := BuildRunBudgetContext(23)
-	for _, want := range []string{
-		"Turn budget: 23 LLM turns for this top-level run",
-		"not one tool call",
-		"hard ceiling, not a target",
-		"complete and verified",
-	} {
-		if !strings.Contains(ctx, want) {
-			t.Fatalf("expected run budget context to contain %q, got %s", want, ctx)
-		}
-	}
-	if strings.Contains(ctx, "sub-agent") || strings.Contains(ctx, "<sub_agent_budget>") {
-		t.Fatalf("run budget must not use sub-agent language: %s", ctx)
-	}
-}
-
 func TestSubAgentActivity_RecordToolEnd_TracksWrites(t *testing.T) {
 	a := NewSubAgentActivity()
 
