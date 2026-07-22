@@ -602,10 +602,7 @@ func BuildAgentWithSpecialists(cfg Config, runner *agentsdk.Runner, hostBundle T
 				agentsdk.BuildDelegationGuide(a, specialistAgents),
 			}
 			blocks = append(blocks, modeInstructionBlocks(cfg, features)...)
-			blocks = append(blocks,
-				runtimeWorkspaceContext(cfg, a.Tools, features),
-				agentsdk.BuildRunBudgetContext(cfg.MaxTurns),
-			)
+			blocks = append(blocks, runtimeWorkspaceContext(cfg, a.Tools, features))
 			return strings.Join(nonEmptyStrings(blocks...), "\n\n")
 		},
 	}

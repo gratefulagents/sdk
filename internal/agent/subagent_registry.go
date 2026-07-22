@@ -1858,8 +1858,10 @@ Always state in your final message: what you did, the key findings/decisions, fi
 </result_contract>`, maxTurns)
 }
 
-// BuildRunBudgetContext tells the top-level agent how large its runner budget
-// is without using sub-agent language.
+// BuildRunBudgetContext builds the legacy top-level turn-budget instruction block.
+//
+// Deprecated: the runtime no longer injects turn-budget instructions into agent
+// prompts. This helper remains available for source compatibility.
 func BuildRunBudgetContext(maxTurns int) string {
 	cfg := RunConfig{MaxTurns: maxTurns}
 	maxTurns = cfg.EffectiveMaxTurns()

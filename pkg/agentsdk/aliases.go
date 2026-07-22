@@ -224,10 +224,13 @@ const (
 	SubAgentDependencyAllTerminal = agent.SubAgentDependencyAllTerminal
 )
 
+// BuildRunBudgetContext builds the legacy top-level turn-budget instruction block.
+// Deprecated: the runtime no longer injects this block into agent prompts.
+var BuildRunBudgetContext = agent.BuildRunBudgetContext
+
 var (
 	BuildLLMRequestSnapshot             = agent.BuildLLMRequestSnapshot
 	BuildLLMResponseSnapshot            = agent.BuildLLMResponseSnapshot
-	BuildRunBudgetContext               = agent.BuildRunBudgetContext
 	BuildSubAgentBudgetContext          = agent.BuildSubAgentBudgetContext
 	BuildSubAgentDependencyContext      = agent.BuildSubAgentDependencyContext
 	BuildSubAgentMonitorContext         = agent.BuildSubAgentMonitorContext

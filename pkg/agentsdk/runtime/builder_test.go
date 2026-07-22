@@ -421,11 +421,8 @@ func TestBuilderBuildsRunnableBundleShape(t *testing.T) {
 	if !strings.Contains(instructions, "Active mode: Review") {
 		t.Fatalf("instructions missing active mode label:\n%s", instructions)
 	}
-	if !strings.Contains(instructions, "Turn budget: 3 LLM turns for this top-level run") {
-		t.Fatalf("instructions missing top-level run budget:\n%s", instructions)
-	}
-	if strings.Contains(instructions, "<sub_agent_budget>") || strings.Contains(instructions, "5 LLM turns for this sub-agent") {
-		t.Fatalf("top-level instructions leaked sub-agent budget:\n%s", instructions)
+	if strings.Contains(instructions, "Turn budget:") || strings.Contains(instructions, "<run_budget>") || strings.Contains(instructions, "<sub_agent_budget>") {
+		t.Fatalf("top-level instructions contain a turn budget prompt:\n%s", instructions)
 	}
 }
 

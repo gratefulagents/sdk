@@ -417,9 +417,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// once the cap is hit so a broken gate cannot loop forever.
 	stopGateBlocks := 0
 	verifierRan := false
-	// budgetWarned marks that the one-shot wrap-up warning was injected as
-	// the turn budget neared exhaustion.
-	budgetWarned := false
 
 	maxTurns := cfg.EffectiveMaxTurns()
 
@@ -526,21 +523,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 				return partial, &MaxTurnsExceeded{MaxTurns: maxTurns, PartialResult: partial}
 			}
-		}
-
-		// Approaching the cap: warn the model once so it can wrap up —
-		// persist work in progress, then produce a final answer — instead
-		// of being cut off mid-task with unsaved state. Tiny budgets
-		// (persona consults, capped verification passes) skip the warning.
-		if !budgetWarned && maxTurns >= minTurnsForBudgetWarning && maxTurns-turn <= budgetWarnTurns(maxTurns) {
-			budgetWarned = true
-			warnItem := RunItem{
-				Type:    RunItemMessage,
-				Message: &MessageOutput{Text: budgetWarningNotice(turn, maxTurns)},
-			}
-			currentInput = append(currentInput, warnItem)
-			allItems = append(allItems, warnItem)
-			emitRunItems(ctx, streamEvents, []RunItem{warnItem})
 		}
 
 		select {
@@ -3511,30 +3493,4 @@ func callToolOutputGuardrail(g ToolOutputGuardrail, ctx *RunContext, agent *Agen
 		}
 	}()
 	return g.Fn(ctx, agent, tool, result)
-}
-
-// minTurnsForBudgetWarning skips the wrap-up warning for tiny budgets
-// (persona consults run with MaxTurns=1, capped verification passes with 2-3;
-// a warning would drown the actual task).
-const minTurnsForBudgetWarning = 8
-
-// budgetWarnTurns returns how many turns before the max-turns cap the runner
-// injects the one-shot wrap-up warning: 10% of the budget, clamped to [2, 10].
-func budgetWarnTurns(maxTurns int) int {
-	w := maxTurns / 10
-	if w < 2 {
-		w = 2
-	}
-	if w > 10 {
-		w = 10
-	}
-	return w
-}
-
-// budgetWarningNotice is the message injected into the conversation shortly
-// before the turn budget runs out, prompting the agent to persist anything
-// that must survive and produce a final answer before the hard stop.
-func budgetWarningNotice(turnsUsed, maxTurns int) string {
-	return fmt.Sprintf("[SYSTEM] Turn budget warning: %d of %d turns used — only %d remain before this run is force-stopped. Wrap up NOW. First persist anything that must survive (commit and push work in progress, record durable notes/tasks/state), then deliver your best final answer from what you already have. Do not start new exploratory work.",
-		turnsUsed, maxTurns, maxTurns-turnsUsed)
 }
