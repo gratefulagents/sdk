@@ -194,6 +194,11 @@ func TestResponseFailedErrorRetryClassification(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name:      "overloaded server retries",
+			err:       ResponseFailedError{Status: "failed", Code: "server_is_overloaded"},
+			retryable: true,
+		},
+		{
 			name:      "unknown incomplete retries",
 			err:       ResponseFailedError{Status: "incomplete"},
 			retryable: true,

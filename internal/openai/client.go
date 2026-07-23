@@ -262,7 +262,7 @@ func (e *ResponseFailedError) Retryable() bool {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Code)) {
-	case "server_error", "rate_limit_exceeded", "vector_store_timeout":
+	case "server_error", "server_is_overloaded", "rate_limit_exceeded", "vector_store_timeout":
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Status)) {
