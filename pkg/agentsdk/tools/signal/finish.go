@@ -38,7 +38,9 @@ func (t *FinishTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *FinishTool) IsReadOnly() bool { return false }
+// IsReadOnly reports true because finishing controls the run lifecycle without
+// mutating the workspace or external state.
+func (t *FinishTool) IsReadOnly() bool { return true }
 
 func (t *FinishTool) IsEnabled(_ *agentsdk.RunContext) bool { return true }
 
