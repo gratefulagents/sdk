@@ -13,9 +13,10 @@ type QuickAction struct {
 }
 
 type UserInputPause struct {
-	Requested bool
-	Question  string
-	Actions   json.RawMessage
+	Requested  bool
+	PlanReview bool
+	Question   string
+	Actions    json.RawMessage
 }
 
 func MarshalQuickActions(actions ...QuickAction) json.RawMessage {
@@ -88,9 +89,10 @@ func DetectUserInputPause(items []RunItem, finalText string) UserInputPause {
 				question = "The agent needs your input to continue."
 			}
 			return UserInputPause{
-				Requested: true,
-				Question:  question,
-				Actions:   actions,
+				Requested:  true,
+				PlanReview: true,
+				Question:   question,
+				Actions:    actions,
 			}
 		}
 	}

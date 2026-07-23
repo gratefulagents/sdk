@@ -80,7 +80,7 @@ func TestDetectUserInputPause(t *testing.T) {
 			Input: json.RawMessage(`{"question":"Continue?","choices":["Yes","No"]}`),
 		},
 	}}, "")
-	if !pause.Requested || pause.Question != "Continue?" {
+	if !pause.Requested || pause.PlanReview || pause.Question != "Continue?" {
 		t.Fatalf("pause = %#v", pause)
 	}
 	if !strings.Contains(string(pause.Actions), `"label":"Yes"`) {
@@ -94,7 +94,7 @@ func TestDetectUserInputPause(t *testing.T) {
 			Input: json.RawMessage(`{"summary":"Review this plan","actions":[{"id":"approve","label":"Approve"}]}`),
 		},
 	}}, "")
-	if !pause.Requested || pause.Question != "Review this plan" {
+	if !pause.Requested || !pause.PlanReview || pause.Question != "Review this plan" {
 		t.Fatalf("plan pause = %#v", pause)
 	}
 
