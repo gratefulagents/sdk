@@ -56,7 +56,7 @@ func TestExtractAskUserChoices(t *testing.T) {
 }
 
 func TestExtractPresentPlanData(t *testing.T) {
-	summary, actions := ExtractPresentPlanData(json.RawMessage(`{"summary":"Do the thing","actions":[{"id":"approve","label":"Approve"}],"recommended":"approve"}`))
+	summary, actions := ExtractPresentPlanData(json.RawMessage(`{"summary":"Do the thing","actions":[{"id":"approve","label":"Approve","mode":"build"}],"recommended":"approve"}`))
 	if summary != "Do the thing" {
 		t.Fatalf("summary = %q", summary)
 	}
@@ -66,6 +66,9 @@ func TestExtractPresentPlanData(t *testing.T) {
 	}
 	if len(parsed) != 1 || parsed[0].ID != "approve" {
 		t.Fatalf("actions = %#v", parsed)
+	}
+	if strings.Contains(string(actions), `"mode"`) || strings.Contains(string(actions), `"build"`) {
+		t.Fatalf("actions preserved legacy mode: %s", string(actions))
 	}
 }
 
