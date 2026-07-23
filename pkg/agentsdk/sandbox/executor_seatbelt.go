@@ -95,9 +95,7 @@ func (e SeatbeltExecutor) build(ctx context.Context, req Request) (*exec.Cmd, st
 	separator := len(args) - len(req.Argv) - 1
 	targetEnv := seatbeltProcessEnv(req.Env, e.Config, tempRoot)
 	wrapped := append([]string(nil), args[:separator+1]...)
-	wrapped = append(wrapped, "/usr/bin/env", "-i")
-	wrapped = append(wrapped, targetEnv...)
-	wrapped = append(wrapped, req.Argv...)
+	wrapped = append(wrapped, seatbeltLifecycleCommand(targetEnv, req.Argv)...)
 
 	cmd := exec.CommandContext(ctx, defaultSeatbeltBinary, wrapped...)
 	cmd.Dir = req.WorkDir
@@ -105,6 +103,23 @@ func (e SeatbeltExecutor) build(ctx context.Context, req Request) (*exec.Cmd, st
 	// it applies Seatbelt. /usr/bin/env installs the target environment inside.
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	return cmd, tempRoot, nil
+}
+
+const seatbeltCleanupScript = `
+cleanup() { /bin/rm -rf -- "$TMPDIR"; }
+trap 'status=$?; trap - EXIT HUP INT TERM; cleanup; exit "$status"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"$@"
+`
+
+func seatbeltLifecycleCommand(targetEnv, argv []string) []string {
+	command := []string{"/usr/bin/env", "-i"}
+	command = append(command, targetEnv...)
+	command = append(command, "/bin/sh", "-c", seatbeltCleanupScript, "gratefulagents-seatbelt-cleanup")
+	command = append(command, argv...)
+	return command
 }
 
 func (e SeatbeltExecutor) Run(ctx context.Context, req Request) (Result, error) {

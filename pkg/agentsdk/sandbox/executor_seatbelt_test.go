@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -209,6 +210,37 @@ func TestSeatbeltArgsKeepCommandAndPathsOutOfProfile(t *testing.T) {
 	}
 }
 
+func TestSeatbeltLifecycleCommandPreservesTargetEnvAndArgv(t *testing.T) {
+	command := seatbeltLifecycleCommand(
+		[]string{"HOME=/private/home", "TERM=xterm-256color"},
+		[]string{"/bin/echo", "argument with spaces"},
+	)
+	joined := strings.Join(command, "\x00")
+	for _, want := range []string{
+		"/usr/bin/env\x00-i\x00HOME=/private/home\x00TERM=xterm-256color",
+		"/bin/sh\x00-c\x00" + seatbeltCleanupScript,
+		"gratefulagents-seatbelt-cleanup\x00/bin/echo\x00argument with spaces",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("lifecycle command missing %q: %v", want, command)
+		}
+	}
+}
+
+func TestSeatbeltLifecycleCommandCleansTempOnExit(t *testing.T) {
+	tempRoot := t.TempDir()
+	command := seatbeltLifecycleCommand(
+		[]string{"PATH=/usr/bin:/bin", "TMPDIR=" + tempRoot},
+		[]string{"/bin/true"},
+	)
+	if err := exec.Command(command[0], command[1:]...).Run(); err != nil {
+		t.Fatalf("lifecycle command failed: %v", err)
+	}
+	if _, err := os.Stat(tempRoot); !os.IsNotExist(err) {
+		t.Fatalf("private temp root still exists after process exit: %s (stat error %v)", tempRoot, err)
+	}
+}
+
 func TestSeatbeltProcessEnvUsesPrivateHomeAndTemp(t *testing.T) {
 	tempRoot := t.TempDir()
 	env := strings.Join(seatbeltProcessEnv(map[string]string{
@@ -255,6 +287,37 @@ func TestSeatbeltExecutorEnforcementOnDarwin(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); !os.IsNotExist(err) {
 		t.Fatalf("outside file exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestSeatbeltBuildCleansPrivateTempOnProcessExit(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Seatbelt integration test requires macOS")
+	}
+	workspace := t.TempDir()
+	cmd, err := (SeatbeltExecutor{Config: Config{WorkspaceRoot: workspace}}).Build(context.Background(), Request{
+		Argv:           []string{"/usr/bin/true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("Seatbelt Build() error = %v", err)
+	}
+	tempRoot := ""
+	for _, arg := range cmd.Args {
+		if strings.HasPrefix(arg, "TMPDIR=") {
+			tempRoot = strings.TrimPrefix(arg, "TMPDIR=")
+			break
+		}
+	}
+	if tempRoot == "" {
+		t.Fatalf("private TMPDIR missing from command: %v", cmd.Args)
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("built Seatbelt command failed: %v", err)
+	}
+	if _, err := os.Stat(tempRoot); !os.IsNotExist(err) {
+		t.Fatalf("private temp root still exists after process exit: %s (stat error %v)", tempRoot, err)
 	}
 }
 
