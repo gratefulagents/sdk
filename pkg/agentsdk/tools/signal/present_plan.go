@@ -33,10 +33,10 @@ func (t *PresentPlanTool) InputSchema() json.RawMessage {
 				"type": "array",
 				"items": {
 					"type": "object",
+					"additionalProperties": false,
 					"properties": {
 						"id": {"type": "string", "description": "Unique action identifier"},
 						"label": {"type": "string", "description": "Button label shown to the user"},
-						"mode": {"type": "string", "description": "Target mode to switch to when clicked"},
 						"style": {
 							"type": "string",
 							"enum": ["primary", "secondary", "destructive"],
@@ -64,8 +64,13 @@ func (t *PresentPlanTool) NeedsApproval() bool { return false }
 
 func (t *PresentPlanTool) TimeoutSeconds() int { return 0 }
 
-// PresentPlanAction represents a single action button in a present_plan call.
-type PresentPlanAction = agentsdk.QuickAction
+// PresentPlanAction represents a continuation button in a present_plan call.
+// Plan actions deliberately cannot request runtime mode transitions.
+type PresentPlanAction struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Style string `json:"style,omitempty"`
+}
 
 type presentPlanInput struct {
 	Summary     string              `json:"summary"`

@@ -9,14 +9,14 @@ import (
 type QuickAction struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
-	Mode  string `json:"mode,omitempty"`
 	Style string `json:"style,omitempty"`
 }
 
 type UserInputPause struct {
-	Requested bool
-	Question  string
-	Actions   json.RawMessage
+	Requested  bool
+	PlanReview bool
+	Question   string
+	Actions    json.RawMessage
 }
 
 func MarshalQuickActions(actions ...QuickAction) json.RawMessage {
@@ -49,14 +49,16 @@ func ExtractAskUserChoices(input json.RawMessage) json.RawMessage {
 
 func ExtractPresentPlanData(input json.RawMessage) (string, json.RawMessage) {
 	var in struct {
-		Summary     string          `json:"summary"`
-		Actions     json.RawMessage `json:"actions"`
-		Recommended string          `json:"recommended"`
+		Summary     string        `json:"summary"`
+		Actions     []QuickAction `json:"actions"`
+		Recommended string        `json:"recommended"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return "", nil
 	}
-	return in.Summary, in.Actions
+	// Re-marshalling through QuickAction strips legacy or unvalidated fields
+	// such as mode before plan actions are persisted.
+	return in.Summary, MarshalQuickActions(in.Actions...)
 }
 
 func DetectUserInputPause(items []RunItem, finalText string) UserInputPause {
@@ -87,9 +89,10 @@ func DetectUserInputPause(items []RunItem, finalText string) UserInputPause {
 				question = "The agent needs your input to continue."
 			}
 			return UserInputPause{
-				Requested: true,
-				Question:  question,
-				Actions:   actions,
+				Requested:  true,
+				PlanReview: true,
+				Question:   question,
+				Actions:    actions,
 			}
 		}
 	}
