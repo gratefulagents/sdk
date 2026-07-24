@@ -120,24 +120,30 @@ not selected automatically in this mode.
 
 ### Sandbox filesystem and environment model
 
-The bubblewrap sandbox exposes the entire host filesystem **read-only**
-(`--ro-bind / /`) with a minimal `/dev`. `/proc` is freshly mounted for the
-sandbox's pid namespace when the host allows it, and masked entirely when it
-does not (container runtimes with masked `/proc` reject procfs mounts inside
-user namespaces) — either way, `/proc/<pid>/environ` of host processes is
-unreachable. Writes are confined to
-the workspace root, `/tmp` (a persistent bind for write-capable modes, an
-ephemeral tmpfs for read-only), and explicitly configured extra writable
-paths. There are no read-path allowlists: confidentiality of host files is
-not a sandbox goal, write and environment containment are.
+The enforcing backend is Bubblewrap on Linux and Seatbelt (`sandbox-exec`) on
+macOS. Both expose the host filesystem read-only by default, mask known
+credential paths, and confine writes to the workspace root, private temporary
+storage, and explicitly configured extra writable paths. Workspace metadata
+such as Git hooks and agent configuration remains protected. There are no
+general read-path allowlists: confidentiality of arbitrary host files is not a
+sandbox goal; write and environment containment are.
+
+On Linux, Bubblewrap uses a read-only root bind and a minimal `/dev`. `/proc`
+is freshly mounted for the sandbox's pid namespace when the host allows it and
+masked otherwise, so host process environments are unreachable. On macOS,
+Seatbelt uses a default-deny profile with parameterized path rules. Because it
+cannot mount a private tmpfs, each invocation receives a private temporary root
+while the shared host temporary directory is excluded from reads. The SDK runs
+a functional Seatbelt enforcement probe and fails closed if it does not pass.
+Apple has deprecated `sandbox-exec`, so this backend is tested as a compatibility
+boundary rather than treated as a stable public Apple API.
 
 Subprocess environments are explicit: only system variables (`PATH`, `HOME`,
 `USER`, `LOGNAME`, `SHELL`, `TERM`, `COLORTERM`, `LANG`, `LC_*`, `TZ`,
-`TMPDIR`) are inherited from the host process; everything else must be
-granted via sandbox `ExtraEnv` configuration, so host secrets can never leak
-into tool subprocesses implicitly. Inside bubblewrap, `HOME` and `TMPDIR`
-are homed into the writable `/tmp` so toolchain caches work and persist
-across commands.
+`TMPDIR`) are inherited from the host process; everything else must be granted
+via sandbox `ExtraEnv` configuration. `HOME` and `TMPDIR` are remapped to
+sandbox-private writable storage so toolchain caches work without exposing the
+host environment or shared temporary files.
 
 When the enforcing sandbox runs a command, the textual destructive-command
 classifier is skipped (the OS boundary already contains filesystem damage);
@@ -154,7 +160,7 @@ When disabled, known Git remote-write tools are removed, Bash and BashStart
 reject `git push` in every permission mode, and the uninspectable interactive
 Terminal tool is not registered. Because parsing arbitrary shell syntax cannot
 be a security boundary, Bash and BashStart fail closed entirely unless their
-executor enforces the command sandbox. The bubblewrap sandbox masks host GitHub
+executor enforces the command sandbox. The platform sandbox masks host GitHub
 and SSH credentials from subprocesses, so indirect invocations cannot obtain a
 write identity. Local Git commits and remote read operations such as fetch and
 pull remain available in that sandbox, subject to the normal permission-mode
@@ -262,8 +268,8 @@ right. The following are explicitly out of scope:
   intentionally permissive: it executes commands with the host's full
   privileges. It exists for development and trusted-workspace use cases.
   For untrusted code (especially anything driven directly by the model)
-  use the bubblewrap-based subprocess sandbox in
-  `pkg/agentsdk/sandbox`, or run the entire agent in an external sandbox
+  use the platform subprocess sandbox in `pkg/agentsdk/sandbox` (Bubblewrap
+  on Linux or Seatbelt on macOS), or run the entire agent in an external sandbox
   (container, VM).
 - **Denial of service via excessive but non-output resource use.** CPU and
   RSS caps on tool subprocesses are the host's responsibility (cgroups,

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -516,7 +516,7 @@ func TestBubblewrapArgsIncludesConfiguredWritableScratchPaths(t *testing.T) {
 }
 
 func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
-	wantEnforcing := subprocessSandboxAvailable()
+	wantEnforcing := platformSandboxAvailable()
 
 	if got := ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "required"}), policy.PermissionModeWorkspaceWrite); got != wantEnforcing {
 		t.Fatalf("required mode enforcement = %v, want %v", got, wantEnforcing)
@@ -536,9 +536,15 @@ func TestExecutorEnforcesFilesystemReporting(t *testing.T) {
 	if ExecutorEnforcesFilesystem(LocalExecutor{}, policy.PermissionModeWorkspaceWrite) {
 		t.Fatal("LocalExecutor must not report enforcement")
 	}
+	if ExecutorEnforcesFilesystem(DefaultWithConfig(Config{Mode: "invalid"}), policy.PermissionModeWorkspaceWrite) {
+		t.Fatal("invalid sandbox mode must not report enforcement")
+	}
 }
 
 func TestDefaultExecutorRequiredModePreservesWorkspaceBoundary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("bubblewrap argument test requires Linux")
+	}
 	binDir := t.TempDir()
 	bwrap := filepath.Join(binDir, "bwrap")
 	if err := os.WriteFile(bwrap, []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -569,11 +575,8 @@ func TestDefaultExecutorRequiresSandboxInKubernetes(t *testing.T) {
 		WorkDir:        workDir,
 		PermissionMode: policy.PermissionModeWorkspaceWrite,
 	})
-	if err == nil && runtimeHasBubblewrap() {
-		return
-	}
 	if err == nil {
-		t.Fatal("Build() unexpectedly succeeded without bubblewrap")
+		return
 	}
 	if !strings.Contains(err.Error(), "subprocess sandbox") {
 		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
@@ -588,10 +591,7 @@ func TestDefaultExecutorRequiresSandboxForReadOnlyAuto(t *testing.T) {
 		PermissionMode: policy.PermissionModeReadOnly,
 	})
 	if err == nil {
-		if runtimeHasBubblewrap() {
-			return
-		}
-		t.Fatal("Build() error = nil, want subprocess sandbox failure")
+		return
 	}
 	if !strings.Contains(err.Error(), "subprocess sandbox") {
 		t.Fatalf("Build() error = %v, want subprocess sandbox failure", err)
@@ -646,8 +646,8 @@ func TestDefaultExecutorDisabledModeUnsafeOptInStillRejectsReadOnly(t *testing.T
 }
 
 func TestDefaultExecutorAutoModeReadOnlyFailsClosedWithoutOptIn(t *testing.T) {
-	if subprocessSandboxAvailable() {
-		t.Skip("enforcing sandbox available on this platform; the fail-closed path is for non-linux dev hosts")
+	if platformSandboxAvailable() {
+		t.Skip("enforcing sandbox available on this platform")
 	}
 	_, err := DefaultWithConfig(Config{Mode: "auto"}).Build(context.Background(), Request{
 		Argv:           []string{"true"},
@@ -699,11 +699,6 @@ func TestWorkspaceRootForRejectsSymlinkEscape(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "outside configured workspace root") {
 		t.Fatalf("BubblewrapArgs() error = %v, want symlink escape refusal", err)
 	}
-}
-
-func runtimeHasBubblewrap() bool {
-	_, err := exec.LookPath("bwrap")
-	return err == nil
 }
 
 func assertArgSequence(t *testing.T, args []string, want ...string) {

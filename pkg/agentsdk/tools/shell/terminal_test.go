@@ -46,9 +46,9 @@ func TestTerminalToolInteractiveSession(t *testing.T) {
 	sid := snap.SessionID
 
 	// Run a command and observe its output.
-	snap = execTerminal(t, tool, workDir, `{"op":"send","session_id":"`+sid+`","keystrokes":"echo terminal-$((20+22))\n","wait_ms":1500}`)
-	if !strings.Contains(snap.Output, "terminal-42") {
-		t.Fatalf("expected command output, got: %q", snap.Output)
+	snap = execTerminal(t, tool, workDir, `{"op":"send","session_id":"`+sid+`","keystrokes":"echo terminal-$((20+22)) TERM=$TERM\n","wait_ms":1500}`)
+	if !strings.Contains(snap.Output, "terminal-42") || !strings.Contains(snap.Output, "TERM=xterm-256color") {
+		t.Fatalf("expected command output and terminal environment, got: %q", snap.Output)
 	}
 
 	// Incremental read: no repeat of prior output.

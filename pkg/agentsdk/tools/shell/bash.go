@@ -359,7 +359,7 @@ func (t *BashTool) commandBlocked(mode policy.PermissionMode, command string) (b
 // authorized statically, then apply destructive and remote-side-effect policy.
 //
 // NOTE on policy boundaries: this tool-layer denylist is defense in depth for
-// hosts running commands without an enforcing OS sandbox. When the bubblewrap
+// hosts running commands without an enforcing OS sandbox. When the platform
 // subprocess sandbox enforces the filesystem boundary (see
 // pkg/agentsdk/sandbox), the bash tools skip the destructive classifier and
 // apply only git policy, which guards remote-side effects the sandbox cannot

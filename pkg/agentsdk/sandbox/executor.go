@@ -195,14 +195,14 @@ func (e defaultExecutor) Build(ctx context.Context, req Request) (*exec.Cmd, err
 	case sandboxModeDisabled:
 		return LocalExecutor{Config: config}.Build(ctx, req)
 	case sandboxModeRequired:
-		return BubblewrapExecutor{Config: config}.Build(ctx, req)
+		return platformSandboxExecutor(config).Build(ctx, req)
 	case sandboxModeAuto:
 		permissionMode := policy.NormalizePermissionMode(string(req.PermissionMode))
 		if permissionMode != policy.PermissionModeDangerFullAccess || config.RunningInKubernetes {
-			// Every restricted mode requires OS-enforced containment. Bubblewrap
+			// Every restricted mode requires OS-enforced containment. Backend
 			// unavailability fails closed; local execution cannot safely enforce a
 			// filesystem permission boundary.
-			return BubblewrapExecutor{Config: config}.Build(ctx, req)
+			return platformSandboxExecutor(config).Build(ctx, req)
 		}
 		return LocalExecutor{Config: config}.Build(ctx, req)
 	default:
@@ -219,21 +219,23 @@ func (e defaultExecutor) Run(ctx context.Context, req Request) (Result, error) {
 }
 
 // EnforcesFilesystem mirrors the executor-selection logic in Build: it reports
-// true exactly when a request with the given mode would run under the
-// enforcing bubblewrap sandbox on this platform.
+// true exactly when a request with the given mode would run under an enforcing
+// subprocess sandbox supported on this platform.
 func (e defaultExecutor) EnforcesFilesystem(mode policy.PermissionMode) bool {
 	config := normalizeConfig(e.config)
 	switch strings.ToLower(strings.TrimSpace(config.Mode)) {
 	case sandboxModeDisabled:
 		return false
 	case sandboxModeRequired:
-		return subprocessSandboxAvailable()
-	default: // auto (or empty)
-		if !subprocessSandboxAvailable() {
+		return platformSandboxAvailable()
+	case "", sandboxModeAuto:
+		if !platformSandboxAvailable() {
 			return false
 		}
 		return config.RunningInKubernetes ||
 			policy.NormalizePermissionMode(string(mode)) != policy.PermissionModeDangerFullAccess
+	default:
+		return false
 	}
 }
 
@@ -245,11 +247,38 @@ func normalizeConfig(config Config) Config {
 	return config
 }
 
-// subprocessSandboxAvailable reports whether the enforcing bubblewrap sandbox
-// can run on this platform. It is currently linux-only; on other platforms the
-// BubblewrapExecutor fails with a "requires linux" error.
-func subprocessSandboxAvailable() bool {
-	return runtime.GOOS == "linux"
+func platformSandboxAvailable() bool {
+	switch runtime.GOOS {
+	case "linux":
+		return true
+	case "darwin":
+		return seatbeltAvailable()
+	default:
+		return false
+	}
+}
+
+func platformSandboxExecutor(config Config) Executor {
+	switch runtime.GOOS {
+	case "linux":
+		return BubblewrapExecutor{Config: config}
+	case "darwin":
+		return SeatbeltExecutor{Config: config}
+	default:
+		return unavailableSandboxExecutor{goos: runtime.GOOS}
+	}
+}
+
+type unavailableSandboxExecutor struct {
+	goos string
+}
+
+func (e unavailableSandboxExecutor) Build(context.Context, Request) (*exec.Cmd, error) {
+	return nil, fmt.Errorf("subprocess sandbox is unavailable on %s", e.goos)
+}
+
+func (e unavailableSandboxExecutor) Run(context.Context, Request) (Result, error) {
+	return Result{ExitCode: -1}, fmt.Errorf("subprocess sandbox is unavailable on %s", e.goos)
 }
 
 // procfsSupport caches whether bwrap can mount a fresh procfs inside the
@@ -288,7 +317,7 @@ func overrideProcfsMountUsable(usable bool) (restore func()) {
 }
 
 func probeProcfsMount() bool {
-	if !subprocessSandboxAvailable() {
+	if runtime.GOOS != "linux" {
 		return false
 	}
 	resolved, err := exec.LookPath("bwrap")
@@ -401,7 +430,7 @@ func (e BubblewrapExecutor) Run(ctx context.Context, req Request) (Result, error
 // EnforcesFilesystem reports whether this executor can actually enforce the
 // filesystem boundary on the current platform.
 func (e BubblewrapExecutor) EnforcesFilesystem(policy.PermissionMode) bool {
-	return subprocessSandboxAvailable()
+	return runtime.GOOS == "linux"
 }
 
 // BubblewrapArgs returns the bwrap argument vector for tests and diagnostics.

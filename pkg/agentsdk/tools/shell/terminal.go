@@ -91,6 +91,7 @@ func (m *TerminalManager) start(ctx context.Context, workDir string, mode policy
 		Argv:           []string{"bash", "--noprofile", "--norc", "-i"},
 		WorkDir:        workDir,
 		PermissionMode: mode,
+		Env:            map[string]string{"TERM": "xterm-256color"},
 	}
 	built, err := executor.Build(ctx, req)
 	if err != nil {
@@ -99,7 +100,7 @@ func (m *TerminalManager) start(ctx context.Context, workDir string, mode policy
 	args := append([]string(nil), built.Args[1:]...)
 	cmd := exec.Command(built.Path, args...)
 	cmd.Dir = built.Dir
-	cmd.Env = append(append([]string(nil), built.Env...), "TERM=xterm-256color")
+	cmd.Env = append([]string(nil), built.Env...)
 
 	ptyFile, err := startTerminalPTY(cmd, terminalRows, terminalCols)
 	if err != nil {
