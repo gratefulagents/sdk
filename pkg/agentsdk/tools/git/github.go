@@ -360,38 +360,48 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 		return issueError("repo_path rejected: " + err.Error())
 	}
 
+	labels := normalizeLabels(in.Labels)
+	runner := t.runner()
+	if len(labels) > 0 {
+		labelOut, err := runner.RunGH(ctx, repoDir, "label", "list", "--limit", "1000", "--json", "name")
+		if err != nil {
+			return issueError(fmt.Sprintf("gh label list failed: %s\n%s", err, labelOut))
+		}
+		var existing []struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(labelOut), &existing); err != nil {
+			return issueError("gh label list returned invalid output: " + err.Error())
+		}
+		existingLabels := make(map[string]struct{}, len(existing))
+		for _, label := range existing {
+			existingLabels[strings.ToLower(label.Name)] = struct{}{}
+		}
+		for _, label := range labels {
+			if _, ok := existingLabels[strings.ToLower(label)]; ok {
+				continue
+			}
+			createOut, err := runner.RunGH(ctx, repoDir, "label", "create", label, "--color", "BFD4F2")
+			if err != nil && !strings.Contains(strings.ToLower(createOut), "already exists") {
+				return issueError(fmt.Sprintf("gh label create failed: %s\n%s", err, createOut))
+			}
+			existingLabels[strings.ToLower(label)] = struct{}{}
+		}
+	}
+
 	args := []string{"issue", "create", "--title", in.Title}
 	if in.Body != "" {
 		args = append(args, "--body", in.Body)
 	}
-	for _, label := range in.Labels {
+	for _, label := range labels {
 		args = append(args, "--label", label)
 	}
 	for _, assignee := range in.Assignees {
 		args = append(args, "--assignee", assignee)
 	}
 
-	out, err := t.runner().RunGH(ctx, repoDir, args...)
+	out, err := runner.RunGH(ctx, repoDir, args...)
 	if err != nil {
-		// Nonexistent labels abort issue creation entirely; retry without
-		// labels rather than losing the report over metadata.
-		if len(in.Labels) > 0 && strings.Contains(out, "could not add label") {
-			retryArgs := []string{"issue", "create", "--title", in.Title}
-			if in.Body != "" {
-				retryArgs = append(retryArgs, "--body", in.Body)
-			}
-			for _, assignee := range in.Assignees {
-				retryArgs = append(retryArgs, "--assignee", assignee)
-			}
-			retryOut, retryErr := t.runner().RunGH(ctx, repoDir, retryArgs...)
-			if retryErr == nil {
-				if issueURL := strings.TrimSpace(retryOut); strings.HasPrefix(issueURL, "https://") {
-					t.recordIssue(ctx, issueURL)
-					return issueSuccessWithStatus(issueURL, fmt.Sprintf(
-						"Issue created without labels %v (labels do not exist in this repository; create them first or omit them).", in.Labels))
-				}
-			}
-		}
 		return issueError(fmt.Sprintf("gh issue create failed: %s\n%s", err, out))
 	}
 
@@ -404,6 +414,24 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 	}
 	t.recordIssue(ctx, issueURL)
 	return issueSuccess(issueURL)
+}
+
+func normalizeLabels(labels []string) []string {
+	seen := make(map[string]struct{}, len(labels))
+	var normalized []string
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, label)
+	}
+	return normalized
 }
 
 func (t *CreateIssueTool) runner() CommandRunner {
