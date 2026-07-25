@@ -30,6 +30,7 @@ type Registry struct {
 	signals                 bool
 	allowMutating           map[string]struct{}
 	browser                 bool
+	browserScreenshotDir    string
 	disableWeb              bool
 	allowPrivateNetworkURLs bool
 	visionTool              *vision.Tool
@@ -64,6 +65,13 @@ func WithSignalTools() RegistryOption {
 
 func WithBrowserTools() RegistryOption {
 	return func(r *Registry) { r.browser = true }
+}
+
+// WithBrowserScreenshotDir configures the host-managed ephemeral directory for
+// screenshots whose calls omit output_path. Explicit output paths remain
+// workspace-relative.
+func WithBrowserScreenshotDir(dir string) RegistryOption {
+	return func(r *Registry) { r.browserScreenshotDir = strings.TrimSpace(dir) }
 }
 
 func WithoutWebTools() RegistryOption {
@@ -212,7 +220,11 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	// subresources. Register Browser only behind the explicit unrestricted
 	// networking opt-in; WebFetch remains the destination-confined default.
 	if r.browser && r.allowPrivateNetworkURLs {
-		r.Register(&browser.Tool{AllowPrivateNetworkURLs: true, Executor: r.bashExecutor()})
+		r.Register(&browser.Tool{
+			AllowPrivateNetworkURLs: true,
+			Executor:                r.bashExecutor(),
+			ScreenshotDir:           r.browserScreenshotDir,
+		})
 	}
 	if r.visionTool != nil {
 		r.visionTool.AllowPrivateNetworkURLs = r.allowPrivateNetworkURLs

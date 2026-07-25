@@ -22,6 +22,9 @@ type Tool struct {
 	readOnly                bool
 	AllowPrivateNetworkURLs bool
 	Executor                sandbox.Executor
+	// ScreenshotDir is the host-managed directory used for implicit screenshot
+	// outputs. Empty uses the operating system's temporary directory.
+	ScreenshotDir string
 }
 
 type input struct {
@@ -91,7 +94,7 @@ func (t *Tool) InputSchema() json.RawMessage {
 			},
 			"output_path": {
 				"type": "string",
-				"description": "File path for screenshot output (default: .browser/screenshot-<timestamp>.png)"
+				"description": "Workspace-relative file path for screenshot output. Omit to use the ephemeral screenshot directory."
 			},
 			"width": {
 				"type": "integer",
@@ -116,7 +119,12 @@ func (t *Tool) TimeoutSeconds() int { return 0 }
 
 func (t *Tool) ToolForAccess(level agentsdk.ToolAccessLevel) agentsdk.Tool {
 	if agentsdk.NormalizeToolAccessLevel(level) == agentsdk.ToolAccessLevelReadOnly {
-		return &Tool{readOnly: true, AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs, Executor: t.Executor}
+		return &Tool{
+			readOnly:                true,
+			AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs,
+			Executor:                t.Executor,
+			ScreenshotDir:           t.ScreenshotDir,
+		}
 	}
 	return t
 }
@@ -197,12 +205,21 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 	if strings.TrimSpace(workDir) == "" {
 		return agentsdk.ToolResult{Content: "workDir is required for screenshots", IsError: true}, nil
 	}
+	outputRoot := workDir
 	outPath := in.OutputPath
-	if outPath == "" {
+	implicitOutput := outPath == ""
+	if implicitOutput {
+		outputRoot = strings.TrimSpace(t.ScreenshotDir)
+		if outputRoot == "" {
+			outputRoot = os.TempDir()
+		}
+		if err := os.MkdirAll(outputRoot, 0o700); err != nil {
+			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create ephemeral screenshot directory: %v", err), IsError: true}, nil
+		}
 		var err error
-		outPath, err = pathutil.ResolveWorkspace(workDir, filepath.Join(".browser", fmt.Sprintf("screenshot-%d.png", time.Now().UnixNano())))
+		outPath, err = pathutil.ResolveWorkspace(outputRoot, fmt.Sprintf("agentsdk-browser-screenshot-%d.png", time.Now().UnixNano()))
 		if err != nil {
-			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to resolve screenshot path: %v", err), IsError: true}, nil
+			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to resolve ephemeral screenshot path: %v", err), IsError: true}, nil
 		}
 	} else {
 		var err error
@@ -210,9 +227,9 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 		if err != nil {
 			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to resolve output path: %v", err), IsError: true}, nil
 		}
-	}
-	if err := pathutil.MkdirAllInWorkspace(workDir, filepath.Dir(outPath), 0o700); err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create output directory: %v", err), IsError: true}, nil
+		if err := pathutil.MkdirAllInWorkspace(workDir, filepath.Dir(outPath), 0o700); err != nil {
+			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create output directory: %v", err), IsError: true}, nil
+		}
 	}
 	tmpDir, err := os.MkdirTemp("", "agentsdk-browser-*")
 	if err != nil {
@@ -250,16 +267,18 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 	if err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to read temporary screenshot file: %v", err), IsError: true}, nil
 	}
-	if err := pathutil.AtomicWriteFilePreservingModeInWorkspace(workDir, outPath, data, 0o600); err != nil {
+	if err := pathutil.AtomicWriteFilePreservingModeInWorkspace(outputRoot, outPath, data, 0o600); err != nil {
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to save screenshot: %v", err), IsError: true}, nil
 	}
 
-	basePath, _ := pathutil.ResolveWorkspace(workDir, ".")
-	relPath, _ := filepath.Rel(basePath, outPath)
-	if relPath == "" {
-		relPath = outPath
+	displayPath := outPath
+	if !implicitOutput {
+		basePath, _ := pathutil.ResolveWorkspace(workDir, ".")
+		if relPath, err := filepath.Rel(basePath, outPath); err == nil && relPath != "" {
+			displayPath = relPath
+		}
 	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Screenshot saved to %s (%dx%d)", relPath, width, height)}, nil
+	return agentsdk.ToolResult{Content: fmt.Sprintf("Screenshot saved to %s (%dx%d)", displayPath, width, height)}, nil
 }
 
 func (t *Tool) navigate(ctx context.Context, chromeBin string, in input, workDir string, width, height int) (agentsdk.ToolResult, error) {

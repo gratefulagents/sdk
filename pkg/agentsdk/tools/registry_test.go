@@ -52,6 +52,23 @@ func TestRegistryBrowserUsesTrustedSandboxExecutor(t *testing.T) {
 	}
 }
 
+func TestRegistryConfiguresBrowserScreenshotDirectory(t *testing.T) {
+	screenshotDir := t.TempDir()
+	r := NewRegistry(
+		t.TempDir(),
+		WithBrowserTools(),
+		WithBrowserScreenshotDir(screenshotDir),
+		WithPrivateNetworkURLs(true),
+	)
+	tool, ok := r.Get("Browser").(*browser.Tool)
+	if !ok {
+		t.Fatalf("Browser tool = %T, want *browser.Tool", r.Get("Browser"))
+	}
+	if tool.ScreenshotDir != screenshotDir {
+		t.Fatalf("Browser ScreenshotDir = %q, want %q", tool.ScreenshotDir, screenshotDir)
+	}
+}
+
 func TestRegistryDoesNotRegisterUnconfinedBrowserByDefault(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithBrowserTools())
 	if tool := r.Get("Browser"); tool != nil {
