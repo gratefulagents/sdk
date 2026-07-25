@@ -219,15 +219,23 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	// Chromium cannot bind public-only URL validation to redirects, DNS, and
 	// subresources. Register Browser only behind the explicit unrestricted
 	// networking opt-in; WebFetch remains the destination-confined default.
+	effectiveBrowserScreenshotDir := ""
 	if r.browser && r.allowPrivateNetworkURLs {
+		effectiveBrowserScreenshotDir = r.browserScreenshotDir
+		if effectiveBrowserScreenshotDir == "" {
+			effectiveBrowserScreenshotDir = browser.DefaultScreenshotDir()
+		}
 		r.Register(&browser.Tool{
 			AllowPrivateNetworkURLs: true,
 			Executor:                r.bashExecutor(),
-			ScreenshotDir:           r.browserScreenshotDir,
+			ScreenshotDir:           effectiveBrowserScreenshotDir,
 		})
 	}
 	if r.visionTool != nil {
 		r.visionTool.AllowPrivateNetworkURLs = r.allowPrivateNetworkURLs
+		if effectiveBrowserScreenshotDir != "" {
+			r.visionTool.AllowedImageDirs = append(r.visionTool.AllowedImageDirs, effectiveBrowserScreenshotDir)
+		}
 		r.Register(r.visionTool)
 	}
 	if r.memoryTool != nil {

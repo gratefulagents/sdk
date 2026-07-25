@@ -39,11 +39,18 @@ type input struct {
 }
 
 const (
-	defaultViewportWidth  = 1280
-	defaultViewportHeight = 720
-	minViewportSize       = 100
-	maxViewportSize       = 4096
+	defaultViewportWidth     = 1280
+	defaultViewportHeight    = 720
+	defaultScreenshotDirName = "agentsdk-browser"
+	minViewportSize          = 100
+	maxViewportSize          = 4096
 )
+
+// DefaultScreenshotDir returns the dedicated OS-temporary directory used for
+// implicit screenshots when the host does not configure one.
+func DefaultScreenshotDir() string {
+	return filepath.Join(os.TempDir(), defaultScreenshotDirName)
+}
 
 func (t *Tool) Name() string { return "Browser" }
 
@@ -211,7 +218,7 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 	if implicitOutput {
 		outputRoot = strings.TrimSpace(t.ScreenshotDir)
 		if outputRoot == "" {
-			outputRoot = os.TempDir()
+			outputRoot = DefaultScreenshotDir()
 		}
 		if err := os.MkdirAll(outputRoot, 0o700); err != nil {
 			return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to create ephemeral screenshot directory: %v", err), IsError: true}, nil
