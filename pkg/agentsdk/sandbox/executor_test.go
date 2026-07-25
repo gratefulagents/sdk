@@ -92,6 +92,7 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv(SandboxExtraReadOnlyPathsEnv, "/opt/tooling"+sep+"relative")
 	t.Setenv(SandboxExtraWritablePathsEnv, "/tmp/scratch"+sep+"relative")
 	t.Setenv(SandboxExtraEnvEnv, "JAVA_HOME=/opt/jdk\nTOOL_PATH=$PATH:/tooling\nBAD-NAME=no")
+	t.Setenv(SandboxExposeKubernetesServiceAccountEnv, "true")
 
 	cfg := ConfigFromEnv()
 	if cfg.Mode != "required" {
@@ -117,6 +118,9 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if _, ok := cfg.ExtraEnv["BAD-NAME"]; ok {
 		t.Fatalf("invalid env key should be ignored")
+	}
+	if !cfg.ExposeKubernetesServiceAccount {
+		t.Fatal("ExposeKubernetesServiceAccount = false, want true")
 	}
 	env := SafeEnvMapWithConfig(cfg)
 	if env["PATH"] != "/custom/bin:/usr/bin" {
@@ -421,6 +425,59 @@ func TestBubblewrapArgsMasksSensitiveHomeCredentialDirectory(t *testing.T) {
 	maskedPath = resolveExistingPrefix(maskedPath)
 	assertArgSequence(t, args, "--tmpfs", maskedPath)
 	assertArgSequenceAfter(t, args, []string{"--ro-bind", "/", "/"}, []string{"--tmpfs", maskedPath})
+}
+
+func TestBubblewrapArgsExposesKubeDirectoryOnlyWhenExplicitlyEnabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	kubeDir := filepath.Join(home, ".kube")
+	if err := os.Mkdir(kubeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+	if resolvedHome != home {
+		t.Skipf("UserHomeDir() = %q, cannot deterministically exercise HOME-based mask", resolvedHome)
+	}
+
+	workspace := t.TempDir()
+	req := Request{Argv: []string{"true"}, WorkDir: workspace, PermissionMode: policy.PermissionModeWorkspaceWrite}
+	args, err := BubblewrapArgsWithConfig(req, Config{WorkspaceRoot: workspace})
+	if err != nil {
+		t.Fatalf("BubblewrapArgsWithConfig(default) error = %v", err)
+	}
+	kubeDir = resolveExistingPrefix(kubeDir)
+	assertArgSequence(t, args, "--tmpfs", kubeDir)
+
+	args, err = BubblewrapArgsWithConfig(req, Config{WorkspaceRoot: workspace, ExposeKubernetesServiceAccount: true})
+	if err != nil {
+		t.Fatalf("BubblewrapArgsWithConfig(exposed) error = %v", err)
+	}
+	assertArgAbsent(t, args, "--tmpfs", kubeDir)
+}
+
+func TestSandboxMasksFileAndDirectorySecrets(t *testing.T) {
+	root := t.TempDir()
+	secretFile := filepath.Join(root, "file-secret")
+	if err := os.WriteFile(secretFile, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretDir := filepath.Join(root, "directory-secret")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := normalizeSandboxMaskedPaths([]string{secretFile, secretDir})
+	if len(paths) != 2 || paths[0] != resolveExistingPrefix(secretFile) || paths[1] != resolveExistingPrefix(secretDir) {
+		t.Fatalf("normalizeSandboxMaskedPaths() = %#v, want file and directory", paths)
+	}
+
+	fileArgs := appendSandboxMaskArgs(nil, paths[0])
+	assertArgSequence(t, fileArgs, "--ro-bind", "/dev/null", paths[0])
+	dirArgs := appendSandboxMaskArgs(nil, paths[1])
+	assertArgSequence(t, dirArgs, "--tmpfs", paths[1])
 }
 
 func TestBubblewrapArgsReadOnlyIgnoresConfiguredWritablePaths(t *testing.T) {

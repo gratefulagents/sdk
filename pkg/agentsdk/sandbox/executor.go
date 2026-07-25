@@ -25,6 +25,10 @@ const (
 	SandboxExtraReadOnlyPathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RO_PATHS"
 	SandboxExtraWritablePathsEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_RW_PATHS"
 	SandboxExtraEnvEnv           = "GRATEFULAGENTS_COMMAND_SANDBOX_EXTRA_ENV"
+	// SandboxExposeKubernetesServiceAccountEnv allows an explicitly privileged
+	// host to expose the pod's projected service-account credentials. Keep this
+	// opt-in: ordinary agent subprocesses must not inherit Kubernetes identity.
+	SandboxExposeKubernetesServiceAccountEnv = "GRATEFULAGENTS_COMMAND_SANDBOX_EXPOSE_KUBERNETES_SERVICE_ACCOUNT"
 	// SandboxAllowUnsafeReadOnlyLocalEnv is retained for configuration parsing
 	// compatibility. Restricted modes no longer honor it: they always require an
 	// enforcing subprocess sandbox.
@@ -72,6 +76,10 @@ type Config struct {
 	ExtraWritablePaths []string
 	ExtraEnv           map[string]string
 	GOROOT             string
+	// ExposeKubernetesServiceAccount leaves the pod's projected service-account
+	// directory readable. Only trusted hosts should enable this for runs that
+	// intentionally carry Kubernetes credentials.
+	ExposeKubernetesServiceAccount bool
 	// AllowUnsafeReadOnlyLocal is retained for configuration compatibility but
 	// is not honored by executors; restricted modes always fail closed without
 	// OS-enforced containment.
@@ -90,6 +98,7 @@ func SandboxConfigEnvNames() []string {
 		SandboxExtraReadOnlyPathsEnv,
 		SandboxExtraWritablePathsEnv,
 		SandboxExtraEnvEnv,
+		SandboxExposeKubernetesServiceAccountEnv,
 		SandboxAllowUnsafeReadOnlyLocalEnv,
 	}
 }
@@ -99,15 +108,16 @@ func SandboxConfigEnvNames() []string {
 // it for backwards-compatible worker-pod configuration.
 func ConfigFromEnv() Config {
 	return Config{
-		Mode:                     os.Getenv(SandboxModeEnv),
-		Path:                     os.Getenv(SandboxPathEnv),
-		PathPrepend:              splitPathList(os.Getenv(SandboxPathPrependEnv)),
-		PathAppend:               splitPathList(os.Getenv(SandboxPathAppendEnv)),
-		ExtraReadOnlyPaths:       splitPathList(os.Getenv(SandboxExtraReadOnlyPathsEnv)),
-		ExtraWritablePaths:       splitPathList(os.Getenv(SandboxExtraWritablePathsEnv)),
-		ExtraEnv:                 sandboxExtraEnvFromEnv(os.Getenv(SandboxExtraEnvEnv)),
-		GOROOT:                   os.Getenv("GOROOT"),
-		AllowUnsafeReadOnlyLocal: envFlag(os.Getenv(SandboxAllowUnsafeReadOnlyLocalEnv)),
+		Mode:                           os.Getenv(SandboxModeEnv),
+		Path:                           os.Getenv(SandboxPathEnv),
+		PathPrepend:                    splitPathList(os.Getenv(SandboxPathPrependEnv)),
+		PathAppend:                     splitPathList(os.Getenv(SandboxPathAppendEnv)),
+		ExtraReadOnlyPaths:             splitPathList(os.Getenv(SandboxExtraReadOnlyPathsEnv)),
+		ExtraWritablePaths:             splitPathList(os.Getenv(SandboxExtraWritablePathsEnv)),
+		ExtraEnv:                       sandboxExtraEnvFromEnv(os.Getenv(SandboxExtraEnvEnv)),
+		GOROOT:                         os.Getenv("GOROOT"),
+		ExposeKubernetesServiceAccount: envFlag(os.Getenv(SandboxExposeKubernetesServiceAccountEnv)),
+		AllowUnsafeReadOnlyLocal:       envFlag(os.Getenv(SandboxAllowUnsafeReadOnlyLocalEnv)),
 	}
 }
 
@@ -531,8 +541,8 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 			args = append(args, "--ro-bind", path, path)
 		}
 	}
-	for _, path := range sandboxMaskedPaths() {
-		args = append(args, "--tmpfs", path)
+	for _, path := range sandboxMaskedPaths(config) {
+		args = appendSandboxMaskArgs(args, path)
 	}
 
 	args = append(args, "--chdir", workDir, "--")
@@ -841,20 +851,73 @@ func sandboxProtectedWorkspacePaths(workspaceRoot string) []string {
 	return out
 }
 
-func sandboxMaskedPaths() []string {
-	paths := []string{
-		"/var/run/secrets/kubernetes.io/serviceaccount",
-		"/run/secrets",
+func sandboxRunSecretPaths(exposeKubernetesServiceAccount bool) []string {
+	if !exposeKubernetesServiceAccount {
+		return []string{
+			"/var/run/secrets/kubernetes.io/serviceaccount",
+			"/run/secrets",
+		}
 	}
+
+	// /var/run normally resolves to /run. Preserve masking for every other
+	// runtime secret while leaving only the projected Kubernetes service-account
+	// directory visible to explicitly privileged subprocesses.
+	var paths []string
+	entries, err := os.ReadDir("/run/secrets")
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		path := filepath.Join("/run/secrets", entry.Name())
+		if entry.Name() != "kubernetes.io" {
+			paths = append(paths, path)
+			continue
+		}
+		children, childErr := os.ReadDir(path)
+		if childErr != nil {
+			continue
+		}
+		for _, child := range children {
+			if child.Name() != "serviceaccount" {
+				paths = append(paths, filepath.Join(path, child.Name()))
+			}
+		}
+	}
+	return paths
+}
+
+func appendSandboxMaskArgs(args []string, path string) []string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return args
+	}
+	if info.IsDir() {
+		return append(args, "--tmpfs", path)
+	}
+	// Bubblewrap cannot mount tmpfs over a file. Bind the sandbox's inert null
+	// device over file-based runtime secrets instead.
+	return append(args, "--ro-bind", "/dev/null", path)
+}
+
+func sandboxMaskedPaths(config Config) []string {
+	paths := sandboxRunSecretPaths(config.ExposeKubernetesServiceAccount)
 	if home, err := os.UserHomeDir(); err == nil {
-		for _, path := range []string{
+		homePaths := []string{
 			".aws", ".azure", ".codex", ".claude", ".config/gcloud", ".config/gh",
-			".docker", ".gemini", ".agents", ".kube", ".ssh",
-		} {
+			".docker", ".gemini", ".agents", ".ssh",
+		}
+		if !config.ExposeKubernetesServiceAccount {
+			homePaths = append(homePaths, ".kube")
+		}
+		for _, path := range homePaths {
 			paths = append(paths, filepath.Join(home, path))
 		}
 	}
 
+	return normalizeSandboxMaskedPaths(paths)
+}
+
+func normalizeSandboxMaskedPaths(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
 		path = cleanAbsolutePath(path)
@@ -862,8 +925,7 @@ func sandboxMaskedPaths() []string {
 			continue
 		}
 		path = resolveExistingPrefix(path)
-		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
+		if _, err := os.Stat(path); err != nil {
 			continue
 		}
 		covered := false

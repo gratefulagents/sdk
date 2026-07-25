@@ -179,7 +179,7 @@ func seatbeltProfileWithConfig(req Request, config Config, tempRoot string) (str
 	profile.WriteString(seatbeltBasePolicy)
 
 	definitions := make([]string, 0)
-	maskedPaths := seatbeltMaskedPaths()
+	maskedPaths := seatbeltMaskedPaths(config)
 	profile.WriteString("\n; read the host filesystem except credential-bearing and shared temporary paths\n")
 	profile.WriteString("(allow file-read*\n  (require-all\n")
 	for i, path := range maskedPaths {
@@ -289,19 +289,22 @@ func seatbeltProtectedWorkspacePaths(workspaceRoot string) []seatbeltProtection 
 	return out
 }
 
-func seatbeltMaskedPaths() []string {
+func seatbeltMaskedPaths(config Config) []string {
 	paths := []string{
-		"/var/run/secrets/kubernetes.io/serviceaccount",
-		"/run/secrets",
 		"/tmp",
 		"/var/tmp",
 		os.TempDir(),
 	}
+	paths = append(paths, sandboxRunSecretPaths(config.ExposeKubernetesServiceAccount)...)
 	if home, err := os.UserHomeDir(); err == nil {
-		for _, path := range []string{
+		homePaths := []string{
 			".aws", ".azure", ".codex", ".claude", ".config/gcloud", ".config/gh",
-			".docker", ".gemini", ".agents", ".kube", ".ssh",
-		} {
+			".docker", ".gemini", ".agents", ".ssh",
+		}
+		if !config.ExposeKubernetesServiceAccount {
+			homePaths = append(homePaths, ".kube")
+		}
+		for _, path := range homePaths {
 			paths = append(paths, filepath.Join(home, path))
 		}
 	}
