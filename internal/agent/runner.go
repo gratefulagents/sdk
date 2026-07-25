@@ -293,7 +293,35 @@ func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call Too
 		}, nil, nil, false, nil
 	}
 
+	var durableSequence uint64
+	var durableHistory []RunItem
+	if cfg.Durable != nil {
+		cfg.Durable.normalize()
+		if cfg.Durable.Resume != nil {
+			durableSequence = cfg.Durable.Resume.Sequence
+			var restoreErr error
+			durableHistory, restoreErr = RestoreRunItems(cfg.Durable.Resume.History, func(name string) *Agent {
+				if name == agent.Name {
+					return agent
+				}
+				return nil
+			})
+			if restoreErr != nil {
+				return RunItem{}, nil, nil, false, fmt.Errorf("restore approval checkpoint: %w", restoreErr)
+			}
+		}
+		durableHistory = append(durableHistory, RunItem{Type: RunItemToolApproval, Agent: agent, ToolApproval: &ToolApprovalData{ToolName: call.Name, Input: cloneRaw(call.Input), CallID: call.ID, Approved: true}})
+		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolPrepared, agent, durableHistory, nil, runCtx.Usage); err != nil {
+			return RunItem{}, nil, nil, false, fmt.Errorf("persist approved tool preparation: %w", err)
+		}
+	}
 	result := r.executeSingleTool(ctx, runCtx, agent, tool, call, cfg)
+	if result.guardrailErr == nil && cfg.Durable != nil {
+		durableHistory = append(durableHistory, result.item)
+		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolCompleted, agent, durableHistory, nil, runCtx.Usage); err != nil {
+			return RunItem{}, result.inputGuardrails, result.outputGuardrails, result.shouldPause, fmt.Errorf("persist approved tool completion: %w", err)
+		}
+	}
 	return result.item, result.inputGuardrails, result.outputGuardrails, result.shouldPause, result.guardrailErr
 }
 
@@ -379,6 +407,32 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	al := NewAgentLogger(logLevel)
 
 	copy(currentInput, input)
+	var durableSequence uint64
+	if cfg.Durable != nil {
+		cfg.Durable.normalize()
+		if resume := cfg.Durable.Resume; resume != nil {
+			if resume.SchemaVersion != DurableCheckpointSchemaVersion {
+				return nil, fmt.Errorf("unsupported durable checkpoint schema %d", resume.SchemaVersion)
+			}
+			restored, restoreErr := RestoreRunItems(resume.History, func(name string) *Agent { return findRunAgent(agent, name) })
+			if restoreErr != nil {
+				return nil, fmt.Errorf("restore durable checkpoint: %w", restoreErr)
+			}
+			currentInput = restored
+			durableSequence = resume.Sequence
+			if resumedAgent := findRunAgent(agent, resume.AgentName); resumedAgent != nil {
+				currentAgent = resumedAgent
+			} else if resume.AgentName != "" {
+				return nil, fmt.Errorf("restore durable checkpoint: agent %q is not registered", resume.AgentName)
+			}
+			// A model-completed or approval-pending snapshot can contain an
+			// unresolved external effect. It is inspectable and reconcilable, but
+			// must never be blindly replayed as a fresh model request.
+			if resume.Boundary == DurableBoundaryModelCompleted || resume.Boundary == DurableBoundaryApprovalPending || resume.Boundary == DurableBoundaryToolPrepared {
+				return nil, fmt.Errorf("durable checkpoint at %s requires effect reconciliation before resume", resume.Boundary)
+			}
+		}
+	}
 
 	var allItems []RunItem
 	var allResponses []ModelResponse
@@ -449,6 +503,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			return nil, err
 		}
 	}
+	if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunStarted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+		return nil, fmt.Errorf("persist run-start checkpoint: %w", err)
+	}
 
 	// A run that ends early with the conversation still intact — context
 	// cancellation (host shutdown: pod deletion on pause/wake, SIGTERM, run
@@ -463,7 +520,17 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// history of every completed turn — replay-safe, no unpaired tool_use.
 	// Errors raised before anything accumulated keep the nil result.
 	defer func() {
-		if err == nil || result != nil {
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			checkpointCtx, checkpointCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			if checkpointErr := emitDurableCheckpoint(checkpointCtx, cfg.Durable, &durableSequence, DurableBoundaryRunCancelled, currentAgent, currentInput, nil, runCtx.Usage); checkpointErr != nil {
+				err = fmt.Errorf("%w (persist cancellation checkpoint: %v)", err, checkpointErr)
+			}
+			checkpointCancel()
+		}
+		if result != nil {
 			return
 		}
 		if ctx.Err() == nil && len(allItems) == 0 {
@@ -778,6 +845,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				Model:          modelIdentity.Canonical,
 				Turn:           int32(turn + 1),
 			}
+		}
+		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryModelPrepared, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+			return nil, fmt.Errorf("persist model-prepared checkpoint: %w", err)
 		}
 		emitLLMAttemptEvent(cfg.Hooks, attemptEvent("started"))
 		tp.OnSpanStart(genSpan)
@@ -1192,6 +1262,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			return pruned
 		}
 
+		modelHistory := append(append([]RunItem(nil), currentInput...), newItems...)
+		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryModelCompleted, currentAgent, modelHistory, nil, runCtx.Usage); err != nil {
+			return nil, fmt.Errorf("persist model-completed checkpoint: %w", err)
+		}
+
 		// Classify the response.
 		step := classifyResponse(newItems, currentAgent, runCtx)
 
@@ -1331,6 +1406,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 			fireAgentHook(currentAgent.Hooks, func(h AgentHooks) { h.OnEnd(runCtx, currentAgent, s.output) })
 			fireRunHook(cfg.Hooks, func(h RunHooks) { h.OnAgentEnd(runCtx, currentAgent, s.output) })
+			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunCompleted, currentAgent, finalHistory, nil, runCtx.Usage); err != nil {
+				return nil, fmt.Errorf("persist run-completed checkpoint: %w", err)
+			}
 
 			return &RunResult{
 				FinalOutput:                s.output,
@@ -1398,6 +1476,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			currentInput = nextInput
 			currentAgent = s.target
 			pendingCompletion = false
+			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryHandoffCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+				return nil, fmt.Errorf("persist handoff checkpoint: %w", err)
+			}
 
 			handoffSpan.Finish()
 			tp.OnSpanEnd(handoffSpan)
@@ -1407,6 +1488,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		case *toolCallStep:
 			pendingCompletion = false
 			stopGateBlocks = 0
+			preparedHistory := append(append([]RunItem(nil), currentInput...), newItems...)
+			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolPrepared, currentAgent, preparedHistory, nil, runCtx.Usage); err != nil {
+				return nil, fmt.Errorf("persist tool-prepared checkpoint: %w", err)
+			}
 			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, tools, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
@@ -1426,6 +1511,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 			currentInput = append(currentInput, nextTurnToolResults...)
 			currentInput = recordAndPruneResponseCompaction(currentInput)
+			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+				return nil, fmt.Errorf("persist tool-completed checkpoint: %w", err)
+			}
 
 			// Three-strike escalation: when several consecutive tool turns
 			// produce only errors, inject a corrective note instead of letting
@@ -1477,6 +1565,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 			if len(interruptions) > 0 {
+				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryApprovalPending, currentAgent, currentInput, interruptions, runCtx.Usage); err != nil {
+					return nil, fmt.Errorf("persist approval checkpoint: %w", err)
+				}
 				return &RunResult{
 					LastAgent:                  currentAgent,
 					NewItems:                   allItems,
@@ -1539,6 +1630,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 			if shouldPause {
+				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryPaused, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+					return nil, fmt.Errorf("persist pause checkpoint: %w", err)
+				}
 				return &RunResult{
 					LastAgent:                  currentAgent,
 					NewItems:                   allItems,
@@ -2244,6 +2338,10 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 	// Inject call ID and tracing context so nested agent runs can stitch their
 	// spans under this tool invocation instead of starting a disconnected trace.
 	execCtx := WithParentCallID(ctx, call.ID)
+	if cfg.Durable != nil {
+		cfg.Durable.normalize()
+		execCtx = WithDurableIdempotencyKey(execCtx, DurableIdempotencyKey(cfg.Durable.RunID, call.ID))
+	}
 	execCtx = WithTraceContext(execCtx, runCtx.Trace, runCtx.TracingProcessor, funcSpan.ID)
 	execCtx = WithNestedRunConfig(execCtx, cfg)
 	timeout := t.TimeoutSeconds()

@@ -94,6 +94,10 @@ type RetryBackoffSettings = agent.RetryBackoffSettings
 type RetryPolicy = agent.RetryPolicy
 type RetrySpanData = agent.RetrySpanData
 type RunConfig = agent.RunConfig
+type DurableBoundary = agent.DurableBoundary
+type DurableCheckpoint = agent.DurableCheckpoint
+type DurableCheckpointHook = agent.DurableCheckpointHook
+type DurableRunConfig = agent.DurableRunConfig
 type RunContext = agent.RunContext
 type RunErrorAction = agent.RunErrorAction
 type RunErrorData = agent.RunErrorData
@@ -162,6 +166,19 @@ const (
 	ActionRiskMedium = agent.ActionRiskMedium
 	ActionRiskHigh   = agent.ActionRiskHigh
 
+	DurableCheckpointSchemaVersion  = agent.DurableCheckpointSchemaVersion
+	DurableBoundaryRunStarted       = agent.DurableBoundaryRunStarted
+	DurableBoundaryModelPrepared    = agent.DurableBoundaryModelPrepared
+	DurableBoundaryModelCompleted   = agent.DurableBoundaryModelCompleted
+	DurableBoundaryToolPrepared     = agent.DurableBoundaryToolPrepared
+	DurableBoundaryToolCompleted    = agent.DurableBoundaryToolCompleted
+	DurableBoundaryApprovalPending  = agent.DurableBoundaryApprovalPending
+	DurableBoundaryHandoffCompleted = agent.DurableBoundaryHandoffCompleted
+	DurableBoundaryChildChanged     = agent.DurableBoundaryChildChanged
+	DurableBoundaryPaused           = agent.DurableBoundaryPaused
+	DurableBoundaryRunCancelled     = agent.DurableBoundaryRunCancelled
+	DurableBoundaryRunCompleted     = agent.DurableBoundaryRunCompleted
+
 	DefaultMaxTurns                = agent.DefaultMaxTurns
 	DefaultMaxToolResultBytes      = agent.DefaultMaxToolResultBytes
 	DefaultSubAgentMaxTurns        = agent.DefaultSubAgentMaxTurns
@@ -213,12 +230,13 @@ const (
 	LogLevelNormal = agent.LogLevelNormal
 	LogLevelDebug  = agent.LogLevelDebug
 
-	SubAgentTaskPending   = agent.SubAgentTaskPending
-	SubAgentTaskWaiting   = agent.SubAgentTaskWaiting
-	SubAgentTaskRunning   = agent.SubAgentTaskRunning
-	SubAgentTaskCompleted = agent.SubAgentTaskCompleted
-	SubAgentTaskFailed    = agent.SubAgentTaskFailed
-	SubAgentTaskCancelled = agent.SubAgentTaskCancelled
+	SubAgentTaskPending     = agent.SubAgentTaskPending
+	SubAgentTaskWaiting     = agent.SubAgentTaskWaiting
+	SubAgentTaskRunning     = agent.SubAgentTaskRunning
+	SubAgentTaskReconciling = agent.SubAgentTaskReconciling
+	SubAgentTaskCompleted   = agent.SubAgentTaskCompleted
+	SubAgentTaskFailed      = agent.SubAgentTaskFailed
+	SubAgentTaskCancelled   = agent.SubAgentTaskCancelled
 
 	SubAgentDependencyAllSuccess  = agent.SubAgentDependencyAllSuccess
 	SubAgentDependencyAllTerminal = agent.SubAgentDependencyAllTerminal
@@ -230,6 +248,7 @@ var BuildRunBudgetContext = agent.BuildRunBudgetContext
 
 var (
 	BuildLLMRequestSnapshot             = agent.BuildLLMRequestSnapshot
+	RestoreRunItems                     = agent.RestoreRunItems
 	BuildLLMResponseSnapshot            = agent.BuildLLMResponseSnapshot
 	BuildSubAgentBudgetContext          = agent.BuildSubAgentBudgetContext
 	BuildSubAgentDependencyContext      = agent.BuildSubAgentDependencyContext
@@ -237,6 +256,9 @@ var (
 	BuildSubAgentResultsContext         = agent.BuildSubAgentResultsContext
 	BuildWorkspaceContext               = agent.BuildWorkspaceContext
 	DefaultCompactionConfig             = agent.DefaultCompactionConfig
+	DurableIdempotencyKey               = agent.DurableIdempotencyKey
+	DurableIdempotencyKeyFromContext    = agent.DurableIdempotencyKeyFromContext
+	WithDurableIdempotencyKey           = agent.WithDurableIdempotencyKey
 	DefaultRetryPolicy                  = agent.DefaultRetryPolicy
 	CompactionDefaultsForModel          = agent.CompactionDefaultsForModel
 	ExtractAgentMeta                    = agent.ExtractAgentMeta

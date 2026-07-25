@@ -73,6 +73,7 @@ Each feature links to a focused doc with a runnable example.
 | [Policy](examples/features/policy/README.md) | Permission and access-clamping primitives. |
 | [Memory](examples/features/memory/README.md) | Optional memory stores and embedders. |
 | [Trace store](examples/features/tracestore/README.md) | Filesystem trace persistence and OpenTelemetry bridging. |
+| [Durable runs](docs/durable-runs.md) | Versioned checkpoints, crash recovery, fenced stores, effects, and child reconciliation. |
 
 Run every feature example offline:
 

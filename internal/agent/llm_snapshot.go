@@ -41,6 +41,7 @@ type LLMRunItemSnapshot struct {
 	AgentName     string             `json:"agent_name,omitempty"`
 	MessageText   string             `json:"message_text,omitempty"`
 	MessagePhase  string             `json:"message_phase,omitempty"`
+	MessageImages []ImageAttachment  `json:"message_images,omitempty"`
 	ToolCall      *LLMToolCall       `json:"tool_call,omitempty"`
 	ToolOutput    *ToolOutputData    `json:"tool_output,omitempty"`
 	HandoffCall   *HandoffCallData   `json:"handoff_call,omitempty"`
@@ -202,6 +203,7 @@ func SnapshotRunItems(items []RunItem) []LLMRunItemSnapshot {
 			if item.Message != nil {
 				snap.MessageText = item.Message.Text
 				snap.MessagePhase = item.Message.Phase
+				snap.MessageImages = append([]ImageAttachment(nil), item.Message.Images...)
 			}
 		case RunItemToolCall:
 			if item.ToolCall != nil {
