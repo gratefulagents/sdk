@@ -190,6 +190,7 @@ func TestCreatePullRequestToolRefusesProtectedAndUnknownBranches(t *testing.T) {
 func TestCreateIssueToolRunsGitHubFlowAndRecordsURL(t *testing.T) {
 	runner := &fakeRunner{
 		ghOut: map[string]string{
+			"label list --limit 1000 --json name":                                             `[{"name":"bug"},{"name":"sdk"}]`,
 			"issue create --title Bug --body Details --label bug --label sdk --assignee octo": "https://github.com/acme/repo/issues/3\n",
 		},
 	}
@@ -299,35 +300,148 @@ func mustJSON(t *testing.T, value any) json.RawMessage {
 	return data
 }
 
-func TestCreateIssueToolRetriesWithoutMissingLabels(t *testing.T) {
+func TestCreateIssueToolCreatesMissingLabels(t *testing.T) {
 	runner := &fakeRunner{
 		ghOut: map[string]string{
-			"issue create --title Bug report --body details": "https://github.com/acme/repo/issues/12\n",
+			"label list --limit 1000 --json name":                                      `[]`,
+			"issue create --title Bug report --body details --label tests --label sdk": "https://github.com/acme/repo/issues/12\n",
 		},
 		ghErr: map[string]error{
-			"issue create --title Bug report --body details --label tests": errors.New("exit status 1"),
+			"label create --color BFD4F2 -- sdk": errors.New("exit status 1"),
 		},
 	}
-	runner.ghOut["issue create --title Bug report --body details --label tests"] = "could not add label: 'tests' not found\n"
-	sink := &fakeSink{}
-	tool := NewCreateIssueTool(runner, sink)
+	runner.ghOut["label create --color BFD4F2 -- sdk"] = "label already exists\n"
 
-	input := mustJSON(t, map[string]any{"title": "Bug report", "body": "details", "labels": []string{"tests"}})
-	result, err := tool.Execute(context.Background(), input, "/repo")
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
+		"title":  "Bug report",
+		"body":   "details",
+		"labels": []string{" tests ", "sdk", "TESTS"},
+	}), "/repo")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if result.IsError {
 		t.Fatalf("Execute() returned error result: %s", result.Content)
 	}
-	if !strings.Contains(result.Content, `"issue_url":"https://github.com/acme/repo/issues/12"`) {
-		t.Fatalf("result = %s, want issue URL from label-free retry", result.Content)
+	wantCalls := []string{
+		"label list --limit 1000 --json name",
+		"label create --color BFD4F2 -- tests",
+		"label create --color BFD4F2 -- sdk",
+		"issue create --title Bug report --body details --label tests --label sdk",
 	}
-	if !strings.Contains(result.Content, "without labels") {
-		t.Fatalf("result = %s, want dropped-labels status note", result.Content)
+	if !reflect.DeepEqual(runner.ghCalls, wantCalls) {
+		t.Fatalf("gh calls = %#v, want %#v", runner.ghCalls, wantCalls)
 	}
-	if sink.issueURL != "https://github.com/acme/repo/issues/12" {
-		t.Fatalf("recorded issue URL = %q", sink.issueURL)
+}
+
+func TestCreateIssueToolSkipsExistingLabels(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"label list --limit 1000 --json name":                     `[{"name":"Bug"},{"name":"sdk"}]`,
+			"issue create --title Bug report --label bug --label SDK": "https://github.com/acme/repo/issues/12\n",
+		},
+	}
+
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
+		"title":  "Bug report",
+		"labels": []string{" bug ", "SDK", "BUG", " "},
+	}), "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned error result: %s", result.Content)
+	}
+	wantCalls := []string{
+		"label list --limit 1000 --json name",
+		"issue create --title Bug report --label bug --label SDK",
+	}
+	if !reflect.DeepEqual(runner.ghCalls, wantCalls) {
+		t.Fatalf("gh calls = %#v, want %#v", runner.ghCalls, wantCalls)
+	}
+}
+
+func TestCreateIssueToolStopsWhenLabelListingFails(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"label list --limit 1000 --json name": "permission denied\n",
+		},
+		ghErr: map[string]error{
+			"label list --limit 1000 --json name": errors.New("exit status 1"),
+		},
+	}
+
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
+		"title":  "Bug report",
+		"labels": []string{"tests"},
+	}), "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "gh label list failed") {
+		t.Fatalf("result = %+v, want label listing failure", result)
+	}
+	if len(runner.ghCalls) != 1 {
+		t.Fatalf("gh calls = %#v, want only label listing", runner.ghCalls)
+	}
+}
+
+func TestCreateIssueToolStopsWhenLabelCreationFails(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"label list --limit 1000 --json name":  `[]`,
+			"label create --color BFD4F2 -- tests": "permission denied\n",
+		},
+		ghErr: map[string]error{
+			"label create --color BFD4F2 -- tests": errors.New("exit status 1"),
+		},
+	}
+
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
+		"title":  "Bug report",
+		"labels": []string{"tests"},
+	}), "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "gh label create failed") {
+		t.Fatalf("result = %+v, want label creation failure", result)
+	}
+	for _, call := range runner.ghCalls {
+		if strings.HasPrefix(call, "issue create") {
+			t.Fatalf("issue was created after label creation failed: %#v", runner.ghCalls)
+		}
+	}
+}
+
+func TestCreateIssueToolDoesNotDropLabelsWhenIssueCreationFails(t *testing.T) {
+	runner := &fakeRunner{
+		ghOut: map[string]string{
+			"label list --limit 1000 --json name":                          `[{"name":"tests"}]`,
+			"issue create --title Bug report --body details --label tests": "could not add label: 'tests' not found\n",
+		},
+		ghErr: map[string]error{
+			"issue create --title Bug report --body details --label tests": errors.New("exit status 1"),
+		},
+	}
+
+	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
+		"title":  "Bug report",
+		"body":   "details",
+		"labels": []string{"tests"},
+	}), "/repo")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "gh issue create failed") {
+		t.Fatalf("result = %+v, want issue creation failure", result)
+	}
+	wantCalls := []string{
+		"label list --limit 1000 --json name",
+		"issue create --title Bug report --body details --label tests",
+	}
+	if !reflect.DeepEqual(runner.ghCalls, wantCalls) {
+		t.Fatalf("gh calls = %#v, want %#v", runner.ghCalls, wantCalls)
 	}
 }
 
