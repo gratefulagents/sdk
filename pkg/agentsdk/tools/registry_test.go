@@ -13,6 +13,7 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 func TestNewRegistryDefaultTools(t *testing.T) {
@@ -49,6 +50,48 @@ func TestRegistryBrowserUsesTrustedSandboxExecutor(t *testing.T) {
 	}
 	if tool.Executor == nil {
 		t.Fatal("Browser executor = nil")
+	}
+}
+
+func TestRegistryConfiguresBrowserScreenshotDirectory(t *testing.T) {
+	screenshotDir := t.TempDir()
+	r := NewRegistry(
+		t.TempDir(),
+		WithBrowserTools(),
+		WithBrowserScreenshotDir(screenshotDir),
+		WithPrivateNetworkURLs(true),
+		WithVisionTools(nil),
+	)
+	tool, ok := r.Get("Browser").(*browser.Tool)
+	if !ok {
+		t.Fatalf("Browser tool = %T, want *browser.Tool", r.Get("Browser"))
+	}
+	if tool.ScreenshotDir != screenshotDir {
+		t.Fatalf("Browser ScreenshotDir = %q, want %q", tool.ScreenshotDir, screenshotDir)
+	}
+	visionTool, ok := r.Get("AnalyzeImage").(*vision.Tool)
+	if !ok {
+		t.Fatalf("AnalyzeImage tool = %T, want *vision.Tool", r.Get("AnalyzeImage"))
+	}
+	if len(visionTool.AllowedImageDirs) != 1 || visionTool.AllowedImageDirs[0] != screenshotDir {
+		t.Fatalf("AnalyzeImage AllowedImageDirs = %#v, want [%q]", visionTool.AllowedImageDirs, screenshotDir)
+	}
+}
+
+func TestRegistrySharesDefaultBrowserScreenshotDirectoryWithVision(t *testing.T) {
+	r := NewRegistry(
+		t.TempDir(),
+		WithBrowserTools(),
+		WithPrivateNetworkURLs(true),
+		WithVisionTools(nil),
+	)
+	browserTool := r.Get("Browser").(*browser.Tool)
+	visionTool := r.Get("AnalyzeImage").(*vision.Tool)
+	if browserTool.ScreenshotDir != browser.DefaultScreenshotDir() {
+		t.Fatalf("Browser ScreenshotDir = %q, want default %q", browserTool.ScreenshotDir, browser.DefaultScreenshotDir())
+	}
+	if len(visionTool.AllowedImageDirs) != 1 || visionTool.AllowedImageDirs[0] != browserTool.ScreenshotDir {
+		t.Fatalf("AnalyzeImage AllowedImageDirs = %#v, want Browser screenshot dir", visionTool.AllowedImageDirs)
 	}
 }
 

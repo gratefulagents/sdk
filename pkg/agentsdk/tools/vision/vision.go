@@ -29,6 +29,9 @@ type Tool struct {
 	AnalyzeFn               AnalyzeFn
 	AnalyzeWithDetailFn     AnalyzeWithDetailFn
 	AllowPrivateNetworkURLs bool
+	// AllowedImageDirs contains host-managed directories outside the workspace
+	// whose images may be loaded, such as the Browser tool's screenshot dir.
+	AllowedImageDirs []string
 }
 
 type input struct {
@@ -50,7 +53,7 @@ func (t *Tool) InputSchema() json.RawMessage {
 		"properties": {
 			"image_path": {
 				"type": "string",
-				"description": "Local file path to the image (relative to workspace)"
+				"description": "Workspace-relative image path or absolute path returned by the Browser screenshot action"
 			},
 			"url": {
 				"type": "string",
@@ -94,7 +97,7 @@ func (t *Tool) Execute(ctx context.Context, raw json.RawMessage, workDir string)
 	var mimeType string
 	var err error
 	if in.ImagePath != "" {
-		imageData, mimeType, err = LoadImageFromFile(workDir, in.ImagePath)
+		imageData, mimeType, err = LoadImageFromFileInDirs(workDir, in.ImagePath, t.AllowedImageDirs...)
 	} else {
 		imageData, mimeType, err = LoadImageFromURLWithOptions(ctx, in.URL, web.URLSecurityOptions{
 			AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs,
@@ -142,9 +145,33 @@ const maxImageSize = 20 * 1024 * 1024
 var newSafeHTTPClientWithOptions = web.NewSafeHTTPClientWithOptions
 
 func LoadImageFromFile(workDir, path string) ([]byte, string, error) {
-	absPath, err := pathutil.ResolveWorkspace(workDir, path)
-	if err != nil {
-		return nil, "", err
+	return LoadImageFromFileInDirs(workDir, path)
+}
+
+// LoadImageFromFileInDirs loads an image from the workspace or from one of the
+// host-managed allowed directories. Relative paths always resolve against the
+// workspace; allowed directories only authorize absolute paths they contain.
+func LoadImageFromFileInDirs(workDir, path string, allowedDirs ...string) ([]byte, string, error) {
+	absPath, workspaceErr := pathutil.ResolveWorkspace(workDir, path)
+	if workspaceErr != nil {
+		if !filepath.IsAbs(path) {
+			return nil, "", workspaceErr
+		}
+		absPath = ""
+		for _, dir := range allowedDirs {
+			dir = strings.TrimSpace(dir)
+			if dir == "" {
+				continue
+			}
+			candidate, err := pathutil.ResolveWorkspace(dir, path)
+			if err == nil {
+				absPath = candidate
+				break
+			}
+		}
+		if absPath == "" {
+			return nil, "", workspaceErr
+		}
 	}
 	f, err := pathutil.OpenFileNoFollow(absPath, os.O_RDONLY, 0)
 	if err != nil {

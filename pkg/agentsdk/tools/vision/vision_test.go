@@ -41,6 +41,44 @@ func TestExecuteUsesDetailAwareAnalyzer(t *testing.T) {
 	}
 }
 
+func TestLoadImageFromFileInDirsAllowsManagedAbsolutePath(t *testing.T) {
+	workDir := t.TempDir()
+	imageDir := t.TempDir()
+	imagePath := filepath.Join(imageDir, "browser-shot.png")
+	if err := os.WriteFile(imagePath, []byte{0x89, 'P', 'N', 'G'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	data, mimeType, err := LoadImageFromFileInDirs(workDir, imagePath, imageDir)
+	if err != nil {
+		t.Fatalf("LoadImageFromFileInDirs() error = %v", err)
+	}
+	if len(data) != 4 || mimeType != "image/png" {
+		t.Fatalf("data=%v mimeType=%q", data, mimeType)
+	}
+}
+
+func TestLoadImageFromFileInDirsRejectsOtherAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "workspace")
+	imageDir := filepath.Join(root, "screenshots")
+	outside := filepath.Join(root, "outside.png")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(imageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte{0x89, 'P', 'N', 'G'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := LoadImageFromFileInDirs(workDir, outside, imageDir)
+	if err == nil || !strings.Contains(err.Error(), "outside the workspace root") {
+		t.Fatalf("LoadImageFromFileInDirs() error = %v, want path rejection", err)
+	}
+}
+
 func TestLoadImageFromFileRejectsAbsoluteWorkspaceEscape(t *testing.T) {
 	root := t.TempDir()
 	workDir := filepath.Join(root, "workspace")

@@ -30,6 +30,7 @@ type Registry struct {
 	signals                 bool
 	allowMutating           map[string]struct{}
 	browser                 bool
+	browserScreenshotDir    string
 	disableWeb              bool
 	allowPrivateNetworkURLs bool
 	visionTool              *vision.Tool
@@ -64,6 +65,13 @@ func WithSignalTools() RegistryOption {
 
 func WithBrowserTools() RegistryOption {
 	return func(r *Registry) { r.browser = true }
+}
+
+// WithBrowserScreenshotDir configures the host-managed ephemeral directory for
+// screenshots whose calls omit output_path. Explicit output paths remain
+// workspace-relative.
+func WithBrowserScreenshotDir(dir string) RegistryOption {
+	return func(r *Registry) { r.browserScreenshotDir = strings.TrimSpace(dir) }
 }
 
 func WithoutWebTools() RegistryOption {
@@ -211,11 +219,23 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	// Chromium cannot bind public-only URL validation to redirects, DNS, and
 	// subresources. Register Browser only behind the explicit unrestricted
 	// networking opt-in; WebFetch remains the destination-confined default.
+	effectiveBrowserScreenshotDir := ""
 	if r.browser && r.allowPrivateNetworkURLs {
-		r.Register(&browser.Tool{AllowPrivateNetworkURLs: true, Executor: r.bashExecutor()})
+		effectiveBrowserScreenshotDir = r.browserScreenshotDir
+		if effectiveBrowserScreenshotDir == "" {
+			effectiveBrowserScreenshotDir = browser.DefaultScreenshotDir()
+		}
+		r.Register(&browser.Tool{
+			AllowPrivateNetworkURLs: true,
+			Executor:                r.bashExecutor(),
+			ScreenshotDir:           effectiveBrowserScreenshotDir,
+		})
 	}
 	if r.visionTool != nil {
 		r.visionTool.AllowPrivateNetworkURLs = r.allowPrivateNetworkURLs
+		if effectiveBrowserScreenshotDir != "" {
+			r.visionTool.AllowedImageDirs = append(r.visionTool.AllowedImageDirs, effectiveBrowserScreenshotDir)
+		}
 		r.Register(r.visionTool)
 	}
 	if r.memoryTool != nil {

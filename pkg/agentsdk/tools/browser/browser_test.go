@@ -46,6 +46,48 @@ func (e *fakeBrowserExecutor) Run(_ context.Context, req sandbox.Request) (sandb
 	return sandbox.Result{Output: "<html><head><title>OK</title></head><body>Hello</body></html>"}, nil
 }
 
+func TestScreenshotWithoutOutputPathUsesEphemeralDirectory(t *testing.T) {
+	workDir := t.TempDir()
+	screenshotDir := t.TempDir()
+	executor := &fakeBrowserExecutorWithScreenshot{data: []byte("png-data")}
+
+	result, err := (&Tool{Executor: executor, ScreenshotDir: screenshotDir}).screenshot(
+		context.Background(),
+		"chrome",
+		input{URL: "https://example.com"},
+		workDir,
+		800,
+		600,
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("screenshot() result=%#v err=%v", result, err)
+	}
+	entries, err := os.ReadDir(screenshotDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), "agentsdk-browser-screenshot-") {
+		t.Fatalf("scratch entries = %#v, want one generated screenshot", entries)
+	}
+	got, err := os.ReadFile(filepath.Join(screenshotDir, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "png-data" {
+		t.Fatalf("screenshot data = %q", got)
+	}
+	workEntries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workEntries) != 0 {
+		t.Fatalf("workspace entries = %#v, want no implicit screenshot artifacts", workEntries)
+	}
+	if !strings.Contains(result.Content, filepath.Join(screenshotDir, entries[0].Name())) {
+		t.Fatalf("result = %q, want absolute ephemeral screenshot path", result.Content)
+	}
+}
+
 func TestScreenshotRejectsOutputPathEscape(t *testing.T) {
 	root := t.TempDir()
 	workDir := filepath.Join(root, "workspace")
