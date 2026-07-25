@@ -69,7 +69,7 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 			},
 			"agent_name": {
 				"type": "string",
-				"description": "Specialist agent to run. Defaults to the configured default agent."
+				"description": "Specialist agent to run. With 'tasks', this is the default agent for every task that does not set its own agent_name. Defaults to the configured default agent."
 			},
 			"mode": {
 				"type": "string",
@@ -79,7 +79,7 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 			"tool_access": {
 				"type": "string",
 				"enum": ["full", "read-only"],
-				"description": "Optional tool access override. Use read-only for explore/analysis tasks."
+				"description": "Optional tool access override. Use read-only for explore/analysis tasks. With 'tasks', this applies to every task in the batch, and a task cannot widen it: the narrower of the call-level and task-level value wins."
 			},
 			"depends_on": {
 				"type": "array",
@@ -106,9 +106,9 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 					"type": "object",
 					"properties": {
 						"key": {"type": "string", "description": "Logical key other tasks reference in depends_on."},
-						"agent_name": {"type": "string", "description": "Specialist agent. Defaults to the configured default agent."},
+						"agent_name": {"type": "string", "description": "Specialist agent. Defaults to the call-level agent_name, then the configured default agent."},
 						"message": {"type": "string", "description": "Self-contained task packet for this sub-agent."},
-						"tool_access": {"type": "string", "enum": ["full", "read-only"], "description": "Optional tool access override."},
+						"tool_access": {"type": "string", "enum": ["full", "read-only"], "description": "Optional tool access override. Cannot widen the call-level tool_access; the narrower value wins."},
 						"depends_on": {"type": "array", "items": {"type": "string"}, "description": "Keys in this batch or existing task ids that must finish first."},
 						"dependency_policy": {"type": "string", "enum": ["all_success", "all_terminal"], "description": "Defaults to all_success."},
 						"include_dependency_results": {"type": "boolean", "description": "Defaults to true."}
@@ -197,13 +197,44 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 		return joinedTaskResult(task, "", false), nil
 	}
 
-	return t.executeBatch(ctx, params.Tasks, background, params.TimeoutMS)
+	return t.executeBatch(ctx, params.Tasks, batchDefaults{
+		agentName:  params.AgentName,
+		toolAccess: params.ToolAccess,
+	}, background, params.TimeoutMS)
+}
+
+// batchDefaults carries the call-level agent_name/tool_access so a task DAG
+// inherits them instead of silently falling back to the configured default
+// agent and unrestricted tool access.
+type batchDefaults struct {
+	agentName  string
+	toolAccess string
+}
+
+// agentFor resolves the agent for a batch task: task-level wins, then the
+// call-level default, then the registry default.
+func (d batchDefaults) agentFor(task subagentBatchTaskInput) string {
+	if name := strings.TrimSpace(task.AgentName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(d.agentName)
+}
+
+// toolAccessFor resolves tool access for a batch task by taking the NARROWEST
+// of the call-level and task-level values. A task must never be able to widen
+// access beyond what the caller asked for at the call level, so read-only on
+// either level wins.
+func (d batchDefaults) toolAccessFor(task subagentBatchTaskInput) ToolAccessLevel {
+	if access := toolAccessOverride(d.toolAccess); access == ToolAccessLevelReadOnly {
+		return access
+	}
+	return toolAccessOverride(task.ToolAccess)
 }
 
 // executeBatch spawns a keyed DAG of tasks and optionally waits for all of
 // them (sync mode). depends_on entries resolve to in-batch keys first, then to
 // already-existing task ids.
-func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTaskInput, background bool, timeoutMS int64) (ToolResult, error) {
+func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTaskInput, defaults batchDefaults, background bool, timeoutMS int64) (ToolResult, error) {
 	byKey := make(map[string]int, len(batch))
 	for i, task := range batch {
 		key := strings.TrimSpace(task.Key)
@@ -216,7 +247,7 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 		if strings.TrimSpace(task.Message) == "" {
 			return ToolResult{Content: fmt.Sprintf("tasks[%d].message is required", i), IsError: true}, nil
 		}
-		agentName := strings.TrimSpace(task.AgentName)
+		agentName := defaults.agentFor(task)
 		if agentName == "" {
 			agentName = t.defaultAgent
 		}
@@ -282,12 +313,12 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 				continue
 			}
 
-			agentName := strings.TrimSpace(task.AgentName)
+			agentName := defaults.agentFor(task)
 			if agentName == "" {
 				agentName = t.defaultAgent
 			}
 			taskID, err := t.registry.SpawnAsyncWithOptions(ctx, agentName, task.Message, SubAgentSpawnOptions{
-				ToolAccessOverride:       toolAccessOverride(task.ToolAccess),
+				ToolAccessOverride:       defaults.toolAccessFor(task),
 				DependsOn:                depIDs,
 				DependencyPolicy:         SubAgentDependencyPolicy(task.DependencyPolicy),
 				IncludeDependencyResults: task.IncludeDependencyResults,
