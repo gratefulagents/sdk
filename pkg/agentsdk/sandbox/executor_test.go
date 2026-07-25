@@ -458,6 +458,28 @@ func TestBubblewrapArgsExposesKubeDirectoryOnlyWhenExplicitlyEnabled(t *testing.
 	assertArgAbsent(t, args, "--tmpfs", kubeDir)
 }
 
+func TestSandboxMasksFileAndDirectorySecrets(t *testing.T) {
+	root := t.TempDir()
+	secretFile := filepath.Join(root, "file-secret")
+	if err := os.WriteFile(secretFile, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secretDir := filepath.Join(root, "directory-secret")
+	if err := os.Mkdir(secretDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := normalizeSandboxMaskedPaths([]string{secretFile, secretDir})
+	if len(paths) != 2 || paths[0] != resolveExistingPrefix(secretFile) || paths[1] != resolveExistingPrefix(secretDir) {
+		t.Fatalf("normalizeSandboxMaskedPaths() = %#v, want file and directory", paths)
+	}
+
+	fileArgs := appendSandboxMaskArgs(nil, paths[0])
+	assertArgSequence(t, fileArgs, "--ro-bind", "/dev/null", paths[0])
+	dirArgs := appendSandboxMaskArgs(nil, paths[1])
+	assertArgSequence(t, dirArgs, "--tmpfs", paths[1])
+}
+
 func TestBubblewrapArgsReadOnlyIgnoresConfiguredWritablePaths(t *testing.T) {
 	workspace := t.TempDir()
 	scratch := t.TempDir()

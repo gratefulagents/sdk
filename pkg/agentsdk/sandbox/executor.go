@@ -542,7 +542,7 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		}
 	}
 	for _, path := range sandboxMaskedPaths(config) {
-		args = append(args, "--tmpfs", path)
+		args = appendSandboxMaskArgs(args, path)
 	}
 
 	args = append(args, "--chdir", workDir, "--")
@@ -886,6 +886,19 @@ func sandboxRunSecretPaths(exposeKubernetesServiceAccount bool) []string {
 	return paths
 }
 
+func appendSandboxMaskArgs(args []string, path string) []string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return args
+	}
+	if info.IsDir() {
+		return append(args, "--tmpfs", path)
+	}
+	// Bubblewrap cannot mount tmpfs over a file. Bind the sandbox's inert null
+	// device over file-based runtime secrets instead.
+	return append(args, "--ro-bind", "/dev/null", path)
+}
+
 func sandboxMaskedPaths(config Config) []string {
 	paths := sandboxRunSecretPaths(config.ExposeKubernetesServiceAccount)
 	if home, err := os.UserHomeDir(); err == nil {
@@ -901,6 +914,10 @@ func sandboxMaskedPaths(config Config) []string {
 		}
 	}
 
+	return normalizeSandboxMaskedPaths(paths)
+}
+
+func normalizeSandboxMaskedPaths(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
 		path = cleanAbsolutePath(path)
@@ -908,8 +925,7 @@ func sandboxMaskedPaths(config Config) []string {
 			continue
 		}
 		path = resolveExistingPrefix(path)
-		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
+		if _, err := os.Stat(path); err != nil {
 			continue
 		}
 		covered := false
