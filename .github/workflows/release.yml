@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Create patch release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Wait for earlier release runs
+        uses: softprops/turnstyle@v3
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next patch version
+        id: version
+        shell: bash
+        run: |
+          latest_tag="$(
+            git tag --list |
+              awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print }' |
+              sort -V |
+              tail -n 1
+          )"
+
+          if [ -z "${latest_tag}" ]; then
+            latest_tag="v0.0.0"
+          fi
+
+          version="${latest_tag#v}"
+          IFS=. read -r major minor patch <<< "${version}"
+          next_tag="v${major}.${minor}.$((patch + 1))"
+
+          echo "Previous release: ${latest_tag}"
+          echo "Next release: ${next_tag}"
+          echo "tag=${next_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "${TAG_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${RELEASE_SHA}" \
+            --title "${TAG_NAME}" \
+            --generate-notes \
+            --latest
