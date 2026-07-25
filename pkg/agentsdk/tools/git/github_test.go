@@ -307,10 +307,10 @@ func TestCreateIssueToolCreatesMissingLabels(t *testing.T) {
 			"issue create --title Bug report --body details --label tests --label sdk": "https://github.com/acme/repo/issues/12\n",
 		},
 		ghErr: map[string]error{
-			"label create sdk --color BFD4F2": errors.New("exit status 1"),
+			"label create --color BFD4F2 -- sdk": errors.New("exit status 1"),
 		},
 	}
-	runner.ghOut["label create sdk --color BFD4F2"] = "label already exists\n"
+	runner.ghOut["label create --color BFD4F2 -- sdk"] = "label already exists\n"
 
 	result, err := NewCreateIssueTool(runner, nil).Execute(context.Background(), mustJSON(t, map[string]any{
 		"title":  "Bug report",
@@ -325,8 +325,8 @@ func TestCreateIssueToolCreatesMissingLabels(t *testing.T) {
 	}
 	wantCalls := []string{
 		"label list --limit 1000 --json name",
-		"label create tests --color BFD4F2",
-		"label create sdk --color BFD4F2",
+		"label create --color BFD4F2 -- tests",
+		"label create --color BFD4F2 -- sdk",
 		"issue create --title Bug report --body details --label tests --label sdk",
 	}
 	if !reflect.DeepEqual(runner.ghCalls, wantCalls) {
@@ -389,11 +389,11 @@ func TestCreateIssueToolStopsWhenLabelListingFails(t *testing.T) {
 func TestCreateIssueToolStopsWhenLabelCreationFails(t *testing.T) {
 	runner := &fakeRunner{
 		ghOut: map[string]string{
-			"label list --limit 1000 --json name": `[]`,
-			"label create tests --color BFD4F2":   "permission denied\n",
+			"label list --limit 1000 --json name":  `[]`,
+			"label create --color BFD4F2 -- tests": "permission denied\n",
 		},
 		ghErr: map[string]error{
-			"label create tests --color BFD4F2": errors.New("exit status 1"),
+			"label create --color BFD4F2 -- tests": errors.New("exit status 1"),
 		},
 	}
 

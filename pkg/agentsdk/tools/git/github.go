@@ -381,7 +381,7 @@ func (t *CreateIssueTool) Execute(ctx context.Context, input json.RawMessage, wo
 			if _, ok := existingLabels[strings.ToLower(label)]; ok {
 				continue
 			}
-			createOut, err := runner.RunGH(ctx, repoDir, "label", "create", label, "--color", "BFD4F2")
+			createOut, err := runner.RunGH(ctx, repoDir, "label", "create", "--color", "BFD4F2", "--", label)
 			if err != nil && !strings.Contains(strings.ToLower(createOut), "already exists") {
 				return issueError(fmt.Sprintf("gh label create failed: %s\n%s", err, createOut))
 			}
