@@ -136,11 +136,11 @@ type GlobTool struct{}
 func (t *GlobTool) Name() string { return "glob" }
 
 func (t *GlobTool) Description() string {
-	return "Find files matching a glob pattern (for example, **/*.go). Returns sorted relative paths."
+	return "Find files matching a glob pattern (for example, **/*.go). Returns deterministically sorted, pageable results; use output_format=json for structured completion metadata."
 }
 
 func (t *GlobTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional subdirectory to search (default: working directory)"},"limit":{"type":"integer","description":"Max results (default 200)"}},"required":["pattern"]}`)
+	return json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional subdirectory to search (default: working directory)"},"limit":{"type":"integer","description":"Max results per page (default 200)"},"cursor":{"type":"string","description":"Continuation cursor returned by a previous identical search"},"include":{"type":"array","items":{"type":"string"},"description":"Additional include globs; all paths must match at least one"},"exclude":{"type":"array","items":{"type":"string"},"description":"Exclude globs"},"respect_gitignore":{"type":"boolean","description":"Honor workspace .gitignore files (default false for compatibility)"},"skip_default_dirs":{"type":"boolean","description":"Skip .git, node_modules, vendor, .venv, and target (default true)"},"output_format":{"type":"string","enum":["text","json"],"description":"text preserves legacy output; json returns matches/truncated/next_cursor"}},"required":["pattern"]}`)
 }
 
 func (t *GlobTool) IsReadOnly() bool { return true }
@@ -153,9 +153,15 @@ func (t *GlobTool) TimeoutSeconds() int { return 0 }
 
 func (t *GlobTool) Execute(_ context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
 	var params struct {
-		Pattern string `json:"pattern"`
-		Path    string `json:"path"`
-		Limit   int    `json:"limit"`
+		Pattern          string   `json:"pattern"`
+		Path             string   `json:"path"`
+		Limit            int      `json:"limit"`
+		Cursor           string   `json:"cursor"`
+		Include          []string `json:"include"`
+		Exclude          []string `json:"exclude"`
+		RespectGitignore bool     `json:"respect_gitignore"`
+		SkipDefaultDirs  *bool    `json:"skip_default_dirs"`
+		OutputFormat     string   `json:"output_format"`
 	}
 	if err := json.Unmarshal(input, &params); err != nil {
 		return agentsdk.ToolResult{}, err
@@ -163,12 +169,21 @@ func (t *GlobTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if params.Pattern == "" {
 		return agentsdk.ToolResult{Content: "pattern is required", IsError: true}, nil
 	}
+	if len(params.Pattern) > maxSearchPatternBytes {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("pattern must not exceed %d bytes", maxSearchPatternBytes), IsError: true}, nil
+	}
 	if _, err := filepath.Match(params.Pattern, ""); err != nil {
 		return agentsdk.ToolResult{Content: "invalid glob pattern: " + err.Error(), IsError: true}, nil
+	}
+	if params.OutputFormat != "" && params.OutputFormat != "text" && params.OutputFormat != "json" {
+		return agentsdk.ToolResult{Content: "output_format must be text or json", IsError: true}, nil
 	}
 	limit := params.Limit
 	if limit <= 0 {
 		limit = defaultFindLimit
+	}
+	if limit > maxSearchPageSize {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("limit must not exceed %d", maxSearchPageSize), IsError: true}, nil
 	}
 	root, err := workspacePath(workDir, params.Path)
 	if err != nil {
@@ -178,23 +193,37 @@ func (t *GlobTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if err != nil {
 		return agentsdk.ToolResult{}, err
 	}
-	matches, err := globWalk(root, params.Pattern, limit)
+	skipDefaultDirs := params.SkipDefaultDirs == nil || *params.SkipDefaultDirs
+	filters, err := newPathFilters(base, params.Include, params.Exclude, params.RespectGitignore, skipDefaultDirs)
 	if err != nil {
 		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	rel := make([]string, 0, len(matches))
-	for _, match := range matches {
-		r, relErr := filepath.Rel(base, match)
-		if relErr != nil {
-			return agentsdk.ToolResult{Content: fmt.Sprintf("computing relative path for %s: %v", match, relErr), IsError: true}, nil
-		}
-		rel = append(rel, r)
+	query := queryFingerprint("glob", struct {
+		Workspace, Pattern, Path          string
+		Include, Exclude                  []string
+		RespectGitignore, SkipDefaultDirs bool
+	}{base, params.Pattern, params.Path, params.Include, params.Exclude, params.RespectGitignore, skipDefaultDirs})
+	offset, err := decodeCursor(params.Cursor, query)
+	if err != nil {
+		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	sort.Strings(rel)
-	if len(rel) == 0 {
-		return agentsdk.ToolResult{Content: "(no matches)"}, nil
+	page, truncated, err := collectGlob(root, params.Pattern, filters, offset, limit)
+	if err != nil {
+		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	return agentsdk.ToolResult{Content: strings.Join(rel, "\n")}, nil
+	next := ""
+	if truncated {
+		next = encodeCursor(query, offset+len(page))
+	}
+	if params.OutputFormat == "json" {
+		content, marshalErr := structuredPage(page, truncated, next, nil, false)
+		return agentsdk.ToolResult{Content: content}, marshalErr
+	}
+	content := strings.Join(page, "\n")
+	if content == "" {
+		content = "(no matches)"
+	}
+	return agentsdk.ToolResult{Content: appendTextMetadata(content, len(page), truncated, next)}, nil
 }
 
 // GrepTool searches file contents with a regular expression.
@@ -203,11 +232,11 @@ type GrepTool struct{}
 func (t *GrepTool) Name() string { return "grep" }
 
 func (t *GrepTool) Description() string {
-	return "Search file contents with a regular expression. Returns matching lines with file:line prefixes. Prefer this over running grep/rg through Bash. Escape regex metacharacters when searching for literal code (e.g. use interface\\{\\} to find interface{}). Narrow with a path or pattern when a query would match many files."
+	return "Search file contents with a Go regular expression. Supports pageable structured results, context lines, files/count modes, include/exclude globs, and configurable ignore behavior."
 }
 
 func (t *GrepTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Go-syntax regular expression"},"path":{"type":"string","description":"Subdirectory to search (default: working directory)"},"glob":{"type":"string","description":"Optional filename glob filter (for example, *.go)"},"ignore_case":{"type":"boolean"},"limit":{"type":"integer","description":"Max matches returned (default 200)"}},"required":["pattern"]}`)
+	return json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Go-syntax regular expression"},"path":{"type":"string","description":"Subdirectory to search (default: working directory)"},"glob":{"type":"string","description":"Legacy single filename include glob"},"include":{"type":"array","items":{"type":"string"},"description":"Include globs"},"exclude":{"type":"array","items":{"type":"string"},"description":"Exclude globs"},"ignore_case":{"type":"boolean"},"limit":{"type":"integer","description":"Max results per page (default 200)"},"cursor":{"type":"string","description":"Continuation cursor returned by a previous identical search"},"before_context":{"type":"integer","minimum":0},"after_context":{"type":"integer","minimum":0},"mode":{"type":"string","enum":["matches","files","count"],"description":"Result mode (default matches)"},"respect_gitignore":{"type":"boolean","description":"Honor workspace .gitignore files (default false for compatibility)"},"skip_default_dirs":{"type":"boolean","description":"Skip .git, node_modules, vendor, .venv, and target (default true)"},"output_format":{"type":"string","enum":["text","json"],"description":"text preserves legacy output; json returns matches/truncated/next_cursor"}},"required":["pattern"]}`)
 }
 
 func (t *GrepTool) IsReadOnly() bool { return true }
@@ -220,11 +249,20 @@ func (t *GrepTool) TimeoutSeconds() int { return 0 }
 
 func (t *GrepTool) Execute(_ context.Context, input json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
 	var params struct {
-		Pattern    string `json:"pattern"`
-		Path       string `json:"path"`
-		Glob       string `json:"glob"`
-		IgnoreCase bool   `json:"ignore_case"`
-		Limit      int    `json:"limit"`
+		Pattern          string   `json:"pattern"`
+		Path             string   `json:"path"`
+		Glob             string   `json:"glob"`
+		Include          []string `json:"include"`
+		Exclude          []string `json:"exclude"`
+		IgnoreCase       bool     `json:"ignore_case"`
+		Limit            int      `json:"limit"`
+		Cursor           string   `json:"cursor"`
+		BeforeContext    int      `json:"before_context"`
+		AfterContext     int      `json:"after_context"`
+		Mode             string   `json:"mode"`
+		RespectGitignore bool     `json:"respect_gitignore"`
+		SkipDefaultDirs  *bool    `json:"skip_default_dirs"`
+		OutputFormat     string   `json:"output_format"`
 	}
 	if err := json.Unmarshal(input, &params); err != nil {
 		return agentsdk.ToolResult{}, err
@@ -232,10 +270,29 @@ func (t *GrepTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if params.Pattern == "" {
 		return agentsdk.ToolResult{Content: "pattern is required", IsError: true}, nil
 	}
+	if len(params.Pattern) > maxSearchPatternBytes {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("pattern must not exceed %d bytes", maxSearchPatternBytes), IsError: true}, nil
+	}
 	if params.Glob != "" {
 		if _, err := filepath.Match(params.Glob, ""); err != nil {
 			return agentsdk.ToolResult{Content: "invalid glob filter: " + err.Error(), IsError: true}, nil
 		}
+		params.Include = append(params.Include, params.Glob)
+	}
+	if params.BeforeContext < 0 || params.AfterContext < 0 {
+		return agentsdk.ToolResult{Content: "context values must be non-negative", IsError: true}, nil
+	}
+	if params.BeforeContext > maxSearchContext || params.AfterContext > maxSearchContext {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("context values must not exceed %d", maxSearchContext), IsError: true}, nil
+	}
+	if params.Mode == "" {
+		params.Mode = "matches"
+	}
+	if params.Mode != "matches" && params.Mode != "files" && params.Mode != "count" {
+		return agentsdk.ToolResult{Content: "mode must be matches, files, or count", IsError: true}, nil
+	}
+	if params.OutputFormat != "" && params.OutputFormat != "text" && params.OutputFormat != "json" {
+		return agentsdk.ToolResult{Content: "output_format must be text or json", IsError: true}, nil
 	}
 	pattern := params.Pattern
 	if params.IgnoreCase {
@@ -249,6 +306,9 @@ func (t *GrepTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if limit <= 0 {
 		limit = defaultFindLimit
 	}
+	if limit > maxSearchPageSize {
+		return agentsdk.ToolResult{Content: fmt.Sprintf("limit must not exceed %d", maxSearchPageSize), IsError: true}, nil
+	}
 	root, err := workspacePath(workDir, params.Path)
 	if err != nil {
 		return agentsdk.ToolResult{}, err
@@ -257,14 +317,61 @@ func (t *GrepTool) Execute(_ context.Context, input json.RawMessage, workDir str
 	if err != nil {
 		return agentsdk.ToolResult{}, err
 	}
-	out, err := grepWalk(workDir, root, base, re, params.Glob, limit)
+	skipDefaultDirs := params.SkipDefaultDirs == nil || *params.SkipDefaultDirs
+	filters, err := newPathFilters(base, params.Include, params.Exclude, params.RespectGitignore, skipDefaultDirs)
 	if err != nil {
 		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	if out == "" {
-		return agentsdk.ToolResult{Content: "(no matches)"}, nil
+	query := queryFingerprint("grep", struct {
+		Workspace, Pattern, Path, Mode    string
+		Include, Exclude                  []string
+		IgnoreCase                        bool
+		Before, After                     int
+		RespectGitignore, SkipDefaultDirs bool
+	}{base, params.Pattern, params.Path, params.Mode, params.Include, params.Exclude, params.IgnoreCase, params.BeforeContext, params.AfterContext, params.RespectGitignore, skipDefaultDirs})
+	offset, err := decodeCursor(params.Cursor, query)
+	if err != nil {
+		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
-	return agentsdk.ToolResult{Content: out}, nil
+	collection, err := collectGrep(workDir, root, base, re, filters, params.BeforeContext, params.AfterContext, params.Mode, offset, limit)
+	if err != nil {
+		return agentsdk.ToolResult{Content: err.Error(), IsError: true}, nil
+	}
+	var page any
+	var text string
+	var count int
+	switch params.Mode {
+	case "files":
+		page, text, count = collection.Files, strings.Join(collection.Files, "\n"), len(collection.Files)
+	case "count":
+		page, text, count = collection.Counts, formatCountsText(collection.Counts), len(collection.Counts)
+	default:
+		page, text, count = collection.Matches, formatGrepText(collection.Matches, params.BeforeContext, params.AfterContext), len(collection.Matches)
+	}
+	next := ""
+	if collection.Truncated {
+		next = encodeCursor(query, offset+count)
+	}
+	if params.OutputFormat == "json" {
+		content, marshalErr := structuredPage(page, collection.Truncated, next, collection.Omitted, collection.OmittedTruncated)
+		return agentsdk.ToolResult{Content: content}, marshalErr
+	}
+	for _, omitted := range collection.Omitted {
+		if text != "" {
+			text += "\n"
+		}
+		text += "[skipped " + omitted + "]"
+	}
+	if collection.OmittedTruncated {
+		if text != "" {
+			text += "\n"
+		}
+		text += "[additional skipped files omitted from output]"
+	}
+	if text == "" {
+		text = "(no matches)"
+	}
+	return agentsdk.ToolResult{Content: appendTextMetadata(text, count, collection.Truncated, next)}, nil
 }
 
 // DefaultTools returns the SDK's generic read-only workspace discovery tools.
@@ -449,151 +556,34 @@ func shouldSkipDir(name string) bool {
 	}
 }
 
-func globWalk(root, pattern string, limit int) ([]string, error) {
-	var matches []string
-	doublestar := strings.Contains(pattern, "**")
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if shouldSkipDir(d.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return fmt.Errorf("computing relative path for %s: %w", path, err)
-		}
-		var ok bool
-		if doublestar {
-			ok = doubleStarMatch(pattern, rel)
-		} else {
-			matched, matchErr := filepath.Match(pattern, filepath.Base(rel))
-			if matchErr != nil {
-				return matchErr
-			}
-			if matched {
-				ok = true
-			} else {
-				matched, matchErr = filepath.Match(pattern, rel)
-				if matchErr != nil {
-					return matchErr
-				}
-				ok = matched
-			}
-		}
-		if ok {
-			matches = append(matches, path)
-			if len(matches) >= limit {
-				return errors.New("limit-reached")
-			}
-		}
-		return nil
-	})
-	if err != nil && err.Error() != "limit-reached" {
-		return nil, err
-	}
-	return matches, nil
-}
-
 func doubleStarMatch(pattern, name string) bool {
-	if rest, ok := strings.CutPrefix(pattern, "**/"); ok {
-		if ok, _ := filepath.Match(rest, name); ok {
-			return true
+	pattern = filepath.ToSlash(pattern)
+	name = filepath.ToSlash(name)
+	patternParts := strings.Split(pattern, "/")
+	nameParts := strings.Split(name, "/")
+	type state struct{ pattern, name int }
+	memo := make(map[state]bool)
+	visited := make(map[state]bool)
+	var match func(int, int) bool
+	match = func(patternIndex, nameIndex int) bool {
+		current := state{patternIndex, nameIndex}
+		if visited[current] {
+			return memo[current]
 		}
+		visited[current] = true
+		matched := false
+		switch {
+		case patternIndex == len(patternParts):
+			matched = nameIndex == len(nameParts)
+		case patternParts[patternIndex] == "**":
+			matched = match(patternIndex+1, nameIndex) ||
+				(nameIndex < len(nameParts) && match(patternIndex, nameIndex+1))
+		case nameIndex < len(nameParts):
+			componentMatch, err := filepath.Match(patternParts[patternIndex], nameParts[nameIndex])
+			matched = err == nil && componentMatch && match(patternIndex+1, nameIndex+1)
+		}
+		memo[current] = matched
+		return matched
 	}
-	parts := strings.Split(pattern, "**")
-	for i, part := range parts {
-		parts[i] = regexp.QuoteMeta(part)
-	}
-	rePat := "^" + strings.Join(parts, ".*") + "$"
-	rePat = strings.ReplaceAll(rePat, `\*`, "[^/]*")
-	rePat = strings.ReplaceAll(rePat, `\?`, ".")
-	re, err := regexp.Compile(rePat)
-	if err != nil {
-		return false
-	}
-	return re.MatchString(name)
-}
-
-func grepWalk(workDir, root, base string, re *regexp.Regexp, glob string, limit int) (string, error) {
-	var b strings.Builder
-	var skipped []string
-	count := 0
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if shouldSkipDir(d.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if glob != "" {
-			ok, err := filepath.Match(glob, d.Name())
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return nil
-			}
-		}
-		f, err := pathutil.OpenInWorkspace(workDir, path, os.O_RDONLY, 0)
-		if err != nil {
-			return nil
-		}
-		info, err := f.Stat()
-		if err != nil || !info.Mode().IsRegular() || pathutil.RequireSingleLink(info) != nil {
-			_ = f.Close()
-			return nil
-		}
-
-		rel, err := filepath.Rel(base, path)
-		if err != nil {
-			return fmt.Errorf("computing relative path for %s: %w", path, err)
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		lineNum := 0
-		for scanner.Scan() {
-			lineNum++
-			line := scanner.Text()
-			if re.MatchString(line) {
-				if len(line) > maxLineBytes {
-					line = line[:maxLineBytes] + "..."
-				}
-				fmt.Fprintf(&b, "%s:%d: %s\n", rel, lineNum, line)
-				count++
-				if count >= limit {
-					return errors.New("limit-reached")
-				}
-			}
-		}
-		if scanErr := scanner.Err(); scanErr != nil {
-			_ = f.Close()
-			if errors.Is(scanErr, bufio.ErrTooLong) {
-				skipped = append(skipped, rel)
-				return nil
-			}
-			return fmt.Errorf("scanning %s: %w", path, scanErr)
-		}
-		if closeErr := f.Close(); closeErr != nil {
-			return fmt.Errorf("closing %s: %w", path, closeErr)
-		}
-		return nil
-	})
-	if err != nil && err.Error() != "limit-reached" {
-		return "", err
-	}
-	out := strings.TrimRight(b.String(), "\n")
-	for _, rel := range skipped {
-		if out != "" {
-			out += "\n"
-		}
-		out += fmt.Sprintf("[skipped %s: line too long]", rel)
-	}
-	return out, nil
+	return match(0, 0)
 }
