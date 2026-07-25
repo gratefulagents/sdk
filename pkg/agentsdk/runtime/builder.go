@@ -100,22 +100,26 @@ type Config struct {
 	CommandSandboxConfig *sdksandbox.Config
 	Features             *Features
 
-	EnableTools              bool
-	EnableMCP                bool
-	EnableHandoffs           bool
-	EnableSubAgents          bool
-	EnableGuardrails         bool
-	EnableCompaction         bool
-	EnableApproval           bool
-	EnableRetry              bool
-	EnableAsyncShell         bool
-	ForceFinalSummary        bool
-	FinalCheckInstructions   string
-	Debug                    bool
-	AllowPrivateNetworkURLs  bool
-	DisableWebTools          bool
-	OutputSchema             *agentsdk.OutputSchema
-	MCPConfig                *sdkmcp.Config
+	EnableTools             bool
+	EnableMCP               bool
+	EnableHandoffs          bool
+	EnableSubAgents         bool
+	EnableGuardrails        bool
+	EnableCompaction        bool
+	EnableApproval          bool
+	EnableRetry             bool
+	EnableAsyncShell        bool
+	ForceFinalSummary       bool
+	FinalCheckInstructions  string
+	Debug                   bool
+	AllowPrivateNetworkURLs bool
+	DisableWebTools         bool
+	OutputSchema            *agentsdk.OutputSchema
+	MCPConfig               *sdkmcp.Config
+	// MCPManagerOptions carries trusted host policy such as remote server
+	// allowlists, tenant credential providers, and custom TLS roots. These
+	// capabilities must never be populated from repository .mcp.json content.
+	MCPManagerOptions        []sdkmcp.ManagerOption
 	ExtraTools               []agentsdk.Tool
 	DisableDefaultTools      bool
 	DisableSignalTools       bool
@@ -470,6 +474,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		var manager *sdkmcp.Manager
 		var err error
 		managerOptions := []sdkmcp.ManagerOption{sdkmcp.WithPermissionMode(mode)}
+		managerOptions = append(managerOptions, cfg.MCPManagerOptions...)
 		if cfg.CommandSandboxConfig != nil {
 			managerOptions = append(managerOptions, sdkmcp.WithCommandSandboxConfig(*cfg.CommandSandboxConfig))
 		}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -28,6 +29,8 @@ const (
 	// for a single server. Within the cooldown, callers get the original
 	// call error instead of a fresh reconnect attempt.
 	reconnectCooldown = 10 * time.Second
+	maxDiscoveryPages = 100
+	maxDiscoveryItems = 10_000
 )
 
 // ToolDescriptor describes an MCP tool exposed to the LLM.
@@ -57,6 +60,25 @@ type ResourceDescriptor struct {
 	Server      string `json:"server"`
 }
 
+// PromptDescriptor describes an MCP prompt or prompt template.
+type PromptDescriptor struct {
+	Name        string                   `json:"name"`
+	Title       string                   `json:"title,omitempty"`
+	Description string                   `json:"description,omitempty"`
+	Arguments   []*mcpsdk.PromptArgument `json:"arguments,omitempty"`
+	Server      string                   `json:"server"`
+}
+
+type resourceCacheEntry struct {
+	expires time.Time
+	items   []ResourceDescriptor
+}
+
+type promptCacheEntry struct {
+	expires time.Time
+	items   []PromptDescriptor
+}
+
 type serverConn struct {
 	name         string
 	client       *mcpsdk.Client
@@ -66,9 +88,15 @@ type serverConn struct {
 	// termination even if the SDK's graceful shutdown stalls. Nil when the
 	// transport did not expose an exec.Cmd (e.g. injected for tests).
 	cmd *exec.Cmd
-	// cfg is the server's config, retained so the manager can reconnect a
-	// crashed stdio server mid-session.
-	cfg ServerConfig
+	// cfg is retained for diagnostics and compatibility. reconnect constructs a
+	// fresh connection without coupling the manager lifecycle to a transport.
+	cfg       ServerConfig
+	reconnect func(context.Context) (*serverConn, error)
+	// remote is true for network transports. Remote descriptors are always
+	// read-only in the experimental client.
+	remote      bool
+	cleanup     func()
+	reflections *credentialReflections
 	// stderr retains the tail of the child's stderr for diagnostics.
 	stderr *stderrTail
 }
@@ -101,6 +129,11 @@ type Manager struct {
 	// reconnect attempts for one server.
 	reconnectMu sync.Mutex
 	reconnects  map[string]*reconnectState
+	// Discovery caches are tenant-local because a Manager owns exactly one set
+	// of tenant-bound remote sessions.
+	resourceCache map[string]resourceCacheEntry
+	promptCache   map[string]promptCacheEntry
+	closed        bool
 }
 
 // ConfigSnapshot returns the pinned snapshot of .mcp.json, if any. Callers
@@ -118,9 +151,11 @@ type managerOptions struct {
 	executor             sandbox.Executor
 	commandSandboxConfig *sandbox.Config
 	networkAccessServers map[string]struct{}
+	remote               remoteManagerOptions
+	discoveryCacheTTL    time.Duration
 }
 
-// ManagerOption configures MCP subprocess execution.
+// ManagerOption configures MCP transport, lifecycle, and policy behavior.
 type ManagerOption func(*managerOptions)
 
 // WithPermissionMode sets the filesystem mode used for MCP stdio subprocesses.
@@ -163,6 +198,13 @@ func WithCommandSandboxConfig(config sandbox.Config) ManagerOption {
 	}
 }
 
+// WithDiscoveryCacheTTL sets the tool/resource/prompt discovery cache lifetime.
+// A non-positive duration disables resource and prompt caching. Tool discovery
+// remains pinned for the manager lifetime to prevent mid-run capability drift.
+func WithDiscoveryCacheTTL(ttl time.Duration) ManagerOption {
+	return func(opts *managerOptions) { opts.discoveryCacheTTL = ttl }
+}
+
 // NewManager reads .mcp.json from workDir and connects supported servers.
 //
 // It returns (nil, nil) when no config file exists or no servers are configured.
@@ -200,6 +242,8 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 		workDir:             workDir,
 		opts:                options,
 		reconnects:          make(map[string]*reconnectState),
+		resourceCache:       make(map[string]resourceCacheEntry),
+		promptCache:         make(map[string]promptCacheEntry),
 	}
 
 	var errs []error
@@ -217,13 +261,7 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 			continue
 		}
 
-		transportType := strings.TrimSpace(srvCfg.Type)
-		if transportType != "" && !strings.EqualFold(transportType, "stdio") {
-			errs = append(errs, fmt.Errorf("MCP server %q uses unsupported type %q (only stdio is supported)", serverName, srvCfg.Type))
-			continue
-		}
-
-		conn, err := connectStdioServer(ctx, workDir, serverName, srvCfg, options)
+		conn, err := connectConfiguredServer(ctx, workDir, serverName, srvCfg, options)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -232,9 +270,21 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 
 		tools, err := listAllTools(ctx, conn.session)
 		if err != nil {
-			errs = append(errs, errWithStderr(
-				fmt.Errorf("MCP server %q: list tools: %w", serverName, err),
-				conn.stderr.tailAfterGrace(250*time.Millisecond)))
+			if conn.remote {
+				_ = closeSessionBounded(conn, 2*time.Second)
+				delete(m.servers, serverName)
+				errs = append(errs, fmt.Errorf("MCP server %q: remote list tools failed", serverName))
+			} else {
+				errs = append(errs, errWithStderr(
+					fmt.Errorf("MCP server %q: list tools: %w", serverName, err),
+					conn.stderr.tailAfterGrace(250*time.Millisecond)))
+			}
+			continue
+		}
+		if conn.remote && conn.reflections.Contains(tools) {
+			_ = closeSessionBounded(conn, 2*time.Second)
+			delete(m.servers, serverName)
+			errs = append(errs, fmt.Errorf("MCP server %q: credential reflection blocked during tool discovery", serverName))
 			continue
 		}
 
@@ -243,6 +293,13 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 				continue
 			}
 			if !serverToolAllowed(srvCfg, tool.Name) {
+				continue
+			}
+			readOnly := trustedMCPReadOnly(srvCfg, tool)
+			// Remote execution is experimental and read-only. A remote server's
+			// mutation-capable or untrusted descriptor is never registered, so it
+			// cannot be reached by guessing a qualified tool name.
+			if conn.remote && (!readOnly || !remoteToolAllowedByHost(options, serverName, tool.Name)) {
 				continue
 			}
 
@@ -257,7 +314,7 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 				DisplayDescription: SanitizeMCPDisplay(serverName, tool.Description),
 				DisplayTitle:       SanitizeMCPDisplay(serverName, mcpToolTitle(tool)),
 				InputSchema:        normalizeInputSchema(tool.InputSchema),
-				ReadOnly:           trustedMCPReadOnly(srvCfg, tool),
+				ReadOnly:           readOnly,
 			}
 			m.toolDescriptors = append(m.toolDescriptors, desc)
 			m.toolByQualifiedName[qualifiedName] = desc
@@ -318,7 +375,8 @@ func filteredEnv(serverName string, cfg ServerConfig) map[string]string {
 
 func resolveManagerOptions(workDir string, opts ...ManagerOption) managerOptions {
 	options := managerOptions{
-		permissionMode: policy.PermissionModeWorkspaceWrite,
+		permissionMode:    policy.PermissionModeWorkspaceWrite,
+		discoveryCacheTTL: 30 * time.Second,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -347,6 +405,7 @@ func (m *Manager) Close() error {
 	}
 
 	m.mu.Lock()
+	m.closed = true
 	servers := make([]*serverConn, 0, len(m.servers))
 	for _, conn := range m.servers {
 		servers = append(servers, conn)
@@ -354,6 +413,8 @@ func (m *Manager) Close() error {
 	m.servers = map[string]*serverConn{}
 	m.toolDescriptors = nil
 	m.toolByQualifiedName = map[string]ToolDescriptor{}
+	m.resourceCache = map[string]resourceCacheEntry{}
+	m.promptCache = map[string]promptCacheEntry{}
 	m.mu.Unlock()
 
 	var errs []error
@@ -361,10 +422,8 @@ func (m *Manager) Close() error {
 		if conn == nil {
 			continue
 		}
-		if conn.session != nil {
-			if err := conn.session.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("closing MCP server %q: %w", conn.name, err))
-			}
+		if err := closeSessionBounded(conn, 2*time.Second); err != nil {
+			errs = append(errs, fmt.Errorf("closing MCP server %q: %w", conn.name, err))
 		}
 		// Belt-and-suspenders: even if session.Close already reaped the
 		// child, terminateProcess is safe to call. If the SDK stalled
@@ -375,6 +434,39 @@ func (m *Manager) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func closeSessionBounded(conn *serverConn, timeout time.Duration) error {
+	if conn == nil {
+		return nil
+	}
+	if conn.session == nil {
+		if conn.cleanup != nil {
+			conn.cleanup()
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- conn.session.Close() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if conn.cleanup != nil {
+			conn.cleanup()
+		}
+		return err
+	case <-timer.C:
+		if conn.cleanup != nil {
+			conn.cleanup()
+		}
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("session close timed out")
+	}
 }
 
 // ConnectedServerNames returns connected server names sorted alphabetically.
@@ -439,12 +531,42 @@ func (m *Manager) CallTool(ctx context.Context, qualifiedName string, args map[s
 	if err != nil {
 		return nil, err
 	}
+	if conn.remote && (!desc.ReadOnly || !remoteToolAllowedByHost(m.opts, desc.ServerName, desc.ToolName)) {
+		return nil, fmt.Errorf("MCP remote tool %q is not allowed by host read-only policy", qualifiedName)
+	}
 
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, desc.ServerName, "tools/call:"+desc.ToolName, "attempted"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable")
+		}
+	}
 	params := &mcpsdk.CallToolParams{
 		Name:      desc.ToolName,
 		Arguments: args,
 	}
 	result, err := conn.session.CallTool(ctx, params)
+	if err != nil && conn.remote {
+		if errors.Is(err, errRemoteNotSent) {
+			return nil, fmt.Errorf("MCP remote request was not sent")
+		}
+		if errors.Is(err, errRemoteDefinitive) {
+			return nil, fmt.Errorf("MCP remote server returned a definitive HTTP error")
+		}
+		var rpcErr *jsonrpc.Error
+		if errors.As(err, &rpcErr) {
+			return nil, fmt.Errorf("MCP remote server returned a definitive error")
+		}
+		// Never replay a remote tools/call. A disconnect or timeout may occur
+		// after the server applied the operation. Reconnect only prepares the
+		// next independent request; this one remains reconciliation-required.
+		if isSessionClosedErr(err) && ctx.Err() == nil {
+			_, _ = m.reconnectServer(ctx, desc.ServerName, conn)
+		}
+		auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		_ = auditRemote(auditCtx, m.opts, desc.ServerName, "tools/call:"+desc.ToolName, "outcome-unknown")
+		cancelAudit()
+		return nil, &OutcomeUnknownError{Server: desc.ServerName, Tool: desc.ToolName}
+	}
 	if err != nil && isSessionClosedErr(err) {
 		if fresh, rerr := m.reconnectServer(ctx, desc.ServerName, conn); rerr == nil {
 			result, err = fresh.session.CallTool(ctx, params)
@@ -452,6 +574,15 @@ func (m *Manager) CallTool(ctx context.Context, qualifiedName string, args map[s
 	}
 	if err != nil {
 		return nil, fmt.Errorf("MCP %s/%s: %w", desc.ServerName, desc.ToolName, err)
+	}
+	if conn.remote && conn.reflections.Contains(result) {
+		_ = auditRemote(ctx, m.opts, desc.ServerName, "tools/call:"+desc.ToolName, "credential-reflection-blocked")
+		return nil, fmt.Errorf("MCP remote response contained credential material and was blocked")
+	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, desc.ServerName, "tools/call:"+desc.ToolName, "completed"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable after call")
+		}
 	}
 	return result, nil
 }
@@ -472,23 +603,12 @@ func (m *Manager) ListResources(ctx context.Context, serverName string) ([]Resou
 		errs []error
 	)
 	for _, conn := range targets {
-		resources, err := listAllResources(ctx, conn.session)
+		resources, err := m.cachedResources(ctx, conn)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("MCP server %q: list resources: %w", conn.name, err))
 			continue
 		}
-		for _, resource := range resources {
-			if resource == nil {
-				continue
-			}
-			out = append(out, ResourceDescriptor{
-				URI:         resource.URI,
-				Name:        resource.Name,
-				MIMEType:    resource.MIMEType,
-				Description: resource.Description,
-				Server:      conn.name,
-			})
-		}
+		out = append(out, resources...)
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -502,6 +622,170 @@ func (m *Manager) ListResources(ctx context.Context, serverName string) ([]Resou
 		return out, nil
 	}
 	return nil, errors.Join(errs...)
+}
+
+func (m *Manager) cachedResources(ctx context.Context, conn *serverConn) ([]ResourceDescriptor, error) {
+	now := time.Now()
+	m.mu.RLock()
+	cached, ok := m.resourceCache[conn.name]
+	ttl := m.opts.discoveryCacheTTL
+	m.mu.RUnlock()
+	if ttl > 0 && ok && now.Before(cached.expires) {
+		return append([]ResourceDescriptor(nil), cached.items...), nil
+	}
+	resources, err := listAllResources(ctx, conn.session)
+	if err != nil {
+		if conn.remote {
+			return nil, fmt.Errorf("remote resource discovery failed")
+		}
+		return nil, err
+	}
+	if conn.remote && conn.reflections.Contains(resources) {
+		return nil, fmt.Errorf("remote resource discovery contained credential material and was blocked")
+	}
+	items := make([]ResourceDescriptor, 0, len(resources))
+	for _, resource := range resources {
+		if resource != nil {
+			items = append(items, ResourceDescriptor{URI: resource.URI, Name: resource.Name, MIMEType: resource.MIMEType, Description: resource.Description, Server: conn.name})
+		}
+	}
+	if ttl > 0 {
+		m.mu.Lock()
+		m.resourceCache[conn.name] = resourceCacheEntry{expires: now.Add(ttl), items: append([]ResourceDescriptor(nil), items...)}
+		m.mu.Unlock()
+	}
+	return items, nil
+}
+
+// ListPrompts returns cached prompt discovery for all servers or one server.
+func (m *Manager) ListPrompts(ctx context.Context, serverName string) ([]PromptDescriptor, error) {
+	if m == nil {
+		return nil, fmt.Errorf("MCP manager is not initialized")
+	}
+	targets, err := m.capabilityServers(serverName, func(c *serverConn) bool {
+		return c.capabilities != nil && c.capabilities.Prompts != nil
+	}, "prompts")
+	if err != nil {
+		return nil, err
+	}
+	var out []PromptDescriptor
+	var errs []error
+	for _, conn := range targets {
+		items, err := m.cachedPrompts(ctx, conn)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MCP server %q: list prompts: %w", conn.name, err))
+			continue
+		}
+		out = append(out, items...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Server == out[j].Server {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Server < out[j].Server
+	})
+	if len(out) > 0 {
+		return out, nil
+	}
+	return nil, errors.Join(errs...)
+}
+
+func (m *Manager) cachedPrompts(ctx context.Context, conn *serverConn) ([]PromptDescriptor, error) {
+	now := time.Now()
+	m.mu.RLock()
+	cached, ok := m.promptCache[conn.name]
+	ttl := m.opts.discoveryCacheTTL
+	m.mu.RUnlock()
+	if ttl > 0 && ok && now.Before(cached.expires) {
+		return clonePromptDescriptors(cached.items), nil
+	}
+	prompts, err := listAllPrompts(ctx, conn.session)
+	if err != nil {
+		if conn.remote {
+			return nil, fmt.Errorf("remote prompt discovery failed")
+		}
+		return nil, err
+	}
+	if conn.remote && conn.reflections.Contains(prompts) {
+		return nil, fmt.Errorf("remote prompt discovery contained credential material and was blocked")
+	}
+	items := make([]PromptDescriptor, 0, len(prompts))
+	for _, prompt := range prompts {
+		if prompt != nil {
+			items = append(items, PromptDescriptor{Name: prompt.Name, Title: prompt.Title, Description: prompt.Description, Arguments: prompt.Arguments, Server: conn.name})
+		}
+	}
+	if ttl > 0 {
+		m.mu.Lock()
+		m.promptCache[conn.name] = promptCacheEntry{expires: now.Add(ttl), items: clonePromptDescriptors(items)}
+		m.mu.Unlock()
+	}
+	return items, nil
+}
+
+func clonePromptDescriptors(items []PromptDescriptor) []PromptDescriptor {
+	out := make([]PromptDescriptor, len(items))
+	for i, item := range items {
+		out[i] = item
+		out[i].Arguments = make([]*mcpsdk.PromptArgument, len(item.Arguments))
+		for j, argument := range item.Arguments {
+			if argument != nil {
+				copy := *argument
+				out[i].Arguments[j] = &copy
+			}
+		}
+	}
+	return out
+}
+
+// GetPrompt renders a named prompt on a specific server.
+func (m *Manager) GetPrompt(ctx context.Context, serverName, name string, arguments map[string]string) (*mcpsdk.GetPromptResult, error) {
+	if m == nil {
+		return nil, fmt.Errorf("MCP manager is not initialized")
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("prompt name is required")
+	}
+	conn, err := m.getServer(serverName)
+	if err != nil {
+		return nil, err
+	}
+	if conn.capabilities == nil || conn.capabilities.Prompts == nil {
+		return nil, fmt.Errorf("MCP server %q does not support prompts", serverName)
+	}
+	result, err := conn.session.GetPrompt(ctx, &mcpsdk.GetPromptParams{Name: name, Arguments: arguments})
+	if err != nil && isSessionClosedErr(err) {
+		if fresh, reconnectErr := m.reconnectServer(ctx, serverName, conn); reconnectErr == nil {
+			result, err = fresh.session.GetPrompt(ctx, &mcpsdk.GetPromptParams{Name: name, Arguments: arguments})
+		}
+	}
+	if err != nil {
+		if conn.remote {
+			return nil, fmt.Errorf("MCP server %q get prompt %q failed", serverName, name)
+		}
+		return nil, fmt.Errorf("MCP server %q get prompt %q: %w", serverName, name, err)
+	}
+	if conn.remote && conn.reflections.Contains(result) {
+		return nil, fmt.Errorf("MCP remote prompt contained credential material and was blocked")
+	}
+	return result, nil
+}
+
+// InvalidateDiscovery clears resource and prompt caches. An empty server name
+// invalidates every server. Hosts can call this from MCP list-changed hooks.
+func (m *Manager) InvalidateDiscovery(serverName string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if serverName == "" {
+		m.resourceCache = make(map[string]resourceCacheEntry)
+		m.promptCache = make(map[string]promptCacheEntry)
+		return
+	}
+	delete(m.resourceCache, serverName)
+	delete(m.promptCache, serverName)
 }
 
 // ReadResource reads a specific resource from a specific server.
@@ -528,7 +812,13 @@ func (m *Manager) ReadResource(ctx context.Context, serverName, uri string) (*mc
 		}
 	}
 	if err != nil {
+		if conn.remote {
+			return nil, fmt.Errorf("MCP server %q resource read failed", serverName)
+		}
 		return nil, fmt.Errorf("MCP server %q read %q: %w", serverName, uri, err)
+	}
+	if conn.remote && conn.reflections.Contains(result) {
+		return nil, fmt.Errorf("MCP remote resource contained credential material and was blocked")
 	}
 	return result, nil
 }
@@ -576,11 +866,10 @@ func (m *Manager) reconnectStateFor(name string) *reconnectState {
 	return st
 }
 
-// reconnectServer attempts a single reconnect of a crashed stdio server and
-// returns the replacement connection. failed is the connection the caller
-// observed the failure on; if another goroutine already replaced it, the
-// current connection is returned without spawning a new process. Attempts are
-// rate-limited to one per reconnectCooldown per server.
+// reconnectServer attempts a single transport-neutral reconnect and returns
+// the replacement connection. failed is the connection the caller observed the
+// failure on; if another goroutine already replaced it, the current connection
+// is returned. Attempts are rate-limited per server.
 //
 // Note: tool descriptors are NOT refreshed on reconnect — the tool list pinned
 // at construction time keeps serving; a server that changes its tools across
@@ -606,20 +895,29 @@ func (m *Manager) reconnectServer(ctx context.Context, name string, failed *serv
 	}
 	st.lastAttempt = time.Now()
 
-	fresh, err := connectStdioServer(ctx, m.workDir, name, current.cfg, m.opts)
+	if current.reconnect == nil {
+		return nil, fmt.Errorf("MCP server %q does not support reconnect", name)
+	}
+	fresh, err := current.reconnect(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("MCP server %q reconnect: %w", name, err)
+		return nil, fmt.Errorf("MCP server %q reconnect failed", name)
 	}
 
 	m.mu.Lock()
+	if m.closed || m.servers[name] != current {
+		m.mu.Unlock()
+		_ = closeSessionBounded(fresh, 2*time.Second)
+		_ = terminateProcess(fresh.cmd, 2*time.Second)
+		return nil, fmt.Errorf("MCP server %q manager closed or connection changed during reconnect", name)
+	}
 	old := m.servers[name]
 	m.servers[name] = fresh
+	delete(m.resourceCache, name)
+	delete(m.promptCache, name)
 	m.mu.Unlock()
 
 	if old != nil {
-		if old.session != nil {
-			_ = old.session.Close()
-		}
+		_ = closeSessionBounded(old, 2*time.Second)
 		_ = terminateProcess(old.cmd, 2*time.Second)
 	}
 	return fresh, nil
@@ -640,6 +938,28 @@ func (m *Manager) getServer(name string) (*serverConn, error) {
 
 	sort.Strings(names)
 	return nil, fmt.Errorf("MCP server %q not found (available: %s)", name, strings.Join(names, ", "))
+}
+
+func (m *Manager) capabilityServers(serverName string, supported func(*serverConn) bool, capability string) ([]*serverConn, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if serverName != "" {
+		conn, ok := m.servers[serverName]
+		if !ok {
+			return nil, fmt.Errorf("MCP server %q not found", serverName)
+		}
+		if !supported(conn) {
+			return nil, fmt.Errorf("MCP server %q does not support %s", serverName, capability)
+		}
+		return []*serverConn{conn}, nil
+	}
+	var servers []*serverConn
+	for _, conn := range m.servers {
+		if conn != nil && supported(conn) {
+			servers = append(servers, conn)
+		}
+	}
+	return servers, nil
 }
 
 func (m *Manager) resourceServers(serverName string) ([]*serverConn, error) {
@@ -669,6 +989,24 @@ func (m *Manager) resourceServers(serverName string) ([]*serverConn, error) {
 		}
 	}
 	return servers, nil
+}
+
+func connectConfiguredServer(ctx context.Context, workDir, name string, cfg ServerConfig, opts managerOptions) (*serverConn, error) {
+	transportType := strings.ToLower(strings.TrimSpace(cfg.Type))
+	switch transportType {
+	case "", TransportStdio:
+		if strings.TrimSpace(cfg.URL) != "" {
+			return nil, fmt.Errorf("MCP server %q: stdio transport cannot set url", name)
+		}
+		return connectStdioServer(ctx, workDir, name, cfg, opts)
+	case TransportStreamableHTTP, TransportLegacySSE:
+		if strings.TrimSpace(cfg.Command) != "" || len(cfg.Args) != 0 || len(cfg.Env) != 0 || len(cfg.AllowEnv) != 0 {
+			return nil, fmt.Errorf("MCP server %q: remote transport cannot set command, args, env, or allowEnv", name)
+		}
+		return connectRemoteServer(ctx, name, cfg, opts)
+	default:
+		return nil, fmt.Errorf("MCP server %q uses unsupported type %q", name, cfg.Type)
+	}
 }
 
 func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerConfig, opts managerOptions) (*serverConn, error) {
@@ -727,7 +1065,7 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 			stderr.tailAfterGrace(250*time.Millisecond))
 	}
 
-	return &serverConn{
+	conn := &serverConn{
 		name:         name,
 		client:       client,
 		session:      session,
@@ -735,45 +1073,89 @@ func connectStdioServer(ctx context.Context, workDir, name string, cfg ServerCon
 		cmd:          cmd,
 		cfg:          cfg,
 		stderr:       stderr,
-	}, nil
+	}
+	conn.reconnect = func(reconnectCtx context.Context) (*serverConn, error) {
+		return connectStdioServer(reconnectCtx, workDir, name, cfg, opts)
+	}
+	return conn, nil
 }
 
 func listAllTools(ctx context.Context, session *mcpsdk.ClientSession) ([]*mcpsdk.Tool, error) {
-	var (
-		cursor string
-		tools  []*mcpsdk.Tool
-	)
-	for {
-		params := &mcpsdk.ListToolsParams{Cursor: cursor}
-		result, err := session.ListTools(ctx, params)
+	var cursor string
+	var tools []*mcpsdk.Tool
+	seen := make(map[string]struct{})
+	for page := 0; page < maxDiscoveryPages; page++ {
+		result, err := session.ListTools(ctx, &mcpsdk.ListToolsParams{Cursor: cursor})
 		if err != nil {
 			return nil, err
 		}
+		if len(tools)+len(result.Tools) > maxDiscoveryItems {
+			return nil, fmt.Errorf("MCP tool discovery exceeded item limit")
+		}
 		tools = append(tools, result.Tools...)
-		if strings.TrimSpace(result.NextCursor) == "" {
+		next := strings.TrimSpace(result.NextCursor)
+		if next == "" {
 			return tools, nil
 		}
-		cursor = result.NextCursor
+		if _, duplicate := seen[next]; duplicate {
+			return nil, fmt.Errorf("MCP tool discovery repeated cursor")
+		}
+		seen[next] = struct{}{}
+		cursor = next
 	}
+	return nil, fmt.Errorf("MCP tool discovery exceeded page limit")
 }
 
 func listAllResources(ctx context.Context, session *mcpsdk.ClientSession) ([]*mcpsdk.Resource, error) {
-	var (
-		cursor    string
-		resources []*mcpsdk.Resource
-	)
-	for {
-		params := &mcpsdk.ListResourcesParams{Cursor: cursor}
-		result, err := session.ListResources(ctx, params)
+	var cursor string
+	var resources []*mcpsdk.Resource
+	seen := make(map[string]struct{})
+	for page := 0; page < maxDiscoveryPages; page++ {
+		result, err := session.ListResources(ctx, &mcpsdk.ListResourcesParams{Cursor: cursor})
 		if err != nil {
 			return nil, err
 		}
+		if len(resources)+len(result.Resources) > maxDiscoveryItems {
+			return nil, fmt.Errorf("MCP resource discovery exceeded item limit")
+		}
 		resources = append(resources, result.Resources...)
-		if strings.TrimSpace(result.NextCursor) == "" {
+		next := strings.TrimSpace(result.NextCursor)
+		if next == "" {
 			return resources, nil
 		}
-		cursor = result.NextCursor
+		if _, duplicate := seen[next]; duplicate {
+			return nil, fmt.Errorf("MCP resource discovery repeated cursor")
+		}
+		seen[next] = struct{}{}
+		cursor = next
 	}
+	return nil, fmt.Errorf("MCP resource discovery exceeded page limit")
+}
+
+func listAllPrompts(ctx context.Context, session *mcpsdk.ClientSession) ([]*mcpsdk.Prompt, error) {
+	var cursor string
+	var prompts []*mcpsdk.Prompt
+	seen := make(map[string]struct{})
+	for page := 0; page < maxDiscoveryPages; page++ {
+		result, err := session.ListPrompts(ctx, &mcpsdk.ListPromptsParams{Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		if len(prompts)+len(result.Prompts) > maxDiscoveryItems {
+			return nil, fmt.Errorf("MCP prompt discovery exceeded item limit")
+		}
+		prompts = append(prompts, result.Prompts...)
+		next := strings.TrimSpace(result.NextCursor)
+		if next == "" {
+			return prompts, nil
+		}
+		if _, duplicate := seen[next]; duplicate {
+			return nil, fmt.Errorf("MCP prompt discovery repeated cursor")
+		}
+		seen[next] = struct{}{}
+		cursor = next
+	}
+	return nil, fmt.Errorf("MCP prompt discovery exceeded page limit")
 }
 
 func normalizeInputSchema(schema any) json.RawMessage {
