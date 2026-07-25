@@ -6,18 +6,18 @@ on:
       - main
   workflow_dispatch:
 
-concurrency:
-  group: release-main
-  cancel-in-progress: false
-
 jobs:
   release:
     name: Create patch release
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
     steps:
+      - name: Wait for earlier release runs
+        uses: softprops/turnstyle@v3
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
