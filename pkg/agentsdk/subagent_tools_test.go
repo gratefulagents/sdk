@@ -1092,3 +1092,78 @@ func TestSubagentWaitNoTasksInvalidInputAndUndelivered(t *testing.T) {
 		t.Fatal("returned result should be marked delivered")
 	}
 }
+
+// A task DAG must inherit the call-level agent_name. Regression test for a bug
+// where executeBatch ignored params.AgentName and silently fell back to the
+// configured default agent, so callers asking for a specialist got the default.
+func TestSubagentToolBatchInheritsCallLevelAgentName(t *testing.T) {
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: NewRunnerWithModel(&subagentToolMockModel{}),
+		Agents: map[string]*Agent{
+			"worker":  {Name: "worker"},
+			"explore": {Name: "explore"},
+			"critic":  {Name: "critic"},
+		},
+	})
+	tool := &subagentTool{registry: registry, defaultAgent: "worker"}
+
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{
+		"agent_name": "explore",
+		"mode": "background",
+		"tasks": [
+			{"key": "a", "message": "inherit call-level agent"},
+			{"key": "b", "message": "task-level agent wins", "agent_name": "critic"}
+		]
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("batch spawn failed: %+v", result)
+	}
+	var resp struct {
+		Tasks []struct {
+			Key   string `json:"key"`
+			Agent string `json:"agent"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal([]byte(result.Content), &resp); err != nil {
+		t.Fatalf("unmarshal %s: %v", result.Content, err)
+	}
+	got := map[string]string{}
+	for _, task := range resp.Tasks {
+		got[task.Key] = task.Agent
+	}
+	if got["a"] != "explore" {
+		t.Errorf("task a agent = %q, want %q (call-level agent_name must be inherited)", got["a"], "explore")
+	}
+	if got["b"] != "critic" {
+		t.Errorf("task b agent = %q, want %q (task-level agent_name must win)", got["b"], "critic")
+	}
+}
+
+// Call-level tool_access must apply to every task in a DAG, and a task must
+// never be able to widen it. Regression test for a silent privilege escalation
+// where executeBatch ignored params.ToolAccess entirely.
+func TestBatchDefaultsToolAccessResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		callLevel string
+		taskLevel string
+		want      ToolAccessLevel
+	}{
+		{"call-level read-only is inherited", "read-only", "", ToolAccessLevelReadOnly},
+		{"task-level read-only still applies", "", "read-only", ToolAccessLevelReadOnly},
+		{"task cannot widen call-level read-only", "read-only", "full", ToolAccessLevelReadOnly},
+		{"both full stays unrestricted", "full", "full", ""},
+		{"unset stays unrestricted", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defaults := batchDefaults{toolAccess: tc.callLevel}
+			got := defaults.toolAccessFor(subagentBatchTaskInput{ToolAccess: tc.taskLevel})
+			if got != tc.want {
+				t.Errorf("toolAccessFor(call=%q, task=%q) = %q, want %q", tc.callLevel, tc.taskLevel, got, tc.want)
+			}
+		})
+	}
+}
