@@ -67,8 +67,9 @@ checkpoint, its effective tool-access and security baseline, and queued parent
 steering messages.
 
 Scheduler tasks that were active when a process stopped restore as
-`reconciling`, not generic failures. `SubAgentRegistry.ResumeRestoredTask(ctx,
-id)` can continue the same child ID only from `run_started`, `model_prepared`,
+`reconciling`, not generic failures. A task checkpointed before its child Runner
+started can be relaunched under the same ID. `SubAgentRegistry.ResumeRestoredTask(ctx,
+id)` can continue an already-started child only from `run_started`, `model_prepared`,
 `tool_completed`, or `handoff_completed`; a `run_completed` checkpoint records
 completion without dispatching a model request. `model_completed`,
 `tool_prepared`, `approval_pending`, and `paused` checkpoints require an
