@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	webtools "github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
@@ -31,8 +32,20 @@ var (
 	ErrOutcomeUnknown   = errors.New("remote MCP outcome unknown")
 	errRemoteNotSent    = errors.New("remote MCP request was not sent")
 	errRemoteDefinitive = errors.New("remote MCP server returned a definitive HTTP error")
+	errRemoteAmbiguous  = errors.New("remote MCP server returned an ambiguous HTTP error")
 	errResponseTooLarge = errors.New("remote MCP response exceeds limit")
 )
+
+type remoteAttemptContextKey struct{}
+
+type remoteAttemptState struct {
+	ambiguousHTTP atomic.Bool
+}
+
+func remoteAttemptFromContext(ctx context.Context) *remoteAttemptState {
+	state, _ := ctx.Value(remoteAttemptContextKey{}).(*remoteAttemptState)
+	return state
+}
 
 // OutcomeUnknownError identifies the immutable operation requiring
 // reconciliation without retaining transport errors or credentials.
@@ -519,11 +532,20 @@ func (r *remoteRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		release()
 		return nil, err
 	}
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
 		_ = resp.Body.Close()
 		cleanupRequest()
 		release()
 		return nil, errRemoteDefinitive
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		if attempt := remoteAttemptFromContext(req.Context()); attempt != nil {
+			attempt.ambiguousHTTP.Store(true)
+		}
+		_ = resp.Body.Close()
+		cleanupRequest()
+		release()
+		return nil, errRemoteAmbiguous
 	}
 	maxResponseBytes := r.maxResponseBytes
 	if maxResponseBytes <= 0 {

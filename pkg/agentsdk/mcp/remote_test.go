@@ -361,6 +361,114 @@ func TestRemoteTransportDisablesHTTPReplayAndIdempotencyHeaders(t *testing.T) {
 	}
 }
 
+func TestRemoteHTTP5xxIsOutcomeUnknownAndNeverReplayed(t *testing.T) {
+	t.Parallel()
+	var toolCalls atomic.Int32
+	protocolServer := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "http-error", Version: "1"}, nil)
+	mcpsdk.AddTool(protocolServer, &mcpsdk.Tool{Name: "read", Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: true}}, remoteEcho)
+	protocol := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server { return protocolServer }, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			body, _ := io.ReadAll(request.Body)
+			request.Body = io.NopCloser(strings.NewReader(string(body)))
+			if strings.Contains(string(body), `"method":"tools/call"`) {
+				toolCalls.Add(1)
+				http.Error(w, "upstream response lost", http.StatusBadGateway)
+				return
+			}
+		}
+		protocol.ServeHTTP(w, request)
+	}))
+	defer server.Close()
+	manager, err := NewManagerFromConfig(t.Context(), t.TempDir(), Config{MCPServers: map[string]ServerConfig{
+		"http-error": {Type: TransportStreamableHTTP, URL: server.URL, TrustReadOnlyHint: true},
+	}}, WithRemoteServers("http-error"), WithRemoteReadOnlyTools("http-error", "read"), WithPrivateNetworkRemoteServers("http-error"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	_, err = manager.CallTool(t.Context(), BuildToolName("http-error", "read"), map[string]any{"text": "ok"})
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("5xx CallTool error = %v, want ErrOutcomeUnknown", err)
+	}
+	if toolCalls.Load() != 1 {
+		t.Fatalf("5xx tools/call count = %d, want 1", toolCalls.Load())
+	}
+}
+
+func TestReconnectedResourceUsesFreshCredentialReflectionState(t *testing.T) {
+	t.Parallel()
+	const secret = "tenant-resource-secret"
+	provider := HeaderProviderFunc(func(context.Context, string, string, *url.URL) (http.Header, error) {
+		return http.Header{"X-API-Key": []string{secret}}, nil
+	})
+	firstServer := httptest.NewServer(newRemoteTestHandler(secret))
+	defer firstServer.Close()
+	manager, err := NewManagerFromConfig(t.Context(), t.TempDir(), Config{MCPServers: map[string]ServerConfig{
+		"resource": {Type: TransportStreamableHTTP, URL: firstServer.URL, TrustReadOnlyHint: true},
+	}}, WithRemoteServers("resource"), WithRemoteReadOnlyTools("resource", "read"), WithPrivateNetworkRemoteServers("resource"), WithRemoteTenant("tenant-a"), WithRemoteHeaderProvider(provider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	freshProtocol := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "fresh", Version: "1"}, nil)
+	freshProtocol.AddResource(&mcpsdk.Resource{URI: "memory://secret", Name: "secret"}, func(context.Context, *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+		return &mcpsdk.ReadResourceResult{Contents: []*mcpsdk.ResourceContents{{URI: "memory://secret", Text: secret}}}, nil
+	})
+	freshHandler := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server { return freshProtocol }, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
+	freshServer := httptest.NewServer(freshHandler)
+	defer freshServer.Close()
+	freshConfig := ServerConfig{Type: TransportStreamableHTTP, URL: freshServer.URL, TrustReadOnlyHint: true}
+	fresh, err := connectRemoteServer(t.Context(), "resource", freshConfig, manager.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := manager.servers["resource"]
+	old.reconnect = func(context.Context) (*serverConn, error) { return fresh, nil }
+	if err := old.session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.ReadResource(t.Context(), "resource", "memory://secret")
+	if err == nil || !strings.Contains(err.Error(), "credential material") {
+		t.Fatalf("reconnected resource reflection error = %v", err)
+	}
+}
+
+func TestRemoteAuditFailsClosedBeforeResourceRequest(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	var failAudit atomic.Bool
+	handler := newRemoteTestHandler("")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		handler.ServeHTTP(w, request)
+	}))
+	defer server.Close()
+	audit := RemoteAuditHookFunc(func(context.Context, RemoteAuditEvent) error {
+		if failAudit.Load() {
+			return errors.New("audit unavailable")
+		}
+		return nil
+	})
+	manager, err := NewManagerFromConfig(t.Context(), t.TempDir(), Config{MCPServers: map[string]ServerConfig{
+		"audit": {Type: TransportStreamableHTTP, URL: server.URL, TrustReadOnlyHint: true},
+	}}, WithRemoteServers("audit"), WithRemoteReadOnlyTools("audit", "read"), WithPrivateNetworkRemoteServers("audit"), WithRemoteAuditHook(audit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	before := requests.Load()
+	failAudit.Store(true)
+	_, err = manager.ListResources(t.Context(), "audit")
+	if err == nil || !strings.Contains(err.Error(), "audit unavailable") {
+		t.Fatalf("ListResources audit error = %v", err)
+	}
+	if got := requests.Load(); got != before {
+		t.Fatalf("resource request reached network: before=%d after=%d", before, got)
+	}
+}
+
 func TestRemoteCancellationIsOutcomeUnknownAndNeverReplayed(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32

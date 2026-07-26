@@ -267,6 +267,14 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 			continue
 		}
 		m.servers[serverName] = conn
+		if conn.remote {
+			if err := auditRemote(ctx, options, serverName, "tools/list", "attempted"); err != nil {
+				_ = closeSessionBounded(conn, 2*time.Second)
+				delete(m.servers, serverName)
+				errs = append(errs, fmt.Errorf("MCP server %q: remote audit unavailable", serverName))
+				continue
+			}
+		}
 
 		tools, err := listAllTools(ctx, conn.session)
 		if err != nil {
@@ -280,6 +288,14 @@ func NewManagerFromConfig(ctx context.Context, workDir string, cfg Config, opts 
 					conn.stderr.tailAfterGrace(250*time.Millisecond)))
 			}
 			continue
+		}
+		if conn.remote {
+			if err := auditRemote(ctx, options, serverName, "tools/list", "completed"); err != nil {
+				_ = closeSessionBounded(conn, 2*time.Second)
+				delete(m.servers, serverName)
+				errs = append(errs, fmt.Errorf("MCP server %q: remote audit unavailable after discovery", serverName))
+				continue
+			}
 		}
 		if conn.remote && conn.reflections.Contains(tools) {
 			_ = closeSessionBounded(conn, 2*time.Second)
@@ -544,7 +560,12 @@ func (m *Manager) CallTool(ctx context.Context, qualifiedName string, args map[s
 		Name:      desc.ToolName,
 		Arguments: args,
 	}
-	result, err := conn.session.CallTool(ctx, params)
+	attempt := &remoteAttemptState{}
+	callCtx := ctx
+	if conn.remote {
+		callCtx = context.WithValue(ctx, remoteAttemptContextKey{}, attempt)
+	}
+	result, err := conn.session.CallTool(callCtx, params)
 	if err != nil && conn.remote {
 		if errors.Is(err, errRemoteNotSent) {
 			return nil, fmt.Errorf("MCP remote request was not sent")
@@ -552,9 +573,11 @@ func (m *Manager) CallTool(ctx context.Context, qualifiedName string, args map[s
 		if errors.Is(err, errRemoteDefinitive) {
 			return nil, fmt.Errorf("MCP remote server returned a definitive HTTP error")
 		}
-		var rpcErr *jsonrpc.Error
-		if errors.As(err, &rpcErr) {
-			return nil, fmt.Errorf("MCP remote server returned a definitive error")
+		if !attempt.ambiguousHTTP.Load() && !errors.Is(err, errRemoteAmbiguous) {
+			var rpcErr *jsonrpc.Error
+			if errors.As(err, &rpcErr) {
+				return nil, fmt.Errorf("MCP remote server returned a definitive error")
+			}
 		}
 		// Never replay a remote tools/call. A disconnect or timeout may occur
 		// after the server applied the operation. Reconnect only prepares the
@@ -633,6 +656,11 @@ func (m *Manager) cachedResources(ctx context.Context, conn *serverConn) ([]Reso
 	if ttl > 0 && ok && now.Before(cached.expires) {
 		return append([]ResourceDescriptor(nil), cached.items...), nil
 	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, conn.name, "resources/list", "attempted"); err != nil {
+			return nil, fmt.Errorf("remote audit unavailable")
+		}
+	}
 	resources, err := listAllResources(ctx, conn.session)
 	if err != nil {
 		if conn.remote {
@@ -641,7 +669,13 @@ func (m *Manager) cachedResources(ctx context.Context, conn *serverConn) ([]Reso
 		return nil, err
 	}
 	if conn.remote && conn.reflections.Contains(resources) {
+		_ = auditRemote(ctx, m.opts, conn.name, "resources/list", "credential-reflection-blocked")
 		return nil, fmt.Errorf("remote resource discovery contained credential material and was blocked")
+	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, conn.name, "resources/list", "completed"); err != nil {
+			return nil, fmt.Errorf("remote audit unavailable after resource discovery")
+		}
 	}
 	items := make([]ResourceDescriptor, 0, len(resources))
 	for _, resource := range resources {
@@ -699,6 +733,11 @@ func (m *Manager) cachedPrompts(ctx context.Context, conn *serverConn) ([]Prompt
 	if ttl > 0 && ok && now.Before(cached.expires) {
 		return clonePromptDescriptors(cached.items), nil
 	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, conn.name, "prompts/list", "attempted"); err != nil {
+			return nil, fmt.Errorf("remote audit unavailable")
+		}
+	}
 	prompts, err := listAllPrompts(ctx, conn.session)
 	if err != nil {
 		if conn.remote {
@@ -707,7 +746,13 @@ func (m *Manager) cachedPrompts(ctx context.Context, conn *serverConn) ([]Prompt
 		return nil, err
 	}
 	if conn.remote && conn.reflections.Contains(prompts) {
+		_ = auditRemote(ctx, m.opts, conn.name, "prompts/list", "credential-reflection-blocked")
 		return nil, fmt.Errorf("remote prompt discovery contained credential material and was blocked")
+	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, conn.name, "prompts/list", "completed"); err != nil {
+			return nil, fmt.Errorf("remote audit unavailable after prompt discovery")
+		}
 	}
 	items := make([]PromptDescriptor, 0, len(prompts))
 	for _, prompt := range prompts {
@@ -753,9 +798,21 @@ func (m *Manager) GetPrompt(ctx context.Context, serverName, name string, argume
 	if conn.capabilities == nil || conn.capabilities.Prompts == nil {
 		return nil, fmt.Errorf("MCP server %q does not support prompts", serverName)
 	}
+	operation := "prompts/get:" + name
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, serverName, operation, "attempted"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable")
+		}
+	}
 	result, err := conn.session.GetPrompt(ctx, &mcpsdk.GetPromptParams{Name: name, Arguments: arguments})
 	if err != nil && isSessionClosedErr(err) {
 		if fresh, reconnectErr := m.reconnectServer(ctx, serverName, conn); reconnectErr == nil {
+			conn = fresh
+			if conn.remote {
+				if auditErr := auditRemote(ctx, m.opts, serverName, operation, "retry-attempted"); auditErr != nil {
+					return nil, fmt.Errorf("MCP remote audit unavailable before retry")
+				}
+			}
 			result, err = fresh.session.GetPrompt(ctx, &mcpsdk.GetPromptParams{Name: name, Arguments: arguments})
 		}
 	}
@@ -766,7 +823,13 @@ func (m *Manager) GetPrompt(ctx context.Context, serverName, name string, argume
 		return nil, fmt.Errorf("MCP server %q get prompt %q: %w", serverName, name, err)
 	}
 	if conn.remote && conn.reflections.Contains(result) {
+		_ = auditRemote(ctx, m.opts, serverName, operation, "credential-reflection-blocked")
 		return nil, fmt.Errorf("MCP remote prompt contained credential material and was blocked")
+	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, serverName, operation, "completed"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable after prompt request")
+		}
 	}
 	return result, nil
 }
@@ -804,10 +867,22 @@ func (m *Manager) ReadResource(ctx context.Context, serverName, uri string) (*mc
 	if conn.capabilities == nil || conn.capabilities.Resources == nil {
 		return nil, fmt.Errorf("MCP server %q does not support resources", serverName)
 	}
+	operation := "resources/read"
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, serverName, operation, "attempted"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable")
+		}
+	}
 
 	result, err := conn.session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: uri})
 	if err != nil && isSessionClosedErr(err) {
 		if fresh, rerr := m.reconnectServer(ctx, serverName, conn); rerr == nil {
+			conn = fresh
+			if conn.remote {
+				if auditErr := auditRemote(ctx, m.opts, serverName, operation, "retry-attempted"); auditErr != nil {
+					return nil, fmt.Errorf("MCP remote audit unavailable before retry")
+				}
+			}
 			result, err = fresh.session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: uri})
 		}
 	}
@@ -818,7 +893,13 @@ func (m *Manager) ReadResource(ctx context.Context, serverName, uri string) (*mc
 		return nil, fmt.Errorf("MCP server %q read %q: %w", serverName, uri, err)
 	}
 	if conn.remote && conn.reflections.Contains(result) {
+		_ = auditRemote(ctx, m.opts, serverName, operation, "credential-reflection-blocked")
 		return nil, fmt.Errorf("MCP remote resource contained credential material and was blocked")
+	}
+	if conn.remote {
+		if err := auditRemote(ctx, m.opts, serverName, operation, "completed"); err != nil {
+			return nil, fmt.Errorf("MCP remote audit unavailable after resource read")
+		}
 	}
 	return result, nil
 }
