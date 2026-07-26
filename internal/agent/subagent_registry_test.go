@@ -926,15 +926,18 @@ func TestSubAgentRegistrySchedulerCheckpointRestore(t *testing.T) {
 		t.Fatalf("cancelled task not preserved: %+v", got)
 	}
 	for _, task := range tasks[3:] {
-		if task.Status != SubAgentTaskFailed || task.Error != subAgentRuntimeRestartError || len(task.WaitingOn) != 0 {
-			t.Fatalf("active task was not restored as restart tombstone: %+v", task)
+		if task.Status != SubAgentTaskReconciling || task.Error != subAgentRuntimeRestartError || len(task.WaitingOn) != 0 {
+			t.Fatalf("active task was not restored for reconciliation: %+v", task)
 		}
 	}
 	if pending := restored.PendingResultTaskIDs(); strings.Join(pending, ",") != "task_failed,task_cancelled,task_pending,task_waiting,task_running" {
-		t.Fatalf("pending result task IDs = %v, want restored undelivered terminal tasks", pending)
+		t.Fatalf("pending result task IDs = %v, want terminal and reconciling tasks", pending)
 	}
-	if task, err := restored.WaitForTask(context.Background(), "task_running", 1); err != nil || task.Status != SubAgentTaskFailed {
-		t.Fatalf("wait on restart tombstone = %+v, %v", task, err)
+	if err := restored.ReconcileRestoredTask("task_running", SubAgentTaskCompleted, "resumed result", ""); err != nil {
+		t.Fatalf("reconcile restored task: %v", err)
+	}
+	if task, err := restored.WaitForTask(context.Background(), "task_running", 1); err != nil || task.Status != SubAgentTaskCompleted || task.Result != "resumed result" {
+		t.Fatalf("wait on reconciled task = %+v, %v", task, err)
 	}
 	if task, firstDelivery, err := restored.CollectResultIfUndelivered("task_completed"); err != nil || firstDelivery || task.Result != "finished" {
 		t.Fatalf("completed delivery state not preserved: task=%+v first=%v err=%v", task, firstDelivery, err)

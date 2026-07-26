@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"time"
 )
@@ -28,6 +30,33 @@ type spanParentIDKey struct{}
 // nestedRunConfigKey carries parent run settings that nested sub-agent tools
 // must inherit to keep runtime behavior consistent.
 type nestedRunConfigKey struct{}
+
+// durableIdempotencyKey carries a destination-safe stable key for a tool
+// effect. Tools that call a destination supporting idempotency should forward
+// this value unchanged.
+type durableIdempotencyKey struct{}
+
+// DurableIdempotencyKey derives the same opaque key for every replay of one
+// tool call in a durable run.
+func DurableIdempotencyKey(runID, toolCallID string) string {
+	sum := sha256.Sum256([]byte(runID + ":" + toolCallID))
+	return "ga_" + hex.EncodeToString(sum[:])
+}
+
+// WithDurableIdempotencyKey attaches a durable external-effect key.
+func WithDurableIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, durableIdempotencyKey{}, key)
+}
+
+// DurableIdempotencyKeyFromContext returns the key a tool should propagate to
+// a destination that offers idempotent or deduplicated requests.
+func DurableIdempotencyKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(durableIdempotencyKey{}).(string)
+	return value
+}
 
 // WithParentCallID returns a context carrying the given parent tool call ID.
 func WithParentCallID(ctx context.Context, id string) context.Context {

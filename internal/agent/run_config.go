@@ -300,6 +300,10 @@ func (c HandoffHistoryConfig) normalized() HandoffHistoryConfig {
 
 // RunConfig configures a single run of the Runner.
 type RunConfig struct {
+	// Durable optionally enables fail-closed, versioned checkpoints at model,
+	// tool, approval, handoff, child, pause, and completion boundaries. Nil
+	// retains the historical in-process execution path with no store required.
+	Durable          *DurableRunConfig
 	MaxTurns         int           // default 100
 	SubAgentMaxTurns int           // default 50 for nested specialist runs
 	Hooks            RunHooks      // run-level lifecycle hooks

@@ -16,12 +16,16 @@ import (
 type SubAgentTaskStatus string
 
 const (
-	SubAgentTaskPending   SubAgentTaskStatus = "pending"
-	SubAgentTaskWaiting   SubAgentTaskStatus = "waiting"
-	SubAgentTaskRunning   SubAgentTaskStatus = "running"
-	SubAgentTaskCompleted SubAgentTaskStatus = "completed"
-	SubAgentTaskFailed    SubAgentTaskStatus = "failed"
-	SubAgentTaskCancelled SubAgentTaskStatus = "cancelled"
+	SubAgentTaskPending SubAgentTaskStatus = "pending"
+	SubAgentTaskWaiting SubAgentTaskStatus = "waiting"
+	SubAgentTaskRunning SubAgentTaskStatus = "running"
+	// SubAgentTaskReconciling marks work that was active at process loss. The
+	// destination outcome must be resumed by a durable child worker or resolved
+	// explicitly by an operator; it is never silently rewritten as a failure.
+	SubAgentTaskReconciling SubAgentTaskStatus = "reconciling"
+	SubAgentTaskCompleted   SubAgentTaskStatus = "completed"
+	SubAgentTaskFailed      SubAgentTaskStatus = "failed"
+	SubAgentTaskCancelled   SubAgentTaskStatus = "cancelled"
 )
 
 // SubAgentDependencyPolicy controls how a task treats terminal dependency status.
@@ -87,7 +91,7 @@ type SubAgentSchedulerCheckpointRecord struct {
 	IncludeDependencyResults bool         `json:"include_dependency_results"`
 }
 
-const subAgentRuntimeRestartError = "sub-agent runtime restarted before this task completed; spawn a new sub-agent task to retry it"
+const subAgentRuntimeRestartError = "sub-agent runtime restarted while this task was active; durable reconciliation is required"
 
 // subAgentTaskEntry is the internal mutable entry tracked by the registry.
 type subAgentTaskEntry struct {
@@ -289,6 +293,9 @@ type SubAgentRegistry struct {
 	compactionConfig        CompactionConfig
 	compactionModelResolver CompactionModelResolver
 	maxTurns                int
+	checkpoint              func(SubAgentSchedulerCheckpoint) error
+	checkpointMu            sync.Mutex // serializes durable snapshots across task goroutines
+	checkpointErr           error      // guarded by mu
 }
 
 // SubAgentRegistryConfig configures the registry.
@@ -305,6 +312,10 @@ type SubAgentRegistryConfig struct {
 	CompactionConfig        CompactionConfig
 	CompactionModelResolver CompactionModelResolver
 	MaxTurns                int
+	// Checkpoint persists every child scheduler transition. Spawn fails closed
+	// if its initial pending record cannot be stored; later errors are exposed
+	// by CheckpointError for host reconciliation.
+	Checkpoint func(SubAgentSchedulerCheckpoint) error
 }
 
 // NewSubAgentRegistry creates a new registry for tracking async sub-agent tasks.
@@ -324,6 +335,7 @@ func NewSubAgentRegistry(cfg SubAgentRegistryConfig) *SubAgentRegistry {
 		compactionConfig:        cfg.CompactionConfig,
 		compactionModelResolver: cfg.CompactionModelResolver,
 		maxTurns:                effectiveSubAgentMaxTurns(cfg.MaxTurns),
+		checkpoint:              cfg.Checkpoint,
 	}
 	if cfg.MaxConcurrent > 0 {
 		r.sem = make(chan struct{}, cfg.MaxConcurrent)
@@ -454,6 +466,31 @@ func (r *SubAgentRegistry) signalChange() {
 	close(r.changed)
 	r.changed = make(chan struct{})
 	r.mu.Unlock()
+	_ = r.persistSchedulerCheckpoint()
+}
+
+func (r *SubAgentRegistry) persistSchedulerCheckpoint() error {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+	r.mu.Lock()
+	checkpoint := r.checkpoint
+	r.mu.Unlock()
+	if checkpoint == nil {
+		return nil
+	}
+	err := checkpoint(r.SchedulerCheckpoint())
+	r.mu.Lock()
+	r.checkpointErr = err
+	r.mu.Unlock()
+	return err
+}
+
+// CheckpointError returns the latest child scheduler persistence failure.
+// Hosts must pause/reconcile the run when non-nil.
+func (r *SubAgentRegistry) CheckpointError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.checkpointErr
 }
 
 // changeChan returns the current broadcast channel. Capture it BEFORE checking
@@ -848,6 +885,19 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	r.order = append(r.order, taskID)
 	taskSnapshot := entry.task
 	r.mu.Unlock()
+	if err := r.persistSchedulerCheckpoint(); err != nil {
+		r.mu.Lock()
+		delete(r.tasks, taskID)
+		for i, id := range r.order {
+			if id == taskID {
+				r.order = append(r.order[:i], r.order[i+1:]...)
+				break
+			}
+		}
+		r.mu.Unlock()
+		cancel()
+		return "", fmt.Errorf("persist child-run checkpoint: %w", err)
+	}
 	r.emitTaskStatus(taskSnapshot, "spawned", parentCallID)
 
 	go r.runTask(
@@ -1138,8 +1188,8 @@ func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedul
 		}
 		switch task.Status {
 		case SubAgentTaskCompleted, SubAgentTaskFailed, SubAgentTaskCancelled:
-		case SubAgentTaskPending, SubAgentTaskWaiting, SubAgentTaskRunning:
-			task.Status = SubAgentTaskFailed
+		case SubAgentTaskPending, SubAgentTaskWaiting, SubAgentTaskRunning, SubAgentTaskReconciling:
+			task.Status = SubAgentTaskReconciling
 			task.Error = subAgentRuntimeRestartError
 			task.WaitingOn = nil
 		default:
@@ -1161,6 +1211,34 @@ func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedul
 	}
 	r.tasks = restored
 	r.order = order
+	r.mu.Unlock()
+	r.signalChange()
+	return nil
+}
+
+// ReconcileRestoredTask records an operator or durable child-worker decision
+// for a task restored in the reconciling state. Only terminal decisions are
+// accepted so an in-process registry never pretends to have relaunched work it
+// does not own.
+func (r *SubAgentRegistry) ReconcileRestoredTask(taskID string, status SubAgentTaskStatus, result, errMessage string) error {
+	if status != SubAgentTaskCompleted && status != SubAgentTaskFailed && status != SubAgentTaskCancelled {
+		return fmt.Errorf("reconciliation status must be terminal, got %q", status)
+	}
+	r.mu.Lock()
+	entry, ok := r.tasks[taskID]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q not found", taskID)
+	}
+	if entry.task.Status != SubAgentTaskReconciling {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q is %q, not reconciling", taskID, entry.task.Status)
+	}
+	entry.task.Status = status
+	entry.task.Result = result
+	entry.task.Error = errMessage
+	entry.task.WaitingOn = nil
+	r.lastChangedTaskID = taskID
 	r.mu.Unlock()
 	r.signalChange()
 	return nil
