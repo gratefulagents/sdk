@@ -398,3 +398,19 @@ func TestThinkingShapeFlipIgnoresUnrelated400(t *testing.T) {
 		t.Fatalf("requests = %d, want 1 (no shape-flip retry)", calls)
 	}
 }
+
+// TestAnthropicModelDeclaresAdditiveCacheUsage pins the wire semantics the
+// runner stamps onto generation events: Anthropic reports cached prompt
+// tokens as separate additive fields, so hosts must add them to input tokens.
+// Without the declaration the runner marks the semantics unknown and
+// cache-heavy prompts vanish from token analytics.
+func TestAnthropicModelDeclaresAdditiveCacheUsage(t *testing.T) {
+	var model agentsdk.Model = NewAnthropicModelWithClient(nil)
+	semantics, ok := model.(agentsdk.UsageCacheSemantics)
+	if !ok {
+		t.Fatal("AnthropicModel does not implement agentsdk.UsageCacheSemantics")
+	}
+	if semantics.UsageInputIncludesCacheTokens() {
+		t.Fatal("UsageInputIncludesCacheTokens() = true, want false (Anthropic cache fields are additive)")
+	}
+}
