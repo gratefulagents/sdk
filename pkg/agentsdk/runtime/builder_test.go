@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -13,6 +14,9 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
+	sdktools "github.com/gratefulagents/sdk/pkg/agentsdk/tools"
+	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
+	sdklsp "github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
@@ -74,7 +78,7 @@ func TestBuildToolBundleIncludesSDKAndSignalTools(t *testing.T) {
 	for _, tool := range bundle.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"Bash", "Write", "Edit", "LSP", "WebFetch", "AskUserQuestion", "present_plan", "finish", "list_files", "read_file", "glob", "grep"} {
+	for _, want := range []string{"ApplyPatch", "Bash", "Delete", "Edit", "LSP", "Move", "WebFetch", "Write", "AskUserQuestion", "present_plan", "finish", "list_files", "read_file", "glob", "grep"} {
 		if !names[want] {
 			t.Fatalf("missing tool %q; names=%v", want, names)
 		}
@@ -145,6 +149,196 @@ func TestBuildToolBundleStrictFeaturesSelectsIndividualTools(t *testing.T) {
 	for _, notWant := range []string{"list_files", "glob", "grep", "LSP", "Bash", "Write", "Edit", "present_plan", "set_phase", "AskUserQuestion"} {
 		if names[notWant] {
 			t.Fatalf("unexpected tool %q; names=%v", notWant, toolNames(bundle.Tools))
+		}
+	}
+}
+
+func TestBuildToolBundleStrictFeaturesSelectParityToolsDeterministically(t *testing.T) {
+	runner := &runtimeGitHubRunner{}
+	sink := &runtimeGitHubArtifactSink{}
+	features := &Features{Tools: ToolFeatures{
+		LSP:                 true,
+		ApplyPatch:          true,
+		Move:                true,
+		Delete:              true,
+		Browser:             true,
+		Vision:              true,
+		InteractiveTerminal: true,
+		Think:               true,
+		GitHubPullRequest:   true,
+		GitHubIssue:         true,
+	}}
+	cfg := Config{
+		WorkDir:                 t.TempDir(),
+		PermissionMode:          policy.PermissionModeDangerFullAccess,
+		AllowPrivateNetworkURLs: true,
+		Features:                features,
+		LSPConfig:               sdklsp.Config{Command: "typescript-language-server", LanguageID: "typescript"},
+		GitHubCommandRunner:     runner,
+		GitHubArtifactSink:      sink,
+		VisionAnalyzeWithDetailFn: func(context.Context, []byte, string, string, string) (string, error) {
+			return "ok", nil
+		},
+	}
+	first, err := BuildToolBundle(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := BuildToolBundle(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, closer := range first.Closers {
+			_ = closer.Close()
+		}
+		for _, closer := range second.Closers {
+			_ = closer.Close()
+		}
+	}()
+
+	want := map[string]bool{
+		"AnalyzeImage": true, "ApplyPatch": true, "Browser": true, "Delete": true, "LSP": true,
+		"Move": true, "Terminal": true, "create_github_issue": true, "create_pull_request": true, "think": true,
+	}
+	got := map[string]bool{}
+	for _, tool := range first.Tools {
+		got[tool.Name()] = true
+		switch typed := tool.(type) {
+		case *sdklsp.Tool:
+			if typed.Config.Executor == nil {
+				t.Fatal("LSP command sandbox executor was not injected")
+			}
+			actualConfig := typed.Config
+			actualConfig.Executor = nil
+			if !reflect.DeepEqual(actualConfig, cfg.LSPConfig) {
+				t.Fatalf("LSP Config = %#v, want %#v", actualConfig, cfg.LSPConfig)
+			}
+		case *sdkvision.Tool:
+			if typed.AnalyzeWithDetailFn == nil {
+				t.Fatal("Vision analyzer was not injected")
+			}
+		case *sdkgit.CreatePullRequestTool:
+			if typed.Runner != runner || typed.Sink != sink {
+				t.Fatal("pull-request dependencies were not injected")
+			}
+		case *sdkgit.CreateIssueTool:
+			if typed.Runner != runner || typed.Sink != sink {
+				t.Fatal("issue dependencies were not injected")
+			}
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("strict tools = %v, want %v", toolNames(first.Tools), want)
+	}
+	if !reflect.DeepEqual(toolNames(first.Tools), toolNames(second.Tools)) {
+		t.Fatalf("strict tool selection changed: first=%v second=%v", toolNames(first.Tools), toolNames(second.Tools))
+	}
+}
+
+func TestBuildToolBundleStrictFeaturePrerequisites(t *testing.T) {
+	browser, err := BuildToolBundle(context.Background(), Config{
+		WorkDir:  t.TempDir(),
+		Features: &Features{Tools: ToolFeatures{Browser: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(browser.Tools) != 0 {
+		t.Fatalf("Browser bypassed network policy: %v", toolNames(browser.Tools))
+	}
+
+	terminal, err := BuildToolBundle(context.Background(), Config{
+		WorkDir: t.TempDir(),
+		Features: &Features{Tools: ToolFeatures{
+			InteractiveTerminal: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(terminal.Tools) != 0 {
+		t.Fatalf("Terminal bypassed permission prerequisite: %v", toolNames(terminal.Tools))
+	}
+
+	github, err := BuildToolBundle(context.Background(), Config{
+		WorkDir:         t.TempDir(),
+		GitRemoteWrites: policy.GitRemoteWritesDisabled,
+		Features: &Features{Tools: ToolFeatures{
+			GitHubPullRequest: true,
+			GitHubIssue:       true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toolNames(github.Tools); !reflect.DeepEqual(got, []string{"create_github_issue"}) {
+		t.Fatalf("GitHub tools with remote writes disabled = %v, want only create_github_issue", got)
+	}
+}
+
+func TestBuildToolBundleLegacyDoesNotEnableOptInTools(t *testing.T) {
+	bundle, err := BuildToolBundle(context.Background(), Config{
+		WorkDir:     t.TempDir(),
+		EnableTools: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"AnalyzeImage", "Browser", "Terminal", "think", "create_pull_request", "create_github_issue"} {
+		for _, tool := range bundle.Tools {
+			if tool.Name() == name {
+				t.Fatalf("legacy tool selection unexpectedly enabled %q", name)
+			}
+		}
+	}
+}
+
+func TestRegistryCapabilityParity(t *testing.T) {
+	runtimeBuiltIns := map[string]bool{
+		"workspace-search":     ToolFeatures{ListFiles: true, ReadFile: true, Glob: true, Grep: true}.hasRegistryTools(),
+		"workspace-filesystem": ToolFeatures{Write: true, Edit: true, ApplyPatch: true, Move: true, Delete: true}.hasRegistryTools(),
+		"lsp":                  ToolFeatures{LSP: true}.hasRegistryTools(),
+		"bash":                 ToolFeatures{Bash: true}.hasRegistryTools(),
+		"web-fetch":            ToolFeatures{WebFetch: true}.hasRegistryTools(),
+		"async-shell":          ToolFeatures{AsyncShell: true}.hasRegistryTools(),
+		"signals":              ToolFeatures{Signals: SignalFeatures{AskUserQuestion: true}}.hasSignals(),
+		"browser":              ToolFeatures{Browser: true}.hasRegistryTools(),
+		"vision":               ToolFeatures{Vision: true}.hasRegistryTools(),
+		"interactive-terminal": ToolFeatures{InteractiveTerminal: true}.hasRegistryTools(),
+		"think":                ToolFeatures{Think: true}.hasRegistryTools(),
+		"attach-repository":    ToolFeatures{AttachRepository: true}.hasRegistryTools(),
+		"github-pull-request":  ToolFeatures{GitHubPullRequest: true}.hasRegistryTools(),
+		"github-issue":         ToolFeatures{GitHubIssue: true}.hasRegistryTools(),
+	}
+	hostOnly := map[string]bool{"memory": true}
+	seen := map[string]bool{}
+	for _, capability := range sdktools.RegistryCapabilities() {
+		if seen[capability.Family] {
+			t.Fatalf("duplicate registry capability %q", capability.Family)
+		}
+		seen[capability.Family] = true
+		switch capability.Classification {
+		case sdktools.RegistryCapabilityRuntimeBuiltIn:
+			if !runtimeBuiltIns[capability.Family] {
+				t.Fatalf("runtime-built-in registry capability %q lacks runtime feature wiring", capability.Family)
+			}
+		case sdktools.RegistryCapabilityHostOnly:
+			if !hostOnly[capability.Family] {
+				t.Fatalf("host-only registry capability %q lacks an explicit classification", capability.Family)
+			}
+		default:
+			t.Fatalf("registry capability %q has no classification", capability.Family)
+		}
+	}
+	for family := range runtimeBuiltIns {
+		if !seen[family] {
+			t.Fatalf("runtime-built-in capability %q is absent from registry classification", family)
+		}
+	}
+	for family := range hostOnly {
+		if !seen[family] {
+			t.Fatalf("host-only capability %q is absent from registry classification", family)
 		}
 	}
 }
@@ -699,6 +893,18 @@ func TestBuildRunConfigHonorsHostOverrides(t *testing.T) {
 		t.Fatalf("callbacks recorded=%v reported=%v polled=%v", recorded, reported, polled)
 	}
 }
+
+type runtimeGitHubRunner struct{}
+
+func (*runtimeGitHubRunner) RunGit(context.Context, string, ...string) (string, error) {
+	return "", nil
+}
+func (*runtimeGitHubRunner) RunGH(context.Context, string, ...string) (string, error) { return "", nil }
+
+type runtimeGitHubArtifactSink struct{}
+
+func (*runtimeGitHubArtifactSink) RecordPullRequestURL(context.Context, string) error { return nil }
+func (*runtimeGitHubArtifactSink) RecordIssueURL(context.Context, string) error       { return nil }
 
 type staticTool struct {
 	name string

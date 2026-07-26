@@ -17,20 +17,29 @@ type Features struct {
 }
 
 type ToolFeatures struct {
-	ListFiles        bool
-	ReadFile         bool
-	Glob             bool
-	Grep             bool
-	LSP              bool
-	Bash             bool
-	Write            bool
-	Edit             bool
-	WebFetch         bool
-	AsyncShell       bool
-	AttachRepository bool
-	ExtraTools       bool
-	VisionAnalyzer   bool
-	Signals          SignalFeatures
+	ListFiles           bool
+	ReadFile            bool
+	Glob                bool
+	Grep                bool
+	LSP                 bool
+	Bash                bool
+	Write               bool
+	Edit                bool
+	ApplyPatch          bool
+	Move                bool
+	Delete              bool
+	WebFetch            bool
+	AsyncShell          bool
+	Browser             bool
+	Vision              bool
+	InteractiveTerminal bool
+	Think               bool
+	AttachRepository    bool
+	GitHubPullRequest   bool
+	GitHubIssue         bool
+	ExtraTools          bool
+	VisionAnalyzer      bool
+	Signals             SignalFeatures
 }
 
 type SignalFeatures struct {
@@ -123,6 +132,9 @@ func legacyFeatures(cfg Config) Features {
 			Bash:           defaultTools,
 			Write:          defaultTools,
 			Edit:           defaultTools,
+			ApplyPatch:     defaultTools,
+			Move:           defaultTools,
+			Delete:         defaultTools,
 			WebFetch:       defaultTools && !cfg.DisableWebTools,
 			AsyncShell:     defaultTools && cfg.EnableAsyncShell,
 			ExtraTools:     cfg.EnableTools || cfg.EnableSubAgents,
@@ -180,7 +192,7 @@ func legacyFeatures(cfg Config) Features {
 }
 
 func (f ToolFeatures) hasRegistryTools() bool {
-	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.WebFetch || f.AsyncShell || f.AttachRepository
+	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.ApplyPatch || f.Move || f.Delete || f.WebFetch || f.AsyncShell || f.Browser || f.Vision || f.InteractiveTerminal || f.Think || f.AttachRepository || f.GitHubPullRequest || f.GitHubIssue
 }
 
 func (f ToolFeatures) hasSignals() bool {

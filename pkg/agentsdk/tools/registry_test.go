@@ -3,6 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,13 +17,49 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
+func TestRegistryOptionsHaveExplicitCapabilityClassification(t *testing.T) {
+	classified := map[string]string{}
+	for _, capability := range RegistryCapabilities() {
+		for _, option := range capability.Options {
+			if previous := classified[option]; previous != "" {
+				t.Fatalf("registry option %s is classified by both %s and %s", option, previous, capability.Family)
+			}
+			classified[option] = capability.Family
+		}
+	}
+	exemptConfigurationOptions := map[string]bool{
+		"WithReadOnlyTools": true, "WithPermissionMode": true, "WithGitRemoteWrites": true,
+		"WithBrowserScreenshotDir": true, "WithoutWebTools": true, "WithPrivateNetworkURLs": true,
+		"WithCommandSandboxConfig": true, "WithAllowedMutatingTools": true,
+	}
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(currentFile), "registry.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Recv != nil || (!strings.HasPrefix(function.Name.Name, "With") && !strings.HasPrefix(function.Name.Name, "Without")) {
+			continue
+		}
+		name := function.Name.Name
+		if classified[name] == "" && !exemptConfigurationOptions[name] {
+			t.Fatalf("registry option %s has no runtime-built-in, host-only, or configuration-only classification", name)
+		}
+	}
+}
+
 func TestNewRegistryDefaultTools(t *testing.T) {
 	r := NewRegistry(t.TempDir())
-	want := []string{"Bash", "Edit", "LSP", "WebFetch", "Write", "glob", "grep", "list_files", "read_file"}
+	want := []string{"ApplyPatch", "Bash", "Delete", "Edit", "LSP", "Move", "WebFetch", "Write", "glob", "grep", "list_files", "read_file"}
 	got := r.Names()
 	if len(got) != len(want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
@@ -30,12 +71,26 @@ func TestNewRegistryDefaultTools(t *testing.T) {
 	}
 }
 
+func TestRegistryConfiguresLSPAndClosesIt(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithLSPConfig(lsp.Config{Command: "typescript-language-server", LanguageID: "typescript"}))
+	tool, ok := r.Get("LSP").(*lsp.Tool)
+	if !ok {
+		t.Fatalf("LSP = %T, want *lsp.Tool", r.Get("LSP"))
+	}
+	if tool.Config.Command != "typescript-language-server" || tool.Config.LanguageID != "typescript" {
+		t.Fatalf("LSP Config = %#v", tool.Config)
+	}
+	if closers := r.Closers(); len(closers) != 1 || closers[0] != tool {
+		t.Fatalf("Closers() = %#v, want LSP tool", closers)
+	}
+}
+
 func TestNewRegistryWithoutWebTools(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithoutWebTools())
 	if r.Get("WebFetch") != nil {
 		t.Fatalf("registry included WebFetch with WithoutWebTools; names=%v", r.Names())
 	}
-	for _, name := range []string{"Bash", "Edit", "LSP", "Write", "glob", "grep", "list_files", "read_file"} {
+	for _, name := range []string{"ApplyPatch", "Bash", "Delete", "Edit", "LSP", "Move", "Write", "glob", "grep", "list_files", "read_file"} {
 		if r.Get(name) == nil {
 			t.Fatalf("registry missing %q with web disabled; names=%v", name, r.Names())
 		}
@@ -191,6 +246,25 @@ func TestNewRegistryWithAttachRepositoryTool(t *testing.T) {
 	}
 }
 
+func TestRegistryGitHubToolsRespectPermissionAndRemoteWritePolicy(t *testing.T) {
+	readOnly := NewRegistry(t.TempDir(), WithReadOnlyTools(), WithGitHubPullRequestTool(nil, nil), WithGitHubIssueTool(nil, nil))
+	if readOnly.Get("create_pull_request") != nil || readOnly.Get("create_github_issue") != nil {
+		t.Fatalf("read-only registry exposed GitHub mutations: %v", readOnly.Names())
+	}
+
+	remoteWritesDisabled := NewRegistry(t.TempDir(),
+		WithGitRemoteWrites(policy.GitRemoteWritesDisabled),
+		WithGitHubPullRequestTool(nil, nil),
+		WithGitHubIssueTool(nil, nil),
+	)
+	if remoteWritesDisabled.Get("create_pull_request") != nil {
+		t.Fatalf("registry exposed pull-request tool with GitRemoteWrites disabled: %v", remoteWritesDisabled.Names())
+	}
+	if remoteWritesDisabled.Get("create_github_issue") == nil {
+		t.Fatalf("registry omitted issue tool with GitRemoteWrites disabled: %v", remoteWritesDisabled.Names())
+	}
+}
+
 func TestNewRegistryDangerFullAccess(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithPermissionMode(policy.PermissionModeDangerFullAccess))
 	if got := r.PermissionMode(); got != policy.PermissionModeDangerFullAccess {
@@ -262,8 +336,8 @@ func TestNewRegistryAsyncShellTools(t *testing.T) {
 			t.Fatalf("registry missing async shell tool %q; names=%v", name, r.Names())
 		}
 	}
-	if closers := r.Closers(); len(closers) != 1 {
-		t.Fatalf("Closers() len = %d, want 1", len(closers))
+	if closers := r.Closers(); len(closers) != 2 {
+		t.Fatalf("Closers() len = %d, want 2", len(closers))
 	}
 }
 

@@ -85,6 +85,9 @@ func atomicWriteFileInWorkspaceWithMode(workDir, relPath string, data []byte, pe
 			_ = unix.Unlinkat(parent, tmpName, 0)
 		}
 	}()
+	if err := unix.Fchmod(fd, uint32(perm.Perm())); err != nil {
+		return err
+	}
 	if err := writeAll(fd, data); err != nil {
 		return err
 	}
@@ -109,18 +112,26 @@ func createExclusiveFileInWorkspace(workDir, relPath string, data []byte, perm o
 		return err
 	}
 	defer unix.Close(parent)
-	fd, err := unix.Openat(parent, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm.Perm()))
+	tmpName, fd, err := createTempAt(parent, perm)
 	if err != nil {
 		return err
 	}
 	cleanup := true
 	defer func() {
-		unix.Close(fd)
+		if fd >= 0 {
+			unix.Close(fd)
+		}
 		if cleanup {
-			_ = unix.Unlinkat(parent, name, 0)
+			_ = unix.Unlinkat(parent, tmpName, 0)
 		}
 	}()
+	if err := unix.Fchmod(fd, uint32(perm.Perm())); err != nil {
+		return err
+	}
 	if err := writeAll(fd, data); err != nil {
+		return err
+	}
+	if err := unix.Fsync(fd); err != nil {
 		return err
 	}
 	if err := unix.Close(fd); err != nil {
@@ -128,6 +139,9 @@ func createExclusiveFileInWorkspace(workDir, relPath string, data []byte, perm o
 		return err
 	}
 	fd = -1
+	if err := unix.Renameat2(parent, tmpName, parent, name, unix.RENAME_NOREPLACE); err != nil {
+		return err
+	}
 	cleanup = false
 	return nil
 }
