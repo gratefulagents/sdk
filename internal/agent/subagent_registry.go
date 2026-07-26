@@ -110,6 +110,7 @@ const subAgentRuntimeRestartError = "sub-agent runtime restarted while this task
 // subAgentTaskEntry is the internal mutable entry tracked by the registry.
 type subAgentTaskEntry struct {
 	task                     SubAgentTask
+	generation               uint64
 	cancel                   context.CancelFunc
 	activity                 *SubAgentActivity
 	includeDependencyResults bool
@@ -305,14 +306,16 @@ type SubAgentRegistry struct {
 	toolOutputDir     string
 
 	// RunConfig fields inherited from the parent orchestrator.
-	toolAccessLevel         ToolAccessLevel
-	toolPolicy              *ToolPolicy
-	compactionConfig        CompactionConfig
-	compactionModelResolver CompactionModelResolver
-	maxTurns                int
-	checkpoint              func(SubAgentSchedulerCheckpoint) error
-	checkpointMu            sync.Mutex // serializes durable snapshots across task goroutines
-	checkpointErr           error      // guarded by mu
+	toolAccessLevel             ToolAccessLevel
+	toolPolicy                  *ToolPolicy
+	compactionConfig            CompactionConfig
+	compactionModelResolver     CompactionModelResolver
+	maxTurns                    int
+	checkpoint                  func(SubAgentSchedulerCheckpoint) error
+	checkpointTransactionMu     sync.Mutex
+	checkpointTransactionActive bool                        // guarded by mu
+	checkpointCommitted         SubAgentSchedulerCheckpoint // guarded by mu
+	checkpointErr               error                       // guarded by mu
 }
 
 // SubAgentRegistryConfig configures the registry.
@@ -493,15 +496,29 @@ func (r *SubAgentRegistry) signalChangeWithoutCheckpoint() {
 	r.mu.Unlock()
 }
 
+func (r *SubAgentRegistry) lockCheckpointTransaction() {
+	r.checkpointTransactionMu.Lock()
+	r.mu.Lock()
+	r.checkpointTransactionActive = true
+	r.mu.Unlock()
+}
+
+func (r *SubAgentRegistry) unlockCheckpointTransaction() {
+	r.mu.Lock()
+	r.checkpointTransactionActive = false
+	r.mu.Unlock()
+	r.checkpointTransactionMu.Unlock()
+}
+
 func (r *SubAgentRegistry) persistSchedulerCheckpoint() error {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 	return r.persistSchedulerCheckpointLocked()
 }
 
-// persistSchedulerCheckpointLocked persists a snapshot while checkpointMu is
-// held. It never calls a host hook while holding mu, so hooks can safely query
-// task state without deadlocking the registry.
+// persistSchedulerCheckpointLocked persists a snapshot while a checkpoint
+// transaction is active. SchedulerCheckpoint does not acquire that transaction
+// lock, so checkpoint hooks can safely re-enter it.
 func (r *SubAgentRegistry) persistSchedulerCheckpointLocked() error {
 	r.mu.Lock()
 	checkpoint := r.checkpoint
@@ -510,9 +527,12 @@ func (r *SubAgentRegistry) persistSchedulerCheckpointLocked() error {
 	if checkpoint == nil {
 		return nil
 	}
-	err := checkpoint(checkpointState)
+	err := checkpoint(cloneSchedulerCheckpoint(checkpointState))
 	r.mu.Lock()
 	r.checkpointErr = err
+	if err == nil {
+		r.checkpointCommitted = cloneSchedulerCheckpoint(checkpointState)
+	}
 	r.mu.Unlock()
 	return err
 }
@@ -908,7 +928,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	// returns, but the async task must keep running across turns.
 	taskCtx, cancel := context.WithCancel(context.Background())
 
-	r.checkpointMu.Lock()
+	r.lockCheckpointTransaction()
 	r.mu.Lock()
 	agent, ok := r.agents[agentName]
 	if !ok {
@@ -917,14 +937,14 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 			available = append(available, name)
 		}
 		r.mu.Unlock()
-		r.checkpointMu.Unlock()
+		r.unlockCheckpointTransaction()
 		cancel()
 		return "", fmt.Errorf("unknown agent %q; available: %v", agentName, available)
 	}
 	for _, depID := range dependsOn {
 		if _, ok := r.tasks[depID]; !ok {
 			r.mu.Unlock()
-			r.checkpointMu.Unlock()
+			r.unlockCheckpointTransaction()
 			cancel()
 			return "", fmt.Errorf("dependency task %q not found", depID)
 		}
@@ -996,11 +1016,11 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 			}
 		}
 		r.mu.Unlock()
-		r.checkpointMu.Unlock()
+		r.unlockCheckpointTransaction()
 		cancel()
 		return "", fmt.Errorf("persist child-run checkpoint: %w", err)
 	}
-	r.checkpointMu.Unlock()
+	r.unlockCheckpointTransaction()
 	r.emitTaskStatus(taskSnapshot, "spawned", parentCallID)
 
 	go r.runTask(
@@ -1040,6 +1060,10 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			}
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		r.setTerminal(taskID, SubAgentTaskCancelled, "", err.Error(), r.taskDuration(taskID), 0, 0)
+		return
+	}
 	dependencyContext, waitErr := r.waitForDependencies(ctx, taskID)
 	if waitErr != nil {
 		duration := r.taskDuration(taskID)
@@ -1208,8 +1232,8 @@ func (r *SubAgentRegistry) childDurableRunConfig(taskID string, resume *DurableC
 }
 
 func (r *SubAgentRegistry) persistChildCheckpoint(taskID string, child DurableCheckpoint) error {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 
 	r.mu.Lock()
 	entry, ok := r.tasks[taskID]
@@ -1263,6 +1287,7 @@ func (r *SubAgentRegistry) setStatus(taskID string, status SubAgentTaskStatus, r
 				entry.task.WaitingOn = nil
 			}
 			if statusChanged {
+				entry.generation++
 				r.lastChangedTaskID = taskID
 			}
 			if statusChanged && !entry.task.IsTerminal() {
@@ -1299,6 +1324,7 @@ func (r *SubAgentRegistry) setTerminal(taskID string, status SubAgentTaskStatus,
 		entry.task.ToolCount = toolCount
 		entry.task.Tokens = tokens
 		entry.task.WaitingOn = nil
+		entry.generation++
 		r.lastChangedTaskID = taskID
 	}
 	r.mu.Unlock()
@@ -1321,11 +1347,24 @@ func cloneSubAgentTask(task SubAgentTask) SubAgentTask {
 
 // SchedulerCheckpoint returns a durable snapshot of every scheduler task in spawn order.
 func (r *SubAgentRegistry) SchedulerCheckpoint() SubAgentSchedulerCheckpoint {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.checkpoint != nil && r.checkpointTransactionActive {
+		return cloneSchedulerCheckpoint(r.checkpointCommitted)
+	}
 	return r.schedulerCheckpointLocked()
+}
+
+func cloneSchedulerCheckpoint(checkpoint SubAgentSchedulerCheckpoint) SubAgentSchedulerCheckpoint {
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return SubAgentSchedulerCheckpoint{}
+	}
+	var clone SubAgentSchedulerCheckpoint
+	if json.Unmarshal(encoded, &clone) != nil {
+		return SubAgentSchedulerCheckpoint{}
+	}
+	return clone
 }
 
 func (r *SubAgentRegistry) schedulerCheckpointLocked() SubAgentSchedulerCheckpoint {
@@ -1445,8 +1484,8 @@ func securityBaselineAllowsResume(saved, current *SubAgentSecurityBaseline) erro
 
 // ResumeRestoredTask resumes a reconciling durable child using its original ID.
 func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string) error {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 
 	r.mu.Lock()
 	if r.checkpoint == nil {
@@ -1538,12 +1577,15 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	previousActivity := entry.activity
 	previousAccepting := entry.acceptingMessages
 	var agent *Agent
+	var taskCtx context.Context
+	var cancel context.CancelFunc
 	if resume.Boundary != DurableBoundaryRunCompleted {
 		agent = r.agents[entry.task.AgentName]
 		if agent == nil {
 			r.mu.Unlock()
 			return fmt.Errorf("task %q agent %q is not configured", taskID, entry.task.AgentName)
 		}
+		taskCtx, cancel = context.WithCancel(context.Background())
 	}
 	entry.securityBaseline = currentSecurity
 	entry.task.Error = ""
@@ -1556,19 +1598,25 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		entry.task.Status = SubAgentTaskPending
 		entry.activity = NewSubAgentActivity()
 		entry.acceptingMessages = true
-		entry.cancel = nil
+		entry.cancel = cancel
 	}
+	entry.generation++
+	transitionGeneration := entry.generation
 	taskSnapshot := cloneSubAgentTask(entry.task)
 	r.mu.Unlock()
 
 	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		r.mu.Lock()
-		if current, exists := r.tasks[taskID]; exists {
+		if current, exists := r.tasks[taskID]; exists && current.generation == transitionGeneration {
 			current.task = previousTask
 			current.securityBaseline = previousBaseline
 			current.cancel = previousCancel
 			current.activity = previousActivity
 			current.acceptingMessages = previousAccepting
+			current.generation++
 		}
 		r.mu.Unlock()
 		return fmt.Errorf("persist resumed child checkpoint: %w", err)
@@ -1578,13 +1626,21 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		r.signalChangeWithoutCheckpoint()
 		return nil
 	}
-	taskCtx, cancel := context.WithCancel(context.Background())
+	parentCallID := ParentCallIDFromContext(ctx)
+	trace := TraceFromContext(ctx)
+	processor := TracingProcessorFromContext(ctx)
+	parentSpanID := SpanParentIDFromContext(ctx)
 	r.mu.Lock()
-	if current, exists := r.tasks[taskID]; exists {
-		current.cancel = cancel
+	current, launch := r.tasks[taskID]
+	launch = launch && current.generation == transitionGeneration && current.task.Status == SubAgentTaskPending
+	if launch {
+		go r.runTask(taskCtx, taskID, parentCallID, agent, taskSnapshot.Message, childAccess, snap, resume, trace, processor, parentSpanID)
 	}
 	r.mu.Unlock()
-	go r.runTask(taskCtx, taskID, ParentCallIDFromContext(ctx), agent, taskSnapshot.Message, childAccess, snap, resume, TraceFromContext(ctx), TracingProcessorFromContext(ctx), SpanParentIDFromContext(ctx))
+	if !launch {
+		cancel()
+		return nil
+	}
 	r.signalChangeWithoutCheckpoint()
 	return nil
 }
@@ -1597,6 +1653,9 @@ func (r *SubAgentRegistry) ReconcileRestoredTask(taskID string, status SubAgentT
 	if status != SubAgentTaskCompleted && status != SubAgentTaskFailed && status != SubAgentTaskCancelled {
 		return fmt.Errorf("reconciliation status must be terminal, got %q", status)
 	}
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
+
 	r.mu.Lock()
 	entry, ok := r.tasks[taskID]
 	if !ok {
@@ -1607,13 +1666,26 @@ func (r *SubAgentRegistry) ReconcileRestoredTask(taskID string, status SubAgentT
 		r.mu.Unlock()
 		return fmt.Errorf("task %q is %q, not reconciling", taskID, entry.task.Status)
 	}
+	previousTask := cloneSubAgentTask(entry.task)
 	entry.task.Status = status
 	entry.task.Result = result
 	entry.task.Error = errMessage
 	entry.task.WaitingOn = nil
+	entry.generation++
+	decisionGeneration := entry.generation
 	r.lastChangedTaskID = taskID
 	r.mu.Unlock()
-	r.signalChange()
+
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		r.mu.Lock()
+		if current, exists := r.tasks[taskID]; exists && current.generation == decisionGeneration {
+			current.task = previousTask
+			current.generation++
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("persist reconciled child checkpoint: %w", err)
+	}
+	r.signalChangeWithoutCheckpoint()
 	return nil
 }
 
@@ -1674,8 +1746,8 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 		return fmt.Errorf("message is required")
 	}
 
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 	r.mu.Lock()
 	entry, ok := r.tasks[taskID]
 	if !ok {
@@ -1720,8 +1792,8 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 }
 
 func (r *SubAgentRegistry) drainQueuedMessages(taskID string) ([]RunItem, error) {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 	return r.drainQueuedMessagesLocked(taskID, false)
 }
 
@@ -1769,8 +1841,8 @@ func (r *SubAgentRegistry) drainQueuedMessagesLocked(taskID string, finalize boo
 // returning a final result. Pending messages win and force another turn;
 // otherwise admission closes atomically so later SendMessage calls fail.
 func (r *SubAgentRegistry) finalizeOrDrainQueuedMessages(taskID string) ([]RunItem, error) {
-	r.checkpointMu.Lock()
-	defer r.checkpointMu.Unlock()
+	r.lockCheckpointTransaction()
+	defer r.unlockCheckpointTransaction()
 	return r.drainQueuedMessagesLocked(taskID, true)
 }
 
@@ -2169,6 +2241,7 @@ func (r *SubAgentRegistry) Cancel(taskID string) error {
 	entry.task.Error = errMsg
 	entry.task.Duration = time.Since(entry.task.StartedAt)
 	entry.task.WaitingOn = nil
+	entry.generation++
 	r.lastChangedTaskID = taskID
 	r.mu.Unlock()
 
