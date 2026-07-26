@@ -19,6 +19,8 @@ import (
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 	sdksandbox "github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	sdktools "github.com/gratefulagents/sdk/pkg/agentsdk/tools"
+	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
+	sdklsp "github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	sdkprojectstatetools "github.com/gratefulagents/sdk/pkg/agentsdk/tools/projectstate"
 	sdksignal "github.com/gratefulagents/sdk/pkg/agentsdk/tools/signal"
 	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
@@ -94,11 +96,17 @@ type Config struct {
 	ToolAccess             agentsdk.ToolAccessLevel
 	// AllowedMutatingTools lists exact host-trusted tool names that remain
 	// available when ToolAccess is read-only.
-	AllowedMutatingTools []string
-	PermissionMode       policy.PermissionMode
-	GitRemoteWrites      policy.GitRemoteWrites
-	CommandSandboxConfig *sdksandbox.Config
-	Features             *Features
+	AllowedMutatingTools      []string
+	PermissionMode            policy.PermissionMode
+	GitRemoteWrites           policy.GitRemoteWrites
+	CommandSandboxConfig      *sdksandbox.Config
+	LSPConfig                 sdklsp.Config
+	BrowserScreenshotDir      string
+	VisionAnalyzeFn           sdkvision.AnalyzeFn
+	VisionAnalyzeWithDetailFn sdkvision.AnalyzeWithDetailFn
+	GitHubCommandRunner       sdkgit.CommandRunner
+	GitHubArtifactSink        sdkgit.ArtifactSink
+	Features                  *Features
 
 	EnableTools              bool
 	EnableMCP                bool
@@ -430,15 +438,44 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 			sdktools.WithPermissionMode(mode),
 			sdktools.WithGitRemoteWrites(cfg.GitRemoteWrites),
 			sdktools.WithPrivateNetworkURLs(cfg.AllowPrivateNetworkURLs),
+			sdktools.WithAllowedMutatingTools(cfg.AllowedMutatingTools...),
 		}
 		if cfg.CommandSandboxConfig != nil {
 			registryOptions = append(registryOptions, sdktools.WithCommandSandboxConfig(*cfg.CommandSandboxConfig))
 		}
+		if features.value.Tools.LSP {
+			registryOptions = append(registryOptions, sdktools.WithLSPConfig(cfg.LSPConfig))
+		}
 		if features.value.Tools.AsyncShell {
 			registryOptions = append(registryOptions, sdktools.WithAsyncShellTools())
 		}
+		if features.value.Tools.Browser {
+			registryOptions = append(registryOptions,
+				sdktools.WithBrowserTools(),
+				sdktools.WithBrowserScreenshotDir(cfg.BrowserScreenshotDir),
+			)
+		}
+		if features.value.Tools.Vision {
+			if cfg.VisionAnalyzeWithDetailFn != nil {
+				registryOptions = append(registryOptions, sdktools.WithVisionToolsWithDetail(cfg.VisionAnalyzeWithDetailFn))
+			} else {
+				registryOptions = append(registryOptions, sdktools.WithVisionTools(cfg.VisionAnalyzeFn))
+			}
+		}
+		if features.value.Tools.InteractiveTerminal {
+			registryOptions = append(registryOptions, sdktools.WithInteractiveTerminal())
+		}
+		if features.value.Tools.Think {
+			registryOptions = append(registryOptions, sdktools.WithThinkTool())
+		}
 		if features.value.Tools.AttachRepository {
 			registryOptions = append(registryOptions, sdktools.WithAttachRepositoryTool())
+		}
+		if features.value.Tools.GitHubPullRequest {
+			registryOptions = append(registryOptions, sdktools.WithGitHubPullRequestTool(cfg.GitHubCommandRunner, cfg.GitHubArtifactSink))
+		}
+		if features.value.Tools.GitHubIssue {
+			registryOptions = append(registryOptions, sdktools.WithGitHubIssueTool(cfg.GitHubCommandRunner, cfg.GitHubArtifactSink))
 		}
 		if !features.value.Tools.WebFetch {
 			registryOptions = append(registryOptions, sdktools.WithoutWebTools())
@@ -461,7 +498,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 			bundle.Tools = append(bundle.Tools, tool)
 		}
 	}
-	if features.value.Tools.VisionAnalyzer {
+	if features.value.Tools.Vision || features.value.Tools.VisionAnalyzer {
 		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
 	}
 	bundle.Tools = filterGitRemoteWriteTools(bundle.Tools, cfg.GitRemoteWrites)
@@ -901,9 +938,18 @@ func registryToolNames(features ToolFeatures) map[string]bool {
 	add(features.Bash, "Bash")
 	add(features.Write, "Write")
 	add(features.Edit, "Edit")
+	add(features.ApplyPatch, "ApplyPatch")
+	add(features.Move, "Move")
+	add(features.Delete, "Delete")
 	add(features.WebFetch, "WebFetch")
 	add(features.AsyncShell, "BashStart", "BashPoll", "BashKill")
+	add(features.Browser, "Browser")
+	add(features.Vision, "AnalyzeImage")
+	add(features.InteractiveTerminal, "Terminal")
+	add(features.Think, "think")
 	add(features.AttachRepository, "attach_repository")
+	add(features.GitHubPullRequest, "create_pull_request")
+	add(features.GitHubIssue, "create_github_issue")
 	return names
 }
 

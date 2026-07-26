@@ -21,6 +21,41 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
 
+type RegistryCapabilityClassification string
+
+const (
+	RegistryCapabilityRuntimeBuiltIn RegistryCapabilityClassification = "runtime-built-in"
+	RegistryCapabilityHostOnly       RegistryCapabilityClassification = "host-only"
+)
+
+type RegistryCapability struct {
+	Family         string
+	Classification RegistryCapabilityClassification
+	// Options names every RegistryOption constructor that enables this family.
+	// Parity tests statically reject new unclassified capability options.
+	Options []string
+}
+
+func RegistryCapabilities() []RegistryCapability {
+	return []RegistryCapability{
+		{Family: "workspace-search", Classification: RegistryCapabilityRuntimeBuiltIn},
+		{Family: "workspace-filesystem", Classification: RegistryCapabilityRuntimeBuiltIn},
+		{Family: "lsp", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithLSPConfig"}},
+		{Family: "bash", Classification: RegistryCapabilityRuntimeBuiltIn},
+		{Family: "web-fetch", Classification: RegistryCapabilityRuntimeBuiltIn},
+		{Family: "async-shell", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAsyncShellTools"}},
+		{Family: "signals", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithSignalTools"}},
+		{Family: "browser", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithBrowserTools"}},
+		{Family: "vision", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithVisionTools", "WithVisionToolsWithDetail"}},
+		{Family: "interactive-terminal", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithInteractiveTerminal"}},
+		{Family: "think", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithThinkTool"}},
+		{Family: "attach-repository", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAttachRepositoryTool"}},
+		{Family: "github-pull-request", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithGitHubPullRequestTool"}},
+		{Family: "github-issue", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithGitHubIssueTool"}},
+		{Family: "memory", Classification: RegistryCapabilityHostOnly, Options: []string{"WithMemoryStore"}},
+	}
+}
+
 // Registry holds SDK tools with permission-aware registration.
 type Registry struct {
 	tools                   map[string]agentsdk.Tool
@@ -35,6 +70,7 @@ type Registry struct {
 	allowPrivateNetworkURLs bool
 	visionTool              *vision.Tool
 	memoryTool              *memorytool.Tool
+	lspTool                 *lsp.Tool
 	commandSandboxConfig    *sandbox.Config
 	asyncShell              bool
 	asyncShellManager       *shell.AsyncManager
@@ -42,6 +78,8 @@ type Registry struct {
 	interactiveTerminal     bool
 	terminalManager         *shell.TerminalManager
 	attachRepositoryTool    *sdkgit.AttachRepositoryTool
+	pullRequestTool         *sdkgit.CreatePullRequestTool
+	issueTool               *sdkgit.CreateIssueTool
 }
 
 // RegistryOption configures a Registry.
@@ -90,6 +128,11 @@ func WithAsyncShellTools() RegistryOption {
 	return func(r *Registry) { r.asyncShell = true }
 }
 
+// WithLSPConfig registers LSP with the supplied language-server configuration.
+func WithLSPConfig(config lsp.Config) RegistryOption {
+	return func(r *Registry) { r.lspTool = lsp.NewTool(config) }
+}
+
 // WithThinkTool registers the think scratchpad tool, which lets the model
 // record reasoning between actions without changing state.
 func WithThinkTool() RegistryOption {
@@ -123,6 +166,18 @@ func WithAttachRepositoryTool(opts ...sdkgit.AttachRepositoryOption) RegistryOpt
 	}
 }
 
+func WithGitHubPullRequestTool(runner sdkgit.CommandRunner, sink sdkgit.ArtifactSink) RegistryOption {
+	return func(r *Registry) {
+		r.pullRequestTool = sdkgit.NewCreatePullRequestTool(runner, sink)
+	}
+}
+
+func WithGitHubIssueTool(runner sdkgit.CommandRunner, sink sdkgit.ArtifactSink) RegistryOption {
+	return func(r *Registry) {
+		r.issueTool = sdkgit.NewCreateIssueTool(runner, sink)
+	}
+}
+
 func WithAllowedMutatingTools(names ...string) RegistryOption {
 	return func(r *Registry) {
 		if r.allowMutating == nil {
@@ -153,6 +208,11 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	}
 	config.WorkspaceRoot = workDir
 	r.commandSandboxConfig = &config
+	if r.lspTool == nil {
+		r.lspTool = &lsp.Tool{}
+	}
+	r.lspTool.Config.Executor = r.bashExecutor()
+	r.lspTool.Config.AllowUnsafeUnconfined = false
 
 	var allTools []agentsdk.Tool
 	if r.permissionMode == policy.PermissionModeWorkspaceWrite {
@@ -161,13 +221,16 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&search.ReadFileTool{},
 			&search.GlobTool{},
 			&search.GrepTool{},
-			&lsp.Tool{},
+			r.lspTool,
 			&shell.WorkspaceWriteBashTool{BashTool: shell.BashTool{
 				Executor:        r.bashExecutor(),
 				GitRemoteWrites: r.gitRemoteWrites,
 			}},
 			&fs.WorkspaceWriteFileTool{},
 			&fs.WorkspaceEditTool{},
+			&fs.ApplyPatchTool{},
+			&fs.MoveTool{},
+			&fs.DeleteTool{},
 		}
 	} else {
 		allTools = []agentsdk.Tool{
@@ -175,7 +238,7 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			&search.ReadFileTool{},
 			&search.GlobTool{},
 			&search.GrepTool{},
-			&lsp.Tool{},
+			r.lspTool,
 		}
 		if !r.permissionMode.AllowsWriteTools() {
 			allTools = append(allTools, &shell.ReadOnlyBashTool{BashTool: shell.BashTool{
@@ -187,6 +250,9 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 				&shell.BashTool{Executor: r.bashExecutor(), GitRemoteWrites: r.gitRemoteWrites},
 				&fs.FileWriteTool{},
 				&fs.FileEditTool{},
+				&fs.ApplyPatchTool{},
+				&fs.MoveTool{},
+				&fs.DeleteTool{},
 			)
 		}
 	}
@@ -243,6 +309,12 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	}
 	if r.attachRepositoryTool != nil {
 		r.Register(r.attachRepositoryTool)
+	}
+	if r.pullRequestTool != nil {
+		r.Register(r.pullRequestTool)
+	}
+	if r.issueTool != nil {
+		r.Register(r.issueTool)
 	}
 	return r
 }
@@ -326,6 +398,9 @@ func (r *Registry) Closers() []io.Closer {
 		return nil
 	}
 	var closers []io.Closer
+	if r.lspTool != nil {
+		closers = append(closers, r.lspTool)
+	}
 	if r.asyncShellManager != nil {
 		closers = append(closers, r.asyncShellManager)
 	}
