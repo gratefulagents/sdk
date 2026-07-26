@@ -29,7 +29,7 @@ flowchart TD
 - `pkg/agentsdk/providers/anthropic`: Anthropic provider and helpers for API-key and OAuth bearer-token auth.
 - `internal/openai` and `internal/anthropic`: provider implementation details.
 - `pkg/agentsdk/tools`: default tool registry plus built-in tool packages.
-- `pkg/agentsdk/mcp`: `.mcp.json` loading, stdio manager, MCP tool/resource wrapping, result formatting, and break-glass helpers.
+- `pkg/agentsdk/mcp`: `.mcp.json` loading, transport-neutral stdio/Streamable HTTP sessions, read-only remote policy and auth, MCP tool/resource/prompt discovery, policy-gated MCP server mode, result formatting, and break-glass helpers.
 - `pkg/agentsdk/sandbox`: subprocess executor abstraction, local executor, Bubblewrap (Linux) and Seatbelt (macOS) executors, environment handling, and permission-mode enforcement.
 - `pkg/agentsdk/runtime`: bundle builder that assembles providers, runner, tools, agent, hooks, guardrails, compaction, and run config.
 - `pkg/agentsdk/host`: interfaces for application integration.

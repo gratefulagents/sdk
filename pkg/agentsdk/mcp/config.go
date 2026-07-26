@@ -10,7 +10,10 @@ import (
 
 const (
 	// ConfigFileName is the per-repo MCP server configuration file.
-	ConfigFileName = ".mcp.json"
+	ConfigFileName          = ".mcp.json"
+	TransportStdio          = "stdio"
+	TransportStreamableHTTP = "streamable-http"
+	TransportLegacySSE      = "sse"
 )
 
 // Config represents .mcp.json.
@@ -18,13 +21,19 @@ type Config struct {
 	MCPServers map[string]ServerConfig `json:"mcpServers"`
 }
 
-// ServerConfig represents a single MCP server config.
-// Only stdio transport is supported right now.
+// ServerConfig represents a single MCP server config. Type defaults to
+// "stdio". Remote transports are disabled unless the host explicitly enables
+// the server with WithRemoteServers; repository configuration alone cannot
+// grant network access.
 type ServerConfig struct {
 	Type    string            `json:"type,omitempty"`
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	// URL is required for streamable-http and legacy-sse transports. Embedded
+	// credentials, fragments, and query strings are rejected so secrets cannot
+	// leak through diagnostics or redirect targets.
+	URL string `json:"url,omitempty"`
 	// Enabled can explicitly disable a configured server without removing it
 	// from .mcp.json. Nil preserves compatibility and treats the server as
 	// enabled when the runtime MCP feature itself is enabled.

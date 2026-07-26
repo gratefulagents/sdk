@@ -24,8 +24,9 @@ regression test.
 
 ### MCP transport hardening
 
-`.mcp.json` configures Model Context Protocol servers (subprocess plus
-environment). Two abuse vectors are addressed:
+`.mcp.json` configures Model Context Protocol stdio and remote servers. The
+shared manager pins configuration and applies transport-neutral tool/resource
+policy. Important boundaries include:
 
 - **Credential leakage into MCP children.** The inherited environment is
   filtered against a credential denylist (AWS, GitHub, OpenAI, Anthropic,
@@ -35,6 +36,29 @@ environment). Two abuse vectors are addressed:
 - **Configuration tampering.** The `.mcp.json` path is pinned at chatloop
   start and reload semantics are documented; the server set cannot mutate
   the loaded configuration mid-run.
+- **Remote SSRF and TLS.** Streamable HTTP requires a trusted host opt-in for
+  each server, HTTPS for public endpoints, public-only validation on both URL
+  resolution and dial, no proxies, and no redirects. TLS verification remains
+  enabled; custom roots can be supplied without an insecure mode. Private
+  network access is a separate per-server trusted-host exception.
+- **Tenant credentials.** Header and OAuth providers are host-controlled,
+  tenant-bound, invoked on every request, and omitted from configuration and
+  errors. OAuth tokens must match immutable audience/scope policy and have
+  usable lifetime. Authenticated remote setup fails if no tenant is bound.
+- **Remote mutation boundary.** A remote tool is exposed only when the trusted
+  host allowlists its exact raw name and both pinned config and MCP annotation
+  classify it read-only. The invariant is checked again at invocation. Remote
+  `tools/call` is never replayed; ambiguous failures return
+  `mcp.ErrOutcomeUnknown` for reconciliation. Response sizes, discovery pages,
+  item counts, repeated cursors, and per-server concurrency are bounded. A host
+  audit hook receives only tenant/server/operation/outcome provenance and fails
+  closed before execution when durable recording is unavailable.
+- **Server mode.** The Streamable HTTP server requires tenant resolution and a
+  `ServerToolPolicy`; it has no direct `Tool.Execute` fallback. The host policy
+  path must preserve access checks, approvals, guardrails, tracing, quotas,
+  and audit, using the immutable request digest for approval binding. Sessions
+  are tenant-bound, idle-expiring, globally and per-tenant bounded, and reject
+  requests after server shutdown.
 
 ### Tool output as untrusted input
 
