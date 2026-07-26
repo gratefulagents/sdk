@@ -34,7 +34,7 @@ By default, searches preserve the previous behavior:
 - `.git`, `node_modules`, `vendor`, `.venv`, and `target` directories are skipped.
 - `.gitignore` files are not applied.
 
-Set `skip_default_dirs` to `false` to search the built-in skipped directories. Set `respect_gitignore` to `true` to apply workspace and nested `.gitignore` patterns, including negated (`!`) rules. Search never follows symlinks and retains the existing single-hardlink checks for file content reads.
+Set `skip_default_dirs` to `false` to search the built-in skipped directories. Set `respect_gitignore` to `true` to apply workspace and nested `.gitignore` patterns, including negated (`!`) rules and Git's rule that a file cannot be re-included while a parent directory remains excluded. Ignore loading is capped at 10,000 rules; exceeding the cap returns an explicit tool error instead of a potentially incomplete result. Search never follows symlinks and retains the existing single-hardlink checks for file content reads.
 
 ## Grep result controls
 

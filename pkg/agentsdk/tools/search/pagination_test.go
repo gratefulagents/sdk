@@ -256,6 +256,39 @@ func TestGitignorePathRulesApplyToDescendants(t *testing.T) {
 	}
 }
 
+func TestGitignoreNegationCannotReincludeUnderExcludedParent(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, dir, ".gitignore", "foo/\n!foo/bar.txt\n")
+	writeTestFile(t, dir, filepath.Join("foo", "bar.txt"), "needle")
+	writeTestFile(t, dir, "visible.txt", "needle")
+
+	result, err := (&GrepTool{}).Execute(context.Background(), json.RawMessage(`{"pattern":"needle","respect_gitignore":true,"mode":"files","output_format":"json"}`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := decodePage[[]string](t, result.Content)
+	if !reflect.DeepEqual(page.Matches, []string{"visible.txt"}) {
+		t.Fatalf("matches = %#v", page.Matches)
+	}
+}
+
+func TestGitignoreRuleLimitIsExplicit(t *testing.T) {
+	dir := t.TempDir()
+	var rules strings.Builder
+	for i := 0; i <= maxGitignoreRules; i++ {
+		fmt.Fprintf(&rules, "ignored-%d\n", i)
+	}
+	writeTestFile(t, dir, ".gitignore", rules.String())
+
+	result, err := (&GlobTool{}).Execute(context.Background(), json.RawMessage(`{"pattern":"**/*","respect_gitignore":true,"output_format":"json"}`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "cannot load more than") {
+		t.Fatalf("result = %#v, want explicit ignore-rule limit error", result)
+	}
+}
+
 func TestGitignoreSymlinkIsNotFollowed(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "workspace")

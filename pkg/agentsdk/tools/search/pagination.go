@@ -153,7 +153,11 @@ func newPathFilters(root string, includes, excludes []string, respectGitignore, 
 		SkipDefaultDirs: skipDefaultDirs, workspaceRoot: root,
 	}
 	if respectGitignore {
-		filters.gitignoreMatchers = loadGitignoreMatchers(root, skipDefaultDirs)
+		matchers, err := loadGitignoreMatchers(root, skipDefaultDirs)
+		if err != nil {
+			return pathFilters{}, err
+		}
+		filters.gitignoreMatchers = matchers
 	}
 	return filters, nil
 }
@@ -202,6 +206,18 @@ func (f pathFilters) ignored(rel string, isDir bool) bool {
 	if !f.RespectGitignore {
 		return false
 	}
+	if !isDir {
+		components := strings.Split(rel, "/")
+		for i := 1; i < len(components); i++ {
+			if f.ignoredDirect(strings.Join(components[:i], "/"), true) {
+				return true
+			}
+		}
+	}
+	return f.ignoredDirect(rel, isDir)
+}
+
+func (f pathFilters) ignoredDirect(rel string, isDir bool) bool {
 	ignored := false
 	for _, matcher := range f.gitignoreMatchers {
 		candidate := rel
@@ -247,11 +263,12 @@ func (f pathFilters) ignored(rel string, isDir bool) bool {
 	return ignored
 }
 
-func loadGitignoreMatchers(root string, skipDefaultDirs bool) []ignoreMatcher {
+func loadGitignoreMatchers(root string, skipDefaultDirs bool) ([]ignoreMatcher, error) {
 	var matchers []ignoreMatcher
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	errGitignoreRuleLimit := errors.New("gitignore rule limit exceeded")
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() {
 			if path != root && skipDefaultDirs && shouldSkipDir(d.Name()) {
@@ -282,12 +299,12 @@ func loadGitignoreMatchers(root string, skipDefaultDirs bool) []ignoreMatcher {
 		}
 		base = filepath.ToSlash(base)
 		for _, line := range strings.Split(string(data), "\n") {
-			if len(matchers) >= maxGitignoreRules {
-				return filepath.SkipAll
-			}
 			line = strings.TrimSpace(line)
 			if line == "" || len(line) > maxSearchPatternBytes || strings.HasPrefix(line, "#") {
 				continue
+			}
+			if len(matchers) >= maxGitignoreRules {
+				return errGitignoreRuleLimit
 			}
 			matcher := ignoreMatcher{base: base}
 			if strings.HasPrefix(line, "!") {
@@ -304,7 +321,13 @@ func loadGitignoreMatchers(root string, skipDefaultDirs bool) []ignoreMatcher {
 		}
 		return nil
 	})
-	return matchers
+	if errors.Is(err, errGitignoreRuleLimit) {
+		return nil, fmt.Errorf("respect_gitignore cannot load more than %d rules", maxGitignoreRules)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading .gitignore files: %w", err)
+	}
+	return matchers, nil
 }
 
 func collectGlob(root, pattern string, filters pathFilters, offset, limit int) ([]string, bool, error) {
