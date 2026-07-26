@@ -61,11 +61,27 @@ transaction as the run store.
 ## Child runs and cancellation
 
 Snapshots contain first-class child run records and durable cancellation
-requests. Scheduler tasks that were active when a process stopped restore as
-`reconciling`, not generic failures. A durable child worker may finish them, or
-an operator can record a terminal decision with
-`SubAgentRegistry.ReconcileRestoredTask`. No unknown child outcome is silently
-replayed.
+requests. Configure an async scheduler with `SubAgentSchedulerConfig.Checkpoint`
+to persist scheduler transitions. Each child record includes its latest runner
+checkpoint, its effective tool-access and security baseline, and queued parent
+steering messages.
+
+Scheduler tasks that were active when a process stopped restore as
+`reconciling`, not generic failures. `SubAgentRegistry.ResumeRestoredTask(ctx,
+id)` can continue the same child ID only from `run_started`, `model_prepared`,
+`tool_completed`, or `handoff_completed`; a `run_completed` checkpoint records
+completion without dispatching a model request. `model_completed`,
+`tool_prepared`, `approval_pending`, and `paused` checkpoints require an
+explicit `ReconcileRestoredTask` decision because their external outcome is not
+safe to replay.
+
+Steering is crash-safe: draining moves messages to durable in-flight state, and
+the next child checkpoint commits its history while acknowledging those
+messages. Recovery requeues in-flight steering before later queued messages.
+A resume rejects a missing, changed, or weaker security baseline (tool policy,
+guardrails, untrusted-output handling, or output cap); stricter settings are
+accepted and become the new durable baseline. No unknown child outcome is
+silently replayed.
 
 ## Security and lifecycle
 

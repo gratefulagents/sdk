@@ -17,6 +17,7 @@ type SubAgentSchedulerConfig struct {
 	CompactionConfig        CompactionConfig
 	CompactionModelResolver CompactionModelResolver
 	MaxTurns                int
+	Checkpoint              func(SubAgentSchedulerCheckpoint) error
 }
 
 // NewSubAgentScheduler creates a scheduler for async sub-agent tasks.
@@ -38,6 +39,7 @@ func NewSubAgentScheduler(cfg SubAgentSchedulerConfig) *SubAgentScheduler {
 		CompactionConfig:        cfg.CompactionConfig,
 		CompactionModelResolver: cfg.CompactionModelResolver,
 		MaxTurns:                cfg.MaxTurns,
+		Checkpoint:              cfg.Checkpoint,
 	})
 }
 
@@ -69,5 +71,6 @@ func ConfigureSubAgentScheduler(s *SubAgentScheduler, cfg SubAgentSchedulerConfi
 		CompactionConfig:        cfg.CompactionConfig,
 		CompactionModelResolver: cfg.CompactionModelResolver,
 		MaxTurns:                cfg.MaxTurns,
+		Checkpoint:              cfg.Checkpoint,
 	})
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -86,9 +85,24 @@ type SubAgentSchedulerCheckpoint struct {
 
 // SubAgentSchedulerCheckpointRecord preserves a task and its result delivery state.
 type SubAgentSchedulerCheckpointRecord struct {
-	Task                     SubAgentTask `json:"task"`
-	ResultDelivered          bool         `json:"result_delivered"`
-	IncludeDependencyResults bool         `json:"include_dependency_results"`
+	Task                     SubAgentTask              `json:"task"`
+	ResultDelivered          bool                      `json:"result_delivered"`
+	IncludeDependencyResults bool                      `json:"include_dependency_results"`
+	DurableCheckpoint        *DurableCheckpoint        `json:"durable_checkpoint,omitempty"`
+	SecurityBaseline         *SubAgentSecurityBaseline `json:"security_baseline,omitempty"`
+	QueuedMessages           []LLMRunItemSnapshot      `json:"queued_messages,omitempty"`
+	InFlightMessages         []LLMRunItemSnapshot      `json:"in_flight_messages,omitempty"`
+}
+
+// SubAgentSecurityBaseline records the security-sensitive child configuration
+// that must not be weakened when a durable child is resumed.
+type SubAgentSecurityBaseline struct {
+	ToolAccessLevel          ToolAccessLevel `json:"tool_access_level"`
+	ToolPolicy               *ToolPolicy     `json:"tool_policy"`
+	ToolInputGuardrailNames  []string        `json:"tool_input_guardrail_names"`
+	ToolOutputGuardrailNames []string        `json:"tool_output_guardrail_names"`
+	UntrustedToolOutputs     bool            `json:"untrusted_tool_outputs"`
+	MaxToolOutputBytes       int             `json:"max_tool_output_bytes"`
 }
 
 const subAgentRuntimeRestartError = "sub-agent runtime restarted while this task was active; durable reconciliation is required"
@@ -99,7 +113,10 @@ type subAgentTaskEntry struct {
 	cancel                   context.CancelFunc
 	activity                 *SubAgentActivity
 	includeDependencyResults bool
+	durableCheckpoint        *DurableCheckpoint
+	securityBaseline         *SubAgentSecurityBaseline
 	queuedMessages           []RunItem
+	inFlightMessages         []RunItem
 	messageSignal            chan struct{}
 	acceptingMessages        bool
 	resultDelivered          bool
@@ -331,7 +348,7 @@ func NewSubAgentRegistry(cfg SubAgentRegistryConfig) *SubAgentRegistry {
 		workDir:                 cfg.WorkDir,
 		toolOutputDir:           cfg.ToolOutputDir,
 		toolAccessLevel:         NormalizeToolAccessLevel(cfg.ToolAccessLevel),
-		toolPolicy:              cfg.ToolPolicy,
+		toolPolicy:              cloneToolPolicy(cfg.ToolPolicy),
 		compactionConfig:        cfg.CompactionConfig,
 		compactionModelResolver: cfg.CompactionModelResolver,
 		maxTurns:                effectiveSubAgentMaxTurns(cfg.MaxTurns),
@@ -404,7 +421,10 @@ func (r *SubAgentRegistry) Configure(cfg SubAgentRegistryConfig) {
 		r.toolAccessLevel = NormalizeToolAccessLevel(cfg.ToolAccessLevel)
 	}
 	if cfg.ToolPolicy != nil {
-		r.toolPolicy = cfg.ToolPolicy
+		r.toolPolicy = cloneToolPolicy(cfg.ToolPolicy)
+	}
+	if cfg.Checkpoint != nil {
+		r.checkpoint = cfg.Checkpoint
 	}
 	r.compactionConfig = cfg.CompactionConfig
 	r.compactionModelResolver = cfg.CompactionModelResolver
@@ -462,23 +482,35 @@ func (r *SubAgentRegistry) HasAgent(name string) bool {
 // consumes the only signal and the rest sleep until their fallback tickers
 // fire), close() reaches every blocked waiter immediately.
 func (r *SubAgentRegistry) signalChange() {
+	r.signalChangeWithoutCheckpoint()
+	_ = r.persistSchedulerCheckpoint()
+}
+
+func (r *SubAgentRegistry) signalChangeWithoutCheckpoint() {
 	r.mu.Lock()
 	close(r.changed)
 	r.changed = make(chan struct{})
 	r.mu.Unlock()
-	_ = r.persistSchedulerCheckpoint()
 }
 
 func (r *SubAgentRegistry) persistSchedulerCheckpoint() error {
 	r.checkpointMu.Lock()
 	defer r.checkpointMu.Unlock()
+	return r.persistSchedulerCheckpointLocked()
+}
+
+// persistSchedulerCheckpointLocked persists a snapshot while checkpointMu is
+// held. It never calls a host hook while holding mu, so hooks can safely query
+// task state without deadlocking the registry.
+func (r *SubAgentRegistry) persistSchedulerCheckpointLocked() error {
 	r.mu.Lock()
 	checkpoint := r.checkpoint
+	checkpointState := r.schedulerCheckpointLocked()
 	r.mu.Unlock()
 	if checkpoint == nil {
 		return nil
 	}
-	err := checkpoint(r.SchedulerCheckpoint())
+	err := checkpoint(checkpointState)
 	r.mu.Lock()
 	r.checkpointErr = err
 	r.mu.Unlock()
@@ -744,6 +776,70 @@ func (r *SubAgentRegistry) SpawnAsync(ctx context.Context, agentName, message st
 	})
 }
 
+func cloneToolPolicy(policy *ToolPolicy) *ToolPolicy {
+	if policy == nil {
+		return nil
+	}
+	clone := *policy
+	return &clone
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func guardrailNames(input []ToolInputGuardrail, output []ToolOutputGuardrail) ([]string, []string) {
+	inputNames := make([]string, len(input))
+	for i, guardrail := range input {
+		inputNames[i] = guardrail.Name
+	}
+	outputNames := make([]string, len(output))
+	for i, guardrail := range output {
+		outputNames[i] = guardrail.Name
+	}
+	return inputNames, outputNames
+}
+
+func cloneSubAgentSecurityBaseline(baseline *SubAgentSecurityBaseline) *SubAgentSecurityBaseline {
+	if baseline == nil {
+		return nil
+	}
+	clone := *baseline
+	clone.ToolPolicy = cloneToolPolicy(baseline.ToolPolicy)
+	clone.ToolInputGuardrailNames = append([]string(nil), baseline.ToolInputGuardrailNames...)
+	clone.ToolOutputGuardrailNames = append([]string(nil), baseline.ToolOutputGuardrailNames...)
+	return &clone
+}
+
+func securityBaseline(toolAccess ToolAccessLevel, policy *ToolPolicy, input []ToolInputGuardrail, output []ToolOutputGuardrail, untrusted *bool, maxToolOutputBytes int) *SubAgentSecurityBaseline {
+	inputNames, outputNames := guardrailNames(input, output)
+	cfg := RunConfig{UntrustedToolOutputs: untrusted, MaxToolOutputBytes: maxToolOutputBytes}
+	return &SubAgentSecurityBaseline{
+		ToolAccessLevel:          NormalizeToolAccessLevel(toolAccess),
+		ToolPolicy:               cloneToolPolicy(policy),
+		ToolInputGuardrailNames:  inputNames,
+		ToolOutputGuardrailNames: outputNames,
+		UntrustedToolOutputs:     cfg.ShouldTagUntrustedToolOutputs(),
+		MaxToolOutputBytes:       cfg.EffectiveMaxToolOutputBytes(),
+	}
+}
+
+func effectiveChildToolAccess(parent, override ToolAccessLevel) ToolAccessLevel {
+	access := NormalizeToolAccessLevel(parent)
+	if override == "" {
+		return access
+	}
+	override = NormalizeToolAccessLevel(override)
+	if access == ToolAccessLevelReadOnly && override != ToolAccessLevelReadOnly {
+		return ToolAccessLevelReadOnly
+	}
+	return override
+}
+
 // taskRunSnapshot captures the registry configuration a task needs at spawn
 // time. Tasks run against this immutable snapshot so concurrent Configure /
 // SetAllowedAgents calls (hosts reconfigure per user turn) cannot race with
@@ -812,6 +908,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	// returns, but the async task must keep running across turns.
 	taskCtx, cancel := context.WithCancel(context.Background())
 
+	r.checkpointMu.Lock()
 	r.mu.Lock()
 	agent, ok := r.agents[agentName]
 	if !ok {
@@ -820,12 +917,14 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 			available = append(available, name)
 		}
 		r.mu.Unlock()
+		r.checkpointMu.Unlock()
 		cancel()
 		return "", fmt.Errorf("unknown agent %q; available: %v", agentName, available)
 	}
 	for _, depID := range dependsOn {
 		if _, ok := r.tasks[depID]; !ok {
 			r.mu.Unlock()
+			r.checkpointMu.Unlock()
 			cancel()
 			return "", fmt.Errorf("dependency task %q not found", depID)
 		}
@@ -854,16 +953,16 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		workDir:                 r.workDir,
 		toolOutputDir:           r.toolOutputDir,
 		toolAccessLevel:         r.toolAccessLevel,
-		toolPolicy:              r.toolPolicy,
+		toolPolicy:              cloneToolPolicy(r.toolPolicy),
 		compactionConfig:        r.compactionConfig,
 		compactionModelResolver: r.compactionModelResolver,
 		maxTurns:                r.maxTurns,
 		sem:                     r.sem,
 	}
 	if nestedCfg, ok := NestedRunConfigFromContext(ctx); ok {
-		snap.toolInputGuardrails = nestedCfg.ToolInputGuardrails
-		snap.toolOutputGuardrails = nestedCfg.ToolOutputGuardrails
-		snap.untrustedToolOutputs = nestedCfg.UntrustedToolOutputs
+		snap.toolInputGuardrails = append([]ToolInputGuardrail(nil), nestedCfg.ToolInputGuardrails...)
+		snap.toolOutputGuardrails = append([]ToolOutputGuardrail(nil), nestedCfg.ToolOutputGuardrails...)
+		snap.untrustedToolOutputs = cloneBool(nestedCfg.UntrustedToolOutputs)
 		snap.maxToolOutputBytes = nestedCfg.MaxToolOutputBytes
 		snap.toolOutputDir = nestedCfg.ToolOutputDir
 		snap.handoffHistory = nestedCfg.HandoffHistory
@@ -881,11 +980,13 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 			snap.toolAccessLevel = ToolAccessLevelReadOnly
 		}
 	}
+	childToolAccess := effectiveChildToolAccess(snap.toolAccessLevel, opts.ToolAccessOverride)
+	entry.securityBaseline = securityBaseline(childToolAccess, snap.toolPolicy, snap.toolInputGuardrails, snap.toolOutputGuardrails, snap.untrustedToolOutputs, snap.maxToolOutputBytes)
 	r.tasks[taskID] = entry
 	r.order = append(r.order, taskID)
 	taskSnapshot := entry.task
 	r.mu.Unlock()
-	if err := r.persistSchedulerCheckpoint(); err != nil {
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
 		r.mu.Lock()
 		delete(r.tasks, taskID)
 		for i, id := range r.order {
@@ -895,9 +996,11 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 			}
 		}
 		r.mu.Unlock()
+		r.checkpointMu.Unlock()
 		cancel()
 		return "", fmt.Errorf("persist child-run checkpoint: %w", err)
 	}
+	r.checkpointMu.Unlock()
 	r.emitTaskStatus(taskSnapshot, "spawned", parentCallID)
 
 	go r.runTask(
@@ -906,8 +1009,9 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		parentCallID,
 		agent,
 		message,
-		opts.ToolAccessOverride,
+		childToolAccess,
 		snap,
+		nil,
 		TraceFromContext(ctx),
 		TracingProcessorFromContext(ctx),
 		SpanParentIDFromContext(ctx),
@@ -919,7 +1023,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 // runTask executes the sub-agent in a goroutine with semaphore gating.
 // All registry-level configuration is read from the spawn-time snapshot so the
 // task never races with concurrent registry reconfiguration.
-func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, toolAccessOverride ToolAccessLevel, snap taskRunSnapshot, trace *Trace, processor TracingProcessor, parentSpanID string) {
+func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, childToolAccess ToolAccessLevel, snap taskRunSnapshot, resume *DurableCheckpoint, trace *Trace, processor TracingProcessor, parentSpanID string) {
 	// A panic anywhere in the sub-agent run must fail this task, not crash the
 	// host process: runTask executes as a bare goroutine, so an unrecovered
 	// panic here is fatal to the whole program (mirrors RunStreamed's guard).
@@ -993,20 +1097,7 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	}
 	r.mu.Unlock()
 
-	// Sub-agents inherit the parent's tool access level by default.
-	// A per-spawn override (e.g., "read-only" for explore agents) takes priority.
-	// H4: clamp the child to ≤ parent. Hosts can downgrade (full → read-only)
-	// but never upgrade (read-only → full); attempted upgrades are downgraded
-	// with a warning instead of rejected so flows keep working.
-	childToolAccess := NormalizeToolAccessLevel(snap.toolAccessLevel)
-	if toolAccessOverride != "" {
-		toolAccessOverride = NormalizeToolAccessLevel(toolAccessOverride)
-		if childToolAccess == ToolAccessLevelReadOnly && toolAccessOverride != ToolAccessLevelReadOnly {
-			log.Printf("[subagent_registry] clamping child %q tool_access from %q to parent's %q (cannot escalate above parent)", taskID, toolAccessOverride, childToolAccess)
-		} else {
-			childToolAccess = toolAccessOverride
-		}
-	}
+	durable := r.childDurableRunConfig(taskID, resume)
 
 	runSubAgentOnce(ctx, subAgentRunSpec{
 		Runner:        snap.runner,
@@ -1057,11 +1148,12 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			CompactionModelResolver:   snap.compactionModelResolver,
 			CompactionRecorder:        snap.compactionRecorder,
 			CompactionFailureReporter: snap.compactionFailureReporter,
+			Durable:                   durable,
 			Trace:                     trace,
 			ParentSpanID:              parentSpanID,
 			TracingProcessor:          processor,
 			ImmediateInputPoller: func(context.Context) ([]RunItem, error) {
-				return r.drainQueuedMessages(taskID), nil
+				return r.drainQueuedMessages(taskID)
 			},
 			ImmediateInputSignal: messageSignal,
 			ImmediateInputFinalizer: func(context.Context) ([]RunItem, error) {
@@ -1069,6 +1161,83 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			},
 		},
 	})
+}
+
+func cloneDurableCheckpoint(checkpoint *DurableCheckpoint) *DurableCheckpoint {
+	if checkpoint == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return nil
+	}
+	var clone DurableCheckpoint
+	if json.Unmarshal(encoded, &clone) != nil {
+		return nil
+	}
+	return &clone
+}
+
+func restoreSteeringMessages(snapshots []LLMRunItemSnapshot) ([]RunItem, error) {
+	items, err := RestoreRunItems(snapshots, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if item.Type != RunItemMessage || item.Message == nil {
+			return nil, fmt.Errorf("steering contains a non-message item")
+		}
+	}
+	return items, nil
+}
+
+func (r *SubAgentRegistry) childDurableRunConfig(taskID string, resume *DurableCheckpoint) *DurableRunConfig {
+	r.mu.Lock()
+	checkpoint := r.checkpoint
+	r.mu.Unlock()
+	if checkpoint == nil {
+		return nil
+	}
+	return &DurableRunConfig{
+		RunID:  taskID,
+		Resume: cloneDurableCheckpoint(resume),
+		Checkpoint: func(_ context.Context, child DurableCheckpoint) error {
+			return r.persistChildCheckpoint(taskID, child)
+		},
+	}
+}
+
+func (r *SubAgentRegistry) persistChildCheckpoint(taskID string, child DurableCheckpoint) error {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+
+	r.mu.Lock()
+	entry, ok := r.tasks[taskID]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q not found", taskID)
+	}
+	if r.checkpointErr != nil {
+		err := r.checkpointErr
+		r.mu.Unlock()
+		return err
+	}
+	previousCheckpoint := cloneDurableCheckpoint(entry.durableCheckpoint)
+	previousInFlight := append([]RunItem(nil), entry.inFlightMessages...)
+	entry.durableCheckpoint = cloneDurableCheckpoint(&child)
+	entry.inFlightMessages = nil
+	r.mu.Unlock()
+
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		r.mu.Lock()
+		if current, exists := r.tasks[taskID]; exists {
+			current.durableCheckpoint = previousCheckpoint
+			current.inFlightMessages = previousInFlight
+		}
+		r.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (r *SubAgentRegistry) setStatus(taskID string, status SubAgentTaskStatus, result, errMsg string) {
@@ -1152,9 +1321,14 @@ func cloneSubAgentTask(task SubAgentTask) SubAgentTask {
 
 // SchedulerCheckpoint returns a durable snapshot of every scheduler task in spawn order.
 func (r *SubAgentRegistry) SchedulerCheckpoint() SubAgentSchedulerCheckpoint {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.schedulerCheckpointLocked()
+}
 
+func (r *SubAgentRegistry) schedulerCheckpointLocked() SubAgentSchedulerCheckpoint {
 	checkpoint := SubAgentSchedulerCheckpoint{
 		Records: make([]SubAgentSchedulerCheckpointRecord, 0, len(r.order)),
 	}
@@ -1167,6 +1341,10 @@ func (r *SubAgentRegistry) SchedulerCheckpoint() SubAgentSchedulerCheckpoint {
 			Task:                     cloneSubAgentTask(subAgentTaskSnapshot(entry)),
 			ResultDelivered:          entry.resultDelivered,
 			IncludeDependencyResults: entry.includeDependencyResults,
+			DurableCheckpoint:        cloneDurableCheckpoint(entry.durableCheckpoint),
+			SecurityBaseline:         cloneSubAgentSecurityBaseline(entry.securityBaseline),
+			QueuedMessages:           SnapshotRunItems(entry.queuedMessages),
+			InFlightMessages:         SnapshotRunItems(entry.inFlightMessages),
 		})
 	}
 	return checkpoint
@@ -1195,10 +1373,23 @@ func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedul
 		default:
 			return fmt.Errorf("scheduler checkpoint task %q has unknown status %q", task.ID, task.Status)
 		}
+		queued, err := restoreSteeringMessages(record.QueuedMessages)
+		if err != nil {
+			return fmt.Errorf("restore queued steering for task %q: %w", task.ID, err)
+		}
+		inFlight, err := restoreSteeringMessages(record.InFlightMessages)
+		if err != nil {
+			return fmt.Errorf("restore in-flight steering for task %q: %w", task.ID, err)
+		}
 		restored[task.ID] = &subAgentTaskEntry{
 			task:                     task,
+			activity:                 NewSubAgentActivity(),
 			includeDependencyResults: record.IncludeDependencyResults,
+			durableCheckpoint:        cloneDurableCheckpoint(record.DurableCheckpoint),
+			securityBaseline:         cloneSubAgentSecurityBaseline(record.SecurityBaseline),
+			queuedMessages:           append(inFlight, queued...),
 			messageSignal:            make(chan struct{}, 1),
+			acceptingMessages:        !task.IsTerminal(),
 			resultDelivered:          record.ResultDelivered,
 		}
 		order = append(order, task.ID)
@@ -1213,6 +1404,188 @@ func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedul
 	r.order = order
 	r.mu.Unlock()
 	r.signalChange()
+	return nil
+}
+
+func securityBaselineAllowsResume(saved, current *SubAgentSecurityBaseline) error {
+	if saved == nil {
+		return fmt.Errorf("missing security baseline")
+	}
+	if saved.ToolAccessLevel == "" {
+		return fmt.Errorf("missing tool-access baseline")
+	}
+	if saved.ToolAccessLevel == ToolAccessLevelReadOnly && current.ToolAccessLevel != ToolAccessLevelReadOnly {
+		return fmt.Errorf("tool access would be weaker than durable baseline")
+	}
+	if saved.ToolPolicy != nil && current.ToolPolicy == nil {
+		return fmt.Errorf("tool policy is missing from resumed task")
+	}
+	if saved.ToolPolicy != nil {
+		if saved.ToolPolicy.ApprovalRequired && !current.ToolPolicy.ApprovalRequired {
+			return fmt.Errorf("tool approval policy would be weaker than durable baseline")
+		}
+		if saved.ToolPolicy.DefaultTimeout > 0 && (current.ToolPolicy.DefaultTimeout <= 0 || current.ToolPolicy.DefaultTimeout > saved.ToolPolicy.DefaultTimeout) {
+			return fmt.Errorf("tool timeout policy would be weaker than durable baseline")
+		}
+	}
+	if len(current.ToolInputGuardrailNames) < len(saved.ToolInputGuardrailNames) || !sameStringSlice(current.ToolInputGuardrailNames[:len(saved.ToolInputGuardrailNames)], saved.ToolInputGuardrailNames) {
+		return fmt.Errorf("tool input guardrails are missing or changed from durable baseline")
+	}
+	if len(current.ToolOutputGuardrailNames) < len(saved.ToolOutputGuardrailNames) || !sameStringSlice(current.ToolOutputGuardrailNames[:len(saved.ToolOutputGuardrailNames)], saved.ToolOutputGuardrailNames) {
+		return fmt.Errorf("tool output guardrails are missing or changed from durable baseline")
+	}
+	if saved.UntrustedToolOutputs && !current.UntrustedToolOutputs {
+		return fmt.Errorf("untrusted tool-output protection would be weaker than durable baseline")
+	}
+	if saved.MaxToolOutputBytes > 0 && (current.MaxToolOutputBytes <= 0 || current.MaxToolOutputBytes > saved.MaxToolOutputBytes) {
+		return fmt.Errorf("tool-output cap would be weaker than durable baseline")
+	}
+	return nil
+}
+
+// ResumeRestoredTask resumes a reconciling durable child using its original ID.
+func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string) error {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+
+	r.mu.Lock()
+	if r.checkpoint == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q cannot resume without a scheduler checkpoint hook", taskID)
+	}
+	entry, ok := r.tasks[taskID]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q not found", taskID)
+	}
+	if entry.task.Status != SubAgentTaskReconciling {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q is %q, not reconciling", taskID, entry.task.Status)
+	}
+	resume := cloneDurableCheckpoint(entry.durableCheckpoint)
+	if resume == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q has no durable child checkpoint", taskID)
+	}
+	if resume.SchemaVersion != DurableCheckpointSchemaVersion {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q has unsupported durable checkpoint schema %d", taskID, resume.SchemaVersion)
+	}
+	switch resume.Boundary {
+	case DurableBoundaryRunStarted, DurableBoundaryModelPrepared, DurableBoundaryToolCompleted, DurableBoundaryHandoffCompleted, DurableBoundaryRunCompleted:
+	case DurableBoundaryModelCompleted, DurableBoundaryToolPrepared, DurableBoundaryApprovalPending, DurableBoundaryPaused:
+		r.mu.Unlock()
+		return fmt.Errorf("task %q checkpoint at %s requires explicit reconciliation", taskID, resume.Boundary)
+	default:
+		r.mu.Unlock()
+		return fmt.Errorf("task %q checkpoint at %s cannot be resumed", taskID, resume.Boundary)
+	}
+
+	snap := taskRunSnapshot{
+		runner:                  r.runner,
+		tracker:                 r.tracker,
+		eventStream:             r.eventStream,
+		workDir:                 r.workDir,
+		toolOutputDir:           r.toolOutputDir,
+		toolAccessLevel:         r.toolAccessLevel,
+		toolPolicy:              cloneToolPolicy(r.toolPolicy),
+		compactionConfig:        r.compactionConfig,
+		compactionModelResolver: r.compactionModelResolver,
+		maxTurns:                r.maxTurns,
+		sem:                     r.sem,
+	}
+	if nestedCfg, nested := NestedRunConfigFromContext(ctx); nested {
+		snap.toolInputGuardrails = append([]ToolInputGuardrail(nil), nestedCfg.ToolInputGuardrails...)
+		snap.toolOutputGuardrails = append([]ToolOutputGuardrail(nil), nestedCfg.ToolOutputGuardrails...)
+		snap.untrustedToolOutputs = cloneBool(nestedCfg.UntrustedToolOutputs)
+		snap.maxToolOutputBytes = nestedCfg.MaxToolOutputBytes
+		snap.toolOutputDir = nestedCfg.ToolOutputDir
+		snap.handoffHistory = nestedCfg.HandoffHistory
+		snap.compactionRecorder = nestedCfg.CompactionRecorder
+		snap.compactionFailureReporter = nestedCfg.CompactionFailureReporter
+		snap.retryPolicy = nestedCfg.RetryPolicy
+		snap.modelCallTimeout = nestedCfg.ModelCallTimeout
+		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
+			snap.toolAccessLevel = ToolAccessLevelReadOnly
+		}
+	}
+	childAccess := NormalizeToolAccessLevel(snap.toolAccessLevel)
+	if entry.securityBaseline != nil && entry.securityBaseline.ToolAccessLevel == ToolAccessLevelReadOnly {
+		childAccess = ToolAccessLevelReadOnly
+	}
+	currentSecurity := securityBaseline(childAccess, snap.toolPolicy, snap.toolInputGuardrails, snap.toolOutputGuardrails, snap.untrustedToolOutputs, snap.maxToolOutputBytes)
+	if err := securityBaselineAllowsResume(entry.securityBaseline, currentSecurity); err != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("resume task %q: %w", taskID, err)
+	}
+
+	var finalOutput string
+	if resume.Boundary == DurableBoundaryRunCompleted {
+		history, err := RestoreRunItems(resume.History, nil)
+		if err != nil {
+			r.mu.Unlock()
+			return fmt.Errorf("restore completed task %q: %w", taskID, err)
+		}
+		finalOutput = Items.ExtractLastText(history)
+	} else if snap.runner == nil {
+		r.mu.Unlock()
+		return fmt.Errorf("task %q cannot resume without a runner", taskID)
+	}
+
+	previousTask := cloneSubAgentTask(entry.task)
+	previousBaseline := cloneSubAgentSecurityBaseline(entry.securityBaseline)
+	previousCancel := entry.cancel
+	previousActivity := entry.activity
+	previousAccepting := entry.acceptingMessages
+	var agent *Agent
+	if resume.Boundary != DurableBoundaryRunCompleted {
+		agent = r.agents[entry.task.AgentName]
+		if agent == nil {
+			r.mu.Unlock()
+			return fmt.Errorf("task %q agent %q is not configured", taskID, entry.task.AgentName)
+		}
+	}
+	entry.securityBaseline = currentSecurity
+	entry.task.Error = ""
+	entry.task.WaitingOn = nil
+	if resume.Boundary == DurableBoundaryRunCompleted {
+		entry.task.Status = SubAgentTaskCompleted
+		entry.task.Result = finalOutput
+		entry.acceptingMessages = false
+	} else {
+		entry.task.Status = SubAgentTaskPending
+		entry.activity = NewSubAgentActivity()
+		entry.acceptingMessages = true
+		entry.cancel = nil
+	}
+	taskSnapshot := cloneSubAgentTask(entry.task)
+	r.mu.Unlock()
+
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		r.mu.Lock()
+		if current, exists := r.tasks[taskID]; exists {
+			current.task = previousTask
+			current.securityBaseline = previousBaseline
+			current.cancel = previousCancel
+			current.activity = previousActivity
+			current.acceptingMessages = previousAccepting
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("persist resumed child checkpoint: %w", err)
+	}
+
+	if resume.Boundary == DurableBoundaryRunCompleted {
+		r.signalChangeWithoutCheckpoint()
+		return nil
+	}
+	taskCtx, cancel := context.WithCancel(context.Background())
+	r.mu.Lock()
+	if current, exists := r.tasks[taskID]; exists {
+		current.cancel = cancel
+	}
+	r.mu.Unlock()
+	go r.runTask(taskCtx, taskID, ParentCallIDFromContext(ctx), agent, taskSnapshot.Message, childAccess, snap, resume, TraceFromContext(ctx), TracingProcessorFromContext(ctx), SpanParentIDFromContext(ctx))
+	r.signalChangeWithoutCheckpoint()
 	return nil
 }
 
@@ -1274,17 +1647,21 @@ func (r *SubAgentRegistry) ListTasks() []*SubAgentTask {
 func (r *SubAgentRegistry) GetActivity(taskID string, includeRecent bool) (*SubAgentActivitySnapshot, error) {
 	r.mu.Lock()
 	entry, ok := r.tasks[taskID]
+	var activity *SubAgentActivity
+	if ok {
+		activity = entry.activity
+	}
 	r.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("task %q not found", taskID)
 	}
-	if entry.activity == nil {
+	if activity == nil {
 		return &SubAgentActivitySnapshot{
 			FilesRead:    []string{},
 			FilesWritten: []string{},
 		}, nil
 	}
-	snap := entry.activity.Snapshot(includeRecent)
+	snap := activity.Snapshot(includeRecent)
 	return &snap, nil
 }
 
@@ -1297,6 +1674,8 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 		return fmt.Errorf("message is required")
 	}
 
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
 	r.mu.Lock()
 	entry, ok := r.tasks[taskID]
 	if !ok {
@@ -1311,66 +1690,88 @@ func (r *SubAgentRegistry) SendMessage(taskID, message string) error {
 		}
 		return fmt.Errorf("task %q is already %s", taskID, status)
 	}
+	queuedLen := len(entry.queuedMessages)
+	messagesReceived := entry.task.MessagesReceived
+	lastParentMessage := entry.task.LastParentMessage
 	entry.queuedMessages = append(entry.queuedMessages, RunItem{
 		Type:    RunItemMessage,
 		Message: &MessageOutput{Text: "[PARENT MESSAGE]\n" + message},
 	})
 	entry.task.MessagesReceived++
 	entry.task.LastParentMessage = Truncate(message, 160)
-	// Publish the queue entry and wake-up under the same lock so the runner
-	// cannot drain the message between those operations and inherit a stale
-	// signal on its replacement request.
 	select {
 	case entry.messageSignal <- struct{}{}:
 	default:
 	}
 	r.mu.Unlock()
 
-	r.signalChange()
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		r.mu.Lock()
+		if current, exists := r.tasks[taskID]; exists {
+			current.queuedMessages = current.queuedMessages[:queuedLen]
+			current.task.MessagesReceived = messagesReceived
+			current.task.LastParentMessage = lastParentMessage
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("persist steering message: %w", err)
+	}
+	r.signalChangeWithoutCheckpoint()
 	return nil
 }
 
-func (r *SubAgentRegistry) drainQueuedMessages(taskID string) []RunItem {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry, ok := r.tasks[taskID]
-	if !ok {
-		return nil
-	}
-	return drainTaskMessages(entry)
+func (r *SubAgentRegistry) drainQueuedMessages(taskID string) ([]RunItem, error) {
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+	return r.drainQueuedMessagesLocked(taskID, false)
 }
 
-func drainTaskMessages(entry *subAgentTaskEntry) []RunItem {
+func (r *SubAgentRegistry) drainQueuedMessagesLocked(taskID string, finalize bool) ([]RunItem, error) {
+	r.mu.Lock()
+	entry, ok := r.tasks[taskID]
+	if !ok {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("task %q not found", taskID)
+	}
 	if len(entry.queuedMessages) == 0 {
-		return nil
+		if finalize {
+			entry.acceptingMessages = false
+		}
+		select {
+		case <-entry.messageSignal:
+		default:
+		}
+		r.mu.Unlock()
+		return nil, nil
 	}
 	items := append([]RunItem(nil), entry.queuedMessages...)
+	previousInFlight := append([]RunItem(nil), entry.inFlightMessages...)
+	entry.inFlightMessages = append(entry.inFlightMessages, entry.queuedMessages...)
 	entry.queuedMessages = nil
-	// If no model call was active (for example while a tool was running), the
-	// coalesced wake-up is still buffered. The poll itself has now observed the
-	// message, so discard that stale signal before the next request starts.
 	select {
 	case <-entry.messageSignal:
 	default:
 	}
-	return items
+	r.mu.Unlock()
+
+	if err := r.persistSchedulerCheckpointLocked(); err != nil {
+		r.mu.Lock()
+		if current, exists := r.tasks[taskID]; exists {
+			current.queuedMessages = append(items, current.queuedMessages...)
+			current.inFlightMessages = previousInFlight
+		}
+		r.mu.Unlock()
+		return nil, err
+	}
+	return items, nil
 }
 
 // finalizeOrDrainQueuedMessages closes the race between accepting steering and
 // returning a final result. Pending messages win and force another turn;
 // otherwise admission closes atomically so later SendMessage calls fail.
 func (r *SubAgentRegistry) finalizeOrDrainQueuedMessages(taskID string) ([]RunItem, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry, ok := r.tasks[taskID]
-	if !ok {
-		return nil, fmt.Errorf("task %q not found", taskID)
-	}
-	if items := drainTaskMessages(entry); len(items) > 0 {
-		return items, nil
-	}
-	entry.acceptingMessages = false
-	return nil, nil
+	r.checkpointMu.Lock()
+	defer r.checkpointMu.Unlock()
+	return r.drainQueuedMessagesLocked(taskID, true)
 }
 
 // WaitForAny blocks until any task changes state or the timeout expires.
