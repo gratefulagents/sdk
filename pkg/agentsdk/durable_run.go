@@ -27,13 +27,17 @@ type StoredRunOptions struct {
 // StoredRun binds Runner checkpoints to a RunStore lease and CAS revision.
 // Close releases ownership; callers should always defer it.
 type StoredRun struct {
-	mu       sync.Mutex
-	store    durable.RunStore
-	snapshot durable.RunSnapshot
-	lease    durable.Lease
-	leaseTTL time.Duration
-	resume   *DurableCheckpoint
-	base     durable.BudgetCounters
+	mu        sync.Mutex
+	store     durable.RunStore
+	snapshot  durable.RunSnapshot
+	lease     durable.Lease
+	leaseTTL  time.Duration
+	resume    *DurableCheckpoint
+	base      durable.BudgetCounters
+	leaseErr  error
+	stopLease chan struct{}
+	leaseDone chan struct{}
+	closeOnce sync.Once
 }
 
 // OpenStoredRun creates or resumes a run and acquires its fencing lease. A
@@ -71,7 +75,10 @@ func OpenStoredRun(ctx context.Context, store durable.RunStore, opts StoredRunOp
 	if err != nil {
 		return nil, fmt.Errorf("agentsdk: acquire durable run: %w", err)
 	}
-	s := &StoredRun{store: store, snapshot: snapshot, lease: lease, leaseTTL: opts.LeaseTTL, base: snapshot.CumulativeBudget}
+	s := &StoredRun{
+		store: store, snapshot: snapshot, lease: lease, leaseTTL: opts.LeaseTTL,
+		base: snapshot.CumulativeBudget, stopLease: make(chan struct{}), leaseDone: make(chan struct{}),
+	}
 	if len(snapshot.State) != 0 {
 		var cp DurableCheckpoint
 		if err := json.Unmarshal(snapshot.State, &cp); err != nil {
@@ -80,7 +87,39 @@ func OpenStoredRun(ctx context.Context, store durable.RunStore, opts StoredRunOp
 		}
 		s.resume = &cp
 	}
+	go s.renewLeaseLoop()
 	return s, nil
+}
+
+func (s *StoredRun) renewLeaseLoop() {
+	defer close(s.leaseDone)
+	interval := s.leaseTTL / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopLease:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			s.mu.Lock()
+			if s.lease.Token == "" {
+				s.mu.Unlock()
+				cancel()
+				return
+			}
+			renewed, err := s.store.RenewLease(ctx, s.lease, s.leaseTTL)
+			if err == nil {
+				s.lease = renewed
+			}
+			s.leaseErr = err
+			s.mu.Unlock()
+			cancel()
+		}
+	}
 }
 
 // ID returns the stable durable run ID.
@@ -106,6 +145,9 @@ func (s *StoredRun) RunConfig() *DurableRunConfig {
 func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if errors.Is(s.leaseErr, durable.ErrLeaseLost) {
+		return fmt.Errorf("renew ownership: %w", s.leaseErr)
+	}
 	renewed, err := s.store.RenewLease(ctx, s.lease, s.leaseTTL)
 	if err != nil {
 		return fmt.Errorf("renew ownership: %w", err)
@@ -154,6 +196,8 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 // Close releases this worker's fenced ownership. The persisted continuation is
 // unaffected and can immediately be acquired by another process.
 func (s *StoredRun) Close(ctx context.Context) error {
+	s.closeOnce.Do(func() { close(s.stopLease) })
+	<-s.leaseDone
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lease.Token == "" {

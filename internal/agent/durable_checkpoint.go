@@ -101,7 +101,14 @@ func emitDurableCheckpoint(ctx context.Context, cfg *DurableRunConfig, sequence 
 		children := cfg.Children()
 		cp.Children = &children
 	}
-	return cfg.Checkpoint(ctx, cp)
+	if err := cfg.Checkpoint(ctx, cp); err != nil {
+		return err
+	}
+	// Keep the caller's live config synchronized with the checkpoint just
+	// committed. Approval resolution commonly reuses the same config in
+	// ExecuteApprovedTool before a new StoredRun.RunConfig can be fetched.
+	cfg.Resume = &cp
+	return nil
 }
 
 // RestoreRunItems converts persisted, provider-neutral checkpoint history back

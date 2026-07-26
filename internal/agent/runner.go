@@ -425,6 +425,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			} else if resume.AgentName != "" {
 				return nil, fmt.Errorf("restore durable checkpoint: agent %q is not registered", resume.AgentName)
 			}
+			if resume.Boundary == DurableBoundaryRunCompleted {
+				return &RunResult{
+					FinalOutput:  Items.ExtractLastText(restored),
+					LastAgent:    currentAgent,
+					Usage:        resume.Usage,
+					FinalHistory: append([]RunItem(nil), restored...),
+				}, nil
+			}
 			// A model-completed or approval-pending snapshot can contain an
 			// unresolved external effect. It is inspectable and reconcilable, but
 			// must never be blindly replayed as a fresh model request.
@@ -1601,6 +1609,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					if err != nil {
 						return nil, err
 					}
+				}
+				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
+					return nil, fmt.Errorf("persist tool-result completion checkpoint: %w", err)
 				}
 				return &RunResult{
 					FinalOutput:                finalOutput,
