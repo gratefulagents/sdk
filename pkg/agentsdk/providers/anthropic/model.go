@@ -164,6 +164,15 @@ func NewAnthropicModelWithClient(client *internalanthropic.Client) *AnthropicMod
 
 func (m *AnthropicModel) Provider() string { return "anthropic" }
 
+// UsageInputIncludesCacheTokens reports Anthropic wire usage semantics:
+// usage.input_tokens counts only the uncached prompt, with
+// cache_read_input_tokens and cache_creation_input_tokens reported as
+// separate, additive fields. Without this the runner cannot tell whether the
+// cached prompt is already included, and hosts that sum usage (context
+// gauges, generation-token analytics) silently drop the cached prompt — which
+// on a warm run is nearly the entire input.
+func (m *AnthropicModel) UsageInputIncludesCacheTokens() bool { return false }
+
 func (m *AnthropicModel) GetResponse(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.ModelResponse, error) {
 	if m == nil || m.client == nil {
 		return nil, errors.New("anthropic model is not configured")
