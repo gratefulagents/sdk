@@ -414,6 +414,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if resume.SchemaVersion != DurableCheckpointSchemaVersion {
 				return nil, fmt.Errorf("unsupported durable checkpoint schema %d", resume.SchemaVersion)
 			}
+			runCtx.Usage = resume.Usage
 			restored, restoreErr := RestoreRunItems(resume.History, func(name string) *Agent { return findRunAgent(agent, name) })
 			if restoreErr != nil {
 				return nil, fmt.Errorf("restore durable checkpoint: %w", restoreErr)

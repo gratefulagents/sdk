@@ -208,7 +208,7 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 	if outcome.FinalText == "" {
 		outcome.FinalText = "(no output)"
 	}
-	for _, item := range result.NewItems {
+	for _, item := range result.FinalHistory {
 		if item.Type == RunItemToolCall && item.ToolCall != nil {
 			outcome.ToolCount++
 		}
