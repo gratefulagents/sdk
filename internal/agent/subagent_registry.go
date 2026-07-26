@@ -537,6 +537,16 @@ func (r *SubAgentRegistry) persistSchedulerCheckpointLocked() error {
 	return err
 }
 
+// FlushCheckpoint waits for any in-flight scheduler persistence and durably
+// writes the latest committed state. Hosts call it before committing a parent
+// result so a late child transition cannot escape the durability boundary.
+func (r *SubAgentRegistry) FlushCheckpoint() error {
+	if r == nil {
+		return nil
+	}
+	return r.persistSchedulerCheckpoint()
+}
+
 // CheckpointError returns the latest child scheduler persistence failure.
 // Hosts must pause/reconcile the run when non-nil.
 func (r *SubAgentRegistry) CheckpointError() error {
