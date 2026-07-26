@@ -1512,22 +1512,20 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		return fmt.Errorf("task %q is %q, not reconciling", taskID, entry.task.Status)
 	}
 	resume := cloneDurableCheckpoint(entry.durableCheckpoint)
-	if resume == nil {
-		r.mu.Unlock()
-		return fmt.Errorf("task %q has no durable child checkpoint", taskID)
-	}
-	if resume.SchemaVersion != DurableCheckpointSchemaVersion {
-		r.mu.Unlock()
-		return fmt.Errorf("task %q has unsupported durable checkpoint schema %d", taskID, resume.SchemaVersion)
-	}
-	switch resume.Boundary {
-	case DurableBoundaryRunStarted, DurableBoundaryModelPrepared, DurableBoundaryToolCompleted, DurableBoundaryHandoffCompleted, DurableBoundaryRunCompleted:
-	case DurableBoundaryModelCompleted, DurableBoundaryToolPrepared, DurableBoundaryApprovalPending, DurableBoundaryPaused:
-		r.mu.Unlock()
-		return fmt.Errorf("task %q checkpoint at %s requires explicit reconciliation", taskID, resume.Boundary)
-	default:
-		r.mu.Unlock()
-		return fmt.Errorf("task %q checkpoint at %s cannot be resumed", taskID, resume.Boundary)
+	if resume != nil {
+		if resume.SchemaVersion != DurableCheckpointSchemaVersion {
+			r.mu.Unlock()
+			return fmt.Errorf("task %q has unsupported durable checkpoint schema %d", taskID, resume.SchemaVersion)
+		}
+		switch resume.Boundary {
+		case DurableBoundaryRunStarted, DurableBoundaryModelPrepared, DurableBoundaryToolCompleted, DurableBoundaryHandoffCompleted, DurableBoundaryRunCompleted:
+		case DurableBoundaryModelCompleted, DurableBoundaryToolPrepared, DurableBoundaryApprovalPending, DurableBoundaryPaused:
+			r.mu.Unlock()
+			return fmt.Errorf("task %q checkpoint at %s requires explicit reconciliation", taskID, resume.Boundary)
+		default:
+			r.mu.Unlock()
+			return fmt.Errorf("task %q checkpoint at %s cannot be resumed", taskID, resume.Boundary)
+		}
 	}
 
 	snap := taskRunSnapshot{
@@ -1568,8 +1566,9 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		return fmt.Errorf("resume task %q: %w", taskID, err)
 	}
 
+	completedResume := resume != nil && resume.Boundary == DurableBoundaryRunCompleted
 	var finalOutput string
-	if resume.Boundary == DurableBoundaryRunCompleted {
+	if completedResume {
 		history, err := RestoreRunItems(resume.History, nil)
 		if err != nil {
 			r.mu.Unlock()
@@ -1589,7 +1588,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	var agent *Agent
 	var taskCtx context.Context
 	var cancel context.CancelFunc
-	if resume.Boundary != DurableBoundaryRunCompleted {
+	if !completedResume {
 		agent = r.agents[entry.task.AgentName]
 		if agent == nil {
 			r.mu.Unlock()
@@ -1600,7 +1599,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	entry.securityBaseline = currentSecurity
 	entry.task.Error = ""
 	entry.task.WaitingOn = nil
-	if resume.Boundary == DurableBoundaryRunCompleted {
+	if completedResume {
 		entry.task.Status = SubAgentTaskCompleted
 		entry.task.Result = finalOutput
 		entry.acceptingMessages = false
@@ -1632,7 +1631,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		return fmt.Errorf("persist resumed child checkpoint: %w", err)
 	}
 
-	if resume.Boundary == DurableBoundaryRunCompleted {
+	if completedResume {
 		r.signalChangeWithoutCheckpoint()
 		return nil
 	}
