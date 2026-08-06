@@ -279,6 +279,66 @@ func TestApplyPatchOpenAIEnvelopeGrammarVariants(t *testing.T) {
 	assertFileContent(t, filepath.Join(workDir, "crlf.txt"), "new\r\n")
 }
 
+func TestApplyPatchOpenAIEnvelopePreservesSourceLineEndings(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	for _, test := range []struct {
+		name    string
+		content string
+		patch   string
+		want    string
+	}{
+		{
+			name:    "lf-envelope-crlf-source",
+			content: "old\r\n",
+			patch:   "*** Begin Patch\n*** Update File: lf-envelope-crlf-source.txt\n@@\n-old\n+new\n*** End Patch\n",
+			want:    "new\r\n",
+		},
+		{
+			name:    "crlf-envelope-lf-source",
+			content: "old\n",
+			patch:   "*** Begin Patch\r\n*** Update File: crlf-envelope-lf-source.txt\r\n@@\r\n-old\r\n+new\r\n*** End Patch\r\n",
+			want:    "new\n",
+		},
+		{
+			name:    "unterminated-final-line",
+			content: "first\nlast",
+			patch:   "*** Begin Patch\n*** Update File: unterminated-final-line.txt\n@@\n first\n-last\n+final\n*** End Patch\n",
+			want:    "first\nfinal",
+		},
+		{
+			name:    "multiline-replacement",
+			content: "before\r\nold\r\nafter\r\n",
+			patch:   "*** Begin Patch\n*** Update File: multiline-replacement.txt\n@@\n before\n-old\n+first\n+second\n after\n*** End Patch\n",
+			want:    "before\r\nfirst\r\nsecond\r\nafter\r\n",
+		},
+		{
+			name:    "insert-after-unterminated-final-line",
+			content: "last",
+			patch:   "*** Begin Patch\n*** Update File: insert-after-unterminated-final-line.txt\n@@\n last\n+after\n*** End Patch\n",
+			want:    "last\nafter",
+		},
+		{
+			name:    "delete-unterminated-final-line",
+			content: "first\nlast",
+			patch:   "*** Begin Patch\n*** Update File: delete-unterminated-final-line.txt\n@@\n first\n-last\n*** End Patch\n",
+			want:    "first\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := test.name + ".txt"
+			writePatchTestFile(t, workDir, file, test.content, 0o644)
+			result := executePatch(t, workDir, test.patch, false)
+			if result.IsError {
+				t.Fatalf("Execute() = %#v", result)
+			}
+			assertFileContent(t, filepath.Join(workDir, file), test.want)
+		})
+	}
+}
+
 func TestApplyPatchOpenAIEnvelopeRejectsSuffixAndOutOfOrderHunks(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("workspace mutation tools fail closed outside Linux")

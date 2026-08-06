@@ -463,7 +463,7 @@ func parseOpenAIPatch(patch string) ([]patchFile, error) {
 			}
 			current.hunks[len(current.hunks)-1].endOfFile = true
 		default:
-			if current != nil && kind == "update" && len(current.hunks) == 0 && len(line) > 0 && (line[0] == ' ' || line[0] == '+' || line[0] == '-') {
+			if current != nil && kind == "update" && len(current.hunks) == 0 && len(control) > 0 && (control[0] == ' ' || control[0] == '+' || control[0] == '-') {
 				hunk, next, err := parseRangeLessPatchHunk(lines, i-1, "")
 				if err != nil {
 					return nil, err
@@ -474,7 +474,7 @@ func parseOpenAIPatch(patch string) ([]patchFile, error) {
 				i = next - 1
 				continue
 			}
-			if current == nil || kind != "add" || len(line) == 0 || line[0] != '+' {
+			if current == nil || kind != "add" || len(control) == 0 || control[0] != '+' {
 				return nil, fmt.Errorf("unsupported OpenAI patch line %q", control)
 			}
 			if len(current.hunks) == 0 {
@@ -486,7 +486,7 @@ func parseOpenAIPatch(patch string) ([]patchFile, error) {
 			if len(hunk.lines) >= maxOpenAIHunkLines {
 				return nil, fmt.Errorf("OpenAI hunk has too many lines (limit %d)", maxOpenAIHunkLines)
 			}
-			hunk.lines = append(hunk.lines, patchLine{kind: '+', text: line[1:]})
+			hunk.lines = append(hunk.lines, patchLine{kind: '+', text: control[1:]})
 			hunk.newCount++
 		}
 	}
@@ -512,14 +512,14 @@ func parseRangeLessPatchHunk(lines []string, start int, locator string) (patchHu
 			}
 			return hunk, i, nil
 		}
-		if len(line) == 0 || (line[0] != ' ' && line[0] != '+' && line[0] != '-') {
+		if len(control) == 0 || (control[0] != ' ' && control[0] != '+' && control[0] != '-') {
 			return patchHunk{}, 0, fmt.Errorf("malformed range-less hunk body")
 		}
 		if len(hunk.lines) >= maxOpenAIHunkLines {
 			return patchHunk{}, 0, fmt.Errorf("OpenAI hunk has too many lines (limit %d)", maxOpenAIHunkLines)
 		}
-		hunk.lines = append(hunk.lines, patchLine{kind: line[0], text: line[1:]})
-		switch line[0] {
+		hunk.lines = append(hunk.lines, patchLine{kind: control[0], text: control[1:]})
+		switch control[0] {
 		case ' ':
 			hunk.oldCount++
 			hunk.newCount++
@@ -1124,6 +1124,7 @@ func applyPatchHunks(content string, hunks []patchHunk) (string, error) {
 }
 
 func applyRangeLessPatchHunks(content string, hunks []patchHunk) (string, error) {
+	lineEnding := rangeLessLineEnding(content)
 	edits := make([]rangeLessEdit, 0)
 	hunkCursor := 0
 	changedCursor := 0
@@ -1131,13 +1132,16 @@ func applyRangeLessPatchHunks(content string, hunks []patchHunk) (string, error)
 		if !hunk.rangeLess {
 			return "", fmt.Errorf("cannot mix range-less and unified hunks")
 		}
-		oldLines, _ := rangeLessHunkLines(hunk)
+		oldLines, newLines := rangeLessHunkLines(hunk)
 		if len(oldLines) == 0 {
 			if content != "" || len(hunks) != 1 {
 				return "", fmt.Errorf("range-less hunk has no context or removed lines")
 			}
-			_, newLines := rangeLessHunkLines(hunk)
-			edits = append(edits, rangeLessEdit{newLines: newLines})
+			rendered := make([]string, len(newLines))
+			for i, line := range newLines {
+				rendered[i] = line + lineEnding
+			}
+			edits = append(edits, rangeLessEdit{newLines: rendered})
 			continue
 		}
 
@@ -1157,7 +1161,7 @@ func applyRangeLessPatchHunks(content string, hunks []patchHunk) (string, error)
 		if match < 0 {
 			return "", fmt.Errorf("range-less hunk does not match file content")
 		}
-		for _, edit := range rangeLessHunkEdits(hunk, content, match) {
+		for _, edit := range rangeLessHunkEdits(hunk, content, match, lineEnding) {
 			if edit.start < changedCursor {
 				return "", fmt.Errorf("overlapping range-less hunks")
 			}
@@ -1196,24 +1200,20 @@ func rangeLessHunkLines(hunk patchHunk) ([]string, []string) {
 	oldLines := make([]string, 0, hunk.oldCount)
 	newLines := make([]string, 0, hunk.newCount)
 	for _, line := range hunk.lines {
-		text := line.text
-		if !line.noNewline {
-			text += "\n"
-		}
 		switch line.kind {
 		case ' ':
-			oldLines = append(oldLines, text)
-			newLines = append(newLines, text)
+			oldLines = append(oldLines, line.text)
+			newLines = append(newLines, line.text)
 		case '-':
-			oldLines = append(oldLines, text)
+			oldLines = append(oldLines, line.text)
 		case '+':
-			newLines = append(newLines, text)
+			newLines = append(newLines, line.text)
 		}
 	}
 	return oldLines, newLines
 }
 
-func rangeLessHunkEdits(hunk patchHunk, content string, start int) []rangeLessEdit {
+func rangeLessHunkEdits(hunk patchHunk, content string, start int, lineEnding string) []rangeLessEdit {
 	edits := make([]rangeLessEdit, 0)
 	position := start
 	for i := 0; i < len(hunk.lines); {
@@ -1225,17 +1225,20 @@ func rangeLessHunkEdits(hunk patchHunk, content string, start int) []rangeLessEd
 		edit := rangeLessEdit{start: position, end: position}
 		for i < len(hunk.lines) && hunk.lines[i].kind != ' ' {
 			patchLine := hunk.lines[i]
-			text := patchLine.text
-			if !patchLine.noNewline {
-				text += "\n"
-			}
 			if patchLine.kind == '-' {
 				edit.end = rangeLessNextLineEnd(content, edit.end)
 				position = edit.end
 			} else {
-				edit.newLines = append(edit.newLines, text)
+				edit.newLines = append(edit.newLines, patchLine.text+lineEnding)
 			}
 			i++
+		}
+		if edit.start == len(content) && edit.start > 0 && !strings.HasSuffix(content, "\n") && len(edit.newLines) > 0 {
+			edit.newLines[0] = lineEnding + edit.newLines[0]
+		}
+		if edit.end == len(content) && edit.end > 0 && !strings.HasSuffix(content, "\n") && len(edit.newLines) > 0 {
+			last := len(edit.newLines) - 1
+			edit.newLines[last] = strings.TrimSuffix(edit.newLines[last], lineEnding)
 		}
 		edits = append(edits, edit)
 	}
@@ -1265,7 +1268,7 @@ func rangeLessLineSequenceMatch(content string, start int, expected []string, en
 	line := 0
 	for start < len(content) {
 		end := rangeLessNextLineEnd(content, start)
-		hash := rangeLessLineHash(content[start:end])
+		hash := rangeLessLineHash(patchContentLineText(content[start:end]))
 		for matched > 0 && !rangeLessLineEqual(content, start, end, hash, pattern[matched]) {
 			matched = prefix[matched-1]
 		}
@@ -1303,7 +1306,7 @@ func rangeLessKMPPrefix(pattern []rangeLessPatternLine) []int {
 }
 
 func rangeLessLineEqual(content string, start, end int, hash uint64, expected rangeLessPatternLine) bool {
-	return hash == expected.hash && content[start:end] == expected.text
+	return hash == expected.hash && patchContentLineText(content[start:end]) == expected.text
 }
 
 func rangeLessPatternLineEqual(left, right rangeLessPatternLine) bool {
@@ -1328,8 +1331,19 @@ func rangeLessNextLineEnd(content string, start int) int {
 	return len(content)
 }
 
+func rangeLessLineEnding(content string) string {
+	if newline := strings.IndexByte(content, '\n'); newline > 0 && content[newline-1] == '\r' {
+		return "\r\n"
+	}
+	return "\n"
+}
+
 func patchContentLineText(line string) string {
-	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+	if strings.HasSuffix(line, "\n") {
+		line = strings.TrimSuffix(line, "\n")
+		return strings.TrimSuffix(line, "\r")
+	}
+	return line
 }
 
 func patchLineStarts(content string) []int {
