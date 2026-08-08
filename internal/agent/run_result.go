@@ -83,9 +83,10 @@ type RunState struct {
 
 // Interruption records why a run was paused (e.g. tool needs approval).
 type Interruption struct {
-	ToolName   string          `json:"tool_name"`
-	ToolInput  json.RawMessage `json:"tool_input"`
-	ToolCallID string          `json:"tool_call_id"`
+	ToolName      string               `json:"tool_name"`
+	ToolInput     json.RawMessage      `json:"tool_input"`
+	ToolCallID    string               `json:"tool_call_id"`
+	ParentContext []LLMRunItemSnapshot `json:"parent_context,omitempty"`
 }
 
 // InputGuardrailResult is the outcome of an input guardrail check.

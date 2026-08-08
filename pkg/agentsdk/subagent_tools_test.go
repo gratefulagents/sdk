@@ -48,6 +48,15 @@ func (m *subagentToolMockModel) GetRetryAdvice(error) *ModelRetryAdvice { return
 func (m *subagentToolMockModel) CalculateCost(Usage) float64            { return 0 }
 func (m *subagentToolMockModel) Provider() string                       { return "mock" }
 
+type askSubagentAuthorizer struct{}
+
+func (askSubagentAuthorizer) Authorize(_ context.Context, request ActionRequest) (ActionAuthorization, error) {
+	if request.ToolName == "subagent" {
+		return ActionAuthorization{Decision: ActionDecisionAsk, Reason: "approve delegation"}, nil
+	}
+	return ActionAuthorization{Decision: ActionDecisionAllow}, nil
+}
+
 type blockingSubagentToolModel struct {
 	started chan struct{}
 	release chan struct{}
@@ -251,6 +260,60 @@ func TestSubagentToolShareParentContext(t *testing.T) {
 				t.Fatalf("child task was not appended last: %#v", last)
 			}
 		})
+	}
+}
+
+func TestApprovedSubagentSharesParentContext(t *testing.T) {
+	continueTurn := false
+	parentModel := &subagentToolMockModel{responses: []*ModelResponse{
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "prior parent context"}}}, EndTurn: &continueTurn},
+		{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{
+			ID: "approved-spawn", Name: "subagent", Input: json.RawMessage(`{"agent_name":"worker","message":"child task","share_parent_context":true}`),
+		}}}},
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent done"}}}},
+	}}
+	childModel := &subagentToolMockModel{responses: []*ModelResponse{
+		{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "child done"}}}},
+	}}
+	runner := NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{
+		"parent-model": parentModel,
+		"child-model":  childModel,
+	}})
+	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+		Runner: runner,
+		Agents: map[string]*Agent{"worker": {Name: "worker", Model: "child-model"}},
+	})
+	parent := &Agent{
+		Name:  "parent",
+		Model: "parent-model",
+		Tools: []Tool{&subagentTool{registry: registry, defaultAgent: "worker"}},
+	}
+
+	result, err := NewChatLoop(ChatLoopOptions{
+		Runner:       runner,
+		Agent:        parent,
+		ApprovalGate: approvingGate{approved: true},
+		RunConfig: RunConfig{
+			MaxTurns:         3,
+			ActionAuthorizer: askSubagentAuthorizer{},
+		},
+	}).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FinalText() != "parent done" {
+		t.Fatalf("final text = %q", result.FinalText())
+	}
+
+	childModel.mu.Lock()
+	requests := append([]ModelRequest(nil), childModel.requests...)
+	childModel.mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("child requests = %d, want 1", len(requests))
+	}
+	input := requests[0].Input
+	if len(input) != 2 || input[0].Message == nil || input[0].Message.Text != "prior parent context" || input[1].Message == nil || input[1].Message.Text != "child task" {
+		t.Fatalf("approved child input = %#v", input)
 	}
 }
 

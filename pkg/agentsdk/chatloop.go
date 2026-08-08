@@ -571,7 +571,22 @@ func (l *ChatLoop) resolveToolApproval(ctx context.Context, agent *Agent, cfg Ru
 		})
 		return items, nil, nil, false, nil
 	}
-	item, inputResults, outputResults, shouldPause, err := l.opts.Runner.ExecuteApprovedTool(ctx, agent, ToolCallData{
+	approvedCtx := ctx
+	if len(pending.ParentContext) > 0 {
+		parentContext, restoreErr := RestoreRunItems(pending.ParentContext, func(name string) *Agent {
+			if name == agent.Name {
+				return agent
+			}
+			// Preserve assistant provenance for history produced by an earlier
+			// agent even when it is not reachable from the current agent.
+			return &Agent{Name: name}
+		})
+		if restoreErr != nil {
+			return items, nil, nil, false, fmt.Errorf("restore parent context for approved tool %q: %w", pending.ToolName, restoreErr)
+		}
+		approvedCtx = WithParentRunItems(ctx, parentContext)
+	}
+	item, inputResults, outputResults, shouldPause, err := l.opts.Runner.ExecuteApprovedTool(approvedCtx, agent, ToolCallData{
 		ID:    pending.ToolCallID,
 		Name:  pending.ToolName,
 		Input: cloneRawMessage(pending.ToolInput),

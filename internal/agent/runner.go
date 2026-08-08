@@ -1504,7 +1504,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// The subagent tool can explicitly opt in to completed parent history.
 			// Do not include newItems: they contain the current assistant's tool
 			// calls without their outputs and would form invalid inherited input.
-			toolCtx := WithParentRunItems(ctx, currentInput)
+			parentHistory := cloneParentRunItems(currentInput)
+			toolCtx := WithParentRunItems(ctx, parentHistory)
 			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(toolCtx, runCtx, currentAgent, tools, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
@@ -1570,11 +1571,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			var interruptions []*Interruption
 			for _, tr := range toolResults {
 				if tr.Type == RunItemToolApproval {
-					interruptions = append(interruptions, &Interruption{
+					interruption := &Interruption{
 						ToolName:   tr.ToolApproval.ToolName,
 						ToolInput:  tr.ToolApproval.Input,
 						ToolCallID: tr.ToolApproval.CallID,
-					})
+					}
+					if tr.ToolApproval.ToolName == "subagent" {
+						interruption.ParentContext = SnapshotRunItems(parentHistory)
+					}
+					interruptions = append(interruptions, interruption)
 				}
 			}
 			if len(interruptions) > 0 {
