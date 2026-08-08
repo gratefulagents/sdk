@@ -110,6 +110,289 @@ diff --git a/second.txt b/second.txt
 	assertFileContent(t, second, "two\n")
 }
 
+func TestApplyPatchOpenAIEnvelopeMultiFileMultiHunk(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	writePatchTestFile(t, workDir, "first.txt", "one\ntwo\nthree\nfour\n", 0o644)
+	writePatchTestFile(t, workDir, "second.txt", "alpha\nbeta\ngamma\n", 0o644)
+	result := executePatch(t, workDir, `*** Begin Patch
+*** Update File: first.txt
+@@
+ one
+-two
++two changed
+ three
+@@
+ three
+-four
++four changed
+*** Update File: second.txt
+@@
+ alpha
+-beta
++BETA
+ gamma
+*** End Patch`, false)
+	if result.IsError {
+		t.Fatalf("Execute() = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "first.txt"), "one\ntwo changed\nthree\nfour changed\n")
+	assertFileContent(t, filepath.Join(workDir, "second.txt"), "alpha\nBETA\ngamma\n")
+}
+
+func TestApplyPatchOpenAIEnvelopeMismatchIsAtomic(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	first := filepath.Join(workDir, "first.txt")
+	second := filepath.Join(workDir, "second.txt")
+	writePatchTestFile(t, workDir, "first.txt", "before\n", 0o644)
+	writePatchTestFile(t, workDir, "second.txt", "actual\n", 0o644)
+	result := executePatch(t, workDir, `*** Begin Patch
+*** Update File: first.txt
+@@
+-before
++after
+*** Update File: second.txt
+@@
+-expected
++changed
+*** End Patch`, false)
+	if !result.IsError || !strings.Contains(result.Content, "does not match") {
+		t.Fatalf("Execute() = %#v", result)
+	}
+	assertFileContent(t, first, "before\n")
+	assertFileContent(t, second, "actual\n")
+}
+
+func TestApplyPatchOpenAIEnvelopeAddDeleteAndMove(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	writePatchTestFile(t, workDir, "delete.txt", "remove\n", 0o644)
+	writePatchTestFile(t, workDir, "old.txt", "before\n", 0o644)
+	result := executePatch(t, workDir, `*** Begin Patch
+*** Add File: added.txt
++created
++line
+*** Delete File: delete.txt
+*** Update File: old.txt
+*** Move to: moved.txt
+@@
+-before
++after
+*** End Patch`, false)
+	if result.IsError {
+		t.Fatalf("Execute() = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "added.txt"), "created\nline\n")
+	if _, err := os.Stat(filepath.Join(workDir, "delete.txt")); !os.IsNotExist(err) {
+		t.Fatalf("delete.txt stat = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "old.txt")); !os.IsNotExist(err) {
+		t.Fatalf("old.txt stat = %v, want not exist", err)
+	}
+	assertFileContent(t, filepath.Join(workDir, "moved.txt"), "after\n")
+}
+
+func TestApplyPatchRejectsMalformedOrEscapingOpenAIEnvelope(t *testing.T) {
+	workDir := t.TempDir()
+	outside := filepath.Join(filepath.Dir(workDir), "outside.txt")
+	for _, patch := range []string{
+		"*** Begin Patch\n*** Update File: note.txt\n@@\n-old\n+new\n",
+		"*** Begin Patch\n*** Update File: note.txt\n@@\n*** End Patch",
+		"*** Begin Patch\n*** Add File: note.txt\nraw\n*** End Patch",
+		"*** Begin Patch\n*** Update File: ../outside.txt\n@@\n-old\n+new\n*** End Patch",
+	} {
+		result := executePatch(t, workDir, patch, false)
+		if !result.IsError {
+			t.Fatalf("patch unexpectedly accepted: %q", patch)
+		}
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("outside stat = %v, want not exist", err)
+	}
+}
+
+func TestApplyPatchOpenAIEnvelopeRejectsAmbiguousHunk(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	writePatchTestFile(t, workDir, "ambiguous.txt", "same\nsame\n", 0o644)
+	result := executePatch(t, workDir, `*** Begin Patch
+*** Update File: ambiguous.txt
+@@
+-same
++changed
+*** End Patch`, false)
+	if !result.IsError || !strings.Contains(result.Content, "more than once") {
+		t.Fatalf("ambiguous patch = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "ambiguous.txt"), "same\nsame\n")
+}
+
+func TestApplyPatchOpenAIEnvelopeRejectsEmptyPathsAtomically(t *testing.T) {
+	workDir := t.TempDir()
+	file := filepath.Join(workDir, "first.txt")
+	writePatchTestFile(t, workDir, "first.txt", "before\n", 0o644)
+	for _, suffix := range []string{
+		"*** Update File: \n@@\n-before\n+after\n",
+		"*** Add File: \n+created\n",
+		"*** Delete File: \n",
+		"*** Move to: \n",
+	} {
+		patch := "*** Begin Patch\n*** Update File: first.txt\n@@\n-before\n+after\n" + suffix + "*** End Patch\n"
+		result := executePatch(t, workDir, patch, false)
+		if !result.IsError {
+			t.Fatalf("empty path patch unexpectedly accepted: %q", suffix)
+		}
+		assertFileContent(t, file, "before\n")
+	}
+}
+
+func TestApplyPatchOpenAIEnvelopeGrammarVariants(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	writePatchTestFile(t, workDir, "located.txt", "header\nlocator text\nbefore\n", 0o644)
+	writePatchTestFile(t, workDir, "direct.txt", "old\n", 0o644)
+	writePatchTestFile(t, workDir, "eof.txt", "last\n", 0o644)
+	result := executePatch(t, workDir, "*** Begin Patch\n*** Update File: located.txt\n@@ locator text\n-before\n+after\n*** Update File: direct.txt\n-old\n+new\n*** Update File: eof.txt\n@@\n-last\n+final\n*** End of File\n*** End Patch\n", false)
+	if result.IsError {
+		t.Fatalf("grammar variant patch = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "located.txt"), "header\nlocator text\nafter\n")
+	assertFileContent(t, filepath.Join(workDir, "direct.txt"), "new\n")
+	assertFileContent(t, filepath.Join(workDir, "eof.txt"), "final\n")
+
+	writePatchTestFile(t, workDir, "crlf.txt", "old\r\n", 0o644)
+	result = executePatch(t, workDir, "*** Begin Patch\r\n*** Update File: crlf.txt\r\n@@\r\n-old\r\n+new\r\n*** End Patch\r\n", false)
+	if result.IsError {
+		t.Fatalf("CRLF patch = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "crlf.txt"), "new\r\n")
+}
+
+func TestApplyPatchOpenAIEnvelopePreservesSourceLineEndings(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	for _, test := range []struct {
+		name    string
+		content string
+		patch   string
+		want    string
+	}{
+		{
+			name:    "lf-envelope-crlf-source",
+			content: "old\r\n",
+			patch:   "*** Begin Patch\n*** Update File: lf-envelope-crlf-source.txt\n@@\n-old\n+new\n*** End Patch\n",
+			want:    "new\r\n",
+		},
+		{
+			name:    "crlf-envelope-lf-source",
+			content: "old\n",
+			patch:   "*** Begin Patch\r\n*** Update File: crlf-envelope-lf-source.txt\r\n@@\r\n-old\r\n+new\r\n*** End Patch\r\n",
+			want:    "new\n",
+		},
+		{
+			name:    "unterminated-final-line",
+			content: "first\nlast",
+			patch:   "*** Begin Patch\n*** Update File: unterminated-final-line.txt\n@@\n first\n-last\n+final\n*** End Patch\n",
+			want:    "first\nfinal",
+		},
+		{
+			name:    "multiline-replacement",
+			content: "before\r\nold\r\nafter\r\n",
+			patch:   "*** Begin Patch\n*** Update File: multiline-replacement.txt\n@@\n before\n-old\n+first\n+second\n after\n*** End Patch\n",
+			want:    "before\r\nfirst\r\nsecond\r\nafter\r\n",
+		},
+		{
+			name:    "insert-after-unterminated-final-line",
+			content: "last",
+			patch:   "*** Begin Patch\n*** Update File: insert-after-unterminated-final-line.txt\n@@\n last\n+after\n*** End Patch\n",
+			want:    "last\nafter",
+		},
+		{
+			name:    "delete-unterminated-final-line",
+			content: "first\nlast",
+			patch:   "*** Begin Patch\n*** Update File: delete-unterminated-final-line.txt\n@@\n first\n-last\n*** End Patch\n",
+			want:    "first\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			file := test.name + ".txt"
+			writePatchTestFile(t, workDir, file, test.content, 0o644)
+			result := executePatch(t, workDir, test.patch, false)
+			if result.IsError {
+				t.Fatalf("Execute() = %#v", result)
+			}
+			assertFileContent(t, filepath.Join(workDir, file), test.want)
+		})
+	}
+}
+
+func TestApplyPatchOpenAIEnvelopeRejectsSuffixAndOutOfOrderHunks(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("workspace mutation tools fail closed outside Linux")
+	}
+	workDir := t.TempDir()
+	writePatchTestFile(t, workDir, "suffix.txt", "prefix-old\n", 0o644)
+	result := executePatch(t, workDir, "*** Begin Patch\n*** Update File: suffix.txt\n@@\n-old\n+new\n*** End Patch\n", false)
+	if !result.IsError || !strings.Contains(result.Content, "does not match") {
+		t.Fatalf("suffix patch = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "suffix.txt"), "prefix-old\n")
+
+	writePatchTestFile(t, workDir, "ordered.txt", "one\ntwo\nthree\nfour\n", 0o644)
+	result = executePatch(t, workDir, "*** Begin Patch\n*** Update File: ordered.txt\n@@\n-three\n+THREE\n@@\n-one\n+ONE\n*** End Patch\n", false)
+	if !result.IsError || !strings.Contains(result.Content, "does not match") {
+		t.Fatalf("out-of-order patch = %#v", result)
+	}
+	assertFileContent(t, filepath.Join(workDir, "ordered.txt"), "one\ntwo\nthree\nfour\n")
+}
+
+func TestApplyPatchOpenAIEnvelopeBoundsHunksAndLines(t *testing.T) {
+	workDir := t.TempDir()
+	tooManyLines := "*** Begin Patch\n*** Add File: bounded.txt\n" + strings.Repeat("+x\n", maxOpenAIHunkLines+1) + "*** End Patch\n"
+	if result := executePatch(t, workDir, tooManyLines, false); !result.IsError {
+		t.Fatalf("oversized OpenAI hunk unexpectedly accepted: %#v", result)
+	}
+	tooManyHunks := "*** Begin Patch\n*** Update File: missing.txt\n" + strings.Repeat("@@\n-x\n+y\n", maxOpenAIPatchHunks+1) + "*** End Patch\n"
+	if result := executePatch(t, workDir, tooManyHunks, false); !result.IsError {
+		t.Fatalf("too many OpenAI hunks unexpectedly accepted: %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "bounded.txt")); !os.IsNotExist(err) {
+		t.Fatalf("bounded.txt stat = %v, want not exist", err)
+	}
+}
+
+func TestApplyRangeLessPatchHunksRepeatedPrefix(t *testing.T) {
+	content := strings.Repeat("a\n", maxPatchedFileBytes/2)
+	lines := make([]patchLine, maxOpenAIHunkLines)
+	for i := range lines {
+		lines[i] = patchLine{kind: ' ', text: "a"}
+	}
+	lines[len(lines)-1] = patchLine{kind: '-', text: "b"}
+
+	_, err := applyRangeLessPatchHunks(content, []patchHunk{{
+		rangeLess: true,
+		oldCount:  len(lines),
+		newCount:  len(lines) - 1,
+		lines:     lines,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("applyRangeLessPatchHunks() error = %v, want no match", err)
+	}
+}
+
 func TestApplyPatchRejectsEscapesBinaryAndOversize(t *testing.T) {
 	workDir := t.TempDir()
 	outside := filepath.Join(filepath.Dir(workDir), "outside.txt")

@@ -29,6 +29,8 @@ const (
 	maxPatchPathBytes      = 512
 	maxPatchOutputBytes    = 8 * 1024
 	maxPatchResultBytes    = 64 * 1024
+	maxOpenAIPatchHunks    = 256
+	maxOpenAIHunkLines     = 16384
 )
 
 type ApplyPatchTool struct{}
@@ -76,15 +78,19 @@ type patchFile struct {
 	sawRenameTo    bool
 	oldMode        *os.FileMode
 	newMode        *os.FileMode
+	deleteAll      bool
 	hunks          []patchHunk
 }
 
 type patchHunk struct {
-	oldStart int
-	oldCount int
-	newStart int
-	newCount int
-	lines    []patchLine
+	oldStart  int
+	oldCount  int
+	newStart  int
+	newCount  int
+	rangeLess bool
+	locator   string
+	endOfFile bool
+	lines     []patchLine
 }
 
 type patchLine struct {
@@ -114,7 +120,7 @@ var unifiedHunkHeader = regexp.MustCompile(`^@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]
 func (t *ApplyPatchTool) Name() string { return "ApplyPatch" }
 
 func (t *ApplyPatchTool) Description() string {
-	return "Applies a unified diff within the workspace. The complete patch is validated before files change; set dry_run to validate and preview without changing files."
+	return "Applies a unified diff or an OpenAI patch envelope within the workspace. The complete patch is validated before files change; set dry_run to validate and preview without changing files."
 }
 
 func (t *ApplyPatchTool) InputSchema() json.RawMessage {
@@ -123,7 +129,7 @@ func (t *ApplyPatchTool) InputSchema() json.RawMessage {
 		"properties": {
 			"patch": {
 				"type": "string",
-				"description": "Unified diff text. Supports file creation, modification, deletion, rename, and executable-bit changes."
+				"description": "Unified diff text, or an OpenAI envelope using *** Begin Patch, *** Update/Add/Delete File, direct change chunks or range-less @@/@@ locator hunks, optional *** Move to, *** End of File, and *** End Patch. Both support file creation, modification, deletion, and rename. Unified diffs also support executable-bit changes."
 			},
 			"dry_run": {
 				"type": "boolean",
@@ -150,7 +156,7 @@ func (t *ApplyPatchTool) Execute(ctx context.Context, input json.RawMessage, wor
 	if err := json.Unmarshal(input, &in); err != nil {
 		return toolError("Invalid input: %v", err), nil
 	}
-	files, err := parseUnifiedPatch(in.Patch)
+	files, err := parsePatch(in.Patch)
 	if err != nil {
 		return toolError("Invalid patch: %v", err), nil
 	}
@@ -296,6 +302,236 @@ func structuredToolResult(value any) (agentsdk.ToolResult, error) {
 		return agentsdk.ToolResult{}, err
 	}
 	return agentsdk.ToolResult{Content: string(data)}, nil
+}
+
+func parsePatch(patch string) ([]patchFile, error) {
+	firstLine := patch
+	if newline := strings.IndexByte(firstLine, '\n'); newline >= 0 {
+		firstLine = firstLine[:newline]
+	}
+	if strings.TrimSuffix(firstLine, "\r") == "*** Begin Patch" {
+		return parseOpenAIPatch(patch)
+	}
+	return parseUnifiedPatch(patch)
+}
+
+func parseOpenAIPatch(patch string) ([]patchFile, error) {
+	if strings.TrimSpace(patch) == "" {
+		return nil, fmt.Errorf("patch is required")
+	}
+	if len(patch) > maxPatchBytes {
+		return nil, fmt.Errorf("patch is too large (%d bytes, limit %d)", len(patch), maxPatchBytes)
+	}
+	if strings.IndexByte(patch, 0) >= 0 || !utf8.ValidString(patch) {
+		return nil, fmt.Errorf("binary patch data is not supported")
+	}
+
+	lines := strings.SplitAfter(patch, "\n")
+	if strings.TrimSuffix(strings.TrimSuffix(lines[0], "\n"), "\r") != "*** Begin Patch" {
+		return nil, fmt.Errorf("patch must begin with *** Begin Patch")
+	}
+
+	var files []patchFile
+	var current *patchFile
+	kind := ""
+	moved := false
+	hunkCount := 0
+	finish := func() error {
+		if current == nil {
+			return nil
+		}
+		for i, hunk := range current.hunks {
+			if hunk.endOfFile && i != len(current.hunks)-1 {
+				return fmt.Errorf("*** End of File must terminate an update")
+			}
+		}
+		switch kind {
+		case "update":
+			if len(current.hunks) == 0 && current.oldPath == current.newPath {
+				return fmt.Errorf("update file %s contains no changes", current.oldPath)
+			}
+		case "add":
+			if current.newPath == "" {
+				return fmt.Errorf("add file has no path")
+			}
+		case "delete":
+			if current.oldPath == "" {
+				return fmt.Errorf("delete file has no path")
+			}
+		}
+		files = append(files, *current)
+		if len(files) > maxPatchFiles {
+			return fmt.Errorf("patch changes too many files (limit %d)", maxPatchFiles)
+		}
+		current = nil
+		kind = ""
+		moved = false
+		return nil
+	}
+	appendHunk := func(hunk patchHunk) error {
+		if hunkCount >= maxOpenAIPatchHunks {
+			return fmt.Errorf("OpenAI patch has too many hunks (limit %d)", maxOpenAIPatchHunks)
+		}
+		current.hunks = append(current.hunks, hunk)
+		hunkCount++
+		return nil
+	}
+	parsePath := func(directive, value string) (string, error) {
+		clean, null, err := parsePatchPath(value, false)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", directive, err)
+		}
+		if null {
+			return "", fmt.Errorf("%s cannot be /dev/null", directive)
+		}
+		return clean, nil
+	}
+
+	for i := 1; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\n")
+		control := strings.TrimSuffix(line, "\r")
+		switch {
+		case control == "*** End Patch":
+			if !hasOnlyTrailingLineEnding(lines, i+1) {
+				return nil, fmt.Errorf("content follows *** End Patch")
+			}
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			if len(files) == 0 {
+				return nil, fmt.Errorf("patch contains no file changes")
+			}
+			return files, nil
+		case strings.HasPrefix(control, "*** Update File: "):
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			filePath, err := parsePath("update file path", strings.TrimPrefix(control, "*** Update File: "))
+			if err != nil {
+				return nil, err
+			}
+			current = &patchFile{oldPath: filePath, newPath: filePath}
+			kind = "update"
+		case strings.HasPrefix(control, "*** Add File: "):
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			filePath, err := parsePath("add file path", strings.TrimPrefix(control, "*** Add File: "))
+			if err != nil {
+				return nil, err
+			}
+			current = &patchFile{newPath: filePath}
+			kind = "add"
+		case strings.HasPrefix(control, "*** Delete File: "):
+			if err := finish(); err != nil {
+				return nil, err
+			}
+			filePath, err := parsePath("delete file path", strings.TrimPrefix(control, "*** Delete File: "))
+			if err != nil {
+				return nil, err
+			}
+			current = &patchFile{oldPath: filePath, deleteAll: true}
+			kind = "delete"
+		case strings.HasPrefix(control, "*** Move to: "):
+			if current == nil || kind != "update" || moved {
+				return nil, fmt.Errorf("move destination must follow one update file directive")
+			}
+			filePath, err := parsePath("move destination", strings.TrimPrefix(control, "*** Move to: "))
+			if err != nil {
+				return nil, err
+			}
+			current.newPath = filePath
+			moved = true
+		case strings.HasPrefix(control, "@@"):
+			if current == nil || kind != "update" {
+				return nil, fmt.Errorf("range-less hunk must follow an update file directive")
+			}
+			hunk, next, err := parseRangeLessPatchHunk(lines, i, strings.TrimSpace(strings.TrimPrefix(control, "@@")))
+			if err != nil {
+				return nil, err
+			}
+			if err := appendHunk(hunk); err != nil {
+				return nil, err
+			}
+			i = next - 1
+		case control == "*** End of File":
+			if current == nil || kind != "update" || len(current.hunks) == 0 {
+				return nil, fmt.Errorf("*** End of File must follow an update hunk")
+			}
+			if current.hunks[len(current.hunks)-1].endOfFile {
+				return nil, fmt.Errorf("duplicate *** End of File")
+			}
+			current.hunks[len(current.hunks)-1].endOfFile = true
+		default:
+			if current != nil && kind == "update" && len(current.hunks) == 0 && len(control) > 0 && (control[0] == ' ' || control[0] == '+' || control[0] == '-') {
+				hunk, next, err := parseRangeLessPatchHunk(lines, i-1, "")
+				if err != nil {
+					return nil, err
+				}
+				if err := appendHunk(hunk); err != nil {
+					return nil, err
+				}
+				i = next - 1
+				continue
+			}
+			if current == nil || kind != "add" || len(control) == 0 || control[0] != '+' {
+				return nil, fmt.Errorf("unsupported OpenAI patch line %q", control)
+			}
+			if len(current.hunks) == 0 {
+				if err := appendHunk(patchHunk{rangeLess: true}); err != nil {
+					return nil, err
+				}
+			}
+			hunk := &current.hunks[0]
+			if len(hunk.lines) >= maxOpenAIHunkLines {
+				return nil, fmt.Errorf("OpenAI hunk has too many lines (limit %d)", maxOpenAIHunkLines)
+			}
+			hunk.lines = append(hunk.lines, patchLine{kind: '+', text: control[1:]})
+			hunk.newCount++
+		}
+	}
+	return nil, fmt.Errorf("patch is missing *** End Patch")
+}
+
+func hasOnlyTrailingLineEnding(lines []string, start int) bool {
+	return start == len(lines) || (start+1 == len(lines) && lines[start] == "")
+}
+
+func parseRangeLessPatchHunk(lines []string, start int, locator string) (patchHunk, int, error) {
+	hunk := patchHunk{rangeLess: true, locator: locator}
+	changed := false
+	for i := start + 1; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\n")
+		control := strings.TrimSuffix(line, "\r")
+		if strings.HasPrefix(control, "@@") || strings.HasPrefix(control, "*** ") {
+			if len(hunk.lines) == 0 {
+				return patchHunk{}, 0, fmt.Errorf("range-less hunk has no body")
+			}
+			if !changed {
+				return patchHunk{}, 0, fmt.Errorf("range-less hunk has no changes")
+			}
+			return hunk, i, nil
+		}
+		if len(control) == 0 || (control[0] != ' ' && control[0] != '+' && control[0] != '-') {
+			return patchHunk{}, 0, fmt.Errorf("malformed range-less hunk body")
+		}
+		if len(hunk.lines) >= maxOpenAIHunkLines {
+			return patchHunk{}, 0, fmt.Errorf("OpenAI hunk has too many lines (limit %d)", maxOpenAIHunkLines)
+		}
+		hunk.lines = append(hunk.lines, patchLine{kind: control[0], text: control[1:]})
+		switch control[0] {
+		case ' ':
+			hunk.oldCount++
+			hunk.newCount++
+		case '-':
+			hunk.oldCount++
+			changed = true
+		case '+':
+			hunk.newCount++
+			changed = true
+		}
+	}
+	return patchHunk{}, 0, fmt.Errorf("range-less hunk is not followed by a patch directive")
 }
 
 func parseUnifiedPatch(patch string) ([]patchFile, error) {
@@ -757,13 +993,17 @@ func planPatch(workDir string, files []patchFile) ([]plannedPatchOperation, map[
 		if source.exists {
 			original = string(source.data)
 		}
-		updated, err := applyPatchHunks(original, file.hunks)
-		if err != nil {
-			pathForError := file.oldPath
-			if pathForError == "" {
-				pathForError = file.newPath
+		updated := ""
+		if !file.deleteAll {
+			var err error
+			updated, err = applyPatchHunks(original, file.hunks)
+			if err != nil {
+				pathForError := file.oldPath
+				if pathForError == "" {
+					pathForError = file.newPath
+				}
+				return nil, nil, fmt.Errorf("%s: %w", pathForError, err)
 			}
-			return nil, nil, fmt.Errorf("%s: %w", pathForError, err)
 		}
 		if operation == "delete" && updated != "" {
 			return nil, nil, fmt.Errorf("delete patch for %s does not remove all file content", file.oldPath)
@@ -832,6 +1072,9 @@ func applyPatchHunks(content string, hunks []patchHunk) (string, error) {
 	if len(hunks) == 0 {
 		return content, nil
 	}
+	if hunks[0].rangeLess {
+		return applyRangeLessPatchHunks(content, hunks)
+	}
 	starts := patchLineStarts(content)
 	lineCount := len(starts)
 	if content == "" {
@@ -878,6 +1121,229 @@ func applyPatchHunks(content string, hunks []patchHunk) (string, error) {
 		return "", fmt.Errorf("patched file is too large (%d bytes, limit %d)", result.Len(), maxPatchedFileBytes)
 	}
 	return result.String(), nil
+}
+
+func applyRangeLessPatchHunks(content string, hunks []patchHunk) (string, error) {
+	lineEnding := rangeLessLineEnding(content)
+	edits := make([]rangeLessEdit, 0)
+	hunkCursor := 0
+	changedCursor := 0
+	for _, hunk := range hunks {
+		if !hunk.rangeLess {
+			return "", fmt.Errorf("cannot mix range-less and unified hunks")
+		}
+		oldLines, newLines := rangeLessHunkLines(hunk)
+		if len(oldLines) == 0 {
+			if content != "" || len(hunks) != 1 {
+				return "", fmt.Errorf("range-less hunk has no context or removed lines")
+			}
+			rendered := make([]string, len(newLines))
+			for i, line := range newLines {
+				rendered[i] = line + lineEnding
+			}
+			edits = append(edits, rangeLessEdit{newLines: rendered})
+			continue
+		}
+
+		searchStart := hunkCursor
+		if hunk.locator != "" {
+			var found bool
+			searchStart, found = rangeLessLocatorEnd(content, hunkCursor, hunk.locator)
+			if !found {
+				return "", fmt.Errorf("range-less hunk locator does not match file content")
+			}
+		}
+
+		match, ambiguous := rangeLessLineSequenceMatch(content, searchStart, oldLines, hunk.endOfFile)
+		if ambiguous {
+			return "", fmt.Errorf("range-less hunk matches file content more than once")
+		}
+		if match < 0 {
+			return "", fmt.Errorf("range-less hunk does not match file content")
+		}
+		for _, edit := range rangeLessHunkEdits(hunk, content, match, lineEnding) {
+			if edit.start < changedCursor {
+				return "", fmt.Errorf("overlapping range-less hunks")
+			}
+			edits = append(edits, edit)
+			changedCursor = edit.end
+		}
+		hunkCursor = match
+	}
+
+	var result strings.Builder
+	cursor := 0
+	for _, edit := range edits {
+		result.WriteString(content[cursor:edit.start])
+		result.WriteString(strings.Join(edit.newLines, ""))
+		cursor = edit.end
+	}
+	result.WriteString(content[cursor:])
+	if result.Len() > maxPatchedFileBytes {
+		return "", fmt.Errorf("patched file is too large (%d bytes, limit %d)", result.Len(), maxPatchedFileBytes)
+	}
+	return result.String(), nil
+}
+
+type rangeLessEdit struct {
+	start    int
+	end      int
+	newLines []string
+}
+
+type rangeLessPatternLine struct {
+	text string
+	hash uint64
+}
+
+func rangeLessHunkLines(hunk patchHunk) ([]string, []string) {
+	oldLines := make([]string, 0, hunk.oldCount)
+	newLines := make([]string, 0, hunk.newCount)
+	for _, line := range hunk.lines {
+		switch line.kind {
+		case ' ':
+			oldLines = append(oldLines, line.text)
+			newLines = append(newLines, line.text)
+		case '-':
+			oldLines = append(oldLines, line.text)
+		case '+':
+			newLines = append(newLines, line.text)
+		}
+	}
+	return oldLines, newLines
+}
+
+func rangeLessHunkEdits(hunk patchHunk, content string, start int, lineEnding string) []rangeLessEdit {
+	edits := make([]rangeLessEdit, 0)
+	position := start
+	for i := 0; i < len(hunk.lines); {
+		if hunk.lines[i].kind == ' ' {
+			position = rangeLessNextLineEnd(content, position)
+			i++
+			continue
+		}
+		edit := rangeLessEdit{start: position, end: position}
+		for i < len(hunk.lines) && hunk.lines[i].kind != ' ' {
+			patchLine := hunk.lines[i]
+			if patchLine.kind == '-' {
+				edit.end = rangeLessNextLineEnd(content, edit.end)
+				position = edit.end
+			} else {
+				edit.newLines = append(edit.newLines, patchLine.text+lineEnding)
+			}
+			i++
+		}
+		if edit.start == len(content) && edit.start > 0 && !strings.HasSuffix(content, "\n") && len(edit.newLines) > 0 {
+			edit.newLines[0] = lineEnding + edit.newLines[0]
+		}
+		if edit.end == len(content) && edit.end > 0 && !strings.HasSuffix(content, "\n") && len(edit.newLines) > 0 {
+			last := len(edit.newLines) - 1
+			edit.newLines[last] = strings.TrimSuffix(edit.newLines[last], lineEnding)
+		}
+		edits = append(edits, edit)
+	}
+	return edits
+}
+
+func rangeLessLocatorEnd(content string, start int, locator string) (int, bool) {
+	for start < len(content) {
+		end := rangeLessNextLineEnd(content, start)
+		if patchContentLineText(content[start:end]) == locator {
+			return end, true
+		}
+		start = end
+	}
+	return 0, false
+}
+
+func rangeLessLineSequenceMatch(content string, start int, expected []string, endOfFile bool) (int, bool) {
+	pattern := make([]rangeLessPatternLine, len(expected))
+	for i, text := range expected {
+		pattern[i] = rangeLessPatternLine{text: text, hash: rangeLessLineHash(text)}
+	}
+	prefix := rangeLessKMPPrefix(pattern)
+	starts := make([]int, len(pattern))
+	match := -1
+	matched := 0
+	line := 0
+	for start < len(content) {
+		end := rangeLessNextLineEnd(content, start)
+		hash := rangeLessLineHash(patchContentLineText(content[start:end]))
+		for matched > 0 && !rangeLessLineEqual(content, start, end, hash, pattern[matched]) {
+			matched = prefix[matched-1]
+		}
+		if rangeLessLineEqual(content, start, end, hash, pattern[matched]) {
+			matched++
+		}
+		starts[line%len(pattern)] = start
+		line++
+		if matched == len(pattern) {
+			if !endOfFile || end == len(content) {
+				if match >= 0 {
+					return 0, true
+				}
+				match = starts[(line-len(pattern))%len(pattern)]
+			}
+			matched = prefix[matched-1]
+		}
+		start = end
+	}
+	return match, false
+}
+
+func rangeLessKMPPrefix(pattern []rangeLessPatternLine) []int {
+	prefix := make([]int, len(pattern))
+	for i, matched := 1, 0; i < len(pattern); i++ {
+		for matched > 0 && !rangeLessPatternLineEqual(pattern[i], pattern[matched]) {
+			matched = prefix[matched-1]
+		}
+		if rangeLessPatternLineEqual(pattern[i], pattern[matched]) {
+			matched++
+		}
+		prefix[i] = matched
+	}
+	return prefix
+}
+
+func rangeLessLineEqual(content string, start, end int, hash uint64, expected rangeLessPatternLine) bool {
+	return hash == expected.hash && patchContentLineText(content[start:end]) == expected.text
+}
+
+func rangeLessPatternLineEqual(left, right rangeLessPatternLine) bool {
+	return left.hash == right.hash && left.text == right.text
+}
+
+func rangeLessLineHash(line string) uint64 {
+	const offset = 14695981039346656037
+	const prime = 1099511628211
+	hash := uint64(offset)
+	for i := range len(line) {
+		hash ^= uint64(line[i])
+		hash *= prime
+	}
+	return hash
+}
+
+func rangeLessNextLineEnd(content string, start int) int {
+	if newline := strings.IndexByte(content[start:], '\n'); newline >= 0 {
+		return start + newline + 1
+	}
+	return len(content)
+}
+
+func rangeLessLineEnding(content string) string {
+	if newline := strings.IndexByte(content, '\n'); newline > 0 && content[newline-1] == '\r' {
+		return "\r\n"
+	}
+	return "\n"
+}
+
+func patchContentLineText(line string) string {
+	if strings.HasSuffix(line, "\n") {
+		line = strings.TrimSuffix(line, "\n")
+		return strings.TrimSuffix(line, "\r")
+	}
+	return line
 }
 
 func patchLineStarts(content string) []int {
