@@ -31,6 +31,11 @@ type spanParentIDKey struct{}
 // must inherit to keep runtime behavior consistent.
 type nestedRunConfigKey struct{}
 
+// parentRunItemsKey carries a snapshot of the completed conversation history
+// that precedes the current tool-calling model response. Sub-agent tools may
+// opt in to using this history as the initial context for a child run.
+type parentRunItemsKey struct{}
+
 // durableIdempotencyKey carries a destination-safe stable key for a tool
 // effect. Tools that call a destination supporting idempotency should forward
 // this value unchanged.
@@ -171,6 +176,65 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 func NestedRunConfigFromContext(ctx context.Context) (NestedRunConfig, bool) {
 	cfg, ok := ctx.Value(nestedRunConfigKey{}).(NestedRunConfig)
 	return cfg, ok
+}
+
+// WithParentRunItems attaches a defensive copy of the current run history to
+// tool execution context. The current assistant tool-call response is omitted
+// so inherited history never contains an unmatched tool call.
+func WithParentRunItems(ctx context.Context, items []RunItem) context.Context {
+	return context.WithValue(ctx, parentRunItemsKey{}, cloneParentRunItems(items))
+}
+
+// ParentRunItemsFromContext returns a defensive copy of parent run history.
+func ParentRunItemsFromContext(ctx context.Context) []RunItem {
+	if ctx == nil {
+		return nil
+	}
+	items, _ := ctx.Value(parentRunItemsKey{}).([]RunItem)
+	return cloneParentRunItems(items)
+}
+
+func cloneParentRunItems(items []RunItem) []RunItem {
+	cloned := make([]RunItem, len(items))
+	for i, item := range items {
+		cloned[i] = item
+		if item.Message != nil {
+			value := *item.Message
+			value.Images = append([]ImageAttachment(nil), item.Message.Images...)
+			cloned[i].Message = &value
+		}
+		if item.ToolCall != nil {
+			value := *item.ToolCall
+			value.Input = cloneRaw(item.ToolCall.Input)
+			cloned[i].ToolCall = &value
+		}
+		if item.ToolOutput != nil {
+			value := *item.ToolOutput
+			cloned[i].ToolOutput = &value
+		}
+		if item.HandoffCall != nil {
+			value := *item.HandoffCall
+			cloned[i].HandoffCall = &value
+		}
+		if item.HandoffOutput != nil {
+			value := *item.HandoffOutput
+			cloned[i].HandoffOutput = &value
+		}
+		if item.Reasoning != nil {
+			value := *item.Reasoning
+			cloned[i].Reasoning = &value
+		}
+		if item.Compaction != nil {
+			value := *item.Compaction
+			cloned[i].Compaction = &value
+		}
+		if item.ToolApproval != nil {
+			value := *item.ToolApproval
+			value.Input = cloneRaw(item.ToolApproval.Input)
+			cloned[i].ToolApproval = &value
+		}
+	}
+	return cloned
 }
 
 // ToolAccessLevel controls which tools are available during a run.

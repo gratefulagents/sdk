@@ -16,11 +16,15 @@ import (
 // so lifecycle events, context injection, and outcome accounting cannot drift
 // between delegation surfaces.
 type subAgentRunSpec struct {
-	Runner       *Runner
-	Agent        *Agent
-	Message      string
-	TaskID       string
-	ParentCallID string
+	Runner  *Runner
+	Agent   *Agent
+	Message string
+	// InitialContext is optional parent conversation history copied before the
+	// child's task message. It is used only by explicitly context-sharing
+	// delegation surfaces.
+	InitialContext []RunItem
+	TaskID         string
+	ParentCallID   string
 	// Isolation labels the run for progress records ("" = inline tool call,
 	// "async" = managed background task).
 	Isolation string
@@ -137,10 +141,11 @@ func runSubAgentOnce(ctx context.Context, spec subAgentRunSpec) subAgentOutcome 
 	cfg.Hooks = hooks
 	cfg.ForceFinalSummaryTurn = true
 
-	items := []RunItem{{
+	items := cloneParentRunItems(spec.InitialContext)
+	items = append(items, RunItem{
 		Type:    RunItemMessage,
 		Message: &MessageOutput{Text: spec.Message},
-	}}
+	})
 
 	startedAt := time.Now()
 	childCtx := WithTaskID(ctx, spec.TaskID)

@@ -193,6 +193,96 @@ func TestSubagentToolPreservesPendingResultThroughRunnerToolPolicyTimeout(t *tes
 	}
 }
 
+func TestSubagentToolShareParentContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		input      string
+		wantShared bool
+	}{
+		{name: "opt in", input: `{"agent_name":"worker","message":"child task","share_parent_context":true}`, wantShared: true},
+		{name: "isolated by default", input: `{"agent_name":"worker","message":"child task"}`, wantShared: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parentModel := &subagentToolMockModel{responses: []*ModelResponse{
+				{Items: []RunItem{{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: "spawn", Name: "subagent", Input: json.RawMessage(tc.input)}}}},
+				{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "parent done"}}}},
+			}}
+			childModel := &subagentToolMockModel{responses: []*ModelResponse{
+				{Items: []RunItem{{Type: RunItemMessage, Message: &MessageOutput{Text: "child done"}}}},
+			}}
+			runner := NewRunnerWithProvider(subagentWaitModelProvider{models: map[string]Model{
+				"parent-model": parentModel,
+				"child-model":  childModel,
+			}})
+			registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
+				Runner: runner,
+				Agents: map[string]*Agent{"worker": {Name: "worker", Model: "child-model"}},
+			})
+			parent := &Agent{
+				Name:  "parent",
+				Model: "parent-model",
+				Tools: []Tool{&subagentTool{registry: registry, defaultAgent: "worker"}},
+			}
+			initial := []RunItem{
+				{Type: RunItemMessage, Message: &MessageOutput{Text: "parent-only context"}},
+				{Type: RunItemToolCall, Agent: parent, ToolCall: &ToolCallData{ID: "prior-call", Name: "prior-tool", Input: json.RawMessage(`{}`)}},
+				{Type: RunItemToolOutput, Agent: parent, ToolOutput: &ToolOutputData{CallID: "prior-call", Content: "prior result"}},
+			}
+			if _, err := runner.Run(context.Background(), parent, initial, RunConfig{MaxTurns: 2}); err != nil {
+				t.Fatal(err)
+			}
+
+			childModel.mu.Lock()
+			requests := append([]ModelRequest(nil), childModel.requests...)
+			childModel.mu.Unlock()
+			if len(requests) != 1 {
+				t.Fatalf("child requests = %d, want 1", len(requests))
+			}
+			input := requests[0].Input
+			wantItems := 1 + 3*boolInt(tc.wantShared)
+			if got := len(input); got != wantItems {
+				t.Fatalf("child input items = %d, want %d: %#v", got, wantItems, input)
+			}
+			if tc.wantShared && (input[0].Message == nil || input[0].Message.Text != "parent-only context") {
+				t.Fatalf("inherited context = %#v", input[0])
+			}
+			last := input[len(input)-1]
+			if last.Message == nil || last.Message.Text != "child task" {
+				t.Fatalf("child task was not appended last: %#v", last)
+			}
+		})
+	}
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func TestBatchShareParentContextOverrides(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	for _, tc := range []struct {
+		name     string
+		defaults batchDefaults
+		task     subagentBatchTaskInput
+		want     bool
+	}{
+		{name: "default false", defaults: batchDefaults{}, task: subagentBatchTaskInput{}, want: false},
+		{name: "call default true", defaults: batchDefaults{shareParentContext: true}, task: subagentBatchTaskInput{}, want: true},
+		{name: "task disables", defaults: batchDefaults{shareParentContext: true}, task: subagentBatchTaskInput{ShareParentContext: &falseValue}, want: false},
+		{name: "task enables", defaults: batchDefaults{}, task: subagentBatchTaskInput{ShareParentContext: &trueValue}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.defaults.shareParentContextFor(tc.task); got != tc.want {
+				t.Fatalf("shareParentContextFor() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSubagentToolRequiresExactlyOneOfMessageOrTasks(t *testing.T) {
 	registry := NewSubAgentScheduler(SubAgentSchedulerConfig{
 		Runner: NewRunnerWithModel(&subagentToolMockModel{}),

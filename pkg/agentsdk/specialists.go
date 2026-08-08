@@ -164,7 +164,7 @@ func BuildDelegationGuide(a *Agent, specialists map[string]*Agent) string {
 		b.WriteString("Available specialist sub-agents (delegate via the subagent tool, agent_name=<name>):\n")
 		b.WriteString(strings.Join(subAgents, "\n"))
 		b.WriteString("\n\n")
-		b.WriteString(`CRITICAL: When delegating, the "message" is the ONLY context the sub-agent receives.
+		b.WriteString(`By default, the "message" is the only context a sub-agent receives. Set share_parent_context=true only when the child genuinely needs the parent's completed conversation history; sharing increases token usage and can disclose unrelated or sensitive context.
 Give each sub-agent a compact, self-contained task packet: enough context to execute without guessing, but no extra history.
 Include only the pieces that materially affect this task:
 - the exact task or deliverable for this sub-agent
