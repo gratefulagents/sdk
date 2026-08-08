@@ -1501,7 +1501,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolPrepared, currentAgent, preparedHistory, nil, runCtx.Usage); err != nil {
 				return nil, fmt.Errorf("persist tool-prepared checkpoint: %w", err)
 			}
-			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(ctx, runCtx, currentAgent, tools, s.toolCalls, cfg)
+			// The subagent tool can explicitly opt in to completed parent history.
+			// Do not include newItems: they contain the current assistant's tool
+			// calls without their outputs and would form invalid inherited input.
+			parentHistory := cloneParentRunItems(currentInput)
+			toolCtx := WithParentRunItems(ctx, parentHistory)
+			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(toolCtx, runCtx, currentAgent, tools, s.toolCalls, cfg)
 			if toolGuardErr != nil {
 				return nil, toolGuardErr
 			}
@@ -1566,11 +1571,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			var interruptions []*Interruption
 			for _, tr := range toolResults {
 				if tr.Type == RunItemToolApproval {
-					interruptions = append(interruptions, &Interruption{
+					interruption := &Interruption{
 						ToolName:   tr.ToolApproval.ToolName,
 						ToolInput:  tr.ToolApproval.Input,
 						ToolCallID: tr.ToolApproval.CallID,
-					})
+					}
+					if tr.ToolApproval.ToolName == "subagent" {
+						interruption.ParentContext = SnapshotRunItems(parentHistory)
+					}
+					interruptions = append(interruptions, interruption)
 				}
 			}
 			if len(interruptions) > 0 {

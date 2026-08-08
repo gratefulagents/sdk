@@ -51,6 +51,7 @@ type subagentBatchTaskInput struct {
 	DependsOn                []string `json:"depends_on"`
 	DependencyPolicy         string   `json:"dependency_policy"`
 	IncludeDependencyResults *bool    `json:"include_dependency_results"`
+	ShareParentContext       *bool    `json:"share_parent_context"`
 }
 
 func (t *subagentTool) Name() string                  { return "subagent" }
@@ -65,7 +66,7 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 		"properties": {
 			"message": {
 				"type": "string",
-				"description": "Task packet for a single sub-agent. This is the ONLY context it receives: exact task, goal, relevant repo context, constraints/acceptance criteria, prior findings, expected output. Exactly one of message or tasks must be set."
+				"description": "Task packet for a single sub-agent: exact task, goal, relevant repo context, constraints/acceptance criteria, prior findings, expected output. By default this is the only context it receives; set share_parent_context to also inherit completed parent history. Exactly one of message or tasks must be set."
 			},
 			"agent_name": {
 				"type": "string",
@@ -95,6 +96,10 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 				"type": "boolean",
 				"description": "Append completed dependency outputs to the task message before it starts. Defaults to true."
 			},
+			"share_parent_context": {
+				"type": "boolean",
+				"description": "Start the child with a copy of the parent's completed conversation history, followed by its task message. Defaults to false. This increases token usage and may expose unrelated or sensitive context to the child."
+			},
 			"timeout_ms": {
 				"type": "integer",
 				"description": "sync mode only: maximum wait before returning current state. Omit or 0 to wait until done or the run is cancelled."
@@ -111,7 +116,8 @@ func (t *subagentTool) InputSchema() json.RawMessage {
 						"tool_access": {"type": "string", "enum": ["full", "read-only"], "description": "Optional tool access override. Cannot widen the call-level tool_access; the narrower value wins."},
 						"depends_on": {"type": "array", "items": {"type": "string"}, "description": "Keys in this batch or existing task ids that must finish first."},
 						"dependency_policy": {"type": "string", "enum": ["all_success", "all_terminal"], "description": "Defaults to all_success."},
-						"include_dependency_results": {"type": "boolean", "description": "Defaults to true."}
+						"include_dependency_results": {"type": "boolean", "description": "Defaults to true."},
+						"share_parent_context": {"type": "boolean", "description": "Override the call-level context-sharing setting for this task."}
 					},
 					"required": ["key", "message"]
 				}
@@ -129,6 +135,7 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 		DependsOn                []string                 `json:"depends_on"`
 		DependencyPolicy         string                   `json:"dependency_policy"`
 		IncludeDependencyResults *bool                    `json:"include_dependency_results"`
+		ShareParentContext       bool                     `json:"share_parent_context"`
 		TimeoutMS                int64                    `json:"timeout_ms"`
 		Tasks                    []subagentBatchTaskInput `json:"tasks"`
 	}
@@ -160,6 +167,7 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 			DependsOn:                params.DependsOn,
 			DependencyPolicy:         SubAgentDependencyPolicy(params.DependencyPolicy),
 			IncludeDependencyResults: params.IncludeDependencyResults,
+			ShareParentContext:       params.ShareParentContext,
 		})
 		if err != nil {
 			return ToolResult{Content: fmt.Sprintf("failed to spawn: %v", err), IsError: true}, nil
@@ -198,8 +206,9 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 	}
 
 	return t.executeBatch(ctx, params.Tasks, batchDefaults{
-		agentName:  params.AgentName,
-		toolAccess: params.ToolAccess,
+		agentName:          params.AgentName,
+		toolAccess:         params.ToolAccess,
+		shareParentContext: params.ShareParentContext,
 	}, background, params.TimeoutMS)
 }
 
@@ -207,8 +216,9 @@ func (t *subagentTool) Execute(ctx context.Context, input json.RawMessage, _ str
 // inherits them instead of silently falling back to the configured default
 // agent and unrestricted tool access.
 type batchDefaults struct {
-	agentName  string
-	toolAccess string
+	agentName          string
+	toolAccess         string
+	shareParentContext bool
 }
 
 // agentFor resolves the agent for a batch task: task-level wins, then the
@@ -229,6 +239,13 @@ func (d batchDefaults) toolAccessFor(task subagentBatchTaskInput) ToolAccessLeve
 		return access
 	}
 	return toolAccessOverride(task.ToolAccess)
+}
+
+func (d batchDefaults) shareParentContextFor(task subagentBatchTaskInput) bool {
+	if task.ShareParentContext != nil {
+		return *task.ShareParentContext
+	}
+	return d.shareParentContext
 }
 
 // executeBatch spawns a keyed DAG of tasks and optionally waits for all of
@@ -322,6 +339,7 @@ func (t *subagentTool) executeBatch(ctx context.Context, batch []subagentBatchTa
 				DependsOn:                depIDs,
 				DependencyPolicy:         SubAgentDependencyPolicy(task.DependencyPolicy),
 				IncludeDependencyResults: task.IncludeDependencyResults,
+				ShareParentContext:       defaults.shareParentContextFor(task),
 			})
 			if err != nil {
 				// Cancel already-spawned siblings so a mid-batch failure does

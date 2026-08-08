@@ -88,6 +88,7 @@ type SubAgentSchedulerCheckpointRecord struct {
 	Task                     SubAgentTask              `json:"task"`
 	ResultDelivered          bool                      `json:"result_delivered"`
 	IncludeDependencyResults bool                      `json:"include_dependency_results"`
+	ParentContext            []LLMRunItemSnapshot      `json:"parent_context,omitempty"`
 	DurableCheckpoint        *DurableCheckpoint        `json:"durable_checkpoint,omitempty"`
 	SecurityBaseline         *SubAgentSecurityBaseline `json:"security_baseline,omitempty"`
 	QueuedMessages           []LLMRunItemSnapshot      `json:"queued_messages,omitempty"`
@@ -114,6 +115,7 @@ type subAgentTaskEntry struct {
 	cancel                   context.CancelFunc
 	activity                 *SubAgentActivity
 	includeDependencyResults bool
+	parentContext            []RunItem
 	durableCheckpoint        *DurableCheckpoint
 	securityBaseline         *SubAgentSecurityBaseline
 	queuedMessages           []RunItem
@@ -129,6 +131,10 @@ type SubAgentSpawnOptions struct {
 	DependsOn                []string
 	DependencyPolicy         SubAgentDependencyPolicy
 	IncludeDependencyResults *bool
+	// ShareParentContext starts the child with the parent's completed run
+	// history followed by the explicit child task message. It is opt-in to
+	// preserve the existing isolated-task behavior and token usage.
+	ShareParentContext bool
 }
 
 // SubAgentActivityEntry records a single tool invocation by a sub-agent.
@@ -932,6 +938,10 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 	if opts.IncludeDependencyResults != nil {
 		includeDependencyResults = *opts.IncludeDependencyResults
 	}
+	var parentContext []RunItem
+	if opts.ShareParentContext {
+		parentContext = ParentRunItemsFromContext(ctx)
+	}
 
 	// Use an independent context so sub-agent tasks survive the parent turn's
 	// context lifecycle. The parent tool call context expires when the tool
@@ -972,6 +982,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		},
 		activity:                 NewSubAgentActivity(),
 		includeDependencyResults: includeDependencyResults,
+		parentContext:            parentContext,
 		messageSignal:            make(chan struct{}, 1),
 		acceptingMessages:        true,
 		cancel:                   cancel,
@@ -1039,6 +1050,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		parentCallID,
 		agent,
 		message,
+		parentContext,
 		childToolAccess,
 		snap,
 		nil,
@@ -1053,7 +1065,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 // runTask executes the sub-agent in a goroutine with semaphore gating.
 // All registry-level configuration is read from the spawn-time snapshot so the
 // task never races with concurrent registry reconfiguration.
-func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, childToolAccess ToolAccessLevel, snap taskRunSnapshot, resume *DurableCheckpoint, trace *Trace, processor TracingProcessor, parentSpanID string) {
+func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID string, ag *Agent, message string, parentContext []RunItem, childToolAccess ToolAccessLevel, snap taskRunSnapshot, resume *DurableCheckpoint, trace *Trace, processor TracingProcessor, parentSpanID string) {
 	// A panic anywhere in the sub-agent run must fail this task, not crash the
 	// host process: runTask executes as a bare goroutine, so an unrecovered
 	// panic here is fatal to the whole program (mirrors RunStreamed's guard).
@@ -1134,16 +1146,17 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 	durable := r.childDurableRunConfig(taskID, resume)
 
 	runSubAgentOnce(ctx, subAgentRunSpec{
-		Runner:        snap.runner,
-		Agent:         ag,
-		Message:       message,
-		TaskID:        taskID,
-		ParentCallID:  parentCallID,
-		Isolation:     "async",
-		Tracker:       snap.tracker,
-		EventStream:   snap.eventStream,
-		Activity:      activity,
-		FallbackHooks: snap.runner.DefaultHooks,
+		Runner:         snap.runner,
+		Agent:          ag,
+		Message:        message,
+		InitialContext: parentContext,
+		TaskID:         taskID,
+		ParentCallID:   parentCallID,
+		Isolation:      "async",
+		Tracker:        snap.tracker,
+		EventStream:    snap.eventStream,
+		Activity:       activity,
+		FallbackHooks:  snap.runner.DefaultHooks,
 		OnTerminal: func(outcome subAgentOutcome) {
 			switch {
 			case outcome.Err != nil:
@@ -1390,6 +1403,7 @@ func (r *SubAgentRegistry) schedulerCheckpointLocked() SubAgentSchedulerCheckpoi
 			Task:                     cloneSubAgentTask(subAgentTaskSnapshot(entry)),
 			ResultDelivered:          entry.resultDelivered,
 			IncludeDependencyResults: entry.includeDependencyResults,
+			ParentContext:            SnapshotRunItems(entry.parentContext),
 			DurableCheckpoint:        cloneDurableCheckpoint(entry.durableCheckpoint),
 			SecurityBaseline:         cloneSubAgentSecurityBaseline(entry.securityBaseline),
 			QueuedMessages:           SnapshotRunItems(entry.queuedMessages),
@@ -1430,10 +1444,23 @@ func (r *SubAgentRegistry) RestoreSchedulerCheckpoint(checkpoint SubAgentSchedul
 		if err != nil {
 			return fmt.Errorf("restore in-flight steering for task %q: %w", task.ID, err)
 		}
+		parentContext, err := RestoreRunItems(record.ParentContext, func(name string) *Agent {
+			if agent := r.allAgents[name]; agent != nil {
+				return agent
+			}
+			// Provider adapters use non-nil provenance to distinguish assistant
+			// messages from user messages. The parent need not be a registered
+			// specialist, so retain that marker with a minimal placeholder.
+			return &Agent{Name: name}
+		})
+		if err != nil {
+			return fmt.Errorf("restore parent context for task %q: %w", task.ID, err)
+		}
 		restored[task.ID] = &subAgentTaskEntry{
 			task:                     task,
 			activity:                 NewSubAgentActivity(),
 			includeDependencyResults: record.IncludeDependencyResults,
+			parentContext:            parentContext,
 			durableCheckpoint:        cloneDurableCheckpoint(record.DurableCheckpoint),
 			securityBaseline:         cloneSubAgentSecurityBaseline(record.SecurityBaseline),
 			queuedMessages:           append(inFlight, queued...),
@@ -1643,7 +1670,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	current, launch := r.tasks[taskID]
 	launch = launch && current.generation == transitionGeneration && current.task.Status == SubAgentTaskPending
 	if launch {
-		go r.runTask(taskCtx, taskID, parentCallID, agent, taskSnapshot.Message, childAccess, snap, resume, trace, processor, parentSpanID)
+		go r.runTask(taskCtx, taskID, parentCallID, agent, taskSnapshot.Message, current.parentContext, childAccess, snap, resume, trace, processor, parentSpanID)
 	}
 	r.mu.Unlock()
 	if !launch {

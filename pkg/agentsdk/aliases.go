@@ -249,6 +249,7 @@ var BuildRunBudgetContext = agent.BuildRunBudgetContext
 var (
 	BuildLLMRequestSnapshot             = agent.BuildLLMRequestSnapshot
 	RestoreRunItems                     = agent.RestoreRunItems
+	WithParentRunItems                  = agent.WithParentRunItems
 	BuildLLMResponseSnapshot            = agent.BuildLLMResponseSnapshot
 	BuildSubAgentBudgetContext          = agent.BuildSubAgentBudgetContext
 	BuildSubAgentDependencyContext      = agent.BuildSubAgentDependencyContext
