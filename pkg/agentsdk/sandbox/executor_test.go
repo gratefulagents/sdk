@@ -278,6 +278,59 @@ func TestBubblewrapArgsIncludesRequestScopedWritablePath(t *testing.T) {
 	assertArgSequence(t, args, "--bind", resolveExistingPrefix(scratch), resolveExistingPrefix(scratch))
 }
 
+func TestBubblewrapArgsRebindsExtraReadOnlyPathBelowPrivateTmp(t *testing.T) {
+	workspace := t.TempDir()
+	toolRoot := filepath.Join(t.TempDir(), "private", "tools")
+	if err := os.MkdirAll(toolRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: workspace, ExtraReadOnlyPaths: []string{toolRoot}})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	toolRoot = resolveExistingPrefix(toolRoot)
+	assertArgSequenceAfter(t, args, []string{"--tmpfs", "/tmp"}, []string{"--dir", filepath.Dir(toolRoot)})
+	assertArgSequenceAfter(t, args, []string{"--tmpfs", "/tmp"}, []string{"--ro-bind", toolRoot, toolRoot})
+}
+
+func TestBubblewrapArgsIgnoresUnsafeExtraReadOnlyPaths(t *testing.T) {
+	workspace := t.TempDir()
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: workspace, ExtraReadOnlyPaths: []string{"/proc", "/proc/1", "/dev", "/sys"}})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	for _, path := range []string{"/proc", "/proc/1", "/dev", "/sys"} {
+		assertArgAbsent(t, args, "--ro-bind", path, path)
+	}
+}
+
+func TestBubblewrapArgsRebindsWorkspaceExtraReadOnlyPathAfterWorkspaceWrite(t *testing.T) {
+	workspace := t.TempDir()
+	protected := filepath.Join(workspace, "generated-tool")
+	if err := os.Mkdir(protected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"true"},
+		WorkDir:        workspace,
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: workspace, ExtraReadOnlyPaths: []string{protected}})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	workspace = resolveExistingPrefix(workspace)
+	protected = resolveExistingPrefix(protected)
+	assertArgSequenceAfter(t, args, []string{"--bind", workspace, workspace}, []string{"--ro-bind", protected, protected})
+}
+
 func TestBubblewrapArgsReadOnlyIgnoresRequestScopedWritablePath(t *testing.T) {
 	workspace := t.TempDir()
 	scratch := t.TempDir()
