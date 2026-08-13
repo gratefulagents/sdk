@@ -524,7 +524,6 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		"--tmpfs", "/tmp",
 		"--dir", "/tmp/home",
 	)
-
 	if !readOnly {
 		writableConfig := config
 		writableConfig.ExtraWritablePaths = append(append([]string(nil), config.ExtraWritablePaths...), req.WritablePaths...)
@@ -540,6 +539,12 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		for _, path := range sandboxProtectedWorkspacePaths(workspaceRoot) {
 			args = append(args, "--ro-bind", path, path)
 		}
+	}
+	// Apply trusted read-only mounts after writable workspace mounts and the
+	// private /tmp overlay. This both enforces configured read-only subtrees and
+	// re-exposes paths hidden by /tmp (such as materialized MCP launchers).
+	for _, path := range sandboxReadOnlyPaths(config) {
+		args = appendSandboxReadOnlyPathArgs(args, path)
 	}
 	for _, path := range sandboxMaskedPaths(config) {
 		args = appendSandboxMaskArgs(args, path)
@@ -948,6 +953,41 @@ func sandboxWritablePaths(workspaceRoot string, config Config) []string {
 		paths = appendSandboxWritablePath(paths, path, workspaceRoot)
 	}
 	return paths
+}
+
+func sandboxReadOnlyPaths(config Config) []string {
+	var paths []string
+	for _, path := range config.ExtraReadOnlyPaths {
+		clean := cleanAbsolutePath(path)
+		if clean == "" || !pathExists(clean) {
+			continue
+		}
+		clean = resolveExistingPrefix(clean)
+		if clean == string(os.PathSeparator) || clean == "/proc" || isPathWithin(clean, "/proc") ||
+			clean == "/dev" || isPathWithin(clean, "/dev") || clean == "/sys" || isPathWithin(clean, "/sys") {
+			continue
+		}
+		covered := false
+		for _, existing := range paths {
+			if clean == existing || isPathWithin(clean, existing) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			paths = append(paths, clean)
+		}
+	}
+	return paths
+}
+
+func appendSandboxReadOnlyPathArgs(args []string, path string) []string {
+	// The root filesystem already contains ordinary host paths. Only /tmp is
+	// overlaid, so create its hidden destination parent before the bind mount.
+	if isPathWithin(path, "/tmp") {
+		args = append(args, "--dir", filepath.Dir(path))
+	}
+	return append(args, "--ro-bind", path, path)
 }
 
 func appendSandboxWritablePath(paths []string, path, workspaceRoot string) []string {
