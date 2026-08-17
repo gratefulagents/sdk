@@ -174,14 +174,18 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 		if authJSONPath == "" {
 			return nil, fmt.Errorf("oauth auth JSON path or data is required")
 		}
+		// Capture the signature *before* reading (matching the reload path):
+		// if the file rotates between stat and read, the stale signature makes
+		// the next request re-read instead of pairing old-content credentials
+		// with the new target's signature and never reloading.
+		if info, statErr := os.Stat(authJSONPath); statErr == nil {
+			fileModTime = info.ModTime()
+			fileSize = info.Size()
+		}
 		var err error
 		authJSON, err = os.ReadFile(authJSONPath)
 		if err != nil {
 			return nil, fmt.Errorf("read oauth auth json: %w", err)
-		}
-		if info, statErr := os.Stat(authJSONPath); statErr == nil {
-			fileModTime = info.ModTime()
-			fileSize = info.Size()
 		}
 	}
 
