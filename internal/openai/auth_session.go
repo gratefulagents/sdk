@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -83,6 +84,17 @@ type oauthSessionState struct {
 	tokenEndpoint string
 	clientVersion string
 
+	// authJSONPath is set only when the auth material came from a file; it
+	// enables re-reading tokens rotated by an external refresher (e.g. a
+	// Kubernetes Secret mount). Inline material never reloads.
+	authJSONPath  string
+	accountIDPath string
+	// accountIDOverride is the explicit config AccountID; it permanently wins
+	// over any account id found during file reloads.
+	accountIDOverride string
+	fileModTime       time.Time
+	fileSize          int64
+
 	accessToken  string
 	refreshToken string
 	idToken      string
@@ -154,8 +166,11 @@ func NewOAuthAuthSessionFromSecretData(authJSON []byte, accountIDOverride string
 
 func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, error) {
 	authJSON := cfg.AuthJSON
+	authJSONPath := ""
+	var fileModTime time.Time
+	var fileSize int64
 	if len(authJSON) == 0 {
-		authJSONPath := strings.TrimSpace(cfg.AuthJSONPath)
+		authJSONPath = strings.TrimSpace(cfg.AuthJSONPath)
 		if authJSONPath == "" {
 			return nil, fmt.Errorf("oauth auth JSON path or data is required")
 		}
@@ -164,18 +179,21 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 		if err != nil {
 			return nil, fmt.Errorf("read oauth auth json: %w", err)
 		}
+		if info, statErr := os.Stat(authJSONPath); statErr == nil {
+			fileModTime = info.ModTime()
+			fileSize = info.Size()
+		}
 	}
 
 	accountIDOverride := strings.TrimSpace(cfg.AccountID)
-	if accountIDOverride == "" {
-		accountIDPath := strings.TrimSpace(cfg.AccountIDPath)
-		if accountIDPath != "" {
-			rawAccountID, err := os.ReadFile(accountIDPath)
-			if err == nil {
-				accountIDOverride = strings.TrimSpace(string(rawAccountID))
-			} else if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("read oauth account-id file: %w", err)
-			}
+	accountIDPath := strings.TrimSpace(cfg.AccountIDPath)
+	accountID := accountIDOverride
+	if accountID == "" && accountIDPath != "" {
+		rawAccountID, err := os.ReadFile(accountIDPath)
+		if err == nil {
+			accountID = strings.TrimSpace(string(rawAccountID))
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read oauth account-id file: %w", err)
 		}
 	}
 
@@ -187,7 +205,6 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 	accessToken := strings.TrimSpace(parsed.Tokens.AccessToken)
 	refreshToken := strings.TrimSpace(parsed.Tokens.RefreshToken)
 	idToken := strings.TrimSpace(parsed.Tokens.IDToken)
-	accountID := strings.TrimSpace(accountIDOverride)
 	if accountID == "" {
 		accountID = strings.TrimSpace(parsed.Tokens.AccountID)
 	}
@@ -220,15 +237,20 @@ func NewOAuthAuthSessionFromConfig(cfg OAuthSessionConfig) (*OpenAIAuthSession, 
 	return &OpenAIAuthSession{
 		mode: AuthModeOAuth,
 		oauth: &oauthSessionState{
-			httpClient:    &refreshClient,
-			clientID:      clientID,
-			tokenEndpoint: tokenEndpoint,
-			clientVersion: strings.TrimSpace(cfg.ClientVersion),
-			accessToken:   accessToken,
-			refreshToken:  refreshToken,
-			idToken:       idToken,
-			accountID:     accountID,
-			lastRefresh:   parseISOTime(parsed.LastRefresh),
+			httpClient:        &refreshClient,
+			clientID:          clientID,
+			tokenEndpoint:     tokenEndpoint,
+			clientVersion:     strings.TrimSpace(cfg.ClientVersion),
+			authJSONPath:      authJSONPath,
+			accountIDPath:     accountIDPath,
+			accountIDOverride: accountIDOverride,
+			fileModTime:       fileModTime,
+			fileSize:          fileSize,
+			accessToken:       accessToken,
+			refreshToken:      refreshToken,
+			idToken:           idToken,
+			accountID:         accountID,
+			lastRefresh:       parseISOTime(parsed.LastRefresh),
 		},
 	}, nil
 }
@@ -320,6 +342,7 @@ func (s *OpenAIAuthSession) ensureOAuthAccessToken(ctx context.Context, proactiv
 		return nil
 	}
 	s.oauth.mu.Lock()
+	s.oauth.reloadFromFileIfChangedLocked(false)
 	accessToken := strings.TrimSpace(s.oauth.accessToken)
 	refreshToken := strings.TrimSpace(s.oauth.refreshToken)
 	lastRefresh := s.oauth.lastRefresh
@@ -346,6 +369,75 @@ func (s *OpenAIAuthSession) ensureOAuthAccessToken(ctx context.Context, proactiv
 	return nil
 }
 
+// reloadFromFileIfChangedLocked re-reads the backing auth JSON file when the
+// session is file-backed and the file's stat signature changed, adopting
+// rotated tokens written by an external refresher. Unreadable, unparseable, or
+// token-less files keep the in-memory state. force skips the signature check
+// (used after a failed network refresh). Returns true when token material
+// actually changed. Caller must hold s.mu.
+func (o *oauthSessionState) reloadFromFileIfChangedLocked(force bool) bool {
+	if o.authJSONPath == "" {
+		return false
+	}
+	info, statErr := os.Stat(o.authJSONPath)
+	if !force && statErr == nil && info.ModTime().Equal(o.fileModTime) && info.Size() == o.fileSize {
+		return false
+	}
+	raw, err := os.ReadFile(o.authJSONPath)
+	if err != nil {
+		return false
+	}
+	parsed := oauthAuthFile{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false
+	}
+	accessToken := strings.TrimSpace(parsed.Tokens.AccessToken)
+	refreshToken := strings.TrimSpace(parsed.Tokens.RefreshToken)
+	if accessToken == "" && refreshToken == "" {
+		return false
+	}
+	idToken := strings.TrimSpace(parsed.Tokens.IDToken)
+	changed := accessToken != o.accessToken || refreshToken != o.refreshToken || idToken != o.idToken
+	o.accessToken = accessToken
+	o.refreshToken = refreshToken
+	o.idToken = idToken
+	o.lastRefresh = parseISOTime(parsed.LastRefresh)
+	if o.accountIDOverride == "" {
+		accountID := strings.TrimSpace(parsed.Tokens.AccountID)
+		if accountID == "" && o.accountIDPath != "" {
+			if rawAccountID, err := os.ReadFile(o.accountIDPath); err == nil {
+				accountID = strings.TrimSpace(string(rawAccountID))
+			}
+		}
+		if accountID == "" {
+			accountID = deriveAccountIDFromIDToken(idToken)
+		}
+		if accountID != "" {
+			o.accountID = accountID
+		}
+	}
+	// Cache the signature captured *before* the read: if the file rotated
+	// between stat and read, the stale signature forces a harmless re-read on
+	// the next call.
+	if statErr == nil {
+		o.fileModTime = info.ModTime()
+		o.fileSize = info.Size()
+	} else {
+		o.fileModTime = time.Time{}
+		o.fileSize = 0
+	}
+	return changed
+}
+
+type oauthRefreshStatusError struct {
+	status  int
+	message string
+}
+
+func (e *oauthRefreshStatusError) Error() string {
+	return fmt.Sprintf("oauth refresh failed with status %d: %s", e.status, e.message)
+}
+
 func (s *OpenAIAuthSession) refreshOAuthToken(ctx context.Context) error {
 	s.oauth.mu.Lock()
 	refreshToken := strings.TrimSpace(s.oauth.refreshToken)
@@ -364,6 +456,46 @@ func (s *OpenAIAuthSession) refreshOAuthToken(ctx context.Context) error {
 		clientID = DefaultOAuthClientID
 	}
 
+	attemptStart := time.Now()
+	refresh, err := s.requestOAuthTokenRefresh(ctx, tokenEndpoint, clientID, refreshToken, accessToken)
+	if err == nil {
+		return s.adoptOAuthRefreshResponse(refresh)
+	}
+
+	statusErr := &oauthRefreshStatusError{}
+	if !errors.As(err, &statusErr) {
+		return err
+	}
+
+	// The token endpoint rejected our refresh token; an external refresher may
+	// have rotated the mounted file (single-use refresh-token chains). Force a
+	// reload and, when it yields new material, prefer it over failing.
+	s.oauth.mu.Lock()
+	changed := s.oauth.reloadFromFileIfChangedLocked(true)
+	fileAccessToken := strings.TrimSpace(s.oauth.accessToken)
+	fileRefreshToken := strings.TrimSpace(s.oauth.refreshToken)
+	fileLastRefresh := s.oauth.lastRefresh
+	s.oauth.mu.Unlock()
+
+	if !changed {
+		return err
+	}
+	if fileAccessToken != "" && fileAccessToken != accessToken && fileLastRefresh.After(attemptStart) {
+		// The file already holds a token refreshed after our attempt began;
+		// adopt it without burning another single-use refresh token.
+		return nil
+	}
+	if fileRefreshToken != "" && fileRefreshToken != refreshToken {
+		retry, retryErr := s.requestOAuthTokenRefresh(ctx, tokenEndpoint, clientID, fileRefreshToken, fileAccessToken)
+		if retryErr != nil {
+			return err
+		}
+		return s.adoptOAuthRefreshResponse(retry)
+	}
+	return err
+}
+
+func (s *OpenAIAuthSession) requestOAuthTokenRefresh(ctx context.Context, tokenEndpoint, clientID, refreshToken, accessToken string) (oauthRefreshResponse, error) {
 	payload := map[string]string{
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
@@ -372,41 +504,44 @@ func (s *OpenAIAuthSession) refreshOAuthToken(ctx context.Context) error {
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal oauth refresh request: %w", err)
+		return oauthRefreshResponse{}, fmt.Errorf("marshal oauth refresh request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build oauth refresh request: %w", err)
+		return oauthRefreshResponse{}, fmt.Errorf("build oauth refresh request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.oauth.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("oauth refresh request failed: %w", err)
+		return oauthRefreshResponse{}, fmt.Errorf("oauth refresh request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("read oauth refresh response: %w", err)
+		return oauthRefreshResponse{}, fmt.Errorf("read oauth refresh response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet := sanitizeSecretSnippet(string(raw), refreshToken, accessToken)
 		snippet = sanitizeLogBody(snippet)
-		return fmt.Errorf("oauth refresh failed with status %d: %s", resp.StatusCode, snippet)
+		return oauthRefreshResponse{}, &oauthRefreshStatusError{status: resp.StatusCode, message: snippet}
 	}
 
 	refresh := oauthRefreshResponse{}
 	if err := json.Unmarshal(raw, &refresh); err != nil {
-		return fmt.Errorf("parse oauth refresh response: %w", err)
+		return oauthRefreshResponse{}, fmt.Errorf("parse oauth refresh response: %w", err)
 	}
 	refresh.AccessToken = strings.TrimSpace(refresh.AccessToken)
 	refresh.IDToken = strings.TrimSpace(refresh.IDToken)
 	refresh.RefreshToken = strings.TrimSpace(refresh.RefreshToken)
 	if refresh.AccessToken == "" {
-		return fmt.Errorf("oauth refresh response missing access_token")
+		return oauthRefreshResponse{}, fmt.Errorf("oauth refresh response missing access_token")
 	}
+	return refresh, nil
+}
 
+func (s *OpenAIAuthSession) adoptOAuthRefreshResponse(refresh oauthRefreshResponse) error {
 	s.oauth.mu.Lock()
 	defer s.oauth.mu.Unlock()
 
