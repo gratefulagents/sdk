@@ -1151,3 +1151,192 @@ func TestCollectSSEToJSON(t *testing.T) {
 		}
 	})
 }
+
+func writeAuthFileForTest(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+}
+
+func bumpFileMTimeForTest(t *testing.T, path string, offset time.Duration) {
+	t.Helper()
+	future := time.Now().Add(offset)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("Chtimes(%s) error = %v", path, err)
+	}
+}
+
+func TestOAuthAuthSessionReloadsRotatedAuthFile(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/auth.json"
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"access-old","refresh_token":"refresh-old","account_id":"acct-1"},"last_refresh":"2099-01-01T00:00:00Z"}`)
+
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refreshCalls.Add(1)
+		http.Error(w, "refresh should not be called", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSONPath:  authPath,
+		TokenEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+	}
+
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"access-new-rotated","refresh_token":"refresh-new","account_id":"acct-1"},"last_refresh":"2099-01-01T00:00:00Z"}`)
+	bumpFileMTimeForTest(t, authPath, 2*time.Second)
+
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer access-new-rotated" {
+		t.Fatalf("Authorization = %q, want rotated access token", got)
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls = %d, want 0", got)
+	}
+}
+
+func TestOAuthRefresh400RetriesWithRotatedRefreshToken(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/auth.json"
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"stale-access","refresh_token":"refresh-old","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`)
+
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls.Add(1)
+		rawBody, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		var payload map[string]any
+		_ = json.Unmarshal(rawBody, &payload)
+		refreshToken, _ := payload["refresh_token"].(string)
+		switch refreshToken {
+		case "refresh-old":
+			writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"stale-access","refresh_token":"refresh-rotated","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`)
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+		case "refresh-rotated":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"fresh-access","refresh_token":"refresh-next"}`))
+		default:
+			http.Error(w, "unexpected refresh token "+refreshToken, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSONPath:  authPath,
+		TokenEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+	}
+
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer fresh-access" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer fresh-access")
+	}
+	if got := refreshCalls.Load(); got != 2 {
+		t.Fatalf("refresh calls = %d, want 2", got)
+	}
+	session.oauth.mu.Lock()
+	gotRefreshToken := session.oauth.refreshToken
+	session.oauth.mu.Unlock()
+	if gotRefreshToken != "refresh-next" {
+		t.Fatalf("refresh token = %q, want %q", gotRefreshToken, "refresh-next")
+	}
+}
+
+func TestOAuthRefresh400AdoptsFreshFileTokenWithoutRetry(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/auth.json"
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"stale-access","refresh_token":"refresh-old","account_id":"acct-1"},"last_refresh":"2000-01-01T00:00:00Z"}`)
+
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls.Add(1)
+		freshLastRefresh := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
+		writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"rotated-access","refresh_token":"refresh-rotated","account_id":"acct-1"},"last_refresh":"`+freshLastRefresh+`"}`)
+		http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSONPath:  authPath,
+		TokenEndpoint: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+	}
+
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer rotated-access" {
+		t.Fatalf("Authorization = %q, want file-rotated access token", got)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+}
+
+func TestOAuthFileReloadKeepsExplicitAccountIDOverride(t *testing.T) {
+	dir := t.TempDir()
+	authPath := dir + "/auth.json"
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"access-old","refresh_token":"refresh-old","account_id":"acct-file"},"last_refresh":"2099-01-01T00:00:00Z"}`)
+
+	session, err := NewOAuthAuthSessionFromConfig(OAuthSessionConfig{
+		AuthJSONPath: authPath,
+		AccountID:    "acct-override",
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromConfig() error = %v", err)
+	}
+
+	writeAuthFileForTest(t, authPath, `{"tokens":{"access_token":"access-new-rotated","refresh_token":"refresh-new","account_id":"acct-file-2"},"last_refresh":"2099-01-01T00:00:00Z"}`)
+	bumpFileMTimeForTest(t, authPath, 2*time.Second)
+
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer access-new-rotated" {
+		t.Fatalf("Authorization = %q, want rotated access token", got)
+	}
+	if got := headers["chatgpt-account-id"]; got != "acct-override" {
+		t.Fatalf("chatgpt-account-id = %q, want explicit override", got)
+	}
+}
+
+func TestOAuthInlineAuthJSONNeverReloads(t *testing.T) {
+	session, err := NewOAuthAuthSessionFromSecretData([]byte(`{"tokens":{"access_token":"inline-access","refresh_token":"inline-refresh","account_id":"acct-1"},"last_refresh":"2099-01-01T00:00:00Z"}`), "")
+	if err != nil {
+		t.Fatalf("NewOAuthAuthSessionFromSecretData() error = %v", err)
+	}
+	session.oauth.mu.Lock()
+	authJSONPath := session.oauth.authJSONPath
+	reloaded := session.oauth.reloadFromFileIfChangedLocked(true)
+	session.oauth.mu.Unlock()
+	if authJSONPath != "" {
+		t.Fatalf("authJSONPath = %q, want empty for inline material", authJSONPath)
+	}
+	if reloaded {
+		t.Fatal("reloadFromFileIfChangedLocked() = true, want false for inline material")
+	}
+
+	headers, err := session.RequestHeaders(context.Background())
+	if err != nil {
+		t.Fatalf("RequestHeaders() error = %v", err)
+	}
+	if got := headers["Authorization"]; got != "Bearer inline-access" {
+		t.Fatalf("Authorization = %q, want inline access token", got)
+	}
+}

@@ -40,7 +40,10 @@ func TestStoredRunRenewsLeaseDuringLongBoundary(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		select {
 		case <-store.renewed:
-		case <-time.After(time.Second):
+		case <-time.After(10 * time.Second):
+			// Generous bound: renewals normally arrive every few tens of
+			// milliseconds, but loaded CI runners can stall goroutine
+			// scheduling well past a second.
 			t.Fatal("lease heartbeat did not renew")
 		}
 	}
