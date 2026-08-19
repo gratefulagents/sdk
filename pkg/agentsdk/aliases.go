@@ -216,12 +216,13 @@ const (
 	ErrorActionAbort    = agent.ErrorActionAbort
 	ErrorActionContinue = agent.ErrorActionContinue
 
-	ReasoningNone   = agent.ReasoningNone
-	ReasoningLow    = agent.ReasoningLow
-	ReasoningMedium = agent.ReasoningMedium
-	ReasoningHigh   = agent.ReasoningHigh
-	ReasoningXHigh  = agent.ReasoningXHigh
-	ReasoningMax    = agent.ReasoningMax
+	ReasoningNone    = agent.ReasoningNone
+	ReasoningMinimal = agent.ReasoningMinimal
+	ReasoningLow     = agent.ReasoningLow
+	ReasoningMedium  = agent.ReasoningMedium
+	ReasoningHigh    = agent.ReasoningHigh
+	ReasoningXHigh   = agent.ReasoningXHigh
+	ReasoningMax     = agent.ReasoningMax
 
 	TextVerbosityLow    = agent.TextVerbosityLow
 	TextVerbosityMedium = agent.TextVerbosityMedium

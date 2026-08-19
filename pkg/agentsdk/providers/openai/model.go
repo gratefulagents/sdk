@@ -153,6 +153,14 @@ func (m *OpenAIModel) GetResponse(ctx context.Context, req agentsdk.ModelRequest
 	}
 	apiReq := m.buildRequest(req)
 	resp, err := m.client.CreateMessage(ctx, apiReq)
+	for attempts := 0; err != nil && attempts < 2; attempts++ {
+		healed, ok := m.downgradeEffortOnError(err, apiReq)
+		if !ok {
+			break
+		}
+		apiReq = healed
+		resp, err = m.client.CreateMessage(ctx, apiReq)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -237,10 +245,56 @@ func (m *OpenAIModel) StreamResponse(ctx context.Context, req agentsdk.ModelRequ
 	}
 	apiReq := m.buildRequest(req)
 	stream, err := m.client.CreateMessageStream(ctx, apiReq)
+	for attempts := 0; err != nil && attempts < 2; attempts++ {
+		healed, ok := m.downgradeEffortOnError(err, apiReq)
+		if !ok {
+			break
+		}
+		apiReq = healed
+		stream, err = m.client.CreateMessageStream(ctx, apiReq)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return wrapAnthropicStyleStream(ctx, stream), nil
+}
+
+// effortDowngrades is the one-step-lower ladder used when a model rejects a
+// requested reasoning effort value (HTTP 400 such as "invalid_reasoning_effort").
+// Mirrors the Codex CLI catalog reality: xhigh/max are model-dependent top
+// tiers, and effort none only exists on gpt-5.1+ general models.
+var effortDowngrades = map[string]string{
+	"max":   "xhigh",
+	"xhigh": "high",
+	"none":  "minimal",
+}
+
+// downgradeEffortOnError rebuilds the request with the next-lower reasoning
+// effort after the API rejected the requested value. It only reacts to HTTP
+// 400 bodies that mention the reasoning effort, so unrelated bad-request
+// errors still surface immediately. Callers may apply it repeatedly (bounded
+// by the ladder) so e.g. max degrades through xhigh to high on models that
+// support neither top tier.
+func (m *OpenAIModel) downgradeEffortOnError(err error, sent internalanthropic.CreateMessageRequest) (internalanthropic.CreateMessageRequest, bool) {
+	effort := strings.ToLower(strings.TrimSpace(sent.ReasoningEffort))
+	if effort == "" {
+		return sent, false
+	}
+	var reqErr *internalopenai.RequestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != 400 {
+		return sent, false
+	}
+	body := strings.ToLower(reqErr.Body)
+	if !strings.Contains(body, "reasoning") || !strings.Contains(body, "effort") {
+		return sent, false
+	}
+	next, ok := effortDowngrades[effort]
+	if !ok {
+		return sent, false
+	}
+	log.Printf("[openai] model %s rejected reasoning effort %q; retrying with %q", sent.Model, effort, next)
+	sent.ReasoningEffort = next
+	return sent, true
 }
 
 func (m *OpenAIModel) GetRetryAdvice(err error) *agentsdk.ModelRetryAdvice {
@@ -322,9 +376,10 @@ func (m *OpenAIModel) buildRequest(req agentsdk.ModelRequest) internalanthropic.
 		// OpenAI supports an explicit "minimal" effort, but this shim forwards
 		// Anthropic-style thinking budgets. A tiny sentinel budget maps to
 		// explicit minimal reasoning without enabling heavy thinking. "none"
-		// cannot be expressed on the Responses path, so it degrades to minimal
-		// there; on the OpenRouter chat path it disables reasoning outright via
-		// the reasoning.effort field below.
+		// passes through as-is on gpt-5.1+ Responses models and degrades to
+		// minimal on older ones (see sharedReasoning); on the OpenRouter chat
+		// path it disables reasoning outright via the reasoning.effort field
+		// below.
 		apiReq.Thinking = &internalanthropic.ThinkingConfig{
 			Type:         "enabled",
 			BudgetTokens: 1,

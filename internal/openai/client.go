@@ -1114,13 +1114,14 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 		params.ParallelToolCalls = sdk.Bool(true)
 	}
 
-	if reasoning, ok := sharedReasoning(req.ReasoningEffort, req.Thinking); ok {
+	if reasoning, ok := sharedReasoning(req.Model, req.ReasoningEffort, req.Thinking); ok {
 		// Request a reasoning summary so models that withhold raw reasoning
 		// (gpt-5, o-series, codex) still surface human-readable reasoning text via
-		// response.reasoning_summary_text events. Effort "minimal" yields no
-		// reasoning, so a summary is pointless there. The Codex /responses backend
-		// accepts this field and maybeNormalizeCodexResponsesBody preserves it.
-		if reasoning.Effort != "minimal" {
+		// response.reasoning_summary_text events. Efforts "minimal" and "none"
+		// yield no reasoning, so a summary is pointless there. The Codex
+		// /responses backend accepts this field and
+		// maybeNormalizeCodexResponsesBody preserves it.
+		if reasoning.Effort != "minimal" && reasoning.Effort != "none" {
 			reasoning.Summary = shared.ReasoningSummaryAuto
 		}
 		params.Reasoning = reasoning
@@ -1231,7 +1232,7 @@ func toCompactParams(req anthropic.CreateMessageRequest, includeCodexExtras bool
 			extras["tools"] = tools
 			extras["parallel_tool_calls"] = true
 		}
-		if reasoning, ok := sharedReasoning(req.ReasoningEffort, req.Thinking); ok {
+		if reasoning, ok := sharedReasoning(req.Model, req.ReasoningEffort, req.Thinking); ok {
 			extras["reasoning"] = reasoning
 		}
 		if verbosity := normalizeTextVerbosity(req.TextVerbosity); verbosity != "" {
@@ -1342,12 +1343,12 @@ func outputSchemaMap(schema *anthropic.OutputSchema) (map[string]any, error) {
 	return schemaMap, nil
 }
 
-func sharedReasoning(effort string, thinking *anthropic.ThinkingConfig) (shared.ReasoningParam, bool) {
+func sharedReasoning(model, effort string, thinking *anthropic.ThinkingConfig) (shared.ReasoningParam, bool) {
 	if effort = strings.ToLower(strings.TrimSpace(effort)); effort != "" {
-		// The Responses path historically represents explicit none with a tiny
-		// thinking budget, which maps to minimal. Preserve that compatibility
-		// while allowing newer model efforts such as GPT-5.6 max to pass through.
-		if effort == "none" {
+		// Effort "none" is a real Responses API value on gpt-5.1+ general
+		// models (codex-family models do not expose it). Older models degrade
+		// an explicit none to minimal, the historical closest behavior.
+		if effort == "none" && !modelSupportsEffortNone(model) {
 			effort = "minimal"
 		}
 		return shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}, true
@@ -1356,6 +1357,31 @@ func sharedReasoning(effort string, thinking *anthropic.ThinkingConfig) (shared.
 		return shared.ReasoningParam{}, false
 	}
 	return sharedReasoningFromBudget(thinking.BudgetTokens), true
+}
+
+// gptVersionPattern extracts the numeric family version from model IDs such as
+// "gpt-5.1", "gpt-5.6-turbo", or "openai/gpt-6".
+var gptVersionPattern = regexp.MustCompile(`(?:^|[/-])gpt-(\d+)(?:\.(\d+))?`)
+
+// modelSupportsEffortNone reports whether the Responses model accepts
+// reasoning.effort="none" natively. Mirrors the Codex CLI model catalog:
+// gpt-5.1 and newer general models support none; codex-family models and
+// pre-5.1 models do not.
+func modelSupportsEffortNone(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(model, "codex") {
+		return false
+	}
+	m := gptVersionPattern.FindStringSubmatch(model)
+	if m == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor := 0
+	if m[2] != "" {
+		minor, _ = strconv.Atoi(m[2])
+	}
+	return major > 5 || (major == 5 && minor >= 1)
 }
 
 func sharedReasoningFromBudget(budget int) shared.ReasoningParam {
