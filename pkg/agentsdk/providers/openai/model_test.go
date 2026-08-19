@@ -6,8 +6,54 @@ import (
 	"strings"
 	"testing"
 
+	internalanthropic "github.com/gratefulagents/sdk/internal/anthropic"
+	internalopenai "github.com/gratefulagents/sdk/internal/openai"
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
+
+// TestDowngradeEffortOnError pins the one-step effort ladder used when a model
+// rejects the requested reasoning effort value: max→xhigh→high and
+// none→minimal, applied only to 400s that mention the reasoning effort.
+func TestDowngradeEffortOnError(t *testing.T) {
+	m := &OpenAIModel{}
+	effortErr := &internalopenai.RequestError{
+		StatusCode: 400,
+		Body:       `{"error":{"code":"invalid_reasoning_effort","message":"Invalid reasoning effort: not supported for this model"}}`,
+	}
+
+	sent := internalanthropic.CreateMessageRequest{Model: "gpt-5.1", ReasoningEffort: "max"}
+	healed, ok := m.downgradeEffortOnError(effortErr, sent)
+	if !ok || healed.ReasoningEffort != "xhigh" {
+		t.Fatalf("downgrade(max) = %q ok=%v, want xhigh", healed.ReasoningEffort, ok)
+	}
+	healed, ok = m.downgradeEffortOnError(effortErr, healed)
+	if !ok || healed.ReasoningEffort != "high" {
+		t.Fatalf("downgrade(xhigh) = %q ok=%v, want high", healed.ReasoningEffort, ok)
+	}
+	if _, ok := m.downgradeEffortOnError(effortErr, healed); ok {
+		t.Fatal("downgrade(high) should not retry: high is universally supported")
+	}
+
+	sent.ReasoningEffort = "none"
+	healed, ok = m.downgradeEffortOnError(effortErr, sent)
+	if !ok || healed.ReasoningEffort != "minimal" {
+		t.Fatalf("downgrade(none) = %q ok=%v, want minimal", healed.ReasoningEffort, ok)
+	}
+
+	sent.ReasoningEffort = "max"
+	unrelated := &internalopenai.RequestError{StatusCode: 400, Body: "max_tokens is too large"}
+	if _, ok := m.downgradeEffortOnError(unrelated, sent); ok {
+		t.Fatal("unrelated 400 must not trigger an effort downgrade")
+	}
+	server := &internalopenai.RequestError{StatusCode: 500, Body: "reasoning effort backend error"}
+	if _, ok := m.downgradeEffortOnError(server, sent); ok {
+		t.Fatal("non-400 errors must not trigger an effort downgrade")
+	}
+	sent.ReasoningEffort = ""
+	if _, ok := m.downgradeEffortOnError(effortErr, sent); ok {
+		t.Fatal("requests without an effort must not be retried")
+	}
+}
 
 type rawCompactionFixture string
 

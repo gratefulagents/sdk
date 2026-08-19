@@ -115,6 +115,11 @@ type AnthropicModel struct {
 	// API rejected the derived shape with the thinking.type 400 (see
 	// flipThinkingShapeOnError). 0 = auto, 1 = adaptive, 2 = enabled.
 	thinkingShape atomic.Int32
+
+	// capAdaptiveEffort caps adaptive output_config.effort at "high" after the
+	// API rejected a top-tier value (xhigh/max are model-dependent; see
+	// capAdaptiveEffortOnError).
+	capAdaptiveEffort atomic.Bool
 }
 
 type anthropicModelConfig struct {
@@ -180,11 +185,11 @@ func (m *AnthropicModel) GetResponse(ctx context.Context, req agentsdk.ModelRequ
 	apiReq := m.buildRequest(req)
 	resp, err := m.client.CreateMessage(ctx, apiReq)
 	if err != nil {
-		flipped, ok := m.flipThinkingShapeOnError(err, apiReq, req)
+		healed, ok := m.healRequestOnError(err, apiReq, req)
 		if !ok {
 			return nil, err
 		}
-		if resp, err = m.client.CreateMessage(ctx, flipped); err != nil {
+		if resp, err = m.client.CreateMessage(ctx, healed); err != nil {
 			return nil, err
 		}
 	}
@@ -198,15 +203,25 @@ func (m *AnthropicModel) StreamResponse(ctx context.Context, req agentsdk.ModelR
 	apiReq := m.buildRequest(req)
 	stream, err := m.client.CreateMessageStream(ctx, apiReq)
 	if err != nil {
-		flipped, ok := m.flipThinkingShapeOnError(err, apiReq, req)
+		healed, ok := m.healRequestOnError(err, apiReq, req)
 		if !ok {
 			return nil, err
 		}
-		if stream, err = m.client.CreateMessageStream(ctx, flipped); err != nil {
+		if stream, err = m.client.CreateMessageStream(ctx, healed); err != nil {
 			return nil, err
 		}
 	}
 	return m.wrapStream(ctx, stream), nil
+}
+
+// healRequestOnError applies the one-shot self-healing rebuilds for request
+// shapes the target model rejected: first the thinking.type shape flip, then
+// the adaptive effort cap. Returns the rebuilt request when a heal applies.
+func (m *AnthropicModel) healRequestOnError(err error, sent internalanthropic.CreateMessageRequest, req agentsdk.ModelRequest) (internalanthropic.CreateMessageRequest, bool) {
+	if fixed, ok := m.flipThinkingShapeOnError(err, sent, req); ok {
+		return fixed, true
+	}
+	return m.capAdaptiveEffortOnError(err, sent, req)
 }
 
 func (m *AnthropicModel) GetRetryAdvice(err error) *agentsdk.ModelRetryAdvice {
@@ -328,15 +343,37 @@ func (m *AnthropicModel) applyThinkingConfig(apiReq *internalanthropic.CreateMes
 		if effort == "" {
 			effort = string(internalanthropic.OutputEffortMedium)
 		}
+		// A recorded effort cap (see capAdaptiveEffortOnError) means this
+		// model rejected a top-tier effort value; degrade to high, which every
+		// adaptive-thinking model accepts.
+		if m.capAdaptiveEffort.Load() &&
+			(effort == internalanthropic.OutputEffortXHigh || effort == internalanthropic.OutputEffortMax) {
+			effort = internalanthropic.OutputEffortHigh
+		}
 		apiReq.Thinking = &internalanthropic.ThinkingConfig{Type: "adaptive", Display: "summarized"}
 		apiReq.OutputEffort = effort
 		return
 	}
 	budget := settings.ThinkingBudget
 	if budget <= 0 {
-		budget = thinkingBudgetForEffort(effort)
+		// Derive the budget from the raw host effort label, not the
+		// Anthropic-mapped one: mapReasoningEffortToAnthropic folds xhigh into
+		// max for output_config.effort, but on budget models xhigh and max
+		// must stay distinct tiers.
+		budget = thinkingBudgetForEffort(strings.ToLower(strings.TrimSpace(settings.ReasoningEffort)))
 	}
 	if budget <= 0 {
+		return
+	}
+	// The Messages API requires budget_tokens >= 1024 and < max_tokens. Clamp
+	// to the request's output limit (mirroring pi's max_tokens - 1024 clamp) so
+	// a large reasoning tier cannot 400 a request with a small max_tokens.
+	if apiReq.MaxTokens > 0 && budget > apiReq.MaxTokens-1024 {
+		budget = apiReq.MaxTokens - 1024
+	}
+	if budget < 1024 {
+		// Not enough output room for the provider's minimum thinking budget;
+		// skip thinking instead of sending a request the API will reject.
 		return
 	}
 	apiReq.Thinking = &internalanthropic.ThinkingConfig{
@@ -364,20 +401,25 @@ func (m *AnthropicModel) useAdaptiveThinking(model string) bool {
 	return internalanthropic.ModelRequiresAdaptiveThinking(model)
 }
 
-// thinkingBudgetForEffort converts a reasoning-effort label into a fixed
+// thinkingBudgetForEffort converts a host reasoning-effort label into a fixed
 // thinking budget for models that only implement enabled + budget_tokens.
 // The ladder mirrors agent.ModeReasoningSettings so an effort-only request
-// behaves the same as the equivalent mode-level reasoning setting.
+// behaves the same as the equivalent mode-level reasoning setting, and keeps
+// xhigh and max distinct so the top tier is stronger on budget-based models.
 func thinkingBudgetForEffort(effort string) int {
 	switch effort {
+	case "minimal":
+		return 1024
 	case internalanthropic.OutputEffortLow:
 		return 2048
 	case internalanthropic.OutputEffortMedium:
 		return 4096
 	case internalanthropic.OutputEffortHigh:
 		return 8192
-	case internalanthropic.OutputEffortXHigh, internalanthropic.OutputEffortMax:
-		return 12288
+	case internalanthropic.OutputEffortXHigh:
+		return 16384
+	case internalanthropic.OutputEffortMax:
+		return 24576
 	default:
 		return 0
 	}
@@ -406,6 +448,32 @@ func (m *AnthropicModel) flipThinkingShapeOnError(err error, sent internalanthro
 	} else {
 		m.thinkingShape.Store(thinkingShapeAdaptive)
 	}
+	return m.buildRequest(req), true
+}
+
+// capAdaptiveEffortOnError rebuilds the request with output_config.effort
+// capped at "high" after the API rejected a top-tier effort value with HTTP
+// 400. Which top tiers a model accepts is model-dependent (e.g. sonnet-4.6
+// accepts max but rejects xhigh, and older adaptive models accept neither),
+// so instead of maintaining a per-model catalog the first rejection records a
+// cap for the model's lifetime and the retry degrades to high, which every
+// adaptive-thinking model accepts.
+func (m *AnthropicModel) capAdaptiveEffortOnError(err error, sent internalanthropic.CreateMessageRequest, req agentsdk.ModelRequest) (internalanthropic.CreateMessageRequest, bool) {
+	if sent.Thinking == nil || sent.Thinking.Type != "adaptive" {
+		return sent, false
+	}
+	if sent.OutputEffort != internalanthropic.OutputEffortXHigh &&
+		sent.OutputEffort != internalanthropic.OutputEffortMax {
+		return sent, false
+	}
+	var reqErr *internalanthropic.RequestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != 400 {
+		return sent, false
+	}
+	if !strings.Contains(strings.ToLower(reqErr.Body), "effort") {
+		return sent, false
+	}
+	m.capAdaptiveEffort.Store(true)
 	return m.buildRequest(req), true
 }
 

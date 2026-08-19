@@ -275,6 +275,37 @@ func TestBuildRequestThinkingShapePerModel(t *testing.T) {
 			wantType: "",
 		},
 		{
+			name:       "budget model xhigh effort derives 16384",
+			adaptive:   false,
+			model:      "claude-sonnet-4-5",
+			settings:   agentsdk.ModelSettings{ReasoningEffort: "xhigh", MaxTokens: 32000},
+			wantType:   "enabled",
+			wantBudget: 16384,
+		},
+		{
+			name:       "budget model max effort derives 24576 (stronger than xhigh)",
+			adaptive:   false,
+			model:      "claude-sonnet-4-5",
+			settings:   agentsdk.ModelSettings{ReasoningEffort: "max", MaxTokens: 32000},
+			wantType:   "enabled",
+			wantBudget: 24576,
+		},
+		{
+			name:       "budget clamps to max_tokens minus reserve",
+			adaptive:   false,
+			model:      "claude-sonnet-4-5",
+			settings:   agentsdk.ModelSettings{ThinkingBudget: 8192, MaxTokens: 4096},
+			wantType:   "enabled",
+			wantBudget: 3072,
+		},
+		{
+			name:     "budget below provider minimum disables thinking",
+			adaptive: false,
+			model:    "claude-sonnet-4-5",
+			settings: agentsdk.ModelSettings{ThinkingBudget: 8192, MaxTokens: 1536},
+			wantType: "",
+		},
+		{
 			name:     "no reasoning settings sends no thinking config",
 			adaptive: false,
 			model:    "claude-sonnet-4-5",
@@ -365,6 +396,77 @@ func TestThinkingShapeFlipOn400(t *testing.T) {
 	// The working shape sticks: the next request goes straight to adaptive.
 	if apiReq := m.buildRequest(req); apiReq.Thinking == nil || apiReq.Thinking.Type != "adaptive" {
 		t.Fatalf("post-flip Thinking = %+v, want adaptive", apiReq.Thinking)
+	}
+}
+
+// TestCapAdaptiveEffortOn400 verifies the effort self-heal: when a model
+// rejects a top-tier output_config.effort value with a 400, the request is
+// retried once with the effort capped at high, and the cap sticks for
+// subsequent requests from the same model handle.
+func TestCapAdaptiveEffortOn400(t *testing.T) {
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"output_config: effort: Input should be 'low', 'medium' or 'high'"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	m, err := newAnthropicModel(anthropicModelConfig{apiKey: "test-key", baseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.model = "claude-fable-5" // adaptive-thinking model
+	m.adaptiveThinking = true
+
+	req := agentsdk.ModelRequest{
+		Model:    "claude-fable-5",
+		Settings: agentsdk.ModelSettings{ThinkingBudget: 24576, ReasoningEffort: "max"},
+		Input:    []agentsdk.RunItem{{Type: agentsdk.RunItemMessage, Message: &agentsdk.MessageOutput{Text: "hi"}}},
+	}
+	resp, err := m.GetResponse(context.Background(), req)
+	if err != nil {
+		t.Fatalf("GetResponse() error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("GetResponse() = nil response after capped retry")
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2 (original + capped retry)", len(bodies))
+	}
+	firstCfg, _ := bodies[0]["output_config"].(map[string]any)
+	if got, _ := firstCfg["effort"].(string); got != "max" {
+		t.Fatalf("first output_config.effort = %q, want max", got)
+	}
+	secondCfg, _ := bodies[1]["output_config"].(map[string]any)
+	if got, _ := secondCfg["effort"].(string); got != "high" {
+		t.Fatalf("retry output_config.effort = %q, want high", got)
+	}
+
+	// The cap sticks: subsequent top-tier requests go straight to high.
+	if apiReq := m.buildRequest(req); apiReq.OutputEffort != "high" {
+		t.Fatalf("post-cap OutputEffort = %q, want high", apiReq.OutputEffort)
+	}
+}
+
+// TestCapAdaptiveEffortIgnoresLowerTiers ensures the cap heal only reacts to
+// top-tier effort rejections; a 400 on a medium-effort request passes through.
+func TestCapAdaptiveEffortIgnoresLowerTiers(t *testing.T) {
+	m := &AnthropicModel{model: "claude-fable-5", adaptiveThinking: true}
+	sent := m.buildRequest(agentsdk.ModelRequest{
+		Model:    "claude-fable-5",
+		Settings: agentsdk.ModelSettings{ReasoningEffort: "medium"},
+	})
+	err := &internalanthropic.RequestError{StatusCode: 400, Body: "output_config: effort invalid"}
+	if _, ok := m.capAdaptiveEffortOnError(err, sent, agentsdk.ModelRequest{}); ok {
+		t.Fatal("medium effort must not be capped")
 	}
 }
 

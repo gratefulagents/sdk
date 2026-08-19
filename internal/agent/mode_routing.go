@@ -9,12 +9,13 @@ import (
 type ModeReasoningLevel string
 
 const (
-	ReasoningNone   ModeReasoningLevel = "none"
-	ReasoningLow    ModeReasoningLevel = "low"
-	ReasoningMedium ModeReasoningLevel = "medium"
-	ReasoningHigh   ModeReasoningLevel = "high"
-	ReasoningXHigh  ModeReasoningLevel = "xhigh"
-	ReasoningMax    ModeReasoningLevel = "max"
+	ReasoningNone    ModeReasoningLevel = "none"
+	ReasoningMinimal ModeReasoningLevel = "minimal"
+	ReasoningLow     ModeReasoningLevel = "low"
+	ReasoningMedium  ModeReasoningLevel = "medium"
+	ReasoningHigh    ModeReasoningLevel = "high"
+	ReasoningXHigh   ModeReasoningLevel = "xhigh"
+	ReasoningMax     ModeReasoningLevel = "max"
 )
 
 // ModeTextVerbosity is an SDK-native text verbosity label.
@@ -149,10 +150,14 @@ func resolveFallbackModelsForProvider(models []string, provider string) []string
 func ModeReasoningSettings(level any) ModelSettings {
 	switch normalizeModeReasoningLevel(level) {
 	case ReasoningNone:
-		// "none" disables reasoning. On OpenRouter this maps to
-		// reasoning.effort="none"; on the OpenAI Responses path it degrades to
-		// minimal (the closest supported behavior).
+		// "none" disables reasoning. Models that accept effort "none"
+		// (gpt-5.1+) receive it verbatim; older Responses models degrade to
+		// minimal (the closest supported behavior). Budget-based providers
+		// disable thinking entirely.
 		return ModelSettings{ReasoningEffort: "none"}
+	case ReasoningMinimal:
+		// Anthropic's minimum accepted thinking budget is 1024.
+		return ModelSettings{ThinkingBudget: 1024, ReasoningEffort: "minimal"}
 	case ReasoningLow:
 		return ModelSettings{ThinkingBudget: 2048, ReasoningEffort: "low"}
 	case ReasoningMedium:
@@ -160,12 +165,15 @@ func ModeReasoningSettings(level any) ModelSettings {
 	case ReasoningHigh:
 		return ModelSettings{ThinkingBudget: 8192, ReasoningEffort: "high"}
 	case ReasoningXHigh:
-		// Keep the Anthropic budget capped while preserving OpenAI xhigh effort.
-		return ModelSettings{ThinkingBudget: 12288, ReasoningEffort: "xhigh"}
+		// Budgets mirror reference harnesses (pi caps its top tiers at 16384)
+		// while preserving OpenAI xhigh effort. Providers clamp the budget to
+		// the request max-token limit at send time.
+		return ModelSettings{ThinkingBudget: 16384, ReasoningEffort: "xhigh"}
 	case ReasoningMax:
-		// Max is a distinct OpenAI effort above xhigh. Legacy budget-based
-		// providers use the same safe cap as xhigh.
-		return ModelSettings{ThinkingBudget: 12288, ReasoningEffort: "max"}
+		// Max is a distinct OpenAI effort above xhigh; budget-based providers
+		// get a correspondingly larger thinking budget so max is stronger
+		// than xhigh there too.
+		return ModelSettings{ThinkingBudget: 24576, ReasoningEffort: "max"}
 	default:
 		return ModelSettings{}
 	}
@@ -196,6 +204,8 @@ func normalizeModeReasoningLevel(level any) ModeReasoningLevel {
 	switch strings.ToLower(strings.TrimSpace(fmt.Sprint(level))) {
 	case string(ReasoningNone):
 		return ReasoningNone
+	case string(ReasoningMinimal):
+		return ReasoningMinimal
 	case string(ReasoningLow):
 		return ReasoningLow
 	case string(ReasoningMedium):

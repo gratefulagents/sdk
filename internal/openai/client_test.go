@@ -1050,6 +1050,50 @@ func TestAnalyzeImagePostsGPT55ImageInput(t *testing.T) {
 	}
 }
 
+// TestSharedReasoningEffortNonePerModel pins the Codex-CLI-aligned handling of
+// effort "none": gpt-5.1+ general models accept it natively, while codex-family
+// and pre-5.1 models degrade it to minimal.
+func TestSharedReasoningEffortNonePerModel(t *testing.T) {
+	cases := []struct{ model, want string }{
+		{"gpt-5.1", "none"},
+		{"openai/gpt-5.1", "none"},
+		{"gpt-5.6", "none"},
+		{"gpt-6", "none"},
+		{"gpt-5", "minimal"},
+		{"gpt-4o", "minimal"},
+		{"o3", "minimal"},
+		{"gpt-5.1-codex", "minimal"},
+		{"gpt-5.1-codex-max", "minimal"},
+	}
+	for _, tc := range cases {
+		got, ok := sharedReasoning(tc.model, "none", nil)
+		if !ok || string(got.Effort) != tc.want {
+			t.Fatalf("sharedReasoning(%q, none) = %q ok=%v, want %q", tc.model, got.Effort, ok, tc.want)
+		}
+	}
+}
+
+// TestToResponseParams_EffortNoneSkipsSummary verifies that a native effort
+// none request neither remaps the effort nor asks for a reasoning summary
+// (none yields no reasoning, so a summary is pointless).
+func TestToResponseParams_EffortNoneSkipsSummary(t *testing.T) {
+	req := anthropic.CreateMessageRequest{
+		Model:           "gpt-5.1",
+		Messages:        []anthropic.Message{{Role: "user", Content: []anthropic.ContentBlock{{Type: "text", Text: "hi"}}}},
+		ReasoningEffort: "none",
+	}
+	params, err := toResponseParams(req)
+	if err != nil {
+		t.Fatalf("toResponseParams() error = %v", err)
+	}
+	if got := string(params.Reasoning.Effort); got != "none" {
+		t.Fatalf("Reasoning effort = %q, want none (gpt-5.1 accepts none natively)", got)
+	}
+	if got := string(params.Reasoning.Summary); got != "" {
+		t.Fatalf("Reasoning summary = %q, want empty for effort none", got)
+	}
+}
+
 func TestToResponseParams_PreservesExplicitReasoningEffort(t *testing.T) {
 	for _, effort := range []string{"high", "xhigh", "max"} {
 		t.Run(effort, func(t *testing.T) {
