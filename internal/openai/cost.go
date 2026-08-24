@@ -6,16 +6,20 @@ import (
 	"github.com/gratefulagents/sdk/internal/anthropic"
 )
 
-// ModelPricing holds per-million-token prices in USD.
+// ModelPricing holds per-million-token prices in USD. LongContext, when set,
+// applies to requests with more than 272K input tokens.
 type ModelPricing struct {
 	InputPerMillion           float64
 	CachedInputPerMillion     float64
 	CacheWriteInputPerMillion float64
 	OutputPerMillion          float64
+	LongContext               *ModelPricing
 }
 
+const longContextInputThreshold = 272_000
+
 // modelPricing holds OpenAI standard-tier list prices in USD per 1M tokens,
-// verified against https://developers.openai.com/api/docs/pricing (2026-07).
+// verified against https://developers.openai.com/api/docs/pricing (2026-08).
 // CachedInputPerMillion is the prompt-cache read rate. CacheWriteInputPerMillion
 // is the GPT-5.6+ cache-write rate (1.25x regular input). OutputPerMillion already
 // covers reasoning tokens (OpenAI includes them in output_tokens). Batch, Flex,
@@ -101,10 +105,22 @@ var modelPricing = map[string]ModelPricing{
 		OutputPerMillion:      1.25,
 	},
 	"gpt-5.6-sol": {
-		InputPerMillion:           5.0,
-		CachedInputPerMillion:     0.50,
-		CacheWriteInputPerMillion: 6.25,
-		OutputPerMillion:          30.0,
+		InputPerMillion:           4.0,
+		CachedInputPerMillion:     0.40,
+		CacheWriteInputPerMillion: 5.0,
+		OutputPerMillion:          20.0,
+		LongContext: &ModelPricing{
+			InputPerMillion:           8.0,
+			CachedInputPerMillion:     0.80,
+			CacheWriteInputPerMillion: 10.0,
+			OutputPerMillion:          30.0,
+		},
+	},
+	"gpt-5.6-cyber": {
+		InputPerMillion:           12.5,
+		CachedInputPerMillion:     1.25,
+		CacheWriteInputPerMillion: 15.625,
+		OutputPerMillion:          75.0,
 	},
 	"gpt-5.6-terra": {
 		InputPerMillion:           2.5,
@@ -153,8 +169,11 @@ func normalizePricingModel(model string) string {
 	if model == "gpt-4" {
 		return "gpt-4.1"
 	}
-	if model == "gpt-5.6" {
+	if model == "gpt-5.6" || model == "daybreak-blue-latest" || model == "gpt-daybreak-blue-latest" {
 		return "gpt-5.6-sol"
+	}
+	if model == "daybreak-red-latest" || model == "gpt-daybreak-red-latest" {
+		return "gpt-5.6-cyber"
 	}
 	return model
 }
@@ -168,6 +187,9 @@ func EstimateCost(model string, usage anthropic.Usage) (float64, bool) {
 	}
 
 	inputTokens := max(usage.InputTokens, 0)
+	if pricing.LongContext != nil && inputTokens > longContextInputThreshold {
+		pricing = *pricing.LongContext
+	}
 	cacheReadTokens := max(usage.CacheReadInputTokens, 0)
 	if cacheReadTokens > inputTokens {
 		cacheReadTokens = inputTokens
