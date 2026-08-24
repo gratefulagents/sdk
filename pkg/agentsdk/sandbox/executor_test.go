@@ -376,14 +376,30 @@ func TestBubblewrapArgsMaskProcWhenProcfsMountUnavailable(t *testing.T) {
 		t.Fatalf("BubblewrapArgs() error = %v", err)
 	}
 	// Without a fresh procfs the host /proc must remain masked so
-	// /proc/<pid>/environ of the agent process is unreachable. A minimal
-	// /proc/self/exe link keeps runtimes that inspect their own executable
-	// working without exposing any host process metadata.
+	// /proc/<pid>/environ of the agent process is unreachable. A static
+	// /proc/self/exe link would forge the identity of every descendant.
 	assertArgSequence(t, args, "--tmpfs", "/proc")
 	assertArgAbsent(t, args, "--proc", "/proc")
 	assertArgAbsent(t, args, "--ro-bind", "/proc", "/proc")
-	assertArgSequence(t, args, "--dir", "/proc/self")
-	assertArgSequence(t, args, "--symlink", "/usr/bin/example-runtime", "/proc/self/exe")
+	assertArgAbsent(t, args, "--dir", "/proc/self")
+	assertArgAbsent(t, args, "--symlink", "/usr/bin/example-runtime", "/proc/self/exe")
+}
+
+func TestBubblewrapArgsDoesNotForgeChildExecutableIdentityForShell(t *testing.T) {
+	restore := overrideProcfsMountUsable(false)
+	defer restore()
+
+	args, err := BubblewrapArgsWithConfig(Request{
+		Argv:           []string{"bash", "--noprofile", "--norc", "-c", "rustc main.rs"},
+		WorkDir:        "/workspace/repo",
+		PermissionMode: policy.PermissionModeWorkspaceWrite,
+	}, Config{WorkspaceRoot: "/workspace"})
+	if err != nil {
+		t.Fatalf("BubblewrapArgs() error = %v", err)
+	}
+	assertArgSequence(t, args, "--tmpfs", "/proc")
+	assertArgAbsent(t, args, "--dir", "/proc/self")
+	assertArgAbsent(t, args, "--symlink", "/usr/bin/bash", "/proc/self/exe")
 }
 
 func TestBubblewrapArgsReadsArbitraryRuntimeToolchainPathFromReadOnlyRoot(t *testing.T) {
