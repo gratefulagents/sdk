@@ -509,15 +509,12 @@ func BubblewrapArgsWithConfig(req Request, config Config) ([]string, error) {
 		// recursively-bound host /proc entirely so /proc/<pid>/environ of the
 		// agent process (which holds host secrets) stays unreachable.
 		args = append(args, "--tmpfs", "/proc")
-		// Go, Bun, and other runtimes use /proc/self/exe during startup. Keep
-		// the masked procfs model, but provide the one process-independent link
-		// needed by those runtimes instead of exposing the host procfs.
-		if executable := sandboxExecutablePath(req.Argv[0], workDir, bwrapProcessEnv(req.Env, config)); executable != "" {
-			args = append(args,
-				"--dir", "/proc/self",
-				"--symlink", executable, "/proc/self/exe",
-			)
-		}
+		// Do not synthesize /proc/self/exe. A static namespace-wide link cannot
+		// represent process identity: every compiler or tool launched by the
+		// entrypoint would observe the entrypoint as its own executable. That
+		// corrupts provenance and makes self-update probes target read-only system
+		// binaries. Runtimes that require procfs must use a host where the fresh
+		// procfs probe succeeds rather than receiving a convincing false identity.
 	}
 	args = append(args,
 		"--dev", "/dev",
@@ -788,43 +785,6 @@ func resolveExistingPrefix(path string) string {
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-// sandboxExecutablePath resolves the requested command the same way the
-// sandbox child will, returning an absolute link target for the synthetic
-// /proc/self/exe used when a fresh procfs mount is unavailable.
-func sandboxExecutablePath(command, workDir string, env []string) string {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return ""
-	}
-	if filepath.IsAbs(command) {
-		return filepath.Clean(command)
-	}
-	if strings.ContainsRune(command, os.PathSeparator) {
-		return filepath.Clean(filepath.Join(workDir, command))
-	}
-
-	pathValue := ""
-	for _, pair := range env {
-		if key, value, ok := strings.Cut(pair, "="); ok && key == "PATH" {
-			pathValue = value
-			break
-		}
-	}
-	for _, dir := range filepath.SplitList(pathValue) {
-		if dir == "" {
-			dir = workDir
-		} else if !filepath.IsAbs(dir) {
-			dir = filepath.Join(workDir, dir)
-		}
-		candidate := filepath.Clean(filepath.Join(dir, command))
-		info, err := os.Stat(candidate)
-		if err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
-			return candidate
-		}
-	}
-	return ""
 }
 
 func existingPaths(paths []string) []string {
