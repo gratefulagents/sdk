@@ -557,12 +557,28 @@ func openAIVisionEligible(cfg Config) bool {
 	return provider == "openai" || provider == "multi"
 }
 
+// visionModelCandidates returns the model names to try for image analysis,
+// in preference order: the run's own model first (most current models are
+// multimodal), then the default OpenAI chat model as a fallback for
+// configured models that cannot analyze images.
+func visionModelCandidates(cfg Config) []string {
+	fallback := sdkopenai.DefaultChatModel
+	if strings.EqualFold(strings.TrimSpace(cfg.Provider), "multi") {
+		fallback = "openai/" + fallback
+	}
+	candidates := make([]string, 0, 2)
+	if model := strings.TrimSpace(cfg.Model); model != "" {
+		candidates = append(candidates, model)
+	}
+	if len(candidates) == 0 || !strings.EqualFold(candidates[0], fallback) {
+		candidates = append(candidates, fallback)
+	}
+	return candidates
+}
+
 func openAIVisionAnalyzeFn(cfg Config) sdkvision.AnalyzeWithDetailFn {
 	spec := ProviderSpec(cfg)
-	modelName := sdkopenai.DefaultChatModel
-	if strings.EqualFold(strings.TrimSpace(spec.Provider), "multi") {
-		modelName = "openai/" + modelName
-	}
+	candidates := visionModelCandidates(cfg)
 
 	var once sync.Once
 	var analyzer openAIVisionModel
@@ -571,19 +587,23 @@ func openAIVisionAnalyzeFn(cfg Config) sdkvision.AnalyzeWithDetailFn {
 		once.Do(func() {
 			provider, err := sdkproviders.NewProviderFromConfig(spec)
 			if err != nil {
-				initErr = fmt.Errorf("initialize OpenAI vision provider: %w", err)
+				initErr = fmt.Errorf("initialize vision provider: %w", err)
 				return
 			}
-			model, err := provider.GetModel(modelName)
-			if err != nil {
-				initErr = fmt.Errorf("initialize OpenAI vision model %s: %w", modelName, err)
-				return
+			var lastErr error
+			for _, modelName := range candidates {
+				model, err := provider.GetModel(modelName)
+				if err != nil {
+					lastErr = fmt.Errorf("initialize vision model %s: %w", modelName, err)
+					continue
+				}
+				if a, ok := model.(openAIVisionModel); ok {
+					analyzer = a
+					return
+				}
+				lastErr = fmt.Errorf("model %s does not support image analysis", modelName)
 			}
-			var ok bool
-			analyzer, ok = model.(openAIVisionModel)
-			if !ok {
-				initErr = fmt.Errorf("model %s does not support image analysis", modelName)
-			}
+			initErr = lastErr
 		})
 		if initErr != nil {
 			return "", initErr

@@ -13,6 +13,7 @@ import (
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
+	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	sdktools "github.com/gratefulagents/sdk/pkg/agentsdk/tools"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
@@ -477,6 +478,43 @@ func TestBuildToolBundleCanUseOnlyHostTools(t *testing.T) {
 	}
 	if len(bundle.Tools) != 1 || bundle.Tools[0].Name() != "host_tool" {
 		t.Fatalf("tools = %v, want only host_tool", toolNames(bundle.Tools))
+	}
+}
+
+func TestVisionModelCandidatesPrefersConfiguredModel(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want []string
+	}{
+		{
+			name: "openai parent model first with default fallback",
+			cfg:  Config{Provider: "openai", Model: "gpt-test-mini"},
+			want: []string{"gpt-test-mini", sdkopenai.DefaultChatModel},
+		},
+		{
+			name: "empty model falls back to default only",
+			cfg:  Config{Provider: "openai"},
+			want: []string{sdkopenai.DefaultChatModel},
+		},
+		{
+			name: "model equal to default is not duplicated",
+			cfg:  Config{Provider: "openai", Model: sdkopenai.DefaultChatModel},
+			want: []string{sdkopenai.DefaultChatModel},
+		},
+		{
+			name: "multi provider prefixes the fallback",
+			cfg:  Config{Provider: "multi", Model: "anthropic/claude-test"},
+			want: []string{"anthropic/claude-test", "openai/" + sdkopenai.DefaultChatModel},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := visionModelCandidates(tc.cfg)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("visionModelCandidates = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
