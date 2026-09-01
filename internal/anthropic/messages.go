@@ -125,12 +125,22 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 			}
 		}
 
+		// A tool schema with no properties (e.g. `{"type":"object"}`) must
+		// still send input_schema: BetaToolParam tags the field omitzero, so a
+		// zero-value BetaToolInputSchemaParam would drop input_schema entirely
+		// and the API rejects the request with
+		// "tools.N.custom.input_schema: Field required".
+		properties := props["properties"]
+		if properties == nil {
+			properties = map[string]interface{}{}
+		}
+
 		params.Tools = append(params.Tools, sdk.BetaToolUnionParam{
 			OfTool: &sdk.BetaToolParam{
 				Name:        tool.Name,
 				Description: sdk.String(tool.Description),
 				InputSchema: sdk.BetaToolInputSchemaParam{
-					Properties: props["properties"],
+					Properties: properties,
 					Required:   required,
 				},
 				CacheControl: toolCacheControl(tool.CacheControl),
