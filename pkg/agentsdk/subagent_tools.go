@@ -424,6 +424,27 @@ func (t *subagentTool) HasPendingSubAgentFinalJoin() bool {
 	return t.registry != nil && t.registry.HasPendingFinalJoinTasks()
 }
 
+// Durable wiring: the runner persists child task records inside the parent's
+// checkpoint and restores them on resume when the host has not done so.
+
+func (t *subagentTool) SubAgentSchedulerCheckpoint() SubAgentSchedulerCheckpoint {
+	if t.registry == nil {
+		return SubAgentSchedulerCheckpoint{}
+	}
+	return t.registry.SchedulerCheckpoint()
+}
+
+func (t *subagentTool) RestoreSubAgentSchedulerCheckpoint(checkpoint SubAgentSchedulerCheckpoint) error {
+	if t.registry == nil {
+		return errors.New("no sub-agent scheduler configured")
+	}
+	return t.registry.RestoreSchedulerCheckpoint(checkpoint)
+}
+
+func (t *subagentTool) HasSubAgentTasks() bool {
+	return t.registry != nil && t.registry.HasTasks()
+}
+
 func (t *subagentTool) PollSubAgentResults() []RunItem {
 	if t.registry == nil {
 		return nil

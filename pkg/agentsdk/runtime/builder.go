@@ -210,6 +210,26 @@ func (s *SessionState) SubAgentScheduler() *agentsdk.SubAgentScheduler {
 	return s.subAgentScheduler
 }
 
+// Close tears down session-scoped runtime state. Managed sub-agent tasks run
+// on contexts detached from any single turn so they can span turns; without
+// an explicit teardown they outlive the session that spawned them and keep
+// calling the model and writing to the workspace. Close cancels every
+// non-terminal task and flushes the scheduler checkpoint so the cancellations
+// are durable. It is idempotent and safe on a nil receiver.
+func (s *SessionState) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	scheduler := s.subAgentScheduler
+	s.mu.Unlock()
+	if scheduler == nil {
+		return nil
+	}
+	scheduler.CancelAll()
+	return scheduler.FlushCheckpoint()
+}
+
 func (s *SessionState) configureSubAgentScheduler(cfg agentsdk.SubAgentSchedulerConfig) *agentsdk.SubAgentScheduler {
 	if s == nil {
 		return agentsdk.NewSubAgentScheduler(cfg)
@@ -322,11 +342,19 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 	runner.DefaultHooks = hooks
 
 	state := cfg.SessionState
+	ownsState := state == nil
 	if state == nil {
 		state = NewSessionState()
 	}
 	if features.value.SubAgents.asyncEnabled() {
 		agentTools = attachAsyncSubAgentTools(cfg, state, runner, tracker, eventStream, agent, agentTools, specialistAgents)
+	}
+	closers := toolBundle.Closers
+	if ownsState {
+		// Nobody else holds this state, so its background sub-agent tasks
+		// would otherwise outlive the bundle. Host-supplied states span turns
+		// and are closed by the host when the session ends.
+		closers = append(closers, state)
 	}
 	names := toolNames(agentTools)
 	if eventStream != nil {
@@ -343,7 +371,7 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 		Tools:            agentTools,
 		SpecialistAgents: specialistAgents,
 		SessionState:     state,
-		Closers:          toolBundle.Closers,
+		Closers:          closers,
 	}, nil
 }
 

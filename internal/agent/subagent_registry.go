@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -107,6 +108,22 @@ type SubAgentSecurityBaseline struct {
 }
 
 const subAgentRuntimeRestartError = "sub-agent runtime restarted while this task was active; durable reconciliation is required"
+
+// Sentinel errors returned by ResumeRestoredTask. Hosts match them with
+// errors.Is to decide whether a reconciling task can ever be retried
+// automatically instead of string-matching error text.
+var (
+	// ErrSubAgentReconciliationRequired means the child's last checkpoint sits
+	// at a boundary with an unresolved external effect (model_completed,
+	// tool_prepared, approval_pending, paused). It will never resume on its
+	// own: the host must call ReconcileRestoredTask or Cancel.
+	ErrSubAgentReconciliationRequired = errors.New("sub-agent task requires explicit reconciliation")
+	// ErrSubAgentResumeRejected means the task cannot be resumed under the
+	// current process configuration (unsupported checkpoint schema, unknown
+	// boundary, missing agent or runner, or a weaker security baseline).
+	// Retrying without changing configuration will fail the same way.
+	ErrSubAgentResumeRejected = errors.New("sub-agent task cannot be resumed")
+)
 
 // subAgentTaskEntry is the internal mutable entry tracked by the registry.
 type subAgentTaskEntry struct {
@@ -1542,16 +1559,16 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	if resume != nil {
 		if resume.SchemaVersion != DurableCheckpointSchemaVersion {
 			r.mu.Unlock()
-			return fmt.Errorf("task %q has unsupported durable checkpoint schema %d", taskID, resume.SchemaVersion)
+			return fmt.Errorf("%w: task %q has unsupported durable checkpoint schema %d", ErrSubAgentResumeRejected, taskID, resume.SchemaVersion)
 		}
 		switch resume.Boundary {
 		case DurableBoundaryRunStarted, DurableBoundaryModelPrepared, DurableBoundaryToolCompleted, DurableBoundaryHandoffCompleted, DurableBoundaryRunCompleted:
 		case DurableBoundaryModelCompleted, DurableBoundaryToolPrepared, DurableBoundaryApprovalPending, DurableBoundaryPaused:
 			r.mu.Unlock()
-			return fmt.Errorf("task %q checkpoint at %s requires explicit reconciliation", taskID, resume.Boundary)
+			return fmt.Errorf("%w: task %q checkpoint at %s", ErrSubAgentReconciliationRequired, taskID, resume.Boundary)
 		default:
 			r.mu.Unlock()
-			return fmt.Errorf("task %q checkpoint at %s cannot be resumed", taskID, resume.Boundary)
+			return fmt.Errorf("%w: task %q checkpoint at %s has an unknown boundary", ErrSubAgentResumeRejected, taskID, resume.Boundary)
 		}
 	}
 
@@ -1590,7 +1607,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	currentSecurity := securityBaseline(childAccess, snap.toolPolicy, snap.toolInputGuardrails, snap.toolOutputGuardrails, snap.untrustedToolOutputs, snap.maxToolOutputBytes)
 	if err := securityBaselineAllowsResume(entry.securityBaseline, currentSecurity); err != nil {
 		r.mu.Unlock()
-		return fmt.Errorf("resume task %q: %w", taskID, err)
+		return fmt.Errorf("%w: task %q: %v", ErrSubAgentResumeRejected, taskID, err)
 	}
 
 	completedResume := resume != nil && resume.Boundary == DurableBoundaryRunCompleted
@@ -1604,7 +1621,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		finalOutput = Items.ExtractLastText(history)
 	} else if snap.runner == nil {
 		r.mu.Unlock()
-		return fmt.Errorf("task %q cannot resume without a runner", taskID)
+		return fmt.Errorf("%w: task %q has no runner configured", ErrSubAgentResumeRejected, taskID)
 	}
 
 	previousTask := cloneSubAgentTask(entry.task)
@@ -1619,7 +1636,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		agent = r.agents[entry.task.AgentName]
 		if agent == nil {
 			r.mu.Unlock()
-			return fmt.Errorf("task %q agent %q is not configured", taskID, entry.task.AgentName)
+			return fmt.Errorf("%w: task %q agent %q is not configured", ErrSubAgentResumeRejected, taskID, entry.task.AgentName)
 		}
 		taskCtx, cancel = context.WithCancel(context.Background())
 	}
@@ -2350,6 +2367,14 @@ func (r *SubAgentRegistry) HasActiveTasks() bool {
 		}
 	}
 	return false
+}
+
+// HasTasks reports whether the registry holds any task record, terminal or
+// not. A durable restore is only valid into an empty registry.
+func (r *SubAgentRegistry) HasTasks() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.tasks) > 0
 }
 
 // HasPendingFinalJoinTasks returns true if managed sub-agent supervision should

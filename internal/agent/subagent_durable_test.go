@@ -341,9 +341,12 @@ func TestResumeRestoredTaskRejectsUnreconciledOrWeakerSecurity(t *testing.T) {
 		name     string
 		boundary DurableBoundary
 		policy   *ToolPolicy
+		want     error
 	}{
-		{name: "unreconciled model", boundary: DurableBoundaryModelCompleted, policy: &ToolPolicy{ApprovalRequired: true}},
-		{name: "weaker policy", boundary: DurableBoundaryRunStarted, policy: &ToolPolicy{ApprovalRequired: true}},
+		{name: "unreconciled model", boundary: DurableBoundaryModelCompleted, policy: &ToolPolicy{ApprovalRequired: true}, want: ErrSubAgentReconciliationRequired},
+		{name: "approval pending", boundary: DurableBoundaryApprovalPending, policy: &ToolPolicy{ApprovalRequired: true}, want: ErrSubAgentReconciliationRequired},
+		{name: "unknown boundary", boundary: DurableBoundary("bogus"), policy: &ToolPolicy{ApprovalRequired: true}, want: ErrSubAgentResumeRejected},
+		{name: "weaker policy", boundary: DurableBoundaryRunStarted, policy: &ToolPolicy{ApprovalRequired: true}, want: ErrSubAgentResumeRejected},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			registry := NewSubAgentRegistry(SubAgentRegistryConfig{Checkpoint: func(SubAgentSchedulerCheckpoint) error { return nil }})
@@ -355,13 +358,36 @@ func TestResumeRestoredTaskRejectsUnreconciledOrWeakerSecurity(t *testing.T) {
 			if err := registry.RestoreSchedulerCheckpoint(checkpoint); err != nil {
 				t.Fatal(err)
 			}
-			if err := registry.ResumeRestoredTask(context.Background(), "child-1"); err == nil {
+			err := registry.ResumeRestoredTask(context.Background(), "child-1")
+			if err == nil {
 				t.Fatal("expected resume rejection")
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf("resume error %v is not %v", err, test.want)
+			}
+			if errors.Is(err, ErrSubAgentReconciliationRequired) && errors.Is(err, ErrSubAgentResumeRejected) {
+				t.Fatalf("resume error must match exactly one sentinel: %v", err)
 			}
 			task, _ := registry.GetStatus("child-1")
 			if task.Status != SubAgentTaskReconciling {
 				t.Fatalf("failed resume changed task status: %+v", task)
 			}
 		})
+	}
+}
+
+func TestResumeRestoredTaskRejectsUnsupportedSchemaWithSentinel(t *testing.T) {
+	registry := NewSubAgentRegistry(SubAgentRegistryConfig{Checkpoint: func(SubAgentSchedulerCheckpoint) error { return nil }})
+	checkpoint := SubAgentSchedulerCheckpoint{Records: []SubAgentSchedulerCheckpointRecord{{
+		Task:              SubAgentTask{ID: "child-1", AgentName: "worker", Status: SubAgentTaskRunning, Message: "work"},
+		DurableCheckpoint: &DurableCheckpoint{SchemaVersion: DurableCheckpointSchemaVersion + 1, Boundary: DurableBoundaryRunStarted},
+		SecurityBaseline:  securityBaseline(ToolAccessLevelFull, nil, nil, nil, nil, 0),
+	}}}
+	if err := registry.RestoreSchedulerCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	err := registry.ResumeRestoredTask(context.Background(), "child-1")
+	if !errors.Is(err, ErrSubAgentResumeRejected) {
+		t.Fatalf("expected ErrSubAgentResumeRejected, got %v", err)
 	}
 }

@@ -290,6 +290,8 @@ var (
 	NewSpan                             = agent.NewSpan
 	NewSubAgentActivity                 = agent.NewSubAgentActivity
 	NewSubAgentRegistry                 = agent.NewSubAgentRegistry
+	ErrSubAgentReconciliationRequired   = agent.ErrSubAgentReconciliationRequired
+	ErrSubAgentResumeRejected           = agent.ErrSubAgentResumeRejected
 	NewTrace                            = agent.NewTrace
 	NormalizeActionAuthorization        = agent.NormalizeActionAuthorization
 	NormalizeToolAccessLevel            = agent.NormalizeToolAccessLevel
