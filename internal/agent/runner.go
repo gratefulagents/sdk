@@ -158,6 +158,66 @@ type subAgentResultPoller interface {
 	PollSubAgentResults() []RunItem
 }
 
+// subAgentSchedulerCheckpointer is implemented by the managed sub-agent tool
+// so the runner can persist and restore child task records alongside the
+// parent's durable checkpoint without the host wiring the scheduler by hand.
+type subAgentSchedulerCheckpointer interface {
+	SubAgentSchedulerCheckpoint() SubAgentSchedulerCheckpoint
+	RestoreSubAgentSchedulerCheckpoint(SubAgentSchedulerCheckpoint) error
+	HasSubAgentTasks() bool
+}
+
+func findSubAgentSchedulerCheckpointer(tools []Tool) subAgentSchedulerCheckpointer {
+	for _, tool := range tools {
+		if cp, ok := tool.(subAgentSchedulerCheckpointer); ok {
+			return cp
+		}
+	}
+	return nil
+}
+
+// wireDurableChildren connects a durable run to the attached sub-agent
+// scheduler: child records ride along in every parent checkpoint, and a
+// resumed checkpoint that carries child records restores them into an empty
+// scheduler. Hosts that already restored the scheduler themselves (non-empty
+// registry) or provided their own Children callback are left untouched.
+func wireDurableChildren(cfg *DurableRunConfig, tools []Tool) error {
+	if cfg == nil {
+		return nil
+	}
+	checkpointer := findSubAgentSchedulerCheckpointer(tools)
+	if checkpointer != nil && cfg.Children == nil {
+		cfg.Children = checkpointer.SubAgentSchedulerCheckpoint
+	}
+	resume := cfg.Resume
+	if resume == nil || resume.Children == nil || len(resume.Children.Records) == 0 {
+		return nil
+	}
+	if checkpointer == nil {
+		// Terminal records carry nothing that can still act; dropping them
+		// loses only re-readable results. Active records represent in-flight
+		// work with possibly unresolved external effects and must never be
+		// discarded silently.
+		active := 0
+		for _, record := range resume.Children.Records {
+			if !record.Task.IsTerminal() {
+				active++
+			}
+		}
+		if active > 0 {
+			return fmt.Errorf("restore durable checkpoint: %d active child task record(s) but no sub-agent scheduler tool is attached", active)
+		}
+		return nil
+	}
+	if checkpointer.HasSubAgentTasks() {
+		return nil
+	}
+	if err := checkpointer.RestoreSubAgentSchedulerCheckpoint(*resume.Children); err != nil {
+		return fmt.Errorf("restore durable checkpoint: children: %w", err)
+	}
+	return nil
+}
+
 // checkDuplicateToolNames returns an error if any two tools share a name
 // (finding M4). Duplicate registrations cause non-deterministic dispatch and
 // can be exploited to shadow safe tools with malicious ones.
@@ -410,6 +470,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	var durableSequence uint64
 	if cfg.Durable != nil {
 		cfg.Durable.normalize()
+		if err := wireDurableChildren(cfg.Durable, agent.GetAllTools(runCtx)); err != nil {
+			return nil, err
+		}
 		if resume := cfg.Durable.Resume; resume != nil {
 			if resume.SchemaVersion != DurableCheckpointSchemaVersion {
 				return nil, fmt.Errorf("unsupported durable checkpoint schema %d", resume.SchemaVersion)

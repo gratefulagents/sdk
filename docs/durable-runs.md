@@ -66,6 +66,16 @@ to persist scheduler transitions. Each child record includes its latest runner
 checkpoint, its effective tool-access and security baseline, and queued parent
 steering messages.
 
+When the managed `subagent` tool is attached, `Runner.Run` wires the scheduler
+into the parent's durability automatically: `DurableRunConfig.Children`
+defaults to the scheduler's checkpoint, so every parent checkpoint carries the
+child records, and a resumed checkpoint that carries child records restores
+them into an empty scheduler. A host that restores the scheduler itself (a
+non-empty registry) or supplies its own `Children` callback is left untouched.
+Resuming a checkpoint with *active* child records when no scheduler tool is
+attached fails closed instead of dropping in-flight work; terminal-only
+records are ignored.
+
 Scheduler tasks that were active when a process stopped restore as
 `reconciling`, not generic failures. A task checkpointed before its child Runner
 started can be relaunched under the same ID. `SubAgentRegistry.ResumeRestoredTask(ctx,
@@ -74,7 +84,19 @@ id)` can continue an already-started child only from `run_started`, `model_prepa
 completion without dispatching a model request. `model_completed`,
 `tool_prepared`, `approval_pending`, and `paused` checkpoints require an
 explicit `ReconcileRestoredTask` decision because their external outcome is not
-safe to replay.
+safe to replay. `ResumeRestoredTask` reports these outcomes with sentinel
+errors: `errors.Is(err, ErrSubAgentReconciliationRequired)` means the task
+will never resume on its own and needs `ReconcileRestoredTask` or `Cancel`;
+`errors.Is(err, ErrSubAgentResumeRejected)` means the current configuration
+(schema, agent catalog, runner, security baseline) cannot resume it and a
+retry without changes will fail the same way. Hosts should not retry either
+outcome every turn.
+
+Managed child tasks run on contexts detached from any single turn. Hosts that
+reuse a `runtime.SessionState` across turns must call `SessionState.Close()`
+when the session ends; it cancels every non-terminal task and flushes the
+scheduler checkpoint. A `SessionState` created by the runtime itself is
+returned in `Bundle.Closers` and closed with the bundle.
 
 Steering is crash-safe: draining moves messages to durable in-flight state, and
 the next child checkpoint commits its history while acknowledging those
