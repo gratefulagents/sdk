@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -158,7 +159,15 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 	}
 	runner := t.runner()
 	if _, err := os.Stat(dest); err == nil {
-		return attachExistingRepository(ctx, runner, workspaceRoot, dest, repoURL, alias, baseBranch, branchName)
+		if !isIncompleteClone(ctx, runner, dest) {
+			return attachExistingRepository(ctx, runner, workspaceRoot, dest, repoURL, alias, baseBranch, branchName)
+		}
+		// A previous clone was interrupted (killed, timed out, or crashed)
+		// and left a checkout with no commits behind. Nothing of value can
+		// live there, so discard it and clone again.
+		if err := os.RemoveAll(dest); err != nil {
+			return attachRepositoryError(fmt.Sprintf("removing incomplete clone at %s: %v", dest, err))
+		}
 	} else if !os.IsNotExist(err) {
 		return attachRepositoryError(fmt.Sprintf("checking repository destination: %v", err))
 	}
@@ -174,12 +183,12 @@ func (t *AttachRepositoryTool) attachRepository(ctx context.Context, workDir, re
 		if strings.TrimSpace(baseBranch) != "" && isMissingRemoteBranchCloneError(out) {
 			retryOut, retryErr := cloneRepository(ctx, runner, workspaceRoot, repoURL, dest, "")
 			if retryErr != nil {
-				return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", retryErr, retryOut))
+				return cloneFailure(dest, retryErr, retryOut)
 			}
 			cloneNote = fmt.Sprintf("requested base branch %q not found on the remote; cloned the repository default branch instead", baseBranch)
 			baseBranch = ""
 		} else {
-			return attachRepositoryError(fmt.Sprintf("git clone failed: %v\n%s", err, out))
+			return cloneFailure(dest, err, out)
 		}
 	}
 	if branchName != "" {
@@ -224,7 +233,59 @@ func cloneRepository(ctx context.Context, runner CommandRunner, workDir, repoURL
 		args = append(args, "--branch", strings.TrimSpace(baseBranch))
 	}
 	args = append(args, "--", repoURL, dest)
-	return runner.RunGit(ctx, workDir, args...)
+	out, err := runner.RunGit(ctx, workDir, args...)
+	if err != nil {
+		// git removes its destination when it fails cleanly, but not when it
+		// is killed by a signal or timeout. A leftover checkout without HEAD
+		// would break every later attach and any workspace checkpoint that
+		// scans the repository store, so never leave one behind.
+		_ = os.RemoveAll(dest)
+	}
+	return out, err
+}
+
+// cloneFailure formats a clone error, calling out interrupted clones (killed
+// or timed out) so the caller knows the destination was discarded and can
+// retry rather than treating it as a permanent failure.
+func cloneFailure(dest string, err error, out string) (agentsdk.ToolResult, error) {
+	msg := fmt.Sprintf("git clone failed: %v\n%s", err, out)
+	if isInterruptedCloneError(err) {
+		msg += fmt.Sprintf("\nThe clone was interrupted before it completed; the partial checkout at %s was removed. Large repositories may need a retry.", dest)
+	}
+	return attachRepositoryError(msg)
+}
+
+func isInterruptedCloneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "signal: killed") || strings.Contains(lower, "timeout")
+}
+
+// isIncompleteClone reports whether dest holds a git directory whose HEAD does
+// not resolve to a commit and whose working tree contains nothing besides
+// .git: the signature of a clone that was interrupted midway.
+func isIncompleteClone(ctx context.Context, runner CommandRunner, dest string) bool {
+	if !isGitRepository(dest) {
+		return false
+	}
+	if _, err := runner.RunGit(ctx, dest, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"); err == nil {
+		return false
+	}
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Name() != ".git" {
+			return false
+		}
+	}
+	return true
 }
 
 // isMissingRemoteBranchCloneError reports whether a git clone failure output

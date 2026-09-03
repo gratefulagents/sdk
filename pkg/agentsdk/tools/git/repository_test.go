@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAttachRepositoryClonesIntoWorkspaceRepoList(t *testing.T) {
@@ -415,5 +416,125 @@ func TestAttachRepositoryToolDoesNotRetryNonBranchCloneFailures(t *testing.T) {
 	}
 	if cloneCalls != 1 {
 		t.Fatalf("clone attempts = %d, want 1 (no retry on auth failures)", cloneCalls)
+	}
+}
+
+func TestAttachRepositoryToolRemovesPartialCloneWhenCloneIsKilled(t *testing.T) {
+	workDir := t.TempDir()
+	runner := &fakeRunner{gitFn: func(ctx context.Context, dir string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "clone") {
+			// Simulate git being SIGKILLed after it created the destination
+			// but before it wrote any commits.
+			dest := args[len(args)-1]
+			if err := os.MkdirAll(filepath.Join(dest, ".git", "objects"), 0o755); err != nil {
+				return "", err
+			}
+			return "Cloning into 'dest'...\n", fmt.Errorf("signal: killed")
+		}
+		return "", nil
+	}}
+
+	result, err := NewAttachRepositoryTool(runner).Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo"}`), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "git clone failed") {
+		t.Fatalf("result = %+v, want clone failure", result)
+	}
+	if !strings.Contains(result.Content, "interrupted") {
+		t.Fatalf("result = %s, want interrupted-clone hint", result.Content)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "repos", "repo")); !os.IsNotExist(err) {
+		t.Fatalf("partial clone left behind (stat err = %v)", err)
+	}
+}
+
+func TestAttachRepositoryToolRecoversFromLeftoverIncompleteClone(t *testing.T) {
+	workDir := t.TempDir()
+	dest := filepath.Join(workDir, "repos", "repo")
+	// A checkout with a .git directory but no commits and no working tree is
+	// what an interrupted clone leaves behind.
+	if err := os.MkdirAll(filepath.Join(dest, ".git", "objects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cloneCalls := 0
+	runner := &fakeRunner{gitFn: func(ctx context.Context, dir string, args ...string) (string, error) {
+		key := strings.Join(args, " ")
+		switch {
+		case strings.HasPrefix(key, "rev-parse --verify --quiet HEAD"):
+			return "fatal: Needed a single revision\n", fmt.Errorf("exit status 1")
+		case strings.Contains(key, "clone"):
+			cloneCalls++
+		}
+		return cloneFakeRepo(ctx, dir, args...)
+	}}
+
+	result, err := NewAttachRepositoryTool(runner).Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo"}`), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `"status":"attached"`) {
+		t.Fatalf("result = %s, want fresh attach, not already_attached", result.Content)
+	}
+	if cloneCalls != 1 {
+		t.Fatalf("clone attempts = %d, want 1", cloneCalls)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "README.md")); err != nil {
+		t.Fatalf("re-clone did not populate the checkout: %v", err)
+	}
+}
+
+func TestAttachRepositoryToolKeepsExistingRepositoryWithWorkingTree(t *testing.T) {
+	workDir := t.TempDir()
+	dest := filepath.Join(workDir, "repos", "repo")
+	if err := os.MkdirAll(filepath.Join(dest, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, ".git", "config"), []byte("[remote \"origin\"]\n\turl = https://github.com/acme/repo.git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "notes.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{gitFn: func(ctx context.Context, dir string, args ...string) (string, error) {
+		key := strings.Join(args, " ")
+		if strings.HasPrefix(key, "rev-parse --verify --quiet HEAD") {
+			return "", fmt.Errorf("exit status 1")
+		}
+		if strings.Contains(key, "clone") {
+			t.Fatalf("unexpected clone over a repository that has a working tree")
+		}
+		return cloneFakeRepo(ctx, dir, args...)
+	}}
+
+	result, err := NewAttachRepositoryTool(runner).Execute(context.Background(), json.RawMessage(`{"repository":"acme/repo"}`), workDir)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.IsError || !strings.Contains(result.Content, `"status":"already_attached"`) {
+		t.Fatalf("result = %+v, want already_attached", result)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "notes.txt")); err != nil {
+		t.Fatalf("existing working tree was removed: %v", err)
+	}
+}
+
+func TestGitCommandTimeoutUsesNetworkBudgetForRemoteCommands(t *testing.T) {
+	cases := map[string]time.Duration{
+		"-c protocol.allow=never -c protocol.https.allow=always clone --depth 1 -- https://x/y d": networkCommandTimeout,
+		"fetch origin main":        networkCommandTimeout,
+		"push -u origin work":      networkCommandTimeout,
+		"-C repo pull --ff-only":   networkCommandTimeout,
+		"status --porcelain":       commandTimeout,
+		"rev-parse HEAD":           commandTimeout,
+		"--no-pager log --oneline": commandTimeout,
+	}
+	for args, want := range cases {
+		if got := gitCommandTimeout(strings.Fields(args)); got != want {
+			t.Errorf("gitCommandTimeout(%q) = %v, want %v", args, got, want)
+		}
 	}
 }
