@@ -12,7 +12,15 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 )
 
-const commandTimeout = 60 * time.Second
+const (
+	// commandTimeout bounds local git and gh commands.
+	commandTimeout = 60 * time.Second
+	// networkCommandTimeout bounds git commands that talk to a remote (clone,
+	// fetch, pull, push). Even a shallow clone of a large repository can take
+	// well over a minute, and exec.CommandContext SIGKILLs the process at the
+	// deadline, which leaves a half-written checkout behind.
+	networkCommandTimeout = 10 * time.Minute
+)
 
 // ArtifactSink records GitHub artifacts created by the tools.
 type ArtifactSink interface {
@@ -29,12 +37,41 @@ type CommandRunner interface {
 type execCommandRunner struct{}
 
 func (execCommandRunner) RunGit(ctx context.Context, workDir string, args ...string) (string, error) {
-	cmdCtx, cancel := context.WithTimeout(ctx, commandTimeout)
+	cmdCtx, cancel := context.WithTimeout(ctx, gitCommandTimeout(args))
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, "git", args...)
 	cmd.Dir = workDir
 	out, err := cmd.CombinedOutput()
+	if err != nil && cmdCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		err = fmt.Errorf("%w (git %s exceeded the %s timeout)", err, gitSubcommand(args), gitCommandTimeout(args))
+	}
 	return string(out), err
+}
+
+// gitCommandTimeout picks the timeout for a git invocation based on its
+// subcommand: remote-facing commands get the longer network budget.
+func gitCommandTimeout(args []string) time.Duration {
+	switch gitSubcommand(args) {
+	case "clone", "fetch", "pull", "push", "ls-remote":
+		return networkCommandTimeout
+	}
+	return commandTimeout
+}
+
+// gitSubcommand returns the git subcommand from args, skipping leading global
+// options such as "-c key=value" and "-C dir".
+func gitSubcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-c" || arg == "-C":
+			i++
+		case strings.HasPrefix(arg, "-"):
+		default:
+			return arg
+		}
+	}
+	return ""
 }
 
 func (execCommandRunner) RunGH(ctx context.Context, workDir string, args ...string) (string, error) {
