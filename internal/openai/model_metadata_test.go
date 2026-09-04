@@ -131,3 +131,71 @@ func TestFetchModelMetadataStandardOpenAIShape(t *testing.T) {
 		t.Fatalf("models = %#v, want one gpt-test model", models)
 	}
 }
+
+func TestPickerModelMetadataMirrorsCodexPicker(t *testing.T) {
+	// Shape and values mirror the ChatGPT Codex backend /models response at
+	// client_version 0.153.4: Astra is priority 1 and listed, gpt-reserve and
+	// codex-auto-review are hidden.
+	models, err := parseModelMetadata([]byte(`{
+		"models": [
+			{"slug": "gpt-5.6-sol", "visibility": "list", "priority": 6, "display_name": "GPT-5.6 Sol"},
+			{"slug": "gpt-reserve", "visibility": "hide", "priority": 3},
+			{"slug": "gpt-6-astra", "visibility": "list", "priority": 1, "display_name": "GPT-6-Astra",
+			 "description": "Our most capable model for complex, demanding work.",
+			 "default_reasoning_level": "low",
+			 "supported_reasoning_levels": [{"effort":"low","description":""},{"effort":"max","description":""},{"effort":"ultra","description":""}],
+			 "context_window": 272000, "max_context_window": 872000, "minimal_client_version": "0.153.0"},
+			{"slug": "gpt-5.4-mini", "visibility": "list", "priority": 23, "upgrade": {"model": "gpt-5.6-luna"}},
+			{"slug": "codex-auto-review", "visibility": "hide", "priority": 43}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parseModelMetadata returned error: %v", err)
+	}
+	picker := PickerModelMetadata(models)
+	var got []string
+	for _, m := range picker {
+		got = append(got, m.ID)
+	}
+	want := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.4-mini"}
+	if len(got) != len(want) {
+		t.Fatalf("picker models = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("picker models = %v, want %v", got, want)
+		}
+	}
+	astra := picker[0]
+	if astra.DisplayName != "GPT-6-Astra" || astra.Description == "" || astra.DefaultReasoningLevel != "low" {
+		t.Fatalf("astra metadata = %+v", astra)
+	}
+	if len(astra.SupportedReasoningLevels) != 3 || astra.SupportedReasoningLevels[2] != "ultra" {
+		t.Fatalf("astra reasoning levels = %v", astra.SupportedReasoningLevels)
+	}
+	if astra.ResolvedContextWindow() != 272000 {
+		t.Fatalf("astra context window = %d, want 272000", astra.ResolvedContextWindow())
+	}
+	if picker[2].UpgradeModel != "gpt-5.6-luna" {
+		t.Fatalf("gpt-5.4-mini upgrade = %q, want gpt-5.6-luna", picker[2].UpgradeModel)
+	}
+	for _, m := range models {
+		if m.ID == "gpt-reserve" && !m.Hidden() {
+			t.Fatalf("gpt-reserve should be hidden")
+		}
+	}
+}
+
+func TestPickerModelMetadataPlainOpenAIShapeStaysAlphabetical(t *testing.T) {
+	models, err := parseModelMetadata([]byte(`{"data":[{"id":"gpt-5.5"},{"id":"gpt-4.1"},{"id":"o3"}]}`))
+	if err != nil {
+		t.Fatalf("parseModelMetadata returned error: %v", err)
+	}
+	picker := PickerModelMetadata(models)
+	want := []string{"gpt-4.1", "gpt-5.5", "o3"}
+	for i := range want {
+		if picker[i].ID != want[i] {
+			t.Fatalf("picker[%d] = %q, want %q", i, picker[i].ID, want[i])
+		}
+	}
+}
