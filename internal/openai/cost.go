@@ -104,6 +104,20 @@ var modelPricing = map[string]ModelPricing{
 		CachedInputPerMillion: 0.02,
 		OutputPerMillion:      1.25,
 	},
+	// GPT-6 Astra (Codex 0.153 bundled default). Standard rates apply up to
+	// 272K input tokens; the long-context tier doubles input/output above it.
+	"gpt-6-astra": {
+		InputPerMillion:           10.0,
+		CachedInputPerMillion:     1.0,
+		CacheWriteInputPerMillion: 12.5,
+		OutputPerMillion:          50.0,
+		LongContext: &ModelPricing{
+			InputPerMillion:           20.0,
+			CachedInputPerMillion:     2.0,
+			CacheWriteInputPerMillion: 25.0,
+			OutputPerMillion:          75.0,
+		},
+	},
 	"gpt-5.6-sol": {
 		InputPerMillion:           4.0,
 		CachedInputPerMillion:     0.40,

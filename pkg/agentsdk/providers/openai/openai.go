@@ -119,6 +119,12 @@ func FetchModelMetadataByID(ctx context.Context, baseURL string, session *AuthSe
 	return internalopenai.FetchModelMetadataByID(ctx, baseURL, session)
 }
 
+// PickerModelMetadata filters hidden catalog models and orders the rest the
+// way the Codex CLI model picker does (catalog priority, then ID).
+func PickerModelMetadata(models []ModelMetadata) []ModelMetadata {
+	return internalopenai.PickerModelMetadata(models)
+}
+
 func EstimateCost(model string, usage agentsdk.Usage) (float64, bool) {
 	return internalopenai.EstimateCost(model, internalanthropic.Usage{
 		InputTokens:              usage.InputTokens,

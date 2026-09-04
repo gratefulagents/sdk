@@ -210,6 +210,12 @@ func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) 
 		strings.Contains(m, "lite"),
 		strings.Contains(m, "flash"):
 		return 110000, 60000
+	// GPT-6 (Astra) on the ChatGPT Codex backend advertises a 272K
+	// context_window (872K max_context_window); the OpenAI API exposes ~1M.
+	// Trigger at 90% / target 50% of the 272K window; provider metadata or
+	// models.dev overrides this conservative static fallback when available.
+	case strings.HasPrefix(m, "gpt-6"):
+		return 244800, 136000
 	// GPT-5.6 on the ChatGPT Codex backend advertises 372K context. The OpenAI
 	// API can expose larger windows; provider metadata or models.dev overrides
 	// this conservative static fallback when available.

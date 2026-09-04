@@ -108,6 +108,24 @@ func TestCalculateCost(t *testing.T) {
 			wantCost: 2.5,
 		},
 		{
+			name:     "gpt-6-astra input",
+			model:    "gpt-6-astra",
+			usage:    anthropic.Usage{InputTokens: 100_000},
+			wantCost: 1.0,
+		},
+		{
+			name:     "gpt-6-astra output",
+			model:    "openai/gpt-6-astra",
+			usage:    anthropic.Usage{OutputTokens: 100_000},
+			wantCost: 5.0,
+		},
+		{
+			name:     "gpt-6-astra long-context input above 272K uses doubled rates",
+			model:    "gpt-6-astra",
+			usage:    anthropic.Usage{InputTokens: 300_000, OutputTokens: 10_000},
+			wantCost: 300_000*20.0/1_000_000 + 10_000*75.0/1_000_000,
+		},
+		{
 			name:     "gpt-5.6-luna output",
 			model:    "gpt-5.6-luna",
 			usage:    anthropic.Usage{OutputTokens: 1_000_000},

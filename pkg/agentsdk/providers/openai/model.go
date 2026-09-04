@@ -262,11 +262,13 @@ func (m *OpenAIModel) StreamResponse(ctx context.Context, req agentsdk.ModelRequ
 // effortDowngrades is the one-step-lower ladder used when a model rejects a
 // requested reasoning effort value (HTTP 400 such as "invalid_reasoning_effort").
 // Mirrors the Codex CLI catalog reality: xhigh/max are model-dependent top
-// tiers, and effort none only exists on gpt-5.1+ general models.
+// tiers, effort none only exists on gpt-5.1+ general models, and the GPT-5.6
+// / GPT-6 (Astra) catalog floors out at "low" (no minimal tier).
 var effortDowngrades = map[string]string{
-	"max":   "xhigh",
-	"xhigh": "high",
-	"none":  "minimal",
+	"max":     "xhigh",
+	"xhigh":   "high",
+	"none":    "minimal",
+	"minimal": "low",
 }
 
 // downgradeEffortOnError rebuilds the request with the next-lower reasoning

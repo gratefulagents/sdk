@@ -23,6 +23,30 @@ type ModelMetadata struct {
 	MaxOutputTokens               int
 	AutoCompactTokenLimit         int
 	EffectiveContextWindowPercent int
+	// DisplayName/Description are the Codex picker labels ("GPT-6-Astra",
+	// "Our most capable model for complex, demanding work."). Empty for
+	// providers using the plain OpenAI /v1/models shape.
+	DisplayName string
+	Description string
+	// Visibility mirrors Codex's ModelVisibility: "list" shows the model in
+	// the picker, "hide" keeps it selectable but out of the default list.
+	// Empty means the provider did not report visibility (treated as listed).
+	Visibility string
+	// Priority is Codex's picker ordering (lower sorts first; gpt-6-astra is
+	// 1). Zero means unspecified.
+	Priority int
+	// DefaultReasoningLevel and SupportedReasoningLevels come from the Codex
+	// catalog ("low", "medium", "high", "xhigh", "max", "ultra").
+	DefaultReasoningLevel    string
+	SupportedReasoningLevels []string
+	// UpgradeModel is the replacement slug when the catalog marks the model
+	// as retired/upgraded (e.g. gpt-5.4-mini -> gpt-5.6-luna).
+	UpgradeModel string
+}
+
+// Hidden reports whether the catalog marks the model as hidden from pickers.
+func (m ModelMetadata) Hidden() bool {
+	return strings.EqualFold(strings.TrimSpace(m.Visibility), "hide")
 }
 
 // ResolvedContextWindow mirrors Codex's ModelInfo::resolved_context_window.
@@ -31,6 +55,39 @@ func (m ModelMetadata) ResolvedContextWindow() int {
 		return m.ContextWindow
 	}
 	return m.MaxContextWindow
+}
+
+// SortModelMetadataForPicker orders models the way the Codex CLI model picker
+// does: catalog priority ascending (gpt-6-astra first), then ID for models
+// without a priority (plain OpenAI /v1/models shape) or on ties.
+func SortModelMetadataForPicker(models []ModelMetadata) {
+	sort.SliceStable(models, func(i, j int) bool {
+		pi, pj := models[i].Priority, models[j].Priority
+		switch {
+		case pi > 0 && pj > 0 && pi != pj:
+			return pi < pj
+		case pi > 0 && pj <= 0:
+			return true
+		case pi <= 0 && pj > 0:
+			return false
+		}
+		return strings.ToLower(models[i].ID) < strings.ToLower(models[j].ID)
+	})
+}
+
+// PickerModelMetadata returns the models a picker should offer, in Codex
+// picker order: hidden-visibility models are dropped and the remainder is
+// sorted by SortModelMetadataForPicker.
+func PickerModelMetadata(models []ModelMetadata) []ModelMetadata {
+	out := make([]ModelMetadata, 0, len(models))
+	for _, model := range models {
+		if model.Hidden() {
+			continue
+		}
+		out = append(out, model)
+	}
+	SortModelMetadataForPicker(out)
+	return out
 }
 
 // FetchModelMetadata fetches OpenAI-compatible model metadata.
@@ -175,6 +232,17 @@ func parseModelMetadata(body []byte) ([]ModelMetadata, error) {
 			MaxContextWindow              int    `json:"max_context_window"`
 			AutoCompactTokenLimit         int    `json:"auto_compact_token_limit"`
 			EffectiveContextWindowPercent int    `json:"effective_context_window_percent"`
+			DisplayName                   string `json:"display_name"`
+			Description                   string `json:"description"`
+			Visibility                    string `json:"visibility"`
+			Priority                      int    `json:"priority"`
+			DefaultReasoningLevel         string `json:"default_reasoning_level"`
+			SupportedReasoningLevels      []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
+			Upgrade *struct {
+				Model string `json:"model"`
+			} `json:"upgrade"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -188,13 +256,27 @@ func parseModelMetadata(body []byte) ([]ModelMetadata, error) {
 			if id == "" {
 				continue
 			}
-			models = append(models, ModelMetadata{
+			meta := ModelMetadata{
 				ID:                            id,
 				ContextWindow:                 item.ContextWindow,
 				MaxContextWindow:              item.MaxContextWindow,
 				AutoCompactTokenLimit:         item.AutoCompactTokenLimit,
 				EffectiveContextWindowPercent: item.EffectiveContextWindowPercent,
-			})
+				DisplayName:                   strings.TrimSpace(item.DisplayName),
+				Description:                   strings.TrimSpace(item.Description),
+				Visibility:                    strings.ToLower(strings.TrimSpace(item.Visibility)),
+				Priority:                      item.Priority,
+				DefaultReasoningLevel:         strings.ToLower(strings.TrimSpace(item.DefaultReasoningLevel)),
+			}
+			for _, level := range item.SupportedReasoningLevels {
+				if effort := strings.ToLower(strings.TrimSpace(level.Effort)); effort != "" {
+					meta.SupportedReasoningLevels = append(meta.SupportedReasoningLevels, effort)
+				}
+			}
+			if item.Upgrade != nil {
+				meta.UpgradeModel = strings.TrimSpace(item.Upgrade.Model)
+			}
+			models = append(models, meta)
 		}
 	} else {
 		for _, item := range payload.Data {
