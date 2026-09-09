@@ -1187,7 +1187,8 @@ func imageAnalysisResponseParams(model, imageURL, prompt, detail string) (respon
 	}
 	params.Instructions = sdk.String("Analyze the image and answer the user's prompt. Be concise and specific.")
 	params.Truncation = responses.ResponseNewParamsTruncation("auto")
-	params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention("24h")
+	params.Store = sdk.Bool(false)
+	params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention("in_memory")
 	return params, nil
 }
 
