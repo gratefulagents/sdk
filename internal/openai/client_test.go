@@ -987,6 +987,12 @@ func TestImageAnalysisResponseParamsUsesResponsesImageInput(t *testing.T) {
 	if body["model"] != "gpt-5.5" {
 		t.Fatalf("model = %v, want gpt-5.5", body["model"])
 	}
+	if body["store"] != false {
+		t.Fatalf("store = %v, want explicit false", body["store"])
+	}
+	if body["prompt_cache_retention"] != "in_memory" {
+		t.Fatalf("prompt_cache_retention = %v, want in_memory", body["prompt_cache_retention"])
+	}
 	input := body["input"].([]any)
 	message := input[0].(map[string]any)
 	content := message["content"].([]any)
@@ -996,6 +1002,49 @@ func TestImageAnalysisResponseParamsUsesResponsesImageInput(t *testing.T) {
 	image := content[1].(map[string]any)
 	if image["type"] != "input_image" || image["detail"] != "high" || image["image_url"] != "data:image/png;base64,aGVsbG8=" {
 		t.Fatalf("image content = %#v", image)
+	}
+}
+
+func TestImageAnalysisResponseParamsPrivacyAfterNormalization(t *testing.T) {
+	params, err := imageAnalysisResponseParams("gpt-5.5", "data:image/png;base64,aGVsbG8=", "describe it", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name      string
+		url       string
+		mode      AuthMode
+		retention any
+		forced    bool
+	}{
+		{"OpenAI API key", "https://api.openai.com/v1/responses", AuthModeAPIKey, "in_memory", false},
+		{"OpenAI OAuth", "https://api.openai.com/v1/responses", AuthModeOAuth, "in_memory", false},
+		{"Codex OAuth", "https://chatgpt.com/backend-api/codex/responses", AuthModeOAuth, nil, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, tt.url, strings.NewReader(string(raw)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if forced := maybeNormalizeCodexResponsesBody(req, &OpenAIAuthSession{mode: tt.mode}); forced != tt.forced {
+				t.Fatalf("forced stream = %v, want %v", forced, tt.forced)
+			}
+			defer req.Body.Close()
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["store"] != false {
+				t.Fatalf("store = %v, want explicit false", body["store"])
+			}
+			if got, present := body["prompt_cache_retention"]; got != tt.retention || present != (tt.retention != nil) {
+				t.Fatalf("prompt_cache_retention = %v (present %v), want %v", got, present, tt.retention)
+			}
+		})
 	}
 }
 
@@ -1040,6 +1089,12 @@ func TestAnalyzeImagePostsGPT55ImageInput(t *testing.T) {
 
 	if captured["model"] != "gpt-5.5" {
 		t.Fatalf("captured model = %v", captured["model"])
+	}
+	if captured["store"] != false {
+		t.Fatalf("captured store = %v, want explicit false", captured["store"])
+	}
+	if captured["prompt_cache_retention"] != "in_memory" {
+		t.Fatalf("captured prompt_cache_retention = %v, want in_memory", captured["prompt_cache_retention"])
 	}
 	input := captured["input"].([]any)
 	message := input[0].(map[string]any)
