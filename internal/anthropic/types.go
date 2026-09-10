@@ -38,9 +38,10 @@ type ContentBlock struct {
 	Input     json.RawMessage `json:"input,omitempty"`
 
 	// ToolResultBlock fields (type="tool_result").
-	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"` // tool_result text / compaction summary
-	IsError   bool   `json:"is_error,omitempty"`
+	ResultImages []ImageSource `json:"result_images,omitempty"`
+	ToolUseID    string        `json:"tool_use_id,omitempty"`
+	Content      string        `json:"content,omitempty"` // tool_result text / compaction summary
+	IsError      bool          `json:"is_error,omitempty"`
 
 	// ImageBlock fields (type="image").
 	Source *ImageSource `json:"source,omitempty"`

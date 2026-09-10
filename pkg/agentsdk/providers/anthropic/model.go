@@ -589,9 +589,8 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 					if img.Data == "" {
 						continue
 					}
-					block := internalanthropic.NewImageBlock(img.MediaType, img.Data)
-					block.Detail = img.Detail
-					msgs[len(msgs)-1].Content = append(msgs[len(msgs)-1].Content, block)
+					result := &msgs[len(msgs)-1].Content[0]
+					result.ResultImages = append(result.ResultImages, internalanthropic.ImageSource{Type: "base64", MediaType: img.MediaType, Data: img.Data})
 				}
 			}
 		case agentsdk.RunItemReasoning:
