@@ -59,6 +59,7 @@ func MutatingToolEnabled(ctx *RunContext, toolName string) bool {
 // ToolResult is the outcome of a tool execution.
 type ToolResult struct {
 	Content     string
+	Images      []ImageAttachment
 	IsError     bool
 	ShouldPause bool // When true, the runner breaks so the outer loop can handle the event.
 }

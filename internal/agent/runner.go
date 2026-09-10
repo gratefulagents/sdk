@@ -2512,7 +2512,7 @@ func (r *Runner) executeSingleTool(ctx context.Context, runCtx *RunContext, agen
 
 	res.item = RunItem{
 		Type: RunItemToolOutput, Agent: agent,
-		ToolOutput: &ToolOutputData{CallID: call.ID, Content: content, IsError: result.IsError},
+		ToolOutput: &ToolOutputData{CallID: call.ID, Content: content, IsError: result.IsError, Images: result.Images},
 	}
 	if outputGuardrailErr != nil {
 		return res

@@ -44,6 +44,7 @@ type ContentBlock struct {
 
 	// ImageBlock fields (type="image").
 	Source *ImageSource `json:"source,omitempty"`
+	Detail string       `json:"detail,omitempty"`
 
 	// CacheControl for prompt caching.
 	CacheControl *CacheControl `json:"cache_control,omitempty"`

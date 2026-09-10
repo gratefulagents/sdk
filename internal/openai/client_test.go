@@ -1855,3 +1855,24 @@ func TestDrainStreamFeedsReasoningSink(t *testing.T) {
 		t.Fatalf("assembled thinking = %q, want full text", thinking)
 	}
 }
+
+func TestToResponseInputItemsNativeToolImage(t *testing.T) {
+	image := anthropic.NewImageBlock("image/png", "cG5n")
+	image.Detail = "high"
+	items, err := toResponseInputItems([]anthropic.Message{
+		{Role: anthropic.RoleAssistant, Content: []anthropic.ContentBlock{anthropic.NewToolUseBlock("image-call", "AnalyzeImage", []byte(`{}`))}},
+		{Role: anthropic.RoleUser, Content: []anthropic.ContentBlock{anthropic.NewToolResultBlock("image-call", "inspect", false), image}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"type":"input_image"`, `"image_url":"data:image/png;base64,cG5n"`, `"detail":"high"`, `"type":"function_call_output"`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("missing %s in %s", want, data)
+		}
+	}
+}

@@ -451,6 +451,14 @@ func itemsToAnthropicMessages(items []agentsdk.RunItem) []internalanthropic.Mess
 						internalanthropic.NewToolResultBlock(item.ToolOutput.CallID, item.ToolOutput.Content, item.ToolOutput.IsError),
 					},
 				})
+				for _, img := range item.ToolOutput.Images {
+					if img.Data == "" {
+						continue
+					}
+					block := internalanthropic.NewImageBlock(img.MediaType, img.Data)
+					block.Detail = img.Detail
+					msgs[len(msgs)-1].Content = append(msgs[len(msgs)-1].Content, block)
+				}
 			}
 		case agentsdk.RunItemReasoning:
 			if item.Reasoning != nil {
