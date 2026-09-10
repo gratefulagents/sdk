@@ -255,6 +255,11 @@ func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 				{OfText: &sdk.BetaTextBlockParam{Text: block.Content}},
 			}
 		}
+		for _, image := range block.ResultImages {
+			result.Content = append(result.Content, sdk.BetaToolResultBlockParamContentUnion{
+				OfImage: toSDKContentBlock(NewImageBlock(image.MediaType, image.Data)).OfImage,
+			})
+		}
 		if block.CacheControl != nil {
 			result.CacheControl = sdk.BetaCacheControlEphemeralParam{Type: "ephemeral"}
 		}

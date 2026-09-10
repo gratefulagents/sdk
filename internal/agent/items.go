@@ -43,10 +43,11 @@ type MessageOutput struct {
 	Images []ImageAttachment `json:"images,omitempty"`
 }
 
-// ImageAttachment is a base64-encoded image attached to a user message.
+// ImageAttachment is a base64-encoded image attached to a message or tool result.
 type ImageAttachment struct {
 	MediaType string `json:"media_type"`
 	Data      string `json:"data"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // ToolCallData represents a tool invocation by the model.
@@ -58,9 +59,10 @@ type ToolCallData struct {
 
 // ToolOutputData holds the result of a tool execution.
 type ToolOutputData struct {
-	CallID  string `json:"call_id"`
-	Content string `json:"content"`
-	IsError bool   `json:"is_error,omitempty"`
+	Images  []ImageAttachment `json:"images,omitempty"`
+	CallID  string            `json:"call_id"`
+	Content string            `json:"content"`
+	IsError bool              `json:"is_error,omitempty"`
 }
 
 // HandoffCallData records an agent-to-agent handoff request.

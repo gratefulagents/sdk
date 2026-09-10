@@ -210,6 +210,7 @@ func cloneParentRunItems(items []RunItem) []RunItem {
 		}
 		if item.ToolOutput != nil {
 			value := *item.ToolOutput
+			value.Images = append([]ImageAttachment(nil), item.ToolOutput.Images...)
 			cloned[i].ToolOutput = &value
 		}
 		if item.HandoffCall != nil {

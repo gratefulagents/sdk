@@ -24,7 +24,7 @@ type AnalyzeFn func(ctx context.Context, imageData []byte, mimeType, prompt stri
 // caller-requested image detail level.
 type AnalyzeWithDetailFn func(ctx context.Context, imageData []byte, mimeType, prompt, detailLevel string) (string, error)
 
-// Tool analyzes images using a caller-supplied multimodal model function.
+// Tool loads images into the active model conversation.
 type Tool struct {
 	AnalyzeFn               AnalyzeFn
 	AnalyzeWithDetailFn     AnalyzeWithDetailFn
@@ -44,7 +44,7 @@ type input struct {
 func (t *Tool) Name() string { return "AnalyzeImage" }
 
 func (t *Tool) Description() string {
-	return "Analyzes an image using vision AI. Accepts a local file path or URL. Returns a text description or analysis based on the prompt. Useful for reviewing screenshots, UI designs, diagrams, and visual content."
+	return "Loads an image from a local file path or URL directly into your visual context. Inspect the image yourself to answer the prompt; no separate text analysis is generated."
 }
 
 func (t *Tool) InputSchema() json.RawMessage {
@@ -107,28 +107,14 @@ func (t *Tool) Execute(ctx context.Context, raw json.RawMessage, workDir string)
 		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to load image: %v", err), IsError: true}, nil
 	}
 
-	if t.AnalyzeFn == nil && t.AnalyzeWithDetailFn == nil {
-		b64 := base64.StdEncoding.EncodeToString(imageData)
-		return agentsdk.ToolResult{Content: fmt.Sprintf(
-			"Image loaded (%s, %d bytes, base64 length: %d). Vision provider not configured - set up an LLM with vision capabilities to enable analysis.",
-			mimeType, len(imageData), len(b64),
-		)}, nil
-	}
-
-	detailLevel := normalizeDetailLevel(in.DetailLevel)
-	if t.AnalyzeWithDetailFn != nil {
-		analysis, err := t.AnalyzeWithDetailFn(ctx, imageData, mimeType, in.Prompt, detailLevel)
-		if err != nil {
-			return agentsdk.ToolResult{Content: fmt.Sprintf("Vision analysis failed: %v", err), IsError: true}, nil
-		}
-		return agentsdk.ToolResult{Content: analysis}, nil
-	}
-
-	analysis, err := t.AnalyzeFn(ctx, imageData, mimeType, in.Prompt)
-	if err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Vision analysis failed: %v", err), IsError: true}, nil
-	}
-	return agentsdk.ToolResult{Content: analysis}, nil
+	return agentsdk.ToolResult{
+		Content: in.Prompt,
+		Images: []agentsdk.ImageAttachment{{
+			MediaType: mimeType,
+			Data:      base64.StdEncoding.EncodeToString(imageData),
+			Detail:    normalizeDetailLevel(in.DetailLevel),
+		}},
+	}, nil
 }
 
 func normalizeDetailLevel(detailLevel string) string {

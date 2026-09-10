@@ -2,6 +2,7 @@ package vision
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,30 +15,31 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
 
-func TestExecuteUsesDetailAwareAnalyzer(t *testing.T) {
+func TestExecuteReturnsNativeImage(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "pixel.png"), []byte{0x89, 'P', 'N', 'G'}, 0o644); err != nil {
+	data := []byte{0x89, 'P', 'N', 'G'}
+	if err := os.WriteFile(filepath.Join(dir, "pixel.png"), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	var gotDetail string
-	tool := &Tool{AnalyzeWithDetailFn: func(_ context.Context, imageData []byte, mimeType, prompt, detail string) (string, error) {
-		gotDetail = detail
-		if len(imageData) == 0 || mimeType != "image/png" || prompt != "inspect" {
-			t.Fatalf("imageData=%d mime=%q prompt=%q", len(imageData), mimeType, prompt)
+	for _, configured := range []bool{false, true} {
+		tool := &Tool{}
+		if configured {
+			tool.AnalyzeWithDetailFn = func(context.Context, []byte, string, string, string) (string, error) {
+				t.Fatal("separate analyzer must not be called")
+				return "", nil
+			}
 		}
-		return "analysis", nil
-	}}
-
-	result, err := tool.Execute(context.Background(), []byte(`{"image_path":"pixel.png","prompt":"inspect","detail_level":"low"}`), dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.IsError || result.Content != "analysis" {
-		t.Fatalf("result = %+v", result)
-	}
-	if gotDetail != "low" {
-		t.Fatalf("detail = %q, want low", gotDetail)
+		result, err := tool.Execute(context.Background(), []byte(`{"image_path":"pixel.png","prompt":"inspect","detail_level":"low"}`), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.IsError || result.Content != "inspect" || len(result.Images) != 1 {
+			t.Fatalf("result = %+v", result)
+		}
+		image := result.Images[0]
+		if image.MediaType != "image/png" || image.Data != base64.StdEncoding.EncodeToString(data) || image.Detail != "low" {
+			t.Fatalf("image = %+v", image)
+		}
 	}
 }
 

@@ -1491,7 +1491,14 @@ func toResponseInputItems(messages []anthropic.Message) (responses.ResponseInput
 				if mediaType == "" {
 					mediaType = "image/png"
 				}
-				imageContent := responses.ResponseInputContentParamOfInputImage(responses.ResponseInputImageDetailAuto)
+				detail := responses.ResponseInputImageDetailAuto
+				if block.Detail == "low" {
+					detail = responses.ResponseInputImageDetailLow
+				}
+				if block.Detail == "high" {
+					detail = responses.ResponseInputImageDetailHigh
+				}
+				imageContent := responses.ResponseInputContentParamOfInputImage(detail)
 				imageContent.OfInputImage.ImageURL = param.NewOpt(fmt.Sprintf("data:%s;base64,%s", mediaType, block.Source.Data))
 				content := responses.ResponseInputMessageContentListParam{imageContent}
 				items = append(items, responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRole(role)))
