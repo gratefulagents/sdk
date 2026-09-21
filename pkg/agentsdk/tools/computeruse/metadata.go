@@ -1,30 +1,46 @@
-// Package computeruse defines discovery metadata returned by a connected desktop supervisor.
+// Package computeruse describes the selected-display desktop control contract.
 package computeruse
 
-// WindowCapabilities describes current eligibility, not an authorization grant.
-// Observable permits attempting capture; macOS can still refuse protected or off-screen content.
-// Input always requires fresh identity, frame, permission, approval and action-specific focus checks.
-type WindowCapabilities struct {
-	Selectable bool   `json:"selectable"`
-	Observable bool   `json:"observable"`
-	Input      bool   `json:"input"`
-	Reason     string `json:"reason"`
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+)
+
+const Mode = "selected_display"
+const AttachOperation = "attach_desktop"
+
+// DesktopScope binds locally selected display capture, not keyboard focus.
+// Keyboard input is desktop-wide and follows OS focus, including other displays.
+type DesktopScope struct {
+	Mode      string `json:"mode"`
+	Backend   string `json:"backend"`
+	User      string `json:"user"`
+	Namespace string `json:"namespace"`
+	Run       string `json:"run"`
+	DisplayID uint32 `json:"displayId"`
 }
 
-// WindowMetadata is untrusted display data. Ref expires with the discovery/session.
-// OnScreen is nil when unknown; false does not identify a minimized window or another Space.
-type WindowMetadata struct {
-	Ref          string             `json:"ref"`
-	Application  string             `json:"application"`
-	Title        string             `json:"title"`
-	OnScreen     *bool              `json:"onScreen"`
-	Capabilities WindowCapabilities `json:"capabilities"`
+var ErrMigration = errors.New("legacy or invalid desktop scope: update desktop/backend/run and reconnect with selected-display capture and desktop-wide input consent")
+
+func DecodeScope(raw []byte) (DesktopScope, error) {
+	var scope DesktopScope
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&scope) != nil || decoder.Decode(new(any)) != io.EOF || scope.Mode != Mode || scope.DisplayID == 0 || scope.Backend == "" || scope.User == "" || scope.Namespace == "" || scope.Run == "" {
+		return DesktopScope{}, ErrMigration
+	}
+	return scope, nil
 }
 
-// DiscoveryResult preserves the metadata in list_windows and select_window results.
-type DiscoveryResult struct {
-	Windows        []WindowMetadata `json:"windows,omitempty"`
-	Target         *WindowMetadata  `json:"target,omitempty"`
-	TargetRevision uint64           `json:"targetRevision"`
-	Guidance       string           `json:"guidance"`
+// ObservationResult contains vision analysis, never raw screenshots. FrameID is
+// single-use for input; coordinates are returned PNG pixels, not desktop points.
+type ObservationResult struct {
+	ActionStatus string `json:"actionStatus,omitempty"`
+	Analysis     string `json:"analysis"`
+	FrameID      string `json:"frameId"`
+	PixelWidth   int    `json:"pixelWidth"`
+	PixelHeight  int    `json:"pixelHeight"`
+	Coordinates  string `json:"coordinates"`
 }

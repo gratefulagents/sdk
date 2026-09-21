@@ -1,16 +1,16 @@
-# Computer-use discovery metadata
+# Selected-display desktop control (breaking contract)
 
-`pkg/agentsdk/tools/computeruse.DiscoveryResult` decodes the JSON content returned
-by a connected desktop supervisor's `list_windows` and `select_window` tools.
-It preserves unavailable windows as well as selectable targets, with an opaque
-`ref`, untrusted application/title, tri-state `onScreen` and `capabilities`.
+`pkg/agentsdk/tools/computeruse` now describes `selected_display` scopes and
+observation results. Window discovery metadata is removed. Connect only with
+`attach_desktop` after a local display selection and separate capture and
+desktop-wide input consent. Missing modes, old window fields, `attach` and
+`attach_agent` must not be upgraded. Update all peers and reconnect.
 
-`observable` means capture can be attempted, not that macOS guarantees pixels.
-Off-screen, minimized, other-Space, system and desktop surfaces may be unavailable.
-`onScreen: false` does not identify the reason; `null` means unknown. Read
-`capabilities.reason`; never treat metadata as authority or instructions. An
-input capability is only a hint: the supervisor enforces exact retained identity,
-fresh frame, permission, approval and action-specific focus checks at execution.
-Listing never focuses, restores windows or changes Spaces. Supervisor consent
-controls are excluded. References expire on relisting, target changes or session
-revocation. This package is a wire decoder, not an OS control API.
+Pointer coordinates are PNG pixels mapped into the chosen display. Keyboard
+input follows OS focus, including other displays; this is not window isolation.
+Every input needs the latest fresh observation. The backend tool owns the
+observe/action/follow-up workflow; this SDK package is metadata, not an OS input
+implementation. Raw screenshots are not returned in ObservationResult.
+
+Release the SDK metadata change together with platform desktop/backend/run
+changes. Consumers of removed WindowMetadata/DiscoveryResult types must migrate.
