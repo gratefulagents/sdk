@@ -2,8 +2,9 @@
 
 `pkg/agentsdk/tools/computeruse` now describes `selected_display` scopes and
 observation results. Window discovery metadata is removed. Connect only with
-`attach_desktop` after a local display selection and separate capture and
-desktop-wide input consent. Missing modes, old window fields, `attach` and
+`attach_desktop` after a local display selection and an explicit **Start desktop
+control** action authorizing capture and desktop-wide input. Separate consent
+checkboxes are not required. Missing modes, old window fields, `attach` and
 `attach_agent` must not be upgraded. Update all peers and reconnect.
 
 Pointer coordinates are PNG pixels mapped into the chosen display. Keyboard
