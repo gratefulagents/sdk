@@ -1345,7 +1345,16 @@ func outputSchemaMap(schema *anthropic.OutputSchema) (map[string]any, error) {
 }
 
 func sharedReasoning(model, effort string, thinking *anthropic.ThinkingConfig) (shared.ReasoningParam, bool) {
+	if thinking != nil && thinking.BudgetTokens > 0 && strings.TrimSpace(effort) == "" {
+		effort = string(sharedReasoningFromBudget(thinking.BudgetTokens).Effort)
+	}
 	if effort = strings.ToLower(strings.TrimSpace(effort)); effort != "" {
+		// GPT-6 has no minimal tier; Astra also cannot disable reasoning.
+		bareModel := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "openai/")
+		if (bareModel == "gpt-6-astra" && effort == "none") ||
+			((bareModel == "gpt-6-astra" || bareModel == "gpt-6-sol" || bareModel == "gpt-6-luna") && effort == "minimal") {
+			effort = "low"
+		}
 		// Effort "none" is a real Responses API value on gpt-5.1+ general
 		// models (codex-family models do not expose it). Older models degrade
 		// an explicit none to minimal, the historical closest behavior.
@@ -1354,10 +1363,7 @@ func sharedReasoning(model, effort string, thinking *anthropic.ThinkingConfig) (
 		}
 		return shared.ReasoningParam{Effort: shared.ReasoningEffort(effort)}, true
 	}
-	if thinking == nil || thinking.BudgetTokens <= 0 {
-		return shared.ReasoningParam{}, false
-	}
-	return sharedReasoningFromBudget(thinking.BudgetTokens), true
+	return shared.ReasoningParam{}, false
 }
 
 // gptVersionPattern extracts the numeric family version from model IDs such as

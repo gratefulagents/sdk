@@ -1876,3 +1876,33 @@ func TestToResponseInputItemsNativeToolImage(t *testing.T) {
 		}
 	}
 }
+
+func TestGPT6ResponseReasoning(t *testing.T) {
+	for _, model := range []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} {
+		for _, effort := range []string{"", "none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+			t.Run(model+"/"+effort, func(t *testing.T) {
+				want := effort
+				if effort == "minimal" || (model == "gpt-6-astra" && effort == "none") {
+					want = "low"
+				}
+				params, err := toResponseParams(anthropic.CreateMessageRequest{Model: model, ReasoningEffort: effort})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(params.Model) != model || string(params.Reasoning.Effort) != want {
+					t.Fatalf("model=%s effort=%s, want %s/%s", params.Model, params.Reasoning.Effort, model, want)
+				}
+			})
+		}
+	}
+	for _, model := range []string{"gpt-6-astra", "openai/gpt-6-astra"} {
+		got, ok := sharedReasoning(model, "", &anthropic.ThinkingConfig{BudgetTokens: 1024})
+		if !ok || string(got.Effort) != "low" {
+			t.Fatalf("small Astra thinking budget = %v/%v, want low/true", got.Effort, ok)
+		}
+		got, ok = sharedReasoning(model, "none", nil)
+		if !ok || string(got.Effort) != "low" {
+			t.Fatalf("Astra none = %v/%v, want low/true", got.Effort, ok)
+		}
+	}
+}
