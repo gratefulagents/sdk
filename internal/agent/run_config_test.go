@@ -8,6 +8,10 @@ func TestCompactionDefaultsForModel(t *testing.T) {
 		wantTrigger int
 		wantTarget  int
 	}{
+		{"gpt-6-sol", 244800, 136000},
+		{"openai/gpt-6-sol", 244800, 136000},
+		{"gpt-6-luna", 244800, 136000},
+		{"openai/gpt-6-luna", 244800, 136000},
 		{"gpt-6-astra", 244800, 136000},
 		{"openai/gpt-6-astra", 244800, 136000},
 		{"gpt-5.6", 334800, 186000},

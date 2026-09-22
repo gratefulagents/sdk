@@ -304,3 +304,29 @@ func TestEstimateCost(t *testing.T) {
 		})
 	}
 }
+
+func TestGPT6Pricing(t *testing.T) {
+	for _, model := range []struct {
+		id                         string
+		input, read, write, output float64
+	}{
+		{"gpt-6-astra", 10, 1, 12.5, 50},
+		{"gpt-6-sol", 2, .2, 2.5, 10},
+		{"gpt-6-luna", .1, .01, .125, .5},
+	} {
+		for _, prefix := range []string{"", "openai/"} {
+			for _, input := range []int64{100000, 272000, 272001} {
+				usage := anthropic.Usage{InputTokens: input, CacheReadInputTokens: 20000, CacheCreationInputTokens: 10000, OutputTokens: 5000}
+				inputMultiplier, outputMultiplier := 1.0, 1.0
+				if input > 272000 {
+					inputMultiplier, outputMultiplier = 2, 1.5
+				}
+				want := ((float64(input-30000)*model.input+20000*model.read+10000*model.write)*inputMultiplier + 5000*model.output*outputMultiplier) / 1e6
+				got, known := EstimateCost(prefix+model.id, usage)
+				if !known || math.Abs(got-want) > 1e-9 {
+					t.Errorf("EstimateCost(%s, input=%d) = %g, %v; want %g, true", prefix+model.id, input, got, known, want)
+				}
+			}
+		}
+	}
+}
