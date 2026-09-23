@@ -1340,3 +1340,29 @@ func TestOAuthInlineAuthJSONNeverReloads(t *testing.T) {
 		t.Fatalf("Authorization = %q, want inline access token", got)
 	}
 }
+
+func TestCodexHTTPRequestClientVersion(t *testing.T) {
+	session, err := NewOAuthAuthSessionFromSecretData([]byte(`{"tokens":{"access_token":"test-access","refresh_token":"test-refresh","account_id":"test-account"},"last_refresh":"2099-01-01T00:00:00Z"}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"responses", "responses/compact", "models"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/codex/"+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			maybeInjectCodexClientVersion(req, session)
+			if got := req.URL.Query().Get("client_version"); got != "0.156.1" {
+				t.Fatalf("client_version = %q, want latest stable 0.156.1", got)
+			}
+			q := req.URL.Query()
+			q.Set("client_version", "0.999.0")
+			req.URL.RawQuery = q.Encode()
+			maybeInjectCodexClientVersion(req, session)
+			if got := req.URL.Query().Get("client_version"); got != "0.999.0" {
+				t.Fatalf("explicit override lost: %q", got)
+			}
+		})
+	}
+}
