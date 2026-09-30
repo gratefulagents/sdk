@@ -34,8 +34,8 @@ const (
 	openAIBetaResponsesExperimental = "responses=experimental"
 	oauthRefreshInterval            = 8 * 24 * time.Hour
 
-	// Keep aligned with the latest stable openai/codex release (rust-v0.156.1).
-	DefaultCodexClientVersion = "0.156.1"
+	// Keep aligned with the latest stable openai/codex release (rust-v0.159.2).
+	DefaultCodexClientVersion = "0.159.2"
 	DefaultOAuthClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
 	DefaultOAuthIssuer        = "https://auth.openai.com"
 	DefaultOAuthTokenEndpoint = "https://auth.openai.com/oauth/token"
