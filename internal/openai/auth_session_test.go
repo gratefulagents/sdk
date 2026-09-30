@@ -1353,8 +1353,8 @@ func TestCodexHTTPRequestClientVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 			maybeInjectCodexClientVersion(req, session)
-			if got := req.URL.Query().Get("client_version"); got != "0.156.1" {
-				t.Fatalf("client_version = %q, want latest stable 0.156.1", got)
+			if got := req.URL.Query().Get("client_version"); got != "0.159.2" {
+				t.Fatalf("client_version = %q, want latest stable 0.159.2", got)
 			}
 			q := req.URL.Query()
 			q.Set("client_version", "0.999.0")
