@@ -283,16 +283,7 @@ func TestNewProviderFromConfigMultiKeepsAnthropicFallbackAPIKeyWhenOpenAIOAuth(t
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("x-api-key")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test",
-			"type":"message",
-			"role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5",
-			"stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer srv.Close()
 
@@ -336,16 +327,7 @@ func TestNewProviderFromConfigMultiUsesAnthropicOAuthWhenDefaultProvider(t *test
 		gotAuth = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test",
-			"type":"message",
-			"role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5",
-			"stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer srv.Close()
 
@@ -444,16 +426,7 @@ func TestNewProviderFromConfigMultiUsesAnthropicOAuthWhenMountedButNotDefault(t 
 		gotAuth = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test",
-			"type":"message",
-			"role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5",
-			"stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer srv.Close()
 
@@ -541,16 +514,7 @@ func TestNewProviderFromConfigMultiExplicitProviderAuthModesMixAuthFlavors(t *te
 		gotAuth = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test",
-			"type":"message",
-			"role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5",
-			"stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer srv.Close()
 
@@ -614,22 +578,11 @@ func TestNewProviderFromConfigMultiUsesConfiguredDefaultProvider(t *testing.T) {
 // "anthropic-oauth" route using OAuth (Authorization: Bearer + oauth beta). A
 // non-empty Routes list also upgrades the single-provider spec to multi.
 func TestNewProviderFromConfigRoutesAnthropicDualAuth(t *testing.T) {
-	anthropicResponse := []byte(`{
-		"id":"msg_test",
-		"type":"message",
-		"role":"assistant",
-		"content":[{"type":"text","text":"ok"}],
-		"model":"claude-sonnet-4-5",
-		"stop_reason":"end_turn",
-		"usage":{"input_tokens":1,"output_tokens":1}
-	}`)
-
 	var keyAuth, keyAPIKey string
 	keySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		keyAuth = r.Header.Get("Authorization")
 		keyAPIKey = r.Header.Get("x-api-key")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(anthropicResponse)
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer keySrv.Close()
 
@@ -638,8 +591,7 @@ func TestNewProviderFromConfigRoutesAnthropicDualAuth(t *testing.T) {
 		oauthAuth = r.Header.Get("Authorization")
 		oauthAPIKey = r.Header.Get("x-api-key")
 		oauthBeta = r.Header.Get("anthropic-beta")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(anthropicResponse)
+		writeAnthropicSuccess(w, "msg_test", "claude-sonnet-4-5")
 	}))
 	defer oauthSrv.Close()
 

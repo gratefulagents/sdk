@@ -26,6 +26,9 @@ func (r *StreamReader) CollectResponse() (*CreateMessageResponse, error) {
 		assembler.Add(event)
 	}
 
+	if err := assembler.Err(); err != nil {
+		return nil, err
+	}
 	return assembler.Response(), nil
 }
 
@@ -33,6 +36,7 @@ func (r *StreamReader) CollectResponse() (*CreateMessageResponse, error) {
 // events. Providers use it when they need to forward deltas live and still
 // return a complete final ModelResponse.
 type StreamAssembler struct {
+	stopped       bool
 	resp          CreateMessageResponse
 	currentBlocks []ContentBlock
 	builders      map[int]*blockAssembler
@@ -133,8 +137,16 @@ func (a *StreamAssembler) Add(event StreamEvent) {
 		}
 
 	case EventMessageStop:
-		// done
+		a.stopped = true
 	}
+}
+
+// Err reports whether the assembled stream ended without message_stop.
+func (a *StreamAssembler) Err() error {
+	if a == nil || !a.stopped {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 func (a *StreamAssembler) Response() *CreateMessageResponse {

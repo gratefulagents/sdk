@@ -145,6 +145,10 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	sdkOpts := []option.RequestOption{
 		option.WithHTTPClient(httpClient),
 		option.WithMaxRetries(0), // We handle retries ourselves
+		option.WithAPIKey(""),
+		option.WithAuthToken(""),
+		option.WithHeaderDel("X-Api-Key"),
+		option.WithHeaderDel("Authorization"),
 	}
 	// x-app / X-Claude-Code-Session-Id are first-party Anthropic (Claude Code)
 	// headers. Anthropic-compatible gateways such as GitHub Copilot don't expect
@@ -251,7 +255,13 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 	params, betas := toSDKParams(&req)
 
 	var resp *CreateMessageResponse
-	err := c.doWithRetry(ctx, func(ctx context.Context) error {
+	err := c.doWithRetry(ctx, func(ctx context.Context) (err error) {
+		emitted := false
+		defer func() {
+			if err != nil && emitted {
+				err = &emittedStreamError{err}
+			}
+		}()
 		// Stream and accumulate rather than calling the blocking endpoint:
 		// Beta.Messages.New refuses requests whose max_tokens could exceed the
 		// 10-minute non-streaming limit. Streaming has no such cap, and the
@@ -260,17 +270,23 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 		stream := c.sdk.Beta.Messages.NewStreaming(ctx, params, betas...)
 		defer stream.Close()
 		var acc sdk.BetaMessage
+		stopped := false
 		for stream.Next() {
 			event := stream.Current()
 			modelactivity.Notify(ctx)
 			if err := acc.Accumulate(event); err != nil {
 				return err
 			}
+			if event.Type == "message_stop" {
+				stopped = true
+				break
+			}
 			// Surface reasoning text live to any installed sink while the
 			// blocking call keeps accumulating the full response.
 			if sink != nil && event.Type == "content_block_delta" {
 				if delta := event.AsContentBlockDelta().Delta; delta.Type == "thinking_delta" {
 					if text := delta.AsThinkingDelta().Thinking; text != "" {
+						emitted = true
 						sink(text)
 					}
 				}
@@ -279,9 +295,12 @@ func (c *Client) createMessageSDK(ctx context.Context, req CreateMessageRequest)
 		if err := stream.Err(); err != nil {
 			return err
 		}
+		if !stopped {
+			return io.ErrUnexpectedEOF
+		}
 		resp = fromSDKBetaMessage(&acc)
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -300,9 +319,9 @@ func (c *Client) createMessageStreamSDK(ctx context.Context, req CreateMessageRe
 			_ = stream.Close()
 			return err
 		}
-		reader = &StreamReader{sdkStream: stream}
+		reader = &StreamReader{sdkStream: stream, client: c}
 		return nil
-	})
+	}, func(release func()) { reader.release = release })
 	if err != nil {
 		return nil, err
 	}
@@ -407,18 +426,25 @@ func (e *RequestError) RetryAfterMS() int {
 
 // waitForBackoff blocks until any global backoff expires or ctx is cancelled.
 func (c *Client) waitForBackoff(ctx context.Context) error {
-	c.mu.Lock()
-	until := c.backoffUntil
-	c.mu.Unlock()
-
-	if delay := time.Until(until); delay > 0 {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		until := c.backoffUntil
+		c.mu.Unlock()
+		delay := time.Until(until)
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 	}
-	return nil
 }
 
 // setGlobalBackoff sets a shared backoff deadline.
@@ -431,90 +457,85 @@ func (c *Client) setGlobalBackoff(d time.Duration) {
 	}
 }
 
-// doWithRetry wraps an API call with retry logic for transient errors.
-func (c *Client) doWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
-	sleptForRetry := false
+type emittedStreamError struct{ error }
+
+func (e *emittedStreamError) Unwrap() error { return e.error }
+
+// doWithRetry transfers the permit to retainPermit on success when provided.
+func (c *Client) doWithRetry(ctx context.Context, fn func(context.Context) error, retainPermit func(func())) error {
 	tokenRefreshed := false
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 && !sleptForRetry {
-			baseDelay := time.Duration(1<<uint(attempt-1)) * time.Second
-			jitter := time.Duration(rand.Int63n(int64(baseDelay / 2)))
+	delay := time.Duration(0)
+	for attempt := 0; ; {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return ctx.Err()
-			case <-time.After(baseDelay + jitter):
+			case <-timer.C:
 			}
 		}
-		sleptForRetry = false
-
-		if err := c.waitForBackoff(ctx); err != nil {
-			return err
-		}
-
-		// Acquire concurrency semaphore.
 		select {
 		case c.sem <- struct{}{}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-
-		err := fn(ctx)
-		<-c.sem
-
-		if err == nil {
-			return nil
-		}
-
-		// Convert SDK error to our RequestError (for SDK path).
-		reqErr := toRequestError(err)
-		if reqErr == nil {
-			// Not an API error — network error etc.
-			if attempt < maxRetries {
-				log.Printf("[anthropic] Non-API error (attempt %d/%d): %v", attempt+1, maxRetries+1, err)
-				continue
-			}
+		release := sync.OnceFunc(func() { <-c.sem })
+		if err := c.waitForBackoff(ctx); err != nil {
+			release()
 			return err
 		}
 
-		log.Printf("[anthropic] HTTP %d (attempt %d/%d): %s", reqErr.StatusCode, attempt+1, maxRetries+1, errorLogBody(reqErr))
-
-		// An auth failure with a refreshable token source usually means the
-		// in-memory token was rotated or expired mid-run: invalidate once and
-		// retry immediately with a freshly resolved token.
-		if reqErr.StatusCode == http.StatusUnauthorized && c.tokenSource != nil && !tokenRefreshed {
+		err := fn(ctx)
+		if err == nil {
+			if retainPermit != nil {
+				retainPermit(release)
+			} else {
+				release()
+			}
+			return nil
+		}
+		var emitted *emittedStreamError
+		noRetry := errors.As(err, &emitted)
+		if noRetry {
+			err = emitted.error
+		}
+		reqErr := toRequestError(err)
+		delay = 0
+		if reqErr != nil {
+			err = reqErr
+			log.Printf("[anthropic] HTTP %d (attempt %d/%d): %s", reqErr.StatusCode, attempt+1, maxRetries+1, errorLogBody(reqErr))
+			delay = time.Duration(reqErr.RetryAfterMS()) * time.Millisecond
+			if delay == 0 && (reqErr.StatusCode == 429 || reqErr.StatusCode == 529) {
+				delay = rateLimitBackoff(attempt)
+			}
+			if reqErr.StatusCode == 429 {
+				// Publish before releasing admission so queued requests see it.
+				c.setGlobalBackoff(delay)
+			}
+		}
+		release()
+		if noRetry {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if reqErr != nil && reqErr.StatusCode == http.StatusUnauthorized && c.tokenSource != nil && !tokenRefreshed {
 			tokenRefreshed = true
 			c.tokenSource.Invalidate()
-			sleptForRetry = true // no backoff needed; the retry uses a new credential
+			delay = 0
 			continue
 		}
-
-		if !reqErr.Retryable() || attempt >= maxRetries {
-			return reqErr
+		if attempt >= maxRetries || (reqErr != nil && !reqErr.Retryable()) {
+			return err
 		}
-
-		// Prefer provider-directed delay (Retry-After or rate-limit reset
-		// headers). A headerless 429/529 still gets a rate-limit-scale
-		// backoff: those limits recover on the provider's clock, so the
-		// generic 1s ladder just wastes attempts.
-		delay := time.Duration(reqErr.RetryAfterMS()) * time.Millisecond
-		if delay == 0 && (reqErr.StatusCode == 429 || reqErr.StatusCode == 529) {
-			delay = rateLimitBackoff(attempt)
+		if delay == 0 {
+			base := time.Duration(1<<uint(attempt)) * time.Second
+			delay = base + time.Duration(rand.Int63n(int64(base/2)))
 		}
-		if reqErr.StatusCode == 429 && delay > 0 {
-			c.setGlobalBackoff(delay)
-		}
-
-		if delay > 0 {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-			sleptForRetry = true
-		}
+		attempt++
 	}
-
-	return fmt.Errorf("max retries exceeded")
 }
 
 // rateLimitBackoff returns the headerless 429/529 backoff for a 0-indexed
@@ -557,6 +578,16 @@ func toRequestError(err error) *RequestError {
 		reqErr := &RequestError{
 			StatusCode: sdkErr.StatusCode,
 			Body:       compactErrorBody(sdkErr),
+		}
+		if sdkErr.StatusCode == http.StatusOK {
+			switch sdkErr.Type() {
+			case "overloaded_error":
+				reqErr.StatusCode = 529
+			case "rate_limit_error":
+				reqErr.StatusCode = http.StatusTooManyRequests
+			case "api_error":
+				reqErr.StatusCode = http.StatusInternalServerError
+			}
 		}
 		if sdkErr.Response != nil {
 			applyRateLimitHeaders(reqErr, sdkErr.Response.Header)
@@ -659,7 +690,13 @@ func parseRetryAfterSeconds(h http.Header) int {
 
 // StreamReader wraps an SDK stream.
 type StreamReader struct {
-	sdkStream *ssestream.Stream[sdk.BetaRawMessageStreamEventUnion]
+	sdkStream   *ssestream.Stream[sdk.BetaRawMessageStreamEventUnion]
+	client      *Client
+	release     func()
+	closeOnce   sync.Once
+	closeErr    error
+	stopped     bool
+	terminalErr error
 }
 
 // Next returns the next StreamEvent. Returns io.EOF when the stream ends.
@@ -668,27 +705,56 @@ func (r *StreamReader) Next() (StreamEvent, error) {
 }
 
 func (r *StreamReader) nextSDK() (StreamEvent, error) {
+	if r.terminalErr != nil {
+		return StreamEvent{}, r.terminalErr
+	}
 	for r.sdkStream.Next() {
 		sdkEvent := r.sdkStream.Current()
 		event := fromSDKStreamEvent(sdkEvent)
 		if event == nil {
 			continue
 		}
+		if event.Type == EventMessageStop {
+			r.stopped = true
+			r.terminalErr = io.EOF
+			_ = r.Close()
+		}
 		return *event, nil
 	}
 
-	if err := r.sdkStream.Err(); err != nil {
-		return StreamEvent{}, err
+	err := r.sdkStream.Err()
+	if reqErr := toRequestError(err); reqErr != nil {
+		err = reqErr
+		if r.client != nil && reqErr.StatusCode == 429 {
+			delay := time.Duration(reqErr.RetryAfterMS()) * time.Millisecond
+			if delay == 0 {
+				delay = rateLimitBackoff(0)
+			}
+			r.client.setGlobalBackoff(delay)
+		}
 	}
-	return StreamEvent{Type: EventMessageStop}, io.EOF
+	if err == nil {
+		err = io.EOF
+		if !r.stopped {
+			err = io.ErrUnexpectedEOF
+		}
+	}
+	r.terminalErr = err
+	_ = r.Close()
+	return StreamEvent{}, err
 }
 
-// Close closes the underlying stream.
+// Close closes the underlying stream and releases its admission permit once.
 func (r *StreamReader) Close() error {
-	if r.sdkStream == nil {
-		return nil
-	}
-	return r.sdkStream.Close()
+	r.closeOnce.Do(func() {
+		if r.sdkStream != nil {
+			r.closeErr = r.sdkStream.Close()
+		}
+		if r.release != nil {
+			r.release()
+		}
+	})
+	return r.closeErr
 }
 
 // ---- SDK stream event converters (API key path only) ----
