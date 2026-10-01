@@ -181,6 +181,7 @@ func (t *agentTool) Execute(ctx context.Context, input json.RawMessage, workDir 
 		// fails the whole sub-agent tool call instead.
 		runConfig.RetryPolicy = nestedCfg.RetryPolicy
 		runConfig.ModelCallTimeout = nestedCfg.ModelCallTimeout
+		runConfig.MaxRetainedToolImages = nestedCfg.MaxRetainedToolImages
 		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
 			childToolAccess = ToolAccessLevelReadOnly
 		}
