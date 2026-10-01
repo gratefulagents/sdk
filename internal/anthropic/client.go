@@ -32,7 +32,7 @@ const (
 	// Claude Code does. Anthropic's OAuth endpoints expect Claude Code-shaped
 	// traffic; other OAuth integrations (pi-anthropic-oauth, opencode) send an
 	// equivalent identity for compatibility.
-	oauthUserAgent = "claude-cli/2.1.158 (external, cli)"
+	oauthUserAgent = "claude-cli/2.1.280 (external, cli)"
 
 	// rateLimitBaseBackoff is the first-retry delay for 429/529 responses that
 	// carry no Retry-After or rate-limit reset headers. Rate limits recover on
