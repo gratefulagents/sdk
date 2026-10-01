@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -402,6 +403,25 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	if agent == nil {
 		return nil, fmt.Errorf("agent is nil")
 	}
+	// A panic in a host callback that is not individually recovered
+	// (instructions, compaction recorder, …) fails the run instead of
+	// crashing the host. Once the run has accumulated state, settlePartial
+	// hands it back with the error like any other mid-run failure.
+	var settlePartial func()
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		if cfg.Debug {
+			log.Printf("[debug] runner panicked: %v\n%s", rec, debug.Stack())
+		}
+		result = nil
+		err = &AgentError{Message: fmt.Sprintf("run panicked: %v", rec)}
+		if settlePartial != nil {
+			settlePartial()
+		}
+	}()
 	cfg.ToolAccessLevel = NormalizeToolAccessLevel(cfg.ToolAccessLevel)
 	runCtx := newRunContext(ctx, cfg)
 	runCtx.ToolAccessLevel = cfg.ToolAccessLevel
@@ -531,8 +551,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	var allItems []RunItem
 	var allResponses []ModelResponse
 	var llmAttempt int32
-	// turnRetryAttempt counts consecutive failed model calls since the last
-	// successful response. RetryPolicy budgets retries per failing call site,
+	// turnRetryAttempt counts delayed retries (RetryPolicy / provider advice)
+	// since the last successful response; the strip, forced-compaction and
+	// fallback recoveries have their own bounds and do not consume it.
+	// RetryPolicy budgets retries per failing call site,
 	// so the counter resets on success; using the cumulative llmAttempt here
 	// would exhaust the retry budget after MaxRetries successful turns.
 	var turnRetryAttempt int
@@ -639,7 +661,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// follow-up run instead of losing it. currentInput is the post-fold
 	// history of every completed turn — replay-safe, no unpaired tool_use.
 	// Errors raised before anything accumulated keep the nil result.
-	defer func() {
+	settlePartial = func() {
 		if err == nil {
 			return
 		}
@@ -657,7 +679,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			return
 		}
 		result = buildResult(nil, currentInput)
-	}()
+	}
+	defer settlePartial()
 
 	for turn := 0; ; turn++ {
 		if turn >= maxTurns {
@@ -1013,7 +1036,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 
 		if err != nil {
-			turnRetryAttempt++
 			advice := activeModel.GetRetryAdvice(err)
 			genData.LatencyMS = time.Since(llmStartedAt).Milliseconds()
 			genData.Error = err.Error()
@@ -1053,7 +1075,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				genSpan.Data = genData
 				exportGenSpan()
 				emitLLMAttemptEvent(cfg.Hooks, attemptEvent("interrupted"))
-				turnRetryAttempt--
 				turn--
 				continue
 			}
@@ -1139,6 +1160,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if fallbackModel, ok := nextFallbackModel(primaryModelName, requestedModelName, effectiveFallbackModels(currentAgent, cfg)); ok {
 					activeFallbackModels[currentAgent] = fallbackModel
 					fallbackSuccessTurns[currentAgent] = 0
+					// The fallback model gets its own once-per-turn recoveries:
+					// the primary's stripped/compacted request says nothing
+					// about what the new model accepts.
+					strippedEncryptedThisTurn, forcedCompactionThisTurn = false, false
 					reason := fallbackReason(advice)
 					if reason == "" {
 						reason = genData.FailureKind
@@ -1153,7 +1178,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 			}
 
-			if delay, retry := modelRetryDelay(cfg.RetryPolicy, advice, turnRetryAttempt); retry && !streamOutputWasCommitted(err) {
+			if delay, retry := modelRetryDelay(cfg.RetryPolicy, advice, turnRetryAttempt+1); retry && !streamOutputWasCommitted(err) {
+				turnRetryAttempt++
 				genData.RetryScheduled = true
 				genData.RetryAfterMS = delay.Milliseconds()
 				finishFailure("retrying")
@@ -1268,23 +1294,28 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		emitRunItems(ctx, streamEvents, newItems)
 		responseCompactionSummary, responseHasCompaction := providerCompactionSummaryFromItems(newItems)
 		responseCompactionRecorded := false
-		recordAndPruneResponseCompaction := func(items []RunItem) []RunItem {
+		// guardAgent is the agent whose input guardrails vet the carry-forward:
+		// the agent that will receive the pruned history next.
+		recordAndPruneResponseCompaction := func(items []RunItem, guardAgent *Agent) ([]RunItem, error) {
 			if !responseHasCompaction || responseCompactionRecorded {
-				return items
+				return items, nil
 			}
 			pruned, prunedOK := pruneBeforeLatestProviderCompaction(items)
 			if !prunedOK {
-				return items
+				return items, nil
 			}
 			before := requestInputTokens + requestOverheadTokens
 			var carryForward string
 			pruned, carryForward = applyCompactionCarryForward(ctx, pruned, items, cfg, compactionCfg, requestOverheadTokens)
+			if err := guardCompactionCarryForward(runCtx, guardAgent, carryForward); err != nil {
+				return items, err
+			}
 			after := estimateRunItemsTokens(pruned) + requestOverheadTokens
 			if cfg.CompactionRecorder != nil {
 				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(responseCompactionSummary, carryForward))
 			}
 			responseCompactionRecorded = true
-			return pruned
+			return pruned, nil
 		}
 
 		if durableCheckpointsEnabled(cfg.Durable) {
@@ -1299,12 +1330,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
-			continueWith := func(feedback ...RunItem) {
+			continueWith := func(feedback ...RunItem) error {
 				currentInput = append(currentInput, newItems...)
 				currentInput = append(currentInput, feedback...)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
 				allItems = append(allItems, feedback...)
 				emitRunItems(ctx, streamEvents, feedback)
+				pruned, err := recordAndPruneResponseCompaction(currentInput, currentAgent)
+				currentInput = pruned
+				return err
 			}
 			// Match Codex CLI's Responses loop: a completed text-only response requests
 			// another sample only when the backend explicitly sends end_turn=false.
@@ -1313,7 +1346,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// so end_turn=true cannot cancel tool-driven continuation.
 			if resp.EndTurn != nil && !*resp.EndTurn {
 				pendingCompletion = false
-				continueWith()
+				if err := continueWith(); err != nil {
+					return nil, err
+				}
 				continue
 			}
 
@@ -1322,7 +1357,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, joinErr
 			}
 			if len(joinItems) > 0 {
-				continueWith(joinItems...)
+				if err := continueWith(joinItems...); err != nil {
+					return nil, err
+				}
 				if turn >= maxTurns-1 && finalJoinExtensions < maxSubAgentFinalJoinExtensions {
 					finalJoinExtensions++
 					maxTurns++
@@ -1340,7 +1377,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					Type:    RunItemMessage,
 					Message: &MessageOutput{Text: completionConfirmationPrompt},
 				}
-				continueWith(confirmItem)
+				if err := continueWith(confirmItem); err != nil {
+					return nil, err
+				}
 				if turn >= maxTurns-1 {
 					maxTurns++
 				}
@@ -1361,7 +1400,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						Type:    RunItemMessage,
 						Message: &MessageOutput{Text: "[SYSTEM] An independent reviewer examined your answer before finalization and raised these points. Address the valid ones (with tools if needed), then provide your final answer again:\n" + feedback},
 					}
-					continueWith(verifyItem)
+					if err := continueWith(verifyItem); err != nil {
+						return nil, err
+					}
 					pendingCompletion = false
 					if turn >= maxTurns-1 {
 						maxTurns++
@@ -1377,7 +1418,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if continued, finalizeErr := finalizeImmediateInput(newItems...); finalizeErr != nil {
 					return nil, finalizeErr
 				} else if continued {
-					currentInput = recordAndPruneResponseCompaction(currentInput)
+					if currentInput, err = recordAndPruneResponseCompaction(currentInput, currentAgent); err != nil {
+						return nil, err
+					}
 					if turn >= maxTurns-1 {
 						maxTurns++
 					}
@@ -1389,7 +1432,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// the final response itself carries a provider compaction item,
 			// FinalHistory must reflect the post-compaction state — replaying
 			// the unpruned transcript would resend the compacted history.
-			finalHistory := recordAndPruneResponseCompaction(append(append([]RunItem(nil), currentInput...), newItems...))
+			finalHistory, pruneErr := recordAndPruneResponseCompaction(append(append([]RunItem(nil), currentInput...), newItems...), currentAgent)
+			if pruneErr != nil {
+				return nil, pruneErr
+			}
 
 			// Run output guardrails.
 			var outputGuardrailResults []OutputGuardrailResult
@@ -1455,10 +1501,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				}
 				nextInput = filtered
 			}
-			nextInput = recordAndPruneResponseCompaction(nextInput)
+			nextInput, err = recordAndPruneResponseCompaction(nextInput, s.target)
+			if err != nil {
+				return nil, err
+			}
 			if compacted, before, after, ok, reason := MaybeCompactHandoffInput(nextInput, cfg.HandoffHistory); ok {
 				var carryForward string
 				nextInput, carryForward = applyCompactionCarryForward(ctx, compacted, nextInput, cfg, compactionCfg, requestOverheadTokens)
+				if err := guardCompactionCarryForward(runCtx, s.target, carryForward); err != nil {
+					return nil, err
+				}
 				after = estimateRunItemsTokens(nextInput)
 				if cfg.CompactionRecorder != nil {
 					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(compacted), carryForward))
@@ -1526,7 +1578,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				nextTurnToolResults = wrapToolOutputsForInput(toolResults)
 			}
 			currentInput = append(currentInput, nextTurnToolResults...)
-			currentInput = recordAndPruneResponseCompaction(currentInput)
+			if currentInput, err = recordAndPruneResponseCompaction(currentInput, currentAgent); err != nil {
+				return nil, err
+			}
 			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 				return nil, fmt.Errorf("persist tool-completed checkpoint: %w", err)
 			}
@@ -2163,6 +2217,19 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 	}
 	var work []asyncWork
 	var actionAudits []ActionAuditRecord
+	// Once a mutating call is held for approval, later mutating calls must
+	// not run ahead of it: they would apply out of call order (or depend on
+	// a mutation that may yet be denied).
+	mutationHeld := false
+	holdApproval := func(i int, call ToolCallData, t Tool) {
+		slots[i] = toolCallResult{item: RunItem{
+			Type: RunItemToolApproval, Agent: agent,
+			ToolApproval: &ToolApprovalData{ToolName: call.Name, Input: call.Input, CallID: call.ID},
+		}}
+		if !isParallelSafeTool(t) {
+			mutationHeld = true
+		}
+	}
 
 	for i, call := range calls {
 		t, ok := toolMap[call.Name]
@@ -2202,17 +2269,18 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 				}}
 				continue
 			case ActionDecisionAsk:
-				slots[i] = toolCallResult{item: RunItem{
-					Type: RunItemToolApproval, Agent: agent,
-					ToolApproval: &ToolApprovalData{ToolName: call.Name, Input: call.Input, CallID: call.ID},
-				}}
+				holdApproval(i, call, t)
 				continue
 			}
 		}
 		if t.NeedsApproval() {
+			holdApproval(i, call, t)
+			continue
+		}
+		if mutationHeld && !isParallelSafeTool(t) {
 			slots[i] = toolCallResult{item: RunItem{
-				Type: RunItemToolApproval, Agent: agent,
-				ToolApproval: &ToolApprovalData{ToolName: call.Name, Input: call.Input, CallID: call.ID},
+				Type: RunItemToolOutput, Agent: agent,
+				ToolOutput: &ToolOutputData{CallID: call.ID, Content: "tool call not executed: an earlier call in this batch is pending approval; re-issue it after that call resolves", IsError: true},
 			}}
 			continue
 		}
@@ -2584,8 +2652,9 @@ func toolResultsPaired(results []RunItem) bool {
 // isParallelSafeTool reports whether a tool may run concurrently with other
 // tool calls in the same turn. Read-only tools cannot mutate shared state, and
 // control-flow/sub-agent tools manage their own isolation (sub-agent tasks are
-// instructed to own disjoint files), so both classes share a read lock.
-// Everything else (Edit, Write, Bash, custom mutating tools) runs exclusively.
+// instructed to own disjoint files), so neither waits for or holds back the
+// rest of the batch. Everything else (Edit, Write, Bash, custom mutating
+// tools) runs alone, in call order, after earlier calls finish.
 func isParallelSafeTool(t Tool) bool {
 	if t == nil {
 		return true
@@ -3468,8 +3537,8 @@ func isContextLengthExceededError(err error) bool {
 
 // contextLengthErrorPhrases are provider phrasings for a request that does not
 // fit the model's context window: OpenAI ("context_length_exceeded", "maximum
-// context length"), Anthropic ("prompt is too long: N tokens > M maximum"),
-// Bedrock ("input is too long"), Gemini ("exceeds the maximum number of
+// context length"), Anthropic ("prompt is too long: N tokens > M maximum",
+// "input length and `max_tokens` exceed context limit"), Bedrock ("input is too long"), Gemini ("exceeds the maximum number of
 // tokens").
 var contextLengthErrorPhrases = []string{
 	"context_length_exceeded",
@@ -3478,6 +3547,7 @@ var contextLengthErrorPhrases = []string{
 	"maximum context length",
 	"input is too long",
 	"exceeds the maximum number of tokens",
+	"exceed context limit",
 }
 
 // isEncryptedContentError detects provider rejections of encrypted context
