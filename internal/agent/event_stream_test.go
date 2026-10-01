@@ -240,7 +240,7 @@ func TestEmitTimestampsFollowWriteOrderAcrossChildStreams(t *testing.T) {
 		wg.Add(1)
 		go func(es *EventStream) {
 			defer wg.Done()
-			for i := 0; i < 200; i++ {
+			for range 200 {
 				es.EmitText("x")
 			}
 		}(es)
