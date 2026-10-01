@@ -3,7 +3,9 @@ package anthropic
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -183,6 +185,9 @@ func (m *AnthropicModel) GetResponse(ctx context.Context, req agentsdk.ModelRequ
 		return nil, errors.New("anthropic model is not configured")
 	}
 	apiReq := m.buildRequest(req)
+	if err := validateSettings(req.Settings, apiReq); err != nil {
+		return nil, err
+	}
 	resp, err := m.client.CreateMessage(ctx, apiReq)
 	if err != nil {
 		healed, ok := m.healRequestOnError(err, apiReq, req)
@@ -201,6 +206,9 @@ func (m *AnthropicModel) StreamResponse(ctx context.Context, req agentsdk.ModelR
 		return nil, errors.New("anthropic model is not configured")
 	}
 	apiReq := m.buildRequest(req)
+	if err := validateSettings(req.Settings, apiReq); err != nil {
+		return nil, err
+	}
 	stream, err := m.client.CreateMessageStream(ctx, apiReq)
 	if err != nil {
 		healed, ok := m.healRequestOnError(err, apiReq, req)
@@ -294,6 +302,25 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 	}
 
 	m.applyThinkingConfig(&apiReq, model, req.Settings)
+	apiReq.Temperature = req.Settings.Temperature
+	apiReq.TopP = req.Settings.TopP
+	apiReq.StopSequences = append([]string(nil), req.Settings.StopSequences...)
+	switch choice := req.Settings.ToolChoice; choice {
+	case "":
+	case "auto", "none":
+		apiReq.ToolChoice = &internalanthropic.ToolChoice{Type: choice}
+	case "required":
+		apiReq.ToolChoice = &internalanthropic.ToolChoice{Type: "any"}
+	default:
+		apiReq.ToolChoice = &internalanthropic.ToolChoice{Type: "tool", Name: choice}
+	}
+	if req.Settings.ParallelToolCalls != nil && len(req.Tools) > 0 && req.Settings.ToolChoice != "none" {
+		if apiReq.ToolChoice == nil {
+			apiReq.ToolChoice = &internalanthropic.ToolChoice{Type: "auto"}
+		}
+		disableParallel := !*req.Settings.ParallelToolCalls
+		apiReq.ToolChoice.DisableParallelToolUse = &disableParallel
+	}
 
 	// Convert tools.
 	for _, t := range req.Tools {
@@ -312,6 +339,47 @@ func (m *AnthropicModel) buildRequest(req agentsdk.ModelRequest) internalanthrop
 	}
 
 	return apiReq
+}
+
+func validateSettings(settings agentsdk.ModelSettings, req internalanthropic.CreateMessageRequest) error {
+	for _, setting := range []struct {
+		name  string
+		value *float64
+	}{{"Temperature", settings.Temperature}, {"TopP", settings.TopP}} {
+		if setting.value != nil && (math.IsNaN(*setting.value) || math.IsInf(*setting.value, 0) || *setting.value < 0 || *setting.value > 1) {
+			return fmt.Errorf("anthropic: %s must be finite and between 0 and 1", setting.name)
+		}
+	}
+	thinking := req.Thinking != nil && (req.Thinking.Type == "enabled" || req.Thinking.Type == "adaptive")
+	if choice := req.ToolChoice; choice != nil {
+		if choice.Type != "none" && len(req.Tools) == 0 {
+			return errors.New("anthropic: ToolChoice requires tools")
+		}
+		if choice.Type == "tool" {
+			found := false
+			for _, tool := range req.Tools {
+				if tool.Name == choice.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("anthropic: ToolChoice names unknown tool %q", choice.Name)
+			}
+		}
+		if thinking && (choice.Type == "any" || choice.Type == "tool") {
+			return errors.New("anthropic: forced ToolChoice is not supported with thinking")
+		}
+	}
+	if thinking {
+		if settings.Temperature != nil && *settings.Temperature != 1 {
+			return errors.New("anthropic: Temperature must be 1 when thinking is enabled")
+		}
+		if settings.TopP != nil && *settings.TopP < 0.95 {
+			return errors.New("anthropic: TopP must be between 0.95 and 1 when thinking is enabled")
+		}
+	}
+	return nil
 }
 
 // Thinking-shape override states recorded after a thinking.type 400.

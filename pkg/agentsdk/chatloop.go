@@ -239,7 +239,12 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		}
 		result, err := l.opts.Runner.Run(ctx, &agent, history, runCfg)
 		if result == nil {
-			return nil, err
+			if rounds == 0 && len(allNewItems) == 0 {
+				return nil, err
+			}
+			// Earlier rounds already produced (and possibly persisted) work;
+			// hand it back with the error instead of dropping it.
+			return settledResult(&RunResult{}), err
 		}
 		allNewItems = append(allNewItems, result.NewItems...)
 		allResponses = append(allResponses, result.RawResponses...)

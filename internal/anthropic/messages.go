@@ -21,6 +21,9 @@ type CreateMessageRequest struct {
 	Thinking      *ThinkingConfig  `json:"thinking,omitempty"`
 	TextVerbosity string           `json:"text_verbosity,omitempty"`
 	ToolChoice    *ToolChoice      `json:"tool_choice,omitempty"`
+	Temperature   *float64         `json:"temperature,omitempty"`
+	TopP          *float64         `json:"top_p,omitempty"`
+	StopSequences []string         `json:"stop_sequences,omitempty"`
 	Betas         []string         `json:"-"` // Converted to SDK beta headers
 	OutputSchema  *OutputSchema    `json:"-"`
 
@@ -76,8 +79,9 @@ const (
 
 // ToolChoice controls tool selection behavior.
 type ToolChoice struct {
-	Type string `json:"type"`           // "auto", "any", "tool"
-	Name string `json:"name,omitempty"` // only for type "tool"
+	Type                   string `json:"type"`           // "auto", "any", "tool", "none"
+	Name                   string `json:"name,omitempty"` // only for type "tool"
+	DisableParallelToolUse *bool  `json:"disable_parallel_tool_use,omitempty"`
 }
 
 // toSDKParams converts our request to SDK BetaMessageNewParams + request options for betas.
@@ -86,6 +90,14 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 		Model:     sdk.Model(r.Model),
 		MaxTokens: int64(r.MaxTokens),
 	}
+
+	if r.Temperature != nil {
+		params.Temperature = sdk.Float(*r.Temperature)
+	}
+	if r.TopP != nil {
+		params.TopP = sdk.Float(*r.TopP)
+	}
+	params.StopSequences = r.StopSequences
 
 	// Convert messages.
 	for _, msg := range r.Messages {
@@ -113,36 +125,24 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 
 	// Convert tools.
 	for _, tool := range r.Tools {
-		var props map[string]interface{}
-		_ = json.Unmarshal(tool.InputSchema, &props)
-
-		var required []string
-		if rawRequired, ok := props["required"].([]interface{}); ok {
-			for _, item := range rawRequired {
-				if name, ok := item.(string); ok {
-					required = append(required, name)
-				}
-			}
+		var schema map[string]json.RawMessage
+		_ = json.Unmarshal(tool.InputSchema, &schema)
+		extra := make(map[string]any, len(schema))
+		for key, value := range schema {
+			extra[key] = value
 		}
-
-		// A tool schema with no properties (e.g. `{"type":"object"}`) must
-		// still send input_schema: BetaToolParam tags the field omitzero, so a
-		// zero-value BetaToolInputSchemaParam would drop input_schema entirely
-		// and the API rejects the request with
-		// "tools.N.custom.input_schema: Field required".
-		properties := props["properties"]
-		if properties == nil {
-			properties = map[string]interface{}{}
+		// Keep input_schema nonzero even for parameterless tools; otherwise the
+		// SDK omits this required field. ExtraFields preserves root keywords.
+		inputSchema := sdk.BetaToolInputSchemaParam{
+			Properties:  map[string]any{},
+			ExtraFields: extra,
 		}
 
 		params.Tools = append(params.Tools, sdk.BetaToolUnionParam{
 			OfTool: &sdk.BetaToolParam{
-				Name:        tool.Name,
-				Description: sdk.String(tool.Description),
-				InputSchema: sdk.BetaToolInputSchemaParam{
-					Properties: properties,
-					Required:   required,
-				},
+				Name:         tool.Name,
+				Description:  sdk.String(tool.Description),
+				InputSchema:  inputSchema,
 				CacheControl: toolCacheControl(tool.CacheControl),
 			},
 		})
@@ -150,13 +150,17 @@ func toSDKParams(r *CreateMessageRequest) (sdk.BetaMessageNewParams, []option.Re
 
 	// Convert tool choice.
 	if r.ToolChoice != nil {
+		var disableParallel param.Opt[bool]
+		if r.ToolChoice.DisableParallelToolUse != nil {
+			disableParallel = sdk.Bool(*r.ToolChoice.DisableParallelToolUse)
+		}
 		switch r.ToolChoice.Type {
 		case "auto":
-			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAuto: &sdk.BetaToolChoiceAutoParam{}}
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAuto: &sdk.BetaToolChoiceAutoParam{DisableParallelToolUse: disableParallel}}
 		case "any":
-			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAny: &sdk.BetaToolChoiceAnyParam{}}
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfAny: &sdk.BetaToolChoiceAnyParam{DisableParallelToolUse: disableParallel}}
 		case "tool":
-			params.ToolChoice = sdk.BetaToolChoiceParamOfTool(r.ToolChoice.Name)
+			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfTool: &sdk.BetaToolChoiceToolParam{Name: r.ToolChoice.Name, DisableParallelToolUse: disableParallel}}
 		case "none":
 			params.ToolChoice = sdk.BetaToolChoiceUnionParam{OfNone: &sdk.BetaToolChoiceNoneParam{}}
 		}
@@ -240,9 +244,10 @@ func toSDKContentBlock(block ContentBlock) sdk.BetaContentBlockParamUnion {
 		}
 		return sdk.BetaContentBlockParamUnion{
 			OfToolUse: &sdk.BetaToolUseBlockParam{
-				ID:    block.ID,
-				Name:  block.Name,
-				Input: input,
+				ID:           block.ID,
+				Name:         block.Name,
+				Input:        input,
+				CacheControl: toolCacheControl(block.CacheControl),
 			},
 		}
 	case "tool_result":

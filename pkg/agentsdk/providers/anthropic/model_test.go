@@ -356,7 +356,17 @@ func TestThinkingShapeFlipOn400(t *testing.T) {
 			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"\"thinking.type.enabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`))
 	}))
 	defer srv.Close()
 
@@ -415,7 +425,17 @@ func TestCapAdaptiveEffortOn400(t *testing.T) {
 			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"output_config: effort: Input should be 'low', 'medium' or 'high'"}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`))
 	}))
 	defer srv.Close()
 
