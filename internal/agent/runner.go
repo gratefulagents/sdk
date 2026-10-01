@@ -828,6 +828,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 		}
 
+		currentInput = pruneToolOutputImages(currentInput, cfg.MaxRetainedToolImages)
+
 		// --- Structured turn logging ---
 		{
 			var toolNames []string

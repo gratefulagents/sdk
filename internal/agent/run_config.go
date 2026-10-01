@@ -454,6 +454,13 @@ type RunConfig struct {
 	// this value as a hard deadline. 0 uses DefaultModelCallTimeout; negative
 	// disables both safeguards.
 	ModelCallTimeout time.Duration
+
+	// MaxRetainedToolImages bounds how many tool-output images (for example
+	// computer-use screenshots) stay in the conversation. Before each model
+	// call, images on older tool outputs are dropped oldest-first, in chunks of
+	// this size so the retained prefix stays stable for prompt caching. Pruning
+	// is permanent, so durable history shrinks too. 0 means unlimited.
+	MaxRetainedToolImages int
 }
 
 // ShouldTagUntrustedToolOutputs reports whether tool outputs should be tagged
