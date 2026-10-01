@@ -82,8 +82,14 @@ func (c *DurableRunConfig) normalize() {
 	}
 }
 
+// durableCheckpointsEnabled reports whether emitDurableCheckpoint persists
+// anything, letting callers skip building checkpoint-only history copies.
+func durableCheckpointsEnabled(cfg *DurableRunConfig) bool {
+	return cfg != nil && cfg.Checkpoint != nil
+}
+
 func emitDurableCheckpoint(ctx context.Context, cfg *DurableRunConfig, sequence *uint64, boundary DurableBoundary, agent *Agent, history []RunItem, interruptions []*Interruption, usage Usage) error {
-	if cfg == nil || cfg.Checkpoint == nil {
+	if !durableCheckpointsEnabled(cfg) {
 		return nil
 	}
 	cfg.normalize()

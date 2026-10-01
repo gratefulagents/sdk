@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -16,7 +17,34 @@ const (
 	// chars/4 makes the post-compaction estimate exceed the compaction trigger
 	// permanently (self-sustaining re-compaction loop).
 	compactionItemTokenEstimateCap = 20000
+	// imageTokenEstimate is the flat per-image prompt cost. Providers bill
+	// images by pixel dimensions, not by base64 length; ~1.5k tokens matches a
+	// typical screenshot. Counting them as zero makes image-heavy (e.g.
+	// computer-use) histories overflow before compaction triggers.
+	imageTokenEstimate = 1500
+	// compactionMinGainDivisor: a plan that misses the target must still cut
+	// at least 1/N of the estimate. Otherwise oversized protected items (huge
+	// initial user messages) keep the history above the trigger and every turn
+	// re-summarizes the previous turn's few items for negligible gain.
+	compactionMinGainDivisor = 10
+
+	compactionSummaryAgentName = "context-summary"
+	compactionSummaryPrefix    = "[COMPACTED HISTORY SUMMARY]"
 )
+
+// isLocalCompactionSummary reports whether item is a summary message inserted
+// by local compaction.
+func isLocalCompactionSummary(item RunItem) bool {
+	return item.Type == RunItemMessage && item.Message != nil && item.Agent != nil &&
+		item.Agent.Name == compactionSummaryAgentName &&
+		strings.HasPrefix(strings.TrimSpace(item.Message.Text), compactionSummaryPrefix)
+}
+
+// isProviderCompactionBlob reports whether item is a provider compaction item
+// carrying an encrypted blob.
+func isProviderCompactionBlob(item RunItem) bool {
+	return item.Type == RunItemCompaction && item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != ""
+}
 
 // MaybeCompactRunItems reduces history size while preserving the original task
 // framing and the most recent turn context.
@@ -48,7 +76,7 @@ type CompactionPlan struct {
 // summary body. The body is prefixed with the standard compaction marker and
 // scope line so downstream extraction (ExtractCompactionSummary) keeps working.
 func (p CompactionPlan) RebuildWithSummary(summaryBody string) []RunItem {
-	summary := "[COMPACTED HISTORY SUMMARY]\n" +
+	summary := compactionSummaryPrefix + "\n" +
 		summarizeCompactionScope(p.Removed) + "\n" +
 		strings.TrimSpace(summaryBody)
 	return buildCompactedRunItems(p.Source, p.Protected, summary)
@@ -62,7 +90,12 @@ func planRunItemsCompaction(items []RunItem, cfg CompactionConfig) (CompactionPl
 		return CompactionPlan{}, 0, false, "disabled"
 	}
 
-	before := estimateRunItemsTokens(items)
+	itemTokens := make([]int, len(items))
+	before := 0
+	for idx, item := range items {
+		itemTokens[idx] = estimateRunItemTokens(item)
+		before += itemTokens[idx]
+	}
 	if before <= cfg.TriggerTokens {
 		return CompactionPlan{}, before, false, "below-threshold"
 	}
@@ -80,31 +113,44 @@ func planRunItemsCompaction(items []RunItem, cfg CompactionConfig) (CompactionPl
 	}
 
 	var (
-		bestPlan   CompactionPlan
-		bestAfter  = before
-		bestOK     bool
-		bestReason = "no-removable-history"
+		bestPlan      CompactionPlan
+		bestSummary   string
+		bestOK        bool
+		bestReason    = "no-removable-history"
+		prevProtected = -1
 	)
 	for recent := maxRecent; recent >= 1; recent-- {
-		plan, ok, reason := compactRunItemsToRecentLimit(items, protectedPrefix, recent, cfg.SummaryBulletLimit, cfg.TargetTokens)
+		protected := protectedForRecentLimit(items, protectedPrefix, recent)
+		// Protected sets only shrink as recent decreases, so an equal size
+		// means tool-pair integrity re-protected the newly exposed item and
+		// this split is identical to the previous candidate.
+		if len(protected) == prevProtected {
+			continue
+		}
+		prevProtected = len(protected)
+		plan, summary, ok, reason := compactRunItemsWithProtected(items, itemTokens, before, protected, cfg.SummaryBulletLimit, cfg.TargetTokens)
 		if !ok {
 			if bestReason == "no-removable-history" {
 				bestReason = reason
 			}
 			continue
 		}
-		if !bestOK || plan.After < bestAfter {
+		if !bestOK || plan.After < bestPlan.After {
 			bestPlan = plan
-			bestAfter = plan.After
+			bestSummary = summary
 			bestOK = true
 		}
 		if plan.After <= cfg.TargetTokens {
-			return plan, before, true, ""
+			break
 		}
 	}
 	if !bestOK {
 		return CompactionPlan{}, before, false, bestReason
 	}
+	if bestPlan.After > cfg.TargetTokens && before-bestPlan.After < before/compactionMinGainDivisor {
+		return CompactionPlan{}, before, false, "insufficient-reduction"
+	}
+	bestPlan.Items = buildCompactedRunItems(items, bestPlan.Protected, bestSummary)
 	return bestPlan, before, true, ""
 }
 
@@ -131,16 +177,11 @@ func PlanRunItemsCompactionForRequest(items []RunItem, cfg CompactionConfig, req
 		requestOverheadTokens = 0
 	}
 
-	beforeItems := estimateRunItemsTokens(items)
-	beforeTotal := beforeItems + requestOverheadTokens
-	if beforeTotal <= cfg.TriggerTokens {
-		return CompactionPlan{}, beforeTotal, false, "below-threshold"
-	}
-
 	adjusted := cfg
 	adjusted.TriggerTokens = maxInt(1, cfg.TriggerTokens-requestOverheadTokens)
 	adjusted.TargetTokens = maxInt(1, cfg.TargetTokens-requestOverheadTokens)
-	plan, _, ok, reason := planRunItemsCompaction(items, adjusted)
+	plan, beforeItems, ok, reason := planRunItemsCompaction(items, adjusted)
+	beforeTotal := beforeItems + requestOverheadTokens
 	if !ok {
 		return CompactionPlan{}, beforeTotal, false, reason
 	}
@@ -150,16 +191,8 @@ func PlanRunItemsCompactionForRequest(items []RunItem, cfg CompactionConfig, req
 
 func ExtractCompactionSummary(items []RunItem) string {
 	for i := len(items) - 1; i >= 0; i-- {
-		item := items[i]
-		if item.Type != RunItemMessage || item.Message == nil || item.Agent == nil {
-			continue
-		}
-		if item.Agent.Name != "context-summary" {
-			continue
-		}
-		text := strings.TrimSpace(item.Message.Text)
-		if strings.HasPrefix(text, "[COMPACTED HISTORY SUMMARY]") {
-			return text
+		if isLocalCompactionSummary(items[i]) {
+			return strings.TrimSpace(items[i].Message.Text)
 		}
 	}
 	return ""
@@ -184,49 +217,55 @@ func MaybeCompactHandoffInput(items []RunItem, cfg HandoffHistoryConfig) ([]RunI
 func estimateRunItemsTokens(items []RunItem) int {
 	total := 0
 	for _, item := range items {
-		switch item.Type {
-		case RunItemMessage:
-			if item.Message != nil {
-				total += estimateStringTokens(item.Message.Text) + 8
-			}
-		case RunItemToolCall:
-			if item.ToolCall != nil {
-				total += estimateStringTokens(item.ToolCall.Name) + estimateStringTokens(string(item.ToolCall.Input)) + 16
-			}
-		case RunItemToolOutput:
-			if item.ToolOutput != nil {
-				total += estimateStringTokens(item.ToolOutput.Content) + 12
-			}
-		case RunItemReasoning:
-			if item.Reasoning != nil {
-				total += estimateStringTokens(item.Reasoning.Text) + 8
-			}
-		case RunItemCompaction:
-			if item.Compaction != nil {
-				// Provider compaction blobs are encrypted+encoded bytes, not
-				// text: chars/4 wildly overestimates their real prompt cost
-				// (blobs run 100KB-10MB while representing a bounded compacted
-				// window). Cap the estimate so one compaction cannot keep the
-				// total above the trigger forever and re-fire every turn.
-				// Underestimation is safe here: the provider enforces the real
-				// window (context_management + forced compaction on overflow).
-				total += minInt(estimateStringTokens(item.Compaction.EncryptedContent), compactionItemTokenEstimateCap) + 8
-			}
-		case RunItemHandoffCall:
-			if item.HandoffCall != nil {
-				total += estimateStringTokens(item.HandoffCall.FromAgent) + estimateStringTokens(item.HandoffCall.ToAgent) + 8
-			}
-		case RunItemHandoffOutput:
-			if item.HandoffOutput != nil {
-				total += estimateStringTokens(item.HandoffOutput.FromAgent) + estimateStringTokens(item.HandoffOutput.ToAgent) + 8
-			}
-		case RunItemToolApproval:
-			if item.ToolApproval != nil {
-				total += estimateStringTokens(item.ToolApproval.ToolName) + estimateStringTokens(string(item.ToolApproval.Input)) + 8
-			}
-		default:
-			total += 8
+		total += estimateRunItemTokens(item)
+	}
+	return total
+}
+
+func estimateRunItemTokens(item RunItem) int {
+	total := 0
+	switch item.Type {
+	case RunItemMessage:
+		if item.Message != nil {
+			total += estimateStringTokens(item.Message.Text) + 8 + len(item.Message.Images)*imageTokenEstimate
 		}
+	case RunItemToolCall:
+		if item.ToolCall != nil {
+			total += estimateStringTokens(item.ToolCall.Name) + estimateStringTokens(string(item.ToolCall.Input)) + 16
+		}
+	case RunItemToolOutput:
+		if item.ToolOutput != nil {
+			total += estimateStringTokens(item.ToolOutput.Content) + 12 + len(item.ToolOutput.Images)*imageTokenEstimate
+		}
+	case RunItemReasoning:
+		if item.Reasoning != nil {
+			total += estimateStringTokens(item.Reasoning.Text) + 8
+		}
+	case RunItemCompaction:
+		if item.Compaction != nil {
+			// Provider compaction blobs are encrypted+encoded bytes, not
+			// text: chars/4 wildly overestimates their real prompt cost
+			// (blobs run 100KB-10MB while representing a bounded compacted
+			// window). Cap the estimate so one compaction cannot keep the
+			// total above the trigger forever and re-fire every turn.
+			// Underestimation is safe here: the provider enforces the real
+			// window (context_management + forced compaction on overflow).
+			total += minInt(estimateStringTokens(item.Compaction.EncryptedContent), compactionItemTokenEstimateCap) + 8
+		}
+	case RunItemHandoffCall:
+		if item.HandoffCall != nil {
+			total += estimateStringTokens(item.HandoffCall.FromAgent) + estimateStringTokens(item.HandoffCall.ToAgent) + 8
+		}
+	case RunItemHandoffOutput:
+		if item.HandoffOutput != nil {
+			total += estimateStringTokens(item.HandoffOutput.FromAgent) + estimateStringTokens(item.HandoffOutput.ToAgent) + 8
+		}
+	case RunItemToolApproval:
+		if item.ToolApproval != nil {
+			total += estimateStringTokens(item.ToolApproval.ToolName) + estimateStringTokens(string(item.ToolApproval.Input)) + 8
+		}
+	default:
+		total += 8
 	}
 	return total
 }
@@ -264,7 +303,7 @@ func estimateStringTokens(s string) int {
 		return 0
 	}
 	// Rough token estimate: ~4 chars/token plus a small floor.
-	return len([]rune(s))/4 + 1
+	return utf8.RuneCountInString(s)/4 + 1
 }
 
 func selectInitialUserMessageIndices(items []RunItem, limit int) []int {
@@ -298,7 +337,7 @@ func selectInitialUserMessageIndices(items []RunItem, limit int) []int {
 func providerCompactionItemIndices(items []RunItem) []int {
 	var indices []int
 	for idx, item := range items {
-		if item.Type == RunItemCompaction && item.Compaction != nil && strings.TrimSpace(item.Compaction.EncryptedContent) != "" {
+		if isProviderCompactionBlob(item) {
 			indices = append(indices, idx)
 		}
 	}
@@ -316,7 +355,7 @@ func summarizeCompactedHistory(items []RunItem, bulletLimit int) string {
 	if existingSummary != "" {
 		newSummary = mergeCompactionSummaries(existingSummary, newSummary)
 	}
-	return "[COMPACTED HISTORY SUMMARY]\n" + newSummary
+	return compactionSummaryPrefix + "\n" + newSummary
 }
 
 func summarizeCompactedMessages(items []RunItem, bulletLimit int) string {
@@ -392,7 +431,7 @@ func mergeCompactionSummaries(existingSummary, newSummary string) string {
 func summarizeCompactedHistoryTerse(items []RunItem, bulletLimit int) string {
 	bulletLimit = maxInt(bulletLimit, 1)
 	lines := []string{
-		"[COMPACTED HISTORY SUMMARY]",
+		compactionSummaryPrefix,
 		summarizeCompactionScope(items),
 	}
 	if tools := summarizeToolCalls(items, minInt(bulletLimit, 2)); len(tools) > 0 {
@@ -440,11 +479,9 @@ func appendIndentedSummaryLines(lines *[]string, title string, summaries []strin
 
 func latestExistingCompactionSummary(items []RunItem) string {
 	for i := len(items) - 1; i >= 0; i-- {
-		item := items[i]
-		if item.Type != RunItemMessage || item.Message == nil || item.Agent == nil || item.Agent.Name != "context-summary" {
-			continue
+		if isLocalCompactionSummary(items[i]) {
+			return normalizeCompactionSummaryText(items[i].Message.Text)
 		}
-		return normalizeCompactionSummaryText(item.Message.Text)
 	}
 	return ""
 }
@@ -452,7 +489,7 @@ func latestExistingCompactionSummary(items []RunItem) string {
 func excludeCompactionSummaryItems(items []RunItem) []RunItem {
 	out := make([]RunItem, 0, len(items))
 	for _, item := range items {
-		if item.Type == RunItemMessage && item.Message != nil && item.Agent != nil && item.Agent.Name == "context-summary" {
+		if isLocalCompactionSummary(item) {
 			continue
 		}
 		out = append(out, item)
@@ -462,7 +499,7 @@ func excludeCompactionSummaryItems(items []RunItem) []RunItem {
 
 func normalizeCompactionSummaryText(text string) string {
 	text = strings.TrimSpace(text)
-	text = strings.TrimPrefix(text, "[COMPACTED HISTORY SUMMARY]")
+	text = strings.TrimPrefix(text, compactionSummaryPrefix)
 	text = strings.TrimSpace(text)
 	if content, ok := extractTagBlock(text, "summary"); ok {
 		text = "Summary:\n" + strings.TrimSpace(content)
@@ -779,7 +816,7 @@ func summarizeRunItemForTimeline(item RunItem) string {
 		if text == "" {
 			return ""
 		}
-		if strings.HasPrefix(text, "[COMPACTED HISTORY SUMMARY]") {
+		if strings.HasPrefix(text, compactionSummaryPrefix) {
 			return "summary: previous compacted context"
 		}
 		role := "assistant"
@@ -861,12 +898,8 @@ func pluralSuffix(n int) string {
 	return "s"
 }
 
-func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recentLimit, bulletLimit, targetTokens int) (CompactionPlan, bool, string) {
-	tailStart := len(items) - recentLimit
-	if tailStart < 0 {
-		tailStart = 0
-	}
-
+func protectedForRecentLimit(items []RunItem, protectedPrefix []int, recentLimit int) map[int]struct{} {
+	tailStart := maxInt(len(items)-recentLimit, 0)
 	protected := make(map[int]struct{}, len(protectedPrefix)+len(items)-tailStart)
 	for _, idx := range protectedPrefix {
 		protected[idx] = struct{}{}
@@ -874,54 +907,63 @@ func compactRunItemsToRecentLimit(items []RunItem, protectedPrefix []int, recent
 	for idx := tailStart; idx < len(items); idx++ {
 		protected[idx] = struct{}{}
 	}
-
 	// Ensure tool_call/tool_output pairs are never split. If a tool_output
 	// is protected its matching tool_call must be too (and vice versa),
 	// otherwise the API rejects the orphaned reference.
 	ensureToolPairIntegrity(items, protected)
+	return protected
+}
 
+// compactRunItemsWithProtected evaluates one candidate split and returns the
+// plan (without Items) plus the summary text to build it from. Sizes are
+// derived from the per-item estimates so candidates never materialize the
+// compacted history.
+func compactRunItemsWithProtected(items []RunItem, itemTokens []int, before int, protected map[int]struct{}, bulletLimit, targetTokens int) (CompactionPlan, string, bool, string) {
 	var removed []RunItem
+	removedTokens := 0
 	for idx, item := range items {
 		if _, ok := protected[idx]; ok {
 			continue
 		}
 		removed = append(removed, item)
+		removedTokens += itemTokens[idx]
 	}
 	if len(removed) == 0 {
-		return CompactionPlan{}, false, "no-removable-history"
+		return CompactionPlan{}, "", false, "no-removable-history"
 	}
 
-	before := estimateRunItemsTokens(items)
+	keptTokens := before - removedTokens
+	afterWith := func(summary string) int {
+		return keptTokens + estimateStringTokens(summary) + 8
+	}
 	summary := summarizeCompactedHistory(removed, bulletLimit)
-	if estimateStringTokens(summary)+8 >= estimateRunItemsTokens(removed) {
+	terse := false
+	if estimateStringTokens(summary)+8 >= removedTokens {
 		summary = summarizeCompactedHistoryTerse(removed, bulletLimit)
+		terse = true
 	}
-	result := buildCompactedRunItems(items, protected, summary)
-	after := estimateRunItemsTokens(result)
-	if targetTokens > 0 && after > targetTokens {
+	after := afterWith(summary)
+	if targetTokens > 0 && after > targetTokens && !terse {
 		summary = summarizeCompactedHistoryTerse(removed, bulletLimit)
-		result = buildCompactedRunItems(items, protected, summary)
-		after = estimateRunItemsTokens(result)
+		after = afterWith(summary)
 	}
 	if targetTokens > 0 && after > targetTokens {
-		summary = "[COMPACTED HISTORY SUMMARY]\nEarlier context compacted."
-		result = buildCompactedRunItems(items, protected, summary)
-		after = estimateRunItemsTokens(result)
+		summary = compactionSummaryPrefix + "\nEarlier context compacted."
+		after = afterWith(summary)
 	}
 	// A summary that does not actually shrink the token count is worse than
 	// useless: callers treat ok=true as "input reduced" and retry the model
 	// call (including the forced post-overflow path). Reject it regardless of
 	// how many items were collapsed.
 	if after >= before {
-		return CompactionPlan{}, false, "ineffective-summary"
+		return CompactionPlan{}, "", false, "ineffective-summary"
 	}
 	return CompactionPlan{
-		Items:     result,
 		Removed:   removed,
 		Protected: protected,
 		Source:    items,
 		After:     after,
-	}, true, ""
+	}, summary, true, ""
 }
 
 func buildCompactedRunItems(items []RunItem, protected map[int]struct{}, summary string) []RunItem {
@@ -953,7 +995,7 @@ func buildCompactedRunItems(items []RunItem, protected map[int]struct{}, summary
 	insertSummary := func() {
 		result = append(result, RunItem{
 			Type:    RunItemMessage,
-			Agent:   &Agent{Name: "context-summary"},
+			Agent:   &Agent{Name: compactionSummaryAgentName},
 			Message: &MessageOutput{Text: summary},
 		})
 		summaryInserted = true

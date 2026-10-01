@@ -88,6 +88,19 @@ func TestScreenshotWithoutOutputPathUsesEphemeralDirectory(t *testing.T) {
 	}
 }
 
+func TestScreenshotResultMentionsReadFileWhenImagesEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		tool := &Tool{Executor: &fakeBrowserExecutorWithScreenshot{data: []byte("png-data")}, ScreenshotDir: t.TempDir(), ReadFileImages: enabled}
+		result, err := tool.screenshot(context.Background(), "chrome", input{URL: "https://example.com"}, t.TempDir(), 800, 600)
+		if err != nil || result.IsError {
+			t.Fatalf("screenshot() result=%#v err=%v", result, err)
+		}
+		if got := strings.Contains(result.Content, "read_file"); got != enabled {
+			t.Fatalf("ReadFileImages=%v content = %q", enabled, result.Content)
+		}
+	}
+}
+
 func TestScreenshotRejectsOutputPathEscape(t *testing.T) {
 	root := t.TempDir()
 	workDir := filepath.Join(root, "workspace")

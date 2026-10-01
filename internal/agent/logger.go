@@ -61,8 +61,12 @@ func (l *AgentLogger) Instructions(instructions string) {
 }
 
 // InputItems logs conversation items sent to the model.
-// Normal: count + role summary. Debug: full content.
+// Normal: one summary line with counts by item type. Debug: one line per item.
 func (l *AgentLogger) InputItems(items []RunItem) {
+	if !l.IsDebug() {
+		log.Printf("[turn] input_items=%d %s", len(items), summarizeRunItemTypes(items))
+		return
+	}
 	log.Printf("[turn] input_items=%d", len(items))
 	for i, item := range items {
 		switch item.Type {
@@ -75,34 +79,22 @@ func (l *AgentLogger) InputItems(items []RunItem) {
 			if item.Message != nil {
 				text = item.Message.Text
 			}
-			if l.IsDebug() {
-				if len(text) > 500 {
-					text = text[:500] + "…"
-				}
-				log.Printf("[turn] input[%d] type=message role=%s text=%q", i, role, text)
-			} else {
-				log.Printf("[turn] input[%d] type=message role=%s len=%d", i, role, len(text))
+			if len(text) > 500 {
+				text = text[:500] + "…"
 			}
+			log.Printf("[turn] input[%d] type=message role=%s text=%q", i, role, text)
 		case RunItemToolCall:
-			if l.IsDebug() {
-				inputPreview := string(item.ToolCall.Input)
-				if len(inputPreview) > 300 {
-					inputPreview = inputPreview[:300] + "…"
-				}
-				log.Printf("[turn] input[%d] type=tool_call name=%s id=%s input=%s", i, item.ToolCall.Name, item.ToolCall.ID, inputPreview)
-			} else {
-				log.Printf("[turn] input[%d] type=tool_call name=%s id=%s", i, item.ToolCall.Name, item.ToolCall.ID)
+			inputPreview := string(item.ToolCall.Input)
+			if len(inputPreview) > 300 {
+				inputPreview = inputPreview[:300] + "…"
 			}
+			log.Printf("[turn] input[%d] type=tool_call name=%s id=%s input=%s", i, item.ToolCall.Name, item.ToolCall.ID, inputPreview)
 		case RunItemToolOutput:
-			if l.IsDebug() {
-				outputPreview := item.ToolOutput.Content
-				if len(outputPreview) > 300 {
-					outputPreview = outputPreview[:300] + "…"
-				}
-				log.Printf("[turn] input[%d] type=tool_output call_id=%s is_error=%v output=%s", i, item.ToolOutput.CallID, item.ToolOutput.IsError, outputPreview)
-			} else {
-				log.Printf("[turn] input[%d] type=tool_output call_id=%s is_error=%v len=%d", i, item.ToolOutput.CallID, item.ToolOutput.IsError, len(item.ToolOutput.Content))
+			outputPreview := item.ToolOutput.Content
+			if len(outputPreview) > 300 {
+				outputPreview = outputPreview[:300] + "…"
 			}
+			log.Printf("[turn] input[%d] type=tool_output call_id=%s is_error=%v output=%s", i, item.ToolOutput.CallID, item.ToolOutput.IsError, outputPreview)
 		case RunItemCompaction:
 			id := ""
 			encryptedLen := 0
@@ -115,6 +107,23 @@ func (l *AgentLogger) InputItems(items []RunItem) {
 			log.Printf("[turn] input[%d] type=%v", i, item.Type)
 		}
 	}
+}
+
+// summarizeRunItemTypes renders "type=count" pairs in first-seen order.
+func summarizeRunItemTypes(items []RunItem) string {
+	var order []RunItemType
+	counts := map[RunItemType]int{}
+	for _, item := range items {
+		if counts[item.Type] == 0 {
+			order = append(order, item.Type)
+		}
+		counts[item.Type]++
+	}
+	parts := make([]string, len(order))
+	for i, t := range order {
+		parts[i] = fmt.Sprintf("%s=%d", runItemTypeName(t), counts[t])
+	}
+	return strings.Join(parts, " ")
 }
 
 // ToolExec logs a tool execution start.

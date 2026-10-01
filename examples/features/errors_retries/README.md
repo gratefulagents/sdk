@@ -1,6 +1,6 @@
 # Errors And Retries
 
-This example shows model retry advice, typed errors, run error handlers, and `RunConfig.RetryPolicy`.
+This example shows model retry advice, typed errors, and `RunConfig.RetryPolicy`.
 
 Run it:
 
@@ -17,8 +17,7 @@ for the full env table.
 How to use this feature:
 
 - Return `ModelRetryAdvice{ShouldRetry: true}` from your model when a provider error should be retried.
-- Configure `RunConfig.MaxTurns` with enough turns for retry attempts.
-- Use `RunConfig.ErrorHandler` when the application wants to retry, continue, or abort on its own terms.
+- Retries, fallbacks, and context-overflow recovery re-run the same turn; they do not consume `RunConfig.MaxTurns`.
 - Set `RunConfig.RetryPolicy` to apply SDK-level retry behavior when the provider does not return retry advice.
 - Use `errors.As` with SDK typed errors such as `AgentError`, `MaxTurnsExceeded`, `ToolTimeoutError`, and guardrail tripwire errors.
 - Use `agentsdk.DefaultRetryPolicy()` and `DelayForAttempt` when you need the same backoff logic outside the runner.

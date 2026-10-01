@@ -33,7 +33,6 @@ type StoredRun struct {
 	lease     durable.Lease
 	leaseTTL  time.Duration
 	resume    *DurableCheckpoint
-	base      durable.BudgetCounters
 	leaseErr  error
 	stopLease chan struct{}
 	leaseDone chan struct{}
@@ -77,7 +76,7 @@ func OpenStoredRun(ctx context.Context, store durable.RunStore, opts StoredRunOp
 	}
 	s := &StoredRun{
 		store: store, snapshot: snapshot, lease: lease, leaseTTL: opts.LeaseTTL,
-		base: snapshot.CumulativeBudget, stopLease: make(chan struct{}), leaseDone: make(chan struct{}),
+		stopLease: make(chan struct{}), leaseDone: make(chan struct{}),
 	}
 	if len(snapshot.State) != 0 {
 		var cp DurableCheckpoint
@@ -130,10 +129,6 @@ func (s *StoredRun) ID() durable.RunID { s.mu.Lock(); defer s.mu.Unlock(); retur
 func (s *StoredRun) RunConfig() *DurableRunConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Each Runner.Run reports usage from zero. Freeze the already committed
-	// cumulative counters as this attempt's base so later attempts in the same
-	// process can never reset or double-count them.
-	s.base = s.snapshot.CumulativeBudget
 	var resume *DurableCheckpoint
 	if s.resume != nil {
 		cp := *s.resume
@@ -148,11 +143,9 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 	if errors.Is(s.leaseErr, durable.ErrLeaseLost) {
 		return fmt.Errorf("renew ownership: %w", s.leaseErr)
 	}
-	renewed, err := s.store.RenewLease(ctx, s.lease, s.leaseTTL)
-	if err != nil {
-		return fmt.Errorf("renew ownership: %w", err)
-	}
-	s.lease = renewed
+	// Custom checkpoint producers can supply snapshots without going through
+	// SnapshotRunItems. Enforce attachment stripping at the storage boundary too.
+	cp.History = stripCheckpointImages(cp.History)
 	payload, err := json.Marshal(cp)
 	if err != nil {
 		return fmt.Errorf("encode checkpoint: %w", err)
@@ -168,14 +161,13 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 		next.Cancellation = &durable.Cancellation{RequestedAt: cp.CreatedAt, Reason: "runner context cancelled"}
 	}
 	next.UpdatedAt = cp.CreatedAt
-	next.CumulativeBudget = durable.BudgetCounters{
-		InputTokens:  s.base.InputTokens + cp.Usage.InputTokens,
-		OutputTokens: s.base.OutputTokens + cp.Usage.OutputTokens,
-		ToolCalls:    s.base.ToolCalls,
-		CostMicros:   s.base.CostMicros,
-		WallTimeMS:   s.base.WallTimeMS,
+	in, out := usageDelta(s.resume, cp.Usage)
+	next.CumulativeBudget.InputTokens += in
+	next.CumulativeBudget.OutputTokens += out
+	next.Attempts = append([]durable.Attempt(nil), s.snapshot.Attempts...)
+	if n := len(next.Attempts); n == 0 || next.Attempts[n-1].ID != durable.AttemptID(cp.AttemptID) {
+		next.Attempts = append(next.Attempts, durable.Attempt{ID: durable.AttemptID(cp.AttemptID), StartedAt: cp.CreatedAt})
 	}
-	next.Attempts = []durable.Attempt{{ID: durable.AttemptID(cp.AttemptID), StartedAt: cp.CreatedAt}}
 	next.Steps = []durable.Step{{ID: durable.StepID(cp.StepID), Kind: string(cp.Boundary), Status: "committed", StartedAt: cp.CreatedAt, EndedAt: cp.CreatedAt}}
 	next.Approvals = nil
 	for _, interruption := range cp.Interruptions {
@@ -183,7 +175,15 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 			next.Approvals = append(next.Approvals, durable.Approval{ID: durable.ApprovalID(interruption.ToolCallID), Status: "pending", RequestedAt: cp.CreatedAt})
 		}
 	}
-	event := durable.Event{Type: "run." + string(cp.Boundary), At: cp.CreatedAt, Classification: next.Classification, Payload: payload}
+	// The snapshot State already holds the full continuation; events only
+	// record the boundary so the log does not accumulate every past history.
+	light := cp
+	light.History, light.Children = nil, nil
+	eventPayload, err := json.Marshal(light)
+	if err != nil {
+		return fmt.Errorf("encode checkpoint event: %w", err)
+	}
+	event := durable.Event{Type: "run." + string(cp.Boundary), At: cp.CreatedAt, Classification: next.Classification, Payload: eventPayload}
 	updated, err := s.store.Append(ctx, s.lease, s.snapshot.Revision, []durable.Event{event}, next)
 	if err != nil {
 		return fmt.Errorf("commit checkpoint: %w", err)
@@ -191,6 +191,18 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 	s.snapshot = updated
 	s.resume = &cp
 	return nil
+}
+
+// usageDelta returns the token usage consumed since the previous committed
+// checkpoint. Runner resumes restore the checkpoint's usage and keep counting
+// from it, so cp usage is cumulative across attempts; a counter that went
+// backwards was restarted from zero (fresh Run or approved-tool execution) and
+// all of its usage is new.
+func usageDelta(prev *DurableCheckpoint, current Usage) (int64, int64) {
+	if prev == nil || current.InputTokens < prev.Usage.InputTokens || current.OutputTokens < prev.Usage.OutputTokens {
+		return current.InputTokens, current.OutputTokens
+	}
+	return current.InputTokens - prev.Usage.InputTokens, current.OutputTokens - prev.Usage.OutputTokens
 }
 
 // Close releases this worker's fenced ownership. The persisted continuation is
@@ -208,4 +220,30 @@ func (s *StoredRun) Close(ctx context.Context) error {
 		s.lease = durable.Lease{}
 	}
 	return err
+}
+
+func stripCheckpointImages(items []LLMRunItemSnapshot) []LLMRunItemSnapshot {
+	var out []LLMRunItemSnapshot
+	for i, item := range items {
+		if len(item.MessageImages) == 0 && (item.ToolOutput == nil || len(item.ToolOutput.Images) == 0) {
+			continue
+		}
+		if out == nil {
+			out = append([]LLMRunItemSnapshot(nil), items...)
+		}
+		if len(item.MessageImages) > 0 {
+			out[i].MessageImages = nil
+			out[i].MessageText += "\n[image omitted]"
+		}
+		if item.ToolOutput != nil && len(item.ToolOutput.Images) > 0 {
+			value := *item.ToolOutput
+			value.Images = nil
+			value.Content += "\n[image omitted]"
+			out[i].ToolOutput = &value
+		}
+	}
+	if out == nil {
+		return items
+	}
+	return out
 }

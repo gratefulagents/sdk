@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gratefulagents/sdk/pkg/agentsdk/durable"
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
 )
 
@@ -176,6 +177,8 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		runCfg.PromptCacheNamespace = NewTrace(agent.Name).ID
 	}
 
+	defer cancelSubAgentsOnCancel(ctx, agent.Tools)
+
 	history := append([]RunItem(nil), inputItems...)
 	var allNewItems []RunItem
 	var allResponses []ModelResponse
@@ -186,17 +189,76 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 	if maxResumes <= 0 {
 		maxResumes = 12
 	}
+	// Only consecutive approval rounds in which nothing was approved count
+	// toward MaxResumes: a turn that edits many files under approval makes
+	// progress every round. Each round costs at least one model turn, so the
+	// run's turn budget still bounds the total.
+	maxRounds := max(maxResumes, runCfg.EffectiveMaxTurns())
+	stalledRounds := 0
 
-	for resumes := 0; ; resumes++ {
+	// settle records approval-resolution items in the loop history, the
+	// session store, and the durable continuation so every pending tool call
+	// stays paired with an output wherever it is replayed from. It persists
+	// on a detached context: these items are most important exactly when
+	// the loop is being torn down.
+	settle := func(items []RunItem, label string) error {
+		if len(items) == 0 {
+			return nil
+		}
+		allNewItems = append(allNewItems, items...)
+		history = append(history, items...)
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chatLoopPersistTimeout)
+		defer cancel()
+		if l.opts.SessionStore != nil {
+			if err := l.opts.SessionStore.AppendRunItems(persistCtx, items); err != nil {
+				return fmt.Errorf("append %s items: %w", label, err)
+			}
+		}
+		if err := reconcileDurableResume(persistCtx, runCfg.Durable, history); err != nil {
+			return fmt.Errorf("checkpoint %s items: %w", label, err)
+		}
+		return nil
+	}
+
+	// Approval settlement changes the continuation, not just NewItems. Return
+	// the paired history and clear resolved interruptions on every exit.
+	settledResult := func(result *RunResult) *RunResult {
+		combined := combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+		combined.FinalHistory = append([]RunItem(nil), history...)
+		combined.Interruption = nil
+		combined.Interruptions = nil
+		return combined
+	}
+
+	for rounds := 0; ; rounds++ {
+		// A durable resume restores the checkpoint's usage into the run, so
+		// only the usage above it is new to this loop.
+		var resumedUsage Usage
+		if runCfg.Durable != nil && runCfg.Durable.Resume != nil {
+			resumedUsage = runCfg.Durable.Resume.Usage
+		}
 		result, err := l.opts.Runner.Run(ctx, &agent, history, runCfg)
-		if err != nil {
+		if result == nil {
 			return nil, err
 		}
 		allNewItems = append(allNewItems, result.NewItems...)
 		allResponses = append(allResponses, result.RawResponses...)
 		allToolInputResults = append(allToolInputResults, result.ToolInputGuardrailResults...)
 		allToolOutputResults = append(allToolOutputResults, result.ToolOutputGuardrailResults...)
-		totalUsage.Add(result.Usage)
+		totalUsage.Add(usageSince(result.Usage, resumedUsage))
+		if err != nil {
+			// The runner hands back the accumulated transcript with the
+			// error; persist it so the session can continue instead of
+			// silently losing work whose side effects already happened.
+			if l.opts.SessionStore != nil && len(result.NewItems) > 0 {
+				persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chatLoopPersistTimeout)
+				if appendErr := l.opts.SessionStore.AppendRunItems(persistCtx, result.NewItems); appendErr != nil {
+					err = errors.Join(err, fmt.Errorf("append run items: %w", appendErr))
+				}
+				cancel()
+			}
+			return combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage), err
+		}
 		if len(result.FinalHistory) > 0 {
 			// Adopt the runner's post-run conversation state: mid-run
 			// compaction rewrites the input items, so replaying
@@ -213,80 +275,161 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		}
 
 		combined := combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
-		if result.IsInterrupted() {
-			if l.opts.ApprovalGate == nil {
-				// No gate can resolve the pending calls: pair each dangling
-				// tool_use with a denied approval and error output so the
-				// persisted history stays replayable.
-				denied := denyPendingInterruptions(result.AllInterruptions(), "tool call denied: no approval gate configured")
-				if len(denied) > 0 {
-					allNewItems = append(allNewItems, denied...)
-					if l.opts.SessionStore != nil {
-						if err := l.opts.SessionStore.AppendRunItems(ctx, denied); err != nil {
-							combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
-							return combined, fmt.Errorf("append denied approval items: %w", err)
-						}
-					}
-					combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
-				}
-				return l.finalize(ctx, combined)
-			}
-			if resumes >= maxResumes {
-				return combined, fmt.Errorf("too many chat loop resumes after approval interruption")
-			}
-			// Resolve every pending approval from the turn: parallel tool
-			// calls can trigger several, and each pending tool_use needs a
-			// paired output before the next model call.
-			var items []RunItem
-			var resolveErr error
-			var pauseRequested bool
-			for _, pending := range result.AllInterruptions() {
-				resolved, inputResults, outputResults, shouldPause, err := l.resolveToolApproval(ctx, &agent, runCfg, pending)
-				items = append(items, resolved...)
-				allToolInputResults = append(allToolInputResults, inputResults...)
-				allToolOutputResults = append(allToolOutputResults, outputResults...)
-				if shouldPause {
-					pauseRequested = true
-				}
-				if err != nil {
-					resolveErr = err
-					break
-				}
-			}
-			if len(items) > 0 {
-				allNewItems = append(allNewItems, items...)
-				history = append(history, items...)
-			}
-			if len(items) > 0 && l.opts.SessionStore != nil {
-				if err := l.opts.SessionStore.AppendRunItems(ctx, items); err != nil {
-					combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
-					return combined, fmt.Errorf("append approval items: %w", err)
-				}
-			}
-			combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
-			if resolveErr != nil {
-				return combined, resolveErr
-			}
-			if pauseRequested {
-				// An approved tool requested a pause (ToolResult.ShouldPause);
-				// hand control back to the host like the runner's own pause
-				// path instead of immediately resuming another model call.
-				// The approvals were resolved above, so the interrupted
-				// result's pending state must not leak: clear the
-				// interruption fields and adopt the loop's history (which
-				// includes the resolved approval + tool output items) so
-				// hosts neither re-prompt for the same approval nor replay
-				// an unpaired tool call.
-				combined.Interruption = nil
-				combined.Interruptions = nil
-				combined.FinalHistory = append([]RunItem(nil), history...)
-				return l.finalize(ctx, combined)
-			}
-			continue
+		if !result.IsInterrupted() {
+			return l.finalize(ctx, combined)
 		}
-
-		return l.finalize(ctx, combined)
+		pending := result.AllInterruptions()
+		if l.opts.ApprovalGate == nil {
+			// No gate can resolve the pending calls: pair each dangling
+			// tool_use with a denied approval and error output so the
+			// persisted history stays replayable.
+			err := settle(denyPendingInterruptions(pending, "tool call denied: no approval gate configured"), "denied approval")
+			combined = settledResult(result)
+			if err != nil {
+				return combined, err
+			}
+			return l.finalize(ctx, combined)
+		}
+		if rounds >= maxRounds || stalledRounds >= maxResumes {
+			limitErr := fmt.Errorf("too many chat loop resumes after approval interruption")
+			if err := settle(denyPendingInterruptions(pending, "tool call not executed: "+limitErr.Error()), "denied approval"); err != nil {
+				limitErr = errors.Join(limitErr, err)
+			}
+			combined = settledResult(result)
+			return combined, limitErr
+		}
+		// Resolve every pending approval from the turn: parallel tool
+		// calls can trigger several, and each pending tool_use needs a
+		// paired output before the next model call.
+		var items []RunItem
+		var resolveErr error
+		var pauseRequested, approvedAny bool
+		for i, p := range pending {
+			resolved, inputResults, outputResults, shouldPause, err := l.resolveToolApproval(ctx, &agent, runCfg, p)
+			allToolInputResults = append(allToolInputResults, inputResults...)
+			allToolOutputResults = append(allToolOutputResults, outputResults...)
+			if shouldPause {
+				pauseRequested = true
+			}
+			if err != nil {
+				resolveErr = err
+				unresolved := pending[i+1:]
+				if !hasToolOutput(resolved) {
+					resolved, unresolved = nil, pending[i:]
+				}
+				items = append(items, resolved...)
+				items = append(items, denyPendingInterruptions(unresolved, "tool call not executed: approval resolution failed: "+err.Error())...)
+				break
+			}
+			if len(resolved) > 0 && resolved[0].ToolApproval != nil && resolved[0].ToolApproval.Approved {
+				approvedAny = true
+			}
+			items = append(items, resolved...)
+		}
+		if approvedAny {
+			stalledRounds = 0
+		} else {
+			stalledRounds++
+		}
+		settleErr := settle(items, "approval")
+		combined = settledResult(result)
+		if resolveErr != nil || settleErr != nil {
+			return combined, errors.Join(resolveErr, settleErr)
+		}
+		if pauseRequested {
+			// An approved tool requested a pause (ToolResult.ShouldPause);
+			// hand control back to the host like the runner's own pause
+			// path instead of immediately resuming another model call.
+			// The approvals were resolved above, so the interrupted
+			// result's pending state must not leak: clear the
+			// interruption fields and adopt the loop's history (which
+			// includes the resolved approval + tool output items) so
+			// hosts neither re-prompt for the same approval nor replay
+			// an unpaired tool call.
+			combined.Interruption = nil
+			combined.Interruptions = nil
+			combined.FinalHistory = append([]RunItem(nil), history...)
+			return l.finalize(ctx, combined)
+		}
 	}
+}
+
+const chatLoopPersistTimeout = 10 * time.Second
+
+// cancelSubAgentsOnCancel stops background sub-agents when the loop's
+// context is cancelled. Their goroutines run on detached contexts, so
+// without this a cancelled ChatLoop leaves children calling the model and
+// writing to the workspace with no owner. A normally finished loop leaves
+// them running: background tasks may intentionally outlive a turn.
+func cancelSubAgentsOnCancel(ctx context.Context, tools []Tool) {
+	if ctx.Err() == nil {
+		return
+	}
+	for _, tool := range tools {
+		if t, ok := tool.(*subagentTool); ok && t.registry != nil {
+			t.registry.CancelAll()
+		}
+	}
+}
+
+// reconcileDurableResume points a durable run's continuation at the loop's
+// history after approvals were resolved. Denied approvals never pass
+// through the runner, so without this the next Run would restore the
+// approval_pending checkpoint (and refuse to continue) or a history missing
+// the denied calls' outputs.
+func reconcileDurableResume(ctx context.Context, cfg *DurableRunConfig, history []RunItem) error {
+	if cfg == nil || cfg.Resume == nil {
+		return nil
+	}
+	prev := cfg.Resume
+	cp := DurableCheckpoint{
+		SchemaVersion: DurableCheckpointSchemaVersion,
+		RunID:         cfg.RunID,
+		AttemptID:     cfg.AttemptID,
+		StepID:        string(durable.NewStepID()),
+		Sequence:      prev.Sequence + 1,
+		Boundary:      DurableBoundaryToolCompleted,
+		AgentName:     prev.AgentName,
+		History:       SnapshotRunItems(history),
+		Usage:         prev.Usage,
+		Children:      prev.Children,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if cfg.Children != nil {
+		children := cfg.Children()
+		cp.Children = &children
+	}
+	if cfg.Checkpoint != nil {
+		if err := cfg.Checkpoint(ctx, cp); err != nil {
+			return err
+		}
+	}
+	cfg.Resume = &cp
+	return nil
+}
+
+// usageSince returns the usage accrued above base. A total below base means
+// the counter restarted from zero, so all of it is new.
+func usageSince(total, base Usage) Usage {
+	if total.InputTokens < base.InputTokens || total.OutputTokens < base.OutputTokens || total.Requests < base.Requests {
+		return total
+	}
+	return Usage{
+		Requests:          total.Requests - base.Requests,
+		InputTokens:       total.InputTokens - base.InputTokens,
+		OutputTokens:      total.OutputTokens - base.OutputTokens,
+		CacheReadTokens:   max(total.CacheReadTokens-base.CacheReadTokens, 0),
+		CacheCreateTokens: max(total.CacheCreateTokens-base.CacheCreateTokens, 0),
+	}
+}
+
+func hasToolOutput(items []RunItem) bool {
+	for _, item := range items {
+		if item.Type == RunItemToolOutput && item.ToolOutput != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *ChatLoop) prepareRun(ctx context.Context) (Agent, RunConfig, error) {

@@ -23,7 +23,6 @@ import (
 	sdklsp "github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	sdkprojectstatetools "github.com/gratefulagents/sdk/pkg/agentsdk/tools/projectstate"
 	sdksignal "github.com/gratefulagents/sdk/pkg/agentsdk/tools/signal"
-	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 // Config is the SDK-native runtime builder input. Hosts should populate this
@@ -96,17 +95,15 @@ type Config struct {
 	ToolAccess             agentsdk.ToolAccessLevel
 	// AllowedMutatingTools lists exact host-trusted tool names that remain
 	// available when ToolAccess is read-only.
-	AllowedMutatingTools      []string
-	PermissionMode            policy.PermissionMode
-	GitRemoteWrites           policy.GitRemoteWrites
-	CommandSandboxConfig      *sdksandbox.Config
-	LSPConfig                 sdklsp.Config
-	BrowserScreenshotDir      string
-	VisionAnalyzeFn           sdkvision.AnalyzeFn
-	VisionAnalyzeWithDetailFn sdkvision.AnalyzeWithDetailFn
-	GitHubCommandRunner       sdkgit.CommandRunner
-	GitHubArtifactSink        sdkgit.ArtifactSink
-	Features                  *Features
+	AllowedMutatingTools []string
+	PermissionMode       policy.PermissionMode
+	GitRemoteWrites      policy.GitRemoteWrites
+	CommandSandboxConfig *sdksandbox.Config
+	LSPConfig            sdklsp.Config
+	BrowserScreenshotDir string
+	GitHubCommandRunner  sdkgit.CommandRunner
+	GitHubArtifactSink   sdkgit.ArtifactSink
+	Features             *Features
 
 	EnableTools             bool
 	EnableMCP               bool
@@ -488,11 +485,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 			)
 		}
 		if features.value.Tools.Vision {
-			if cfg.VisionAnalyzeWithDetailFn != nil {
-				registryOptions = append(registryOptions, sdktools.WithVisionToolsWithDetail(cfg.VisionAnalyzeWithDetailFn))
-			} else {
-				registryOptions = append(registryOptions, sdktools.WithVisionTools(cfg.VisionAnalyzeFn))
-			}
+			registryOptions = append(registryOptions, sdktools.WithReadFileImages())
 		}
 		if features.value.Tools.InteractiveTerminal {
 			registryOptions = append(registryOptions, sdktools.WithInteractiveTerminal())
@@ -530,9 +523,6 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 			bundle.Tools = append(bundle.Tools, tool)
 		}
 	}
-	if features.value.Tools.Vision || features.value.Tools.VisionAnalyzer {
-		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
-	}
 	bundle.Tools = filterGitRemoteWriteTools(bundle.Tools, cfg.GitRemoteWrites)
 
 	if features.value.MCP.Enabled && features.value.MCP.hasServerSelection() && features.value.MCP.hasToolSelection() {
@@ -553,91 +543,6 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		return bundle, err
 	}
 	return bundle, nil
-}
-
-type openAIVisionModel interface {
-	AnalyzeImageWithDetail(ctx context.Context, imageData []byte, mimeType, prompt, detail string) (string, error)
-}
-
-func attachOpenAIVisionAnalyzer(cfg Config, tools []agentsdk.Tool) []agentsdk.Tool {
-	if !openAIVisionEligible(cfg) {
-		return tools
-	}
-	analyzeFn := openAIVisionAnalyzeFn(cfg)
-	for _, tool := range tools {
-		visionTool, ok := tool.(*sdkvision.Tool)
-		if !ok || visionTool == nil {
-			continue
-		}
-		if visionTool.AnalyzeFn != nil || visionTool.AnalyzeWithDetailFn != nil {
-			continue
-		}
-		visionTool.AnalyzeWithDetailFn = analyzeFn
-	}
-	return tools
-}
-
-func openAIVisionEligible(cfg Config) bool {
-	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
-	if provider == "" {
-		provider = "openai"
-	}
-	return provider == "openai" || provider == "multi"
-}
-
-// visionModelCandidates returns the model names to try for image analysis,
-// in preference order: the run's own model first (most current models are
-// multimodal), then the default OpenAI chat model as a fallback for
-// configured models that cannot analyze images.
-func visionModelCandidates(cfg Config) []string {
-	fallback := sdkopenai.DefaultChatModel
-	if strings.EqualFold(strings.TrimSpace(cfg.Provider), "multi") {
-		fallback = "openai/" + fallback
-	}
-	candidates := make([]string, 0, 2)
-	if model := strings.TrimSpace(cfg.Model); model != "" {
-		candidates = append(candidates, model)
-	}
-	if len(candidates) == 0 || !strings.EqualFold(candidates[0], fallback) {
-		candidates = append(candidates, fallback)
-	}
-	return candidates
-}
-
-func openAIVisionAnalyzeFn(cfg Config) sdkvision.AnalyzeWithDetailFn {
-	spec := ProviderSpec(cfg)
-	candidates := visionModelCandidates(cfg)
-
-	var once sync.Once
-	var analyzer openAIVisionModel
-	var initErr error
-	return func(ctx context.Context, imageData []byte, mimeType, prompt, detail string) (string, error) {
-		once.Do(func() {
-			provider, err := sdkproviders.NewProviderFromConfig(spec)
-			if err != nil {
-				initErr = fmt.Errorf("initialize vision provider: %w", err)
-				return
-			}
-			var lastErr error
-			for _, modelName := range candidates {
-				model, err := provider.GetModel(modelName)
-				if err != nil {
-					lastErr = fmt.Errorf("initialize vision model %s: %w", modelName, err)
-					continue
-				}
-				if a, ok := model.(openAIVisionModel); ok {
-					analyzer = a
-					return
-				}
-				lastErr = fmt.Errorf("model %s does not support image analysis", modelName)
-			}
-			initErr = lastErr
-		})
-		if initErr != nil {
-			return "", initErr
-		}
-		return analyzer.AnalyzeImageWithDetail(ctx, imageData, mimeType, prompt, detail)
-	}
 }
 
 func BuildAgent(cfg Config, runner *agentsdk.Runner, hostBundle ToolBundle) (*agentsdk.Agent, []agentsdk.Tool) {
@@ -997,7 +902,6 @@ func registryToolNames(features ToolFeatures) map[string]bool {
 	add(features.WebFetch, "WebFetch")
 	add(features.AsyncShell, "BashStart", "BashPoll", "BashKill")
 	add(features.Browser, "Browser")
-	add(features.Vision, "AnalyzeImage")
 	add(features.InteractiveTerminal, "Terminal")
 	add(features.Think, "think")
 	add(features.AttachRepository, "attach_repository")

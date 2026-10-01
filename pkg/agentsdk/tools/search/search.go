@@ -15,6 +15,7 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/internal/pathutil"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 const (
@@ -82,13 +83,27 @@ func (t *ListFilesTool) Execute(_ context.Context, input json.RawMessage, workDi
 	return agentsdk.ToolResult{Content: strings.Join(names, "\n")}, nil
 }
 
-// ReadFileTool reads a UTF-8 text file under the workspace.
-type ReadFileTool struct{}
+// ReadFileTool reads a UTF-8 text file under the workspace. When Images is
+// set, image files are returned as downscaled image attachments instead.
+type ReadFileTool struct {
+	Images bool
+	// AllowedImageDirs contains host-managed directories outside the workspace
+	// whose images may be read by absolute path, such as the Browser tool's
+	// screenshot dir. Text reads stay confined to the workspace.
+	AllowedImageDirs []string
+}
 
 func (t *ReadFileTool) Name() string { return "read_file" }
 
 func (t *ReadFileTool) Description() string {
-	return "Read a UTF-8 text file relative to the working directory. Supports line-range slicing via start_line/end_line — prefer ranged reads for large files instead of re-reading the whole file. Use grep to locate content first, then read the relevant range."
+	desc := "Read a UTF-8 text file relative to the working directory. Supports line-range slicing via start_line/end_line — prefer ranged reads for large files instead of re-reading the whole file. Use grep to locate content first, then read the relevant range."
+	if t.Images {
+		desc += " Image files (.png, .jpg, .jpeg, .gif, .webp) are attached as images you can view directly."
+		if len(t.AllowedImageDirs) > 0 {
+			desc += " Absolute screenshot paths returned by the Browser tool are also accepted."
+		}
+	}
+	return desc
 }
 
 func (t *ReadFileTool) InputSchema() json.RawMessage {
@@ -112,6 +127,9 @@ func (t *ReadFileTool) Execute(_ context.Context, input json.RawMessage, workDir
 	if err := json.Unmarshal(input, &params); err != nil {
 		return agentsdk.ToolResult{}, err
 	}
+	if t.Images && vision.IsImagePath(params.Path) {
+		return t.readImage(workDir, params.Path)
+	}
 	path, err := workspacePath(workDir, params.Path)
 	if err != nil {
 		return agentsdk.ToolResult{}, err
@@ -122,6 +140,9 @@ func (t *ReadFileTool) Execute(_ context.Context, input json.RawMessage, workDir
 			return agentsdk.ToolResult{Content: notFoundMessage(workDir, params.Path), IsError: true}, nil
 		}
 		return agentsdk.ToolResult{}, err
+	}
+	if t.Images && params.StartLine <= 0 && params.EndLine <= 0 && isImageData(data) {
+		return t.readImage(workDir, params.Path)
 	}
 	out := string(data)
 	if truncated {

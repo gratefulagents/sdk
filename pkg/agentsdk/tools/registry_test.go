@@ -18,8 +18,8 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
-	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 func TestRegistryOptionsHaveExplicitCapabilityClassification(t *testing.T) {
@@ -115,7 +115,7 @@ func TestRegistryConfiguresBrowserScreenshotDirectory(t *testing.T) {
 		WithBrowserTools(),
 		WithBrowserScreenshotDir(screenshotDir),
 		WithPrivateNetworkURLs(true),
-		WithVisionTools(nil),
+		WithReadFileImages(),
 	)
 	tool, ok := r.Get("Browser").(*browser.Tool)
 	if !ok {
@@ -124,29 +124,40 @@ func TestRegistryConfiguresBrowserScreenshotDirectory(t *testing.T) {
 	if tool.ScreenshotDir != screenshotDir {
 		t.Fatalf("Browser ScreenshotDir = %q, want %q", tool.ScreenshotDir, screenshotDir)
 	}
-	visionTool, ok := r.Get("AnalyzeImage").(*vision.Tool)
+	readFile, ok := r.Get("read_file").(*search.ReadFileTool)
 	if !ok {
-		t.Fatalf("AnalyzeImage tool = %T, want *vision.Tool", r.Get("AnalyzeImage"))
+		t.Fatalf("read_file tool = %T, want *search.ReadFileTool", r.Get("read_file"))
 	}
-	if len(visionTool.AllowedImageDirs) != 1 || visionTool.AllowedImageDirs[0] != screenshotDir {
-		t.Fatalf("AnalyzeImage AllowedImageDirs = %#v, want [%q]", visionTool.AllowedImageDirs, screenshotDir)
+	if !readFile.Images || len(readFile.AllowedImageDirs) != 1 || readFile.AllowedImageDirs[0] != screenshotDir {
+		t.Fatalf("read_file Images = %v AllowedImageDirs = %#v, want [%q]", readFile.Images, readFile.AllowedImageDirs, screenshotDir)
 	}
 }
 
-func TestRegistrySharesDefaultBrowserScreenshotDirectoryWithVision(t *testing.T) {
+func TestRegistrySharesDefaultBrowserScreenshotDirectoryWithReadFile(t *testing.T) {
 	r := NewRegistry(
 		t.TempDir(),
 		WithBrowserTools(),
 		WithPrivateNetworkURLs(true),
-		WithVisionTools(nil),
+		WithReadFileImages(),
 	)
 	browserTool := r.Get("Browser").(*browser.Tool)
-	visionTool := r.Get("AnalyzeImage").(*vision.Tool)
+	readFile := r.Get("read_file").(*search.ReadFileTool)
 	if browserTool.ScreenshotDir != browser.DefaultScreenshotDir() {
 		t.Fatalf("Browser ScreenshotDir = %q, want default %q", browserTool.ScreenshotDir, browser.DefaultScreenshotDir())
 	}
-	if len(visionTool.AllowedImageDirs) != 1 || visionTool.AllowedImageDirs[0] != browserTool.ScreenshotDir {
-		t.Fatalf("AnalyzeImage AllowedImageDirs = %#v, want Browser screenshot dir", visionTool.AllowedImageDirs)
+	if len(readFile.AllowedImageDirs) != 1 || readFile.AllowedImageDirs[0] != browserTool.ScreenshotDir {
+		t.Fatalf("read_file AllowedImageDirs = %#v, want Browser screenshot dir", readFile.AllowedImageDirs)
+	}
+}
+
+func TestRegistryReadFileImagesDefaultOff(t *testing.T) {
+	r := NewRegistry(t.TempDir(), WithBrowserTools(), WithPrivateNetworkURLs(true))
+	readFile := r.Get("read_file").(*search.ReadFileTool)
+	if readFile.Images || len(readFile.AllowedImageDirs) != 0 {
+		t.Fatalf("read_file = %+v, want text-only", readFile)
+	}
+	if r.Get("AnalyzeImage") != nil {
+		t.Fatal("AnalyzeImage must not be registered")
 	}
 }
 

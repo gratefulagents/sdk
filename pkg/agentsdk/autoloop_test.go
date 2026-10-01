@@ -2,6 +2,7 @@ package agentsdk
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -105,5 +106,38 @@ func TestAutoTrackerDetectsIdenticalCallLoop(t *testing.T) {
 	cb := tracker.CheckCircuitBreakers()
 	if !cb.Tripped || !strings.Contains(cb.Reason, "tool loop") {
 		t.Fatalf("circuit breaker = %+v, want tool-loop breaker for identical repeated calls", cb)
+	}
+}
+
+func TestAutoTrackerSameErrorStreakResetsAfterSuccessfulTurn(t *testing.T) {
+	failing := func(id string) []RunItem {
+		return []RunItem{
+			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: id, Name: "bash", Input: []byte(`{"cmd":"` + id + `"}`)}},
+			{Type: RunItemToolOutput, ToolOutput: &ToolOutputData{CallID: id, Content: "timed out after 120s", IsError: true}},
+		}
+	}
+	succeeding := func(id string) []RunItem {
+		return []RunItem{
+			{Type: RunItemToolCall, ToolCall: &ToolCallData{ID: id, Name: "read", Input: []byte(`{"path":"` + id + `"}`)}},
+			{Type: RunItemToolOutput, ToolOutput: &ToolOutputData{CallID: id, Content: "contents"}},
+		}
+	}
+	tracker := &AutoTracker{}
+	for i := 0; i < defaultCBMaxSameErrors*2; i++ {
+		tracker.Update(failing(fmt.Sprintf("fail_%d", i)))
+		tracker.Update(succeeding(fmt.Sprintf("ok_%d", i)))
+	}
+	if result := tracker.CheckCircuitBreakers(); result.Tripped {
+		t.Fatalf("breaker tripped on errors separated by successful work: %s", result.Reason)
+	}
+	if nudge := BuildSmartNudge(tracker, ""); strings.Contains(nudge, "same error") {
+		t.Fatalf("nudge misfired: %s", nudge)
+	}
+
+	for i := 0; i < defaultCBMaxSameErrors; i++ {
+		tracker.Update(failing(fmt.Sprintf("stuck_%d", i)))
+	}
+	if result := tracker.CheckCircuitBreakers(); !result.Tripped || !strings.Contains(result.Reason, "same error") {
+		t.Fatalf("consecutive identical errors did not trip the breaker: %+v", result)
 	}
 }

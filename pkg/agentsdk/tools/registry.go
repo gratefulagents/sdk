@@ -17,7 +17,6 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/signal"
-	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
 
@@ -46,7 +45,7 @@ func RegistryCapabilities() []RegistryCapability {
 		{Family: "async-shell", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAsyncShellTools"}},
 		{Family: "signals", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithSignalTools"}},
 		{Family: "browser", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithBrowserTools"}},
-		{Family: "vision", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithVisionTools", "WithVisionToolsWithDetail"}},
+		{Family: "vision", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithReadFileImages"}},
 		{Family: "interactive-terminal", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithInteractiveTerminal"}},
 		{Family: "think", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithThinkTool"}},
 		{Family: "attach-repository", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAttachRepositoryTool"}},
@@ -68,7 +67,7 @@ type Registry struct {
 	browserScreenshotDir    string
 	disableWeb              bool
 	allowPrivateNetworkURLs bool
-	visionTool              *vision.Tool
+	readFileImages          bool
 	memoryTool              *memorytool.Tool
 	lspTool                 *lsp.Tool
 	commandSandboxConfig    *sandbox.Config
@@ -146,12 +145,11 @@ func WithInteractiveTerminal() RegistryOption {
 	return func(r *Registry) { r.interactiveTerminal = true }
 }
 
-func WithVisionTools(analyzeFn vision.AnalyzeFn) RegistryOption {
-	return func(r *Registry) { r.visionTool = &vision.Tool{AnalyzeFn: analyzeFn} }
-}
-
-func WithVisionToolsWithDetail(analyzeFn vision.AnalyzeWithDetailFn) RegistryOption {
-	return func(r *Registry) { r.visionTool = &vision.Tool{AnalyzeWithDetailFn: analyzeFn} }
+// WithReadFileImages lets read_file return image files as downscaled image
+// attachments. Browser screenshots outside the workspace are readable by the
+// absolute path the Browser tool reports.
+func WithReadFileImages() RegistryOption {
+	return func(r *Registry) { r.readFileImages = true }
 }
 
 func WithMemoryStore(store sdkmemory.Store, namespace, sourceRun, repoURL string) RegistryOption {
@@ -214,11 +212,12 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	r.lspTool.Config.Executor = r.bashExecutor()
 	r.lspTool.Config.AllowUnsafeUnconfined = false
 
+	readFile := &search.ReadFileTool{Images: r.readFileImages}
 	var allTools []agentsdk.Tool
 	if r.permissionMode == policy.PermissionModeWorkspaceWrite {
 		allTools = []agentsdk.Tool{
 			&search.ListFilesTool{},
-			&search.ReadFileTool{},
+			readFile,
 			&search.GlobTool{},
 			&search.GrepTool{},
 			r.lspTool,
@@ -235,7 +234,7 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	} else {
 		allTools = []agentsdk.Tool{
 			&search.ListFilesTool{},
-			&search.ReadFileTool{},
+			readFile,
 			&search.GlobTool{},
 			&search.GrepTool{},
 			r.lspTool,
@@ -295,14 +294,11 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 			AllowPrivateNetworkURLs: true,
 			Executor:                r.bashExecutor(),
 			ScreenshotDir:           effectiveBrowserScreenshotDir,
+			ReadFileImages:          r.readFileImages,
 		})
 	}
-	if r.visionTool != nil {
-		r.visionTool.AllowPrivateNetworkURLs = r.allowPrivateNetworkURLs
-		if effectiveBrowserScreenshotDir != "" {
-			r.visionTool.AllowedImageDirs = append(r.visionTool.AllowedImageDirs, effectiveBrowserScreenshotDir)
-		}
-		r.Register(r.visionTool)
+	if r.readFileImages && effectiveBrowserScreenshotDir != "" {
+		readFile.AllowedImageDirs = append(readFile.AllowedImageDirs, effectiveBrowserScreenshotDir)
 	}
 	if r.memoryTool != nil {
 		r.Register(r.memoryTool)

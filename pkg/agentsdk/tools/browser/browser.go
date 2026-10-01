@@ -25,6 +25,8 @@ type Tool struct {
 	// ScreenshotDir is the host-managed directory used for implicit screenshot
 	// outputs. Empty uses the operating system's temporary directory.
 	ScreenshotDir string
+	// ReadFileImages reports that read_file can attach screenshots as images.
+	ReadFileImages bool
 }
 
 type input struct {
@@ -131,6 +133,7 @@ func (t *Tool) ToolForAccess(level agentsdk.ToolAccessLevel) agentsdk.Tool {
 			AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs,
 			Executor:                t.Executor,
 			ScreenshotDir:           t.ScreenshotDir,
+			ReadFileImages:          t.ReadFileImages,
 		}
 	}
 	return t
@@ -285,7 +288,11 @@ func (t *Tool) screenshot(ctx context.Context, chromeBin string, in input, workD
 			displayPath = relPath
 		}
 	}
-	return agentsdk.ToolResult{Content: fmt.Sprintf("Screenshot saved to %s (%dx%d)", displayPath, width, height)}, nil
+	content := fmt.Sprintf("Screenshot saved to %s (%dx%d)", displayPath, width, height)
+	if t.ReadFileImages {
+		content += ". View it with read_file using this path."
+	}
+	return agentsdk.ToolResult{Content: content}, nil
 }
 
 func (t *Tool) navigate(ctx context.Context, chromeBin string, in input, workDir string, width, height int) (agentsdk.ToolResult, error) {

@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +19,10 @@ import (
 
 	"github.com/gratefulagents/sdk/internal/modeldelta"
 )
+
+// maxSubAgentFinalJoinExtensions caps how many extra turns past MaxTurns the
+// runner grants to digest joined sub-agent results.
+const maxSubAgentFinalJoinExtensions = 3
 
 const finalSummaryTurnDirective = `<final_turn>
 This is your final available turn. No tools are available now.
@@ -310,14 +313,21 @@ func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call Too
 		return RunItem{}, nil, nil, false, fmt.Errorf("agent is nil")
 	}
 	cfg.ToolAccessLevel = NormalizeToolAccessLevel(cfg.ToolAccessLevel)
-	cleanupToolOutput := prepareToolOutputSpill(&cfg)
-	defer cleanupToolOutput()
+	// The approved tool's output becomes part of the history the resumed run
+	// continues from, so a spilled output must outlive this call.
+	prepareToolOutputSpill(&cfg)
+	defer retainToolOutputSpill(cfg)
 
 	runCtx := newRunContext(ctx, cfg)
 	runCtx.ToolAccessLevel = cfg.ToolAccessLevel
+	if cfg.Durable != nil && cfg.Durable.Resume != nil {
+		// Checkpoints below carry runCtx.Usage; start from the paused run's
+		// usage so they do not reset the accumulated total to zero.
+		runCtx.Usage = cfg.Durable.Resume.Usage
+	}
 
 	tp := cfg.TracingProcessor
-	if tp == nil || cfg.TracingDisabled {
+	if tp == nil {
 		tp = NoOpTracingProcessor{}
 	}
 	trace := cfg.Trace
@@ -379,13 +389,13 @@ func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call Too
 	if result.guardrailErr == nil && cfg.Durable != nil {
 		durableHistory = append(durableHistory, result.item)
 		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolCompleted, agent, durableHistory, nil, runCtx.Usage); err != nil {
-			return RunItem{}, result.inputGuardrails, result.outputGuardrails, result.shouldPause, fmt.Errorf("persist approved tool completion: %w", err)
+			return result.item, result.inputGuardrails, result.outputGuardrails, result.shouldPause, fmt.Errorf("persist approved tool completion: %w", err)
 		}
 	}
 	return result.item, result.inputGuardrails, result.outputGuardrails, result.shouldPause, result.guardrailErr
 }
 
-func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg RunConfig, streamEvents chan<- StreamEvent) (result *RunResult, err error) {
+func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg RunConfig, streamEvents *runEventSink) (result *RunResult, err error) {
 	if r == nil {
 		return nil, fmt.Errorf("runner is nil")
 	}
@@ -404,7 +414,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 	// Initialize tracing.
 	tp := cfg.TracingProcessor
-	if tp == nil || cfg.TracingDisabled {
+	if tp == nil {
 		tp = NoOpTracingProcessor{}
 	}
 	// Use a shared trace if the caller provided one (multi-phase runs share a
@@ -423,6 +433,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	runCtx.TracingProcessor = tp
 	runCtx.Trace = trace
 	runCtx.SpanParentID = spanParent
+	_, noOpTracing := tp.(NoOpTracingProcessor)
+	captureRequestSnapshots := !noOpTracing
+	var snapshotter requestSnapshotter
 	logicalCacheKey := strings.TrimSpace(cfg.PromptCacheKey)
 	if logicalCacheKey == "" {
 		logicalCacheKey = TaskIDFromContext(ctx)
@@ -436,7 +449,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	}
 	cfg.PromptCacheKey = promptCacheWireKey(cacheNamespace, logicalCacheKey)
 	cleanupToolOutput := prepareToolOutputSpill(&cfg)
-	defer cleanupToolOutput()
+	// A run that pauses (approval pending, pause tool) is resumed with the
+	// same history, which may reference spilled outputs: keep them then.
+	retainToolOutput := false
+	defer func() {
+		if retainToolOutput {
+			retainToolOutputSpill(cfg)
+			return
+		}
+		cleanupToolOutput()
+	}()
 	defer func() {
 		if ownTrace {
 			trace.Finish()
@@ -514,6 +536,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// so the counter resets on success; using the cumulative llmAttempt here
 	// would exhaust the retry budget after MaxRetries successful turns.
 	var turnRetryAttempt int
+	// Same-turn recovery guards: encrypted-content stripping and forced
+	// context-overflow compaction each run at most once per turn, so a
+	// provider that keeps rejecting the recovered request cannot loop them.
+	var strippedEncryptedThisTurn, forcedCompactionThisTurn bool
 	activeFallbackModels := map[*Agent]string{}
 	// fallbackSuccessTurns counts successful model calls while a fallback is
 	// active; after fallbackPrimaryReprobeTurns the fallback is cleared so the
@@ -528,7 +554,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// answer ends the run (Terminus 2 anti-premature-exit pattern).
 	pendingCompletion := false
 	// consecutiveToolErrorTurns counts tool turns where every executed tool
-	// returned an error; escalation fires at the configured limit.
+	// returned an error; escalation fires at consecutiveToolErrorLimit.
 	consecutiveToolErrorTurns := 0
 	toolErrorEscalated := false
 	// estimateCalibration corrects the token estimator against the actual
@@ -539,30 +565,37 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// of the window. Dividing thresholds by this ratio makes the trigger
 	// fire at true window pressure in both directions.
 	estimateCalibration := 1.0
-	// stopGateBlocks counts consecutive StopGate blocks; the gate is bypassed
-	// once the cap is hit so a broken gate cannot loop forever.
-	stopGateBlocks := 0
 	verifierRan := false
 
 	maxTurns := cfg.EffectiveMaxTurns()
+	originalMaxTurns := maxTurns
+	// finalJoinExtensions counts turns granted past the budget to digest
+	// joined sub-agent results; capped so a model cannot extend forever.
+	finalJoinExtensions := 0
+
+	inject := func(items ...RunItem) {
+		currentInput = append(currentInput, items...)
+		allItems = append(allItems, items...)
+		emitRunItems(ctx, streamEvents, items)
+	}
 
 	// finalizeImmediateInput atomically closes input admission, or folds any
 	// steering accepted before that point into history and asks the caller to
 	// continue instead of returning a terminal result.
-	finalizeImmediateInput := func() (bool, error) {
+	finalizeImmediateInput := func(prior ...RunItem) (bool, error) {
 		if cfg.ImmediateInputFinalizer == nil {
 			return false, nil
 		}
-		items, err := cfg.ImmediateInputFinalizer(ctx)
+		items, err := callRecovering("immediate input finalizer", func() ([]RunItem, error) { return cfg.ImmediateInputFinalizer(ctx) })
 		if err != nil {
+			currentInput = append(currentInput, prior...)
 			return false, err
 		}
 		if len(items) == 0 {
 			return false, nil
 		}
-		currentInput = append(currentInput, items...)
-		allItems = append(allItems, items...)
-		emitRunItems(ctx, streamEvents, items)
+		currentInput = append(currentInput, prior...)
+		inject(items...)
 		pendingCompletion = false
 		return true, nil
 	}
@@ -577,6 +610,21 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	}
 	if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunStarted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 		return nil, fmt.Errorf("persist run-start checkpoint: %w", err)
+	}
+
+	buildResult := func(final any, history []RunItem) *RunResult {
+		return &RunResult{
+			FinalOutput:                final,
+			LastAgent:                  currentAgent,
+			NewItems:                   allItems,
+			RawResponses:               allResponses,
+			InputGuardrailResults:      inputGuardrailResults,
+			ToolInputGuardrailResults:  allToolInputResults,
+			ToolOutputGuardrailResults: allToolOutputResults,
+			ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
+			Usage:                      runCtx.Usage,
+			FinalHistory:               append([]RunItem(nil), history...),
+		}
 	}
 
 	// A run that ends early with the conversation still intact — context
@@ -608,31 +656,20 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		if ctx.Err() == nil && len(allItems) == 0 {
 			return
 		}
-		result = &RunResult{
-			LastAgent:                  currentAgent,
-			NewItems:                   allItems,
-			RawResponses:               allResponses,
-			InputGuardrailResults:      inputGuardrailResults,
-			ToolInputGuardrailResults:  allToolInputResults,
-			ToolOutputGuardrailResults: allToolOutputResults,
-			ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-			Usage:                      runCtx.Usage,
-			FinalHistory:               append([]RunItem(nil), currentInput...),
-		}
+		result = buildResult(nil, currentInput)
 	}()
 
 	for turn := 0; ; turn++ {
 		if turn >= maxTurns {
 			tools := prepareToolsForRun(currentAgent.GetAllTools(runCtx), cfg, runCtx)
-			if hasPendingSubAgentFinalJoin(tools) {
+			if finalJoinExtensions < maxSubAgentFinalJoinExtensions && hasPendingSubAgentFinalJoin(tools) {
 				joinItems, joinErr := collectSubAgentFinalJoinItems(ctx, tools)
 				if joinErr != nil {
 					return nil, joinErr
 				}
 				if len(joinItems) > 0 {
-					currentInput = append(currentInput, joinItems...)
-					allItems = append(allItems, joinItems...)
-					emitRunItems(ctx, streamEvents, joinItems)
+					inject(joinItems...)
+					finalJoinExtensions++
 					maxTurns = turn + 2
 					continue
 				}
@@ -641,7 +678,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, finalizeErr
 			} else if continued {
 				maxTurns = turn + 1
-				// The finalizer already drained the queue; skip the normal poll below.
+				// The finalizer already folded the pending input into history;
+				// the normal poll below then simply finds the queue empty.
 			} else {
 				// The budget is exhausted, but the conversation must not be
 				// lost with it: hand the accumulated run state back alongside
@@ -649,17 +687,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				// hosts can persist the transcript and continue in a follow-up
 				// run. currentInput is the post-fold history of every completed
 				// turn — replay-safe, no unpaired tool_use.
-				partial := &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					InputGuardrailResults:      inputGuardrailResults,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					FinalHistory:               append([]RunItem(nil), currentInput...),
-				}
+				partial := buildResult(nil, currentInput)
 				return partial, &MaxTurnsExceeded{MaxTurns: maxTurns, PartialResult: partial}
 			}
 		}
@@ -671,13 +699,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		}
 
 		if cfg.ImmediateInputPoller != nil {
-			immediateItems, err := cfg.ImmediateInputPoller(ctx)
+			immediateItems, err := callRecovering("immediate input poller", func() ([]RunItem, error) { return cfg.ImmediateInputPoller(ctx) })
 			if err != nil {
 				log.Printf("[runner] WARN: immediate input poll failed: %v", err)
 			} else if len(immediateItems) > 0 {
-				currentInput = append(currentInput, immediateItems...)
-				allItems = append(allItems, immediateItems...)
-				emitRunItems(ctx, streamEvents, immediateItems)
+				inject(immediateItems...)
 				// Steering interrupts a completion-confirmation bounce the
 				// same way finalizeImmediateInput does.
 				pendingCompletion = false
@@ -695,12 +721,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// slower siblings keep running, instead of receiving everything at
 		// final-join.
 		if pollItems := pollSubAgentResultItems(tools); len(pollItems) > 0 {
-			currentInput = append(currentInput, pollItems...)
-			allItems = append(allItems, pollItems...)
-			emitRunItems(ctx, streamEvents, pollItems)
+			inject(pollItems...)
 		}
 		pendingSubAgentJoin := hasPendingSubAgentFinalJoin(tools)
-		if cfg.ForceFinalSummaryTurn && turn == maxTurns-1 && !pendingSubAgentJoin {
+		joinTools := tools
+		// Turns granted past the budget only to digest joined sub-agent
+		// results are summary turns: without tools the model cannot spawn
+		// more sub-agents and extend the run again.
+		joinExtensionTurn := finalJoinExtensions > 0 && turn >= originalMaxTurns
+		if joinExtensionTurn || (cfg.ForceFinalSummaryTurn && turn == maxTurns-1 && !pendingSubAgentJoin) {
 			instructions = instructions + "\n\n" + finalSummaryTurnDirective
 			tools = nil
 		}
@@ -763,7 +792,22 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			compactionCfg.TargetTokens = maxInt(1, int(float64(normalized.TargetTokens)/estimateCalibration))
 		}
 
+		currentInput = elideOldImages(currentInput, DefaultMaxRecentImages)
 		requestOverheadTokens := estimateModelRequestOverheadTokens(instructions, tools, settings)
+		applyCompaction := func(compacted CompactionResult, before int) error {
+			var carryForward string
+			currentInput, carryForward = applyCompactionCarryForward(ctx, compacted.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
+			if err := guardCompactionCarryForward(runCtx, currentAgent, carryForward); err != nil {
+				return err
+			}
+			runCtx.Usage.Add(compacted.Usage)
+			recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compacted.Usage)
+			if cfg.CompactionRecorder != nil {
+				after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
+				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compacted.Summary, carryForward))
+			}
+			return nil
+		}
 		// Post-provider-compaction steady state: while the plaintext that
 		// accumulated after the newest provider compaction blob stays below
 		// the trigger, skip BOTH provider and local compaction this turn.
@@ -771,7 +815,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// total above the trigger, re-compacting it buys nothing, and the
 		// local planner must not run either: falling through to it would
 		// spend an LLM-summary call per turn on negligible growth.
-		if !compactionCfg.Enabled || !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
+		if compactionCfg.Enabled && !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
 			compactRequest := ModelRequest{
 				Model:          modelName,
 				PromptCacheKey: cfg.PromptCacheKey,
@@ -785,16 +829,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
 			compactCancel()
 			if ok {
-				var carryForward string
-				currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
-				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-					return nil, guardErr
-				}
-				after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
-				runCtx.Usage.Add(compactResult.Usage)
-				recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
-				if cfg.CompactionRecorder != nil {
-					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
+				if err := applyCompaction(*compactResult, before); err != nil {
+					return nil, err
 				}
 			} else {
 				if compactErr != nil {
@@ -810,14 +846,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 							compactedItems = rebuilt
 						}
 					}
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
-					}
-					after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
+					compacted := CompactionResult{Items: compactedItems, Summary: ExtractCompactionSummary(compactedItems)}
+					if err := applyCompaction(compacted, before); err != nil {
+						return nil, err
 					}
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 					if compactErr != nil {
@@ -828,7 +859,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 		}
 
-		currentInput = pruneToolOutputImages(currentInput, cfg.MaxRetainedToolImages)
+		currentInput = elideOldImages(currentInput, DefaultMaxRecentImages)
 
 		// --- Structured turn logging ---
 		{
@@ -865,23 +896,24 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			taskID = parentCallID
 		}
 
-		// The request input is exactly the accumulated conversation: plan
-		// state, when a host tracks one, lives in durable history like any
-		// other context (per-request transient re-injection was removed — it
-		// made the model re-orient and re-narrate every turn).
-		requestInput := currentInput
-
 		modelRequest := ModelRequest{
 			Model:               modelName,
 			PromptCacheKey:      cfg.PromptCacheKey,
 			Instructions:        instructions,
-			Input:               requestInput,
+			Input:               currentInput,
 			Tools:               tools,
 			Settings:            settings,
 			OutputSchema:        currentAgent.OutputType,
 			CompactionThreshold: modelCompactionThreshold(activeModel, providerCompactionCfg),
 		}
-		requestSnapshot := BuildLLMRequestSnapshot(currentAgent.Name, modelRequest)
+		// requestOverheadTokens was computed from the same instructions,
+		// tools and settings. The full request snapshot (a copy of the whole
+		// history) is only built when a tracing processor will export it.
+		requestInputTokens := estimateRunItemsTokens(currentInput)
+		var requestSnapshot *LLMRequestSnapshot
+		if captureRequestSnapshots {
+			requestSnapshot = buildLLMRequestSnapshot(currentAgent.Name, modelRequest, requestInputTokens, requestOverheadTokens, &snapshotter)
+		}
 		genData := &GenerationSpanData{
 			RequestedModel:               modelIdentity.Raw,
 			ResolvedModel:                modelName,
@@ -894,9 +926,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			ToolCount:                    int32(len(tools)),
 			InputItemCount:               int32(len(currentInput)),
 			InstructionsLength:           int32(len(instructions)),
-			InputTokenEstimate:           int32(requestSnapshot.InputTokenEstimate),
-			RequestOverheadTokenEstimate: int32(requestSnapshot.RequestOverheadTokenEstimate),
-			TotalRequestTokenEstimate:    int32(requestSnapshot.TotalTokenEstimate),
+			InputTokenEstimate:           int32(requestInputTokens),
+			RequestOverheadTokenEstimate: int32(requestOverheadTokens),
+			TotalRequestTokenEstimate:    int32(requestInputTokens + requestOverheadTokens),
 			Request:                      requestSnapshot,
 		}
 		genSpan := NewSpan("generation", spanParent, genData)
@@ -996,7 +1028,15 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			exportGenSpan := func() {
 				tp.OnSpanEnd(genSpan)
 				openGenSpan = nil
-				trace.AddSpan(genSpan)
+				trace.AddSpan(retainedSpan(genSpan))
+			}
+			finishFailure := func(status string) {
+				genData.Status = status
+				ev := attemptFailureEvent(attemptEvent(status), genData)
+				ev.RetryPlanned = status == "retrying" || status == "fallback"
+				ev.RetryAfterMs = genData.RetryAfterMS
+				emitLLMAttemptEvent(cfg.Hooks, ev)
+				exportGenSpan()
 			}
 
 			if immediateInputArrived && commitment.state.Load() == modelOutputInterrupted {
@@ -1019,9 +1059,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 
 			if isContextCancellation(err) && !perCallTimeout {
-				exportGenSpan()
-				ev := attemptFailureEvent(attemptEvent("failed"), genData)
-				emitLLMAttemptEvent(cfg.Hooks, ev)
+				finishFailure("failed")
 				return nil, err
 			}
 
@@ -1032,19 +1070,22 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// items and retry instead of bricking the session: the preserved
 			// plaintext (initial user messages, recent items, carry-forward)
 			// keeps the run on task.
-			if isEncryptedContentError(err) {
+			// Every recovery/retry path below re-issues the SAME turn (turn--
+			// before continue): retries are bounded by their own budgets and
+			// must never consume MaxTurns.
+			if !streamOutputWasCommitted(err) && !strippedEncryptedThisTurn && isEncryptedContentError(err) {
 				if stripped, removed := stripUndecryptableEncryptedItems(currentInput); removed > 0 {
+					strippedEncryptedThisTurn = true
 					log.Printf("[runner] WARN: provider rejected encrypted context items; stripped %d and retrying: %v", removed, err)
 					currentInput = stripped
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
+					turn--
 					continue
 				}
 			}
 
-			if isContextLengthExceededError(err) {
+			if !streamOutputWasCommitted(err) && !forcedCompactionThisTurn && isContextLengthExceededError(err) {
+				forcedCompactionThisTurn = true
 				forcedRequest := ModelRequest{
 					Model:          modelName,
 					PromptCacheKey: cfg.PromptCacheKey,
@@ -1058,21 +1099,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(forcedCompactCtx, activeModel, forcedRequest, requestOverheadTokens, compactionCfg, true)
 				forcedCompactCancel()
 				if ok {
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
+					if err := applyCompaction(*compactResult, before); err != nil {
+						return nil, err
 					}
-					after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
-					runCtx.Usage.Add(compactResult.Usage)
-					recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
-					}
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
+					turn--
 					continue
 				} else if compactErr != nil {
 					log.Printf("[runner] WARN: provider compaction after context error failed; falling back to local compaction: %v", compactErr)
@@ -1092,19 +1123,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 							compactedItems = rebuilt
 						}
 					}
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
+					compacted := CompactionResult{Items: compactedItems, Summary: ExtractCompactionSummary(compactedItems)}
+					if err := applyCompaction(compacted, before+requestOverheadTokens); err != nil {
+						return nil, err
 					}
-					after := estimateRunItemsTokens(currentInput)
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
-					}
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
+					turn--
 					continue
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 					cfg.CompactionFailureReporter("run", reason, before, after)
@@ -1123,106 +1147,31 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					genData.FallbackFromModel = requestedModelName
 					genData.FallbackToModel = fallbackModel
 					genData.FallbackReason = reason
-					genData.Status = "fallback"
-					genSpan.Data = genData
-					ev := attemptFailureEvent(attemptEvent("fallback"), genData)
-					ev.RetryPlanned = true
-					ev.FallbackPlanned = true
-					ev.FallbackFromModel = requestedModelName
-					ev.FallbackToModel = fallbackModel
-					ev.FallbackReason = reason
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("fallback")
+					turn--
 					continue
 				}
 			}
 
-			// Consult error handler only before any user-visible stream output.
-			// Retrying or continuing after commitment would duplicate that output.
-			if cfg.ErrorHandler != nil && !streamOutputWasCommitted(err) {
-				decision := cfg.ErrorHandler(RunErrorData{Error: err, Agent: currentAgent, Turn: turn})
-				switch decision.Action {
-				case ErrorActionRetry:
-					genData.Status = "retrying"
-					genSpan.Data = genData
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
-					continue
-				case ErrorActionContinue:
-					log.Printf("[runner] error handler chose continue on turn %d: %v", turn, err)
-					ev := attemptFailureEvent(attemptEvent("failed"), genData)
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
-					continue
-				case ErrorActionAbort:
-					ev := attemptFailureEvent(attemptEvent("failed"), genData)
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
-					return nil, &AgentError{Message: fmt.Sprintf("model call failed on turn %d", turn), Cause: err}
-				}
-			}
-
-			if !streamOutputWasCommitted(err) && shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
-				delay := cfg.RetryPolicy.DelayForAttempt(turnRetryAttempt - 1)
-				// A provider-directed delay (e.g. 429 Retry-After) is on the
-				// provider's clock: never retry sooner than it asked for.
-				if advice != nil && advice.RetryAfterMS > delay.Milliseconds() {
-					delay = time.Duration(advice.RetryAfterMS) * time.Millisecond
-				}
-				cappedMS := capRetryAfterMS(delay.Milliseconds())
-				delay = time.Duration(cappedMS) * time.Millisecond
+			if delay, retry := modelRetryDelay(cfg.RetryPolicy, advice, turnRetryAttempt); retry && !streamOutputWasCommitted(err) {
 				genData.RetryScheduled = true
-				genData.RetryAfterMS = cappedMS
-				genData.Status = "retrying"
-				genSpan.Data = genData
-				ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-				ev.RetryPlanned = true
-				ev.RetryAfterMs = genData.RetryAfterMS
-				emitLLMAttemptEvent(cfg.Hooks, ev)
-				exportGenSpan()
+				genData.RetryAfterMS = delay.Milliseconds()
+				finishFailure("retrying")
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-time.After(delay):
 				}
+				turn--
 				continue
 			}
-
-			if !streamOutputWasCommitted(err) && advice != nil && advice.ShouldRetry && turnRetryAttempt <= maxAdviceRetriesPerTurn {
-				cappedMS := capRetryAfterMS(int64(advice.RetryAfterMS))
-				if cappedMS <= 0 {
-					// The provider asked for a retry without saying when (e.g.
-					// a 429 with no Retry-After/reset headers). Never retry
-					// immediately: rate limits recover on the provider's
-					// clock, and a zero delay hammers the API in a tight loop.
-					cappedMS = capRetryAfterMS(adviceRetryDelay(cfg.RetryPolicy, turnRetryAttempt).Milliseconds())
-				}
-				genData.RetryScheduled = true
-				genData.RetryAfterMS = cappedMS
-				genData.Status = "retrying"
-				genSpan.Data = genData
-				ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-				ev.RetryPlanned = true
-				ev.RetryAfterMs = genData.RetryAfterMS
-				emitLLMAttemptEvent(cfg.Hooks, ev)
-				exportGenSpan()
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(time.Duration(cappedMS) * time.Millisecond):
-				}
-				continue // retry this turn
-			}
-			ev := attemptFailureEvent(attemptEvent("failed"), genData)
-			emitLLMAttemptEvent(cfg.Hooks, ev)
-			exportGenSpan()
+			finishFailure("failed")
 			return nil, &AgentError{Message: fmt.Sprintf("model call failed on turn %d", turn), Cause: err}
 		}
 
 		costUSD, costKnown := estimateModelCost(activeModel, resp.Usage)
 		turnRetryAttempt = 0
+		strippedEncryptedThisTurn, forcedCompactionThisTurn = false, false
 		if activeFallbackModels[currentAgent] != "" {
 			fallbackSuccessTurns[currentAgent]++
 			if fallbackSuccessTurns[currentAgent] >= fallbackPrimaryReprobeTurns {
@@ -1244,14 +1193,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		genData.LatencyMS = time.Since(llmStartedAt).Milliseconds()
 		genData.UsageAvailable = true
 		genData.OutputItemCount = int32(len(resp.Items))
-		genData.Response = BuildLLMResponseSnapshot(resp)
+		if captureRequestSnapshots {
+			genData.Response = BuildLLMResponseSnapshot(resp)
+		}
 		genData.Success = true
 		genData.Status = "completed"
 		genSpan.Data = genData
 		genSpan.Finish()
 		tp.OnSpanEnd(genSpan)
 		openGenSpan = nil
-		trace.AddSpan(genSpan)
+		trace.AddSpan(retainedSpan(genSpan))
 		ev := attemptEvent("completed")
 		ev.UsageAvailable = true
 		ev.HasPromptTokens = true
@@ -1300,7 +1251,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if promptOverheadTokens < 0 {
 				promptOverheadTokens = 0
 			}
-			if sentEstimate := estimateRunItemsTokens(requestInput) + promptOverheadTokens; sentEstimate > 0 {
+			if sentEstimate := requestInputTokens + promptOverheadTokens; sentEstimate > 0 {
 				ratio := float64(actual) / float64(sentEstimate)
 				blended := 0.5*estimateCalibration + 0.5*ratio
 				estimateCalibration = math.Max(0.5, math.Min(2.5, blended))
@@ -1325,7 +1276,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if !prunedOK {
 				return items
 			}
-			before := requestSnapshot.TotalTokenEstimate
+			before := requestInputTokens + requestOverheadTokens
 			var carryForward string
 			pruned, carryForward = applyCompactionCarryForward(ctx, pruned, items, cfg, compactionCfg, requestOverheadTokens)
 			after := estimateRunItemsTokens(pruned) + requestOverheadTokens
@@ -1336,9 +1287,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			return pruned
 		}
 
-		modelHistory := append(append([]RunItem(nil), currentInput...), newItems...)
-		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryModelCompleted, currentAgent, modelHistory, nil, runCtx.Usage); err != nil {
-			return nil, fmt.Errorf("persist model-completed checkpoint: %w", err)
+		if durableCheckpointsEnabled(cfg.Durable) {
+			modelHistory := append(append([]RunItem(nil), currentInput...), newItems...)
+			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryModelCompleted, currentAgent, modelHistory, nil, runCtx.Usage); err != nil {
+				return nil, fmt.Errorf("persist model-completed checkpoint: %w", err)
+			}
 		}
 
 		// Classify the response.
@@ -1346,6 +1299,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
+			continueWith := func(feedback ...RunItem) {
+				currentInput = append(currentInput, newItems...)
+				currentInput = append(currentInput, feedback...)
+				currentInput = recordAndPruneResponseCompaction(currentInput)
+				allItems = append(allItems, feedback...)
+				emitRunItems(ctx, streamEvents, feedback)
+			}
 			// Match Codex CLI's Responses loop: a completed text-only response requests
 			// another sample only when the backend explicitly sends end_turn=false.
 			// Message phase is descriptive and does not independently control the loop.
@@ -1353,23 +1313,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// so end_turn=true cannot cancel tool-driven continuation.
 			if resp.EndTurn != nil && !*resp.EndTurn {
 				pendingCompletion = false
-				stopGateBlocks = 0
-				currentInput = append(currentInput, newItems...)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
+				continueWith()
 				continue
 			}
 
-			joinItems, joinErr := collectSubAgentFinalJoinItems(ctx, tools)
+			joinItems, joinErr := collectSubAgentFinalJoinItems(ctx, joinTools)
 			if joinErr != nil {
 				return nil, joinErr
 			}
 			if len(joinItems) > 0 {
-				currentInput = append(currentInput, newItems...)
-				currentInput = append(currentInput, joinItems...)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
-				allItems = append(allItems, joinItems...)
-				emitRunItems(ctx, streamEvents, joinItems)
-				if turn >= maxTurns-1 {
+				continueWith(joinItems...)
+				if turn >= maxTurns-1 && finalJoinExtensions < maxSubAgentFinalJoinExtensions {
+					finalJoinExtensions++
 					maxTurns++
 				}
 				continue
@@ -1385,47 +1340,20 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					Type:    RunItemMessage,
 					Message: &MessageOutput{Text: completionConfirmationPrompt},
 				}
-				currentInput = append(currentInput, newItems...)
-				currentInput = append(currentInput, confirmItem)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
-				allItems = append(allItems, confirmItem)
-				emitRunItems(ctx, streamEvents, []RunItem{confirmItem})
+				continueWith(confirmItem)
 				if turn >= maxTurns-1 {
 					maxTurns++
 				}
 				continue
 			}
 
-			// Deterministic stop gate: block finalization with feedback until
-			// the gate passes or the consecutive-block cap is hit.
-			if cfg.StopGate != nil && len(tools) > 0 && stopGateBlocks < cfg.EffectiveStopGateMaxBlocks() {
-				if ok, feedback := cfg.StopGate(ctx, finalOutputText(s.output)); !ok {
-					stopGateBlocks++
-					if strings.TrimSpace(feedback) == "" {
-						feedback = "the finalization check failed; continue working until it passes"
-					}
-					gateItem := RunItem{
-						Type:    RunItemMessage,
-						Message: &MessageOutput{Text: "[SYSTEM] Final answer blocked by the completion gate (" + strconv.Itoa(stopGateBlocks) + "/" + strconv.Itoa(cfg.EffectiveStopGateMaxBlocks()) + "):\n" + feedback},
-					}
-					currentInput = append(currentInput, newItems...)
-					currentInput = append(currentInput, gateItem)
-					currentInput = recordAndPruneResponseCompaction(currentInput)
-					allItems = append(allItems, gateItem)
-					emitRunItems(ctx, streamEvents, []RunItem{gateItem})
-					if turn >= maxTurns-1 {
-						maxTurns++
-					}
-					continue
-				}
-				stopGateBlocks = 0
-			}
-
 			// Adversarial verification: give a critic one chance to refute
 			// the candidate final answer.
 			if cfg.FinalAnswerVerifier != nil && !verifierRan && len(tools) > 0 {
 				verifierRan = true
-				feedback, vErr := cfg.FinalAnswerVerifier(ctx, finalOutputText(s.output))
+				feedback, vErr := callRecovering("final answer verifier", func() (string, error) {
+					return cfg.FinalAnswerVerifier(ctx, finalOutputText(s.output))
+				})
 				if vErr != nil {
 					log.Printf("[runner] WARN: final answer verifier failed: %v", vErr)
 				} else if strings.TrimSpace(feedback) != "" {
@@ -1433,11 +1361,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						Type:    RunItemMessage,
 						Message: &MessageOutput{Text: "[SYSTEM] An independent reviewer examined your answer before finalization and raised these points. Address the valid ones (with tools if needed), then provide your final answer again:\n" + feedback},
 					}
-					currentInput = append(currentInput, newItems...)
-					currentInput = append(currentInput, verifyItem)
-					currentInput = recordAndPruneResponseCompaction(currentInput)
-					allItems = append(allItems, verifyItem)
-					emitRunItems(ctx, streamEvents, []RunItem{verifyItem})
+					continueWith(verifyItem)
 					pendingCompletion = false
 					if turn >= maxTurns-1 {
 						maxTurns++
@@ -1450,8 +1374,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// Steering accepted before this point wins and gets another turn;
 			// steering racing after it receives a clear finalizing error.
 			if cfg.ImmediateInputFinalizer != nil {
-				currentInput = append(currentInput, newItems...)
-				if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
+				if continued, finalizeErr := finalizeImmediateInput(newItems...); finalizeErr != nil {
 					return nil, finalizeErr
 				} else if continued {
 					currentInput = recordAndPruneResponseCompaction(currentInput)
@@ -1460,7 +1383,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					continue
 				}
-				currentInput = currentInput[:len(currentInput)-len(newItems)]
 			}
 
 			// Record compaction stats and keep the pruned transcript: when
@@ -1484,23 +1406,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, fmt.Errorf("persist run-completed checkpoint: %w", err)
 			}
 
-			return &RunResult{
-				FinalOutput:                s.output,
-				LastAgent:                  currentAgent,
-				NewItems:                   allItems,
-				RawResponses:               allResponses,
-				InputGuardrailResults:      inputGuardrailResults,
-				OutputGuardrailResults:     outputGuardrailResults,
-				ToolInputGuardrailResults:  allToolInputResults,
-				ToolOutputGuardrailResults: allToolOutputResults,
-				ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-				Usage:                      runCtx.Usage,
-				// The final-output branch returns before this turn's newItems
-				// are folded into currentInput, so the continuation state is
-				// currentInput + newItems — pruned when the final response
-				// carried a provider compaction item.
-				FinalHistory: finalHistory,
-			}, nil
+			result := buildResult(s.output, finalHistory)
+			result.OutputGuardrailResults = outputGuardrailResults
+			return result, nil
 
 		case *handoffStep:
 			handoffSpan := NewSpan("handoff", spanParent, &HandoffSpanData{FromAgent: currentAgent.Name, ToAgent: s.target.Name})
@@ -1517,7 +1425,12 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						log.Printf("[runner] WARN: handoff %q input failed schema validation: %v", s.handoff.ToolName, vErr)
 					}
 				}
-				s.handoff.OnHandoff(runCtx, input)
+				if _, hErr := callRecovering("handoff callback", func() (struct{}, error) {
+					s.handoff.OnHandoff(runCtx, input)
+					return struct{}{}, nil
+				}); hErr != nil {
+					return nil, hErr
+				}
 			}
 
 			handoffOutputs := handoffToolOutputs(newItems, s.handoff, currentAgent, s.target)
@@ -1534,7 +1447,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			nextInput = append(nextInput, newItems...)
 			nextInput = append(nextInput, handoffOutputs...)
 			if s.handoff.InputFilter != nil {
-				nextInput = s.handoff.InputFilter(nextInput, allItems)
+				filtered, fErr := callRecovering("handoff input filter", func() ([]RunItem, error) {
+					return s.handoff.InputFilter(nextInput, allItems), nil
+				})
+				if fErr != nil {
+					return nil, fErr
+				}
+				nextInput = filtered
 			}
 			nextInput = recordAndPruneResponseCompaction(nextInput)
 			if compacted, before, after, ok, reason := MaybeCompactHandoffInput(nextInput, cfg.HandoffHistory); ok {
@@ -1561,25 +1480,43 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		case *toolCallStep:
 			pendingCompletion = false
-			stopGateBlocks = 0
-			preparedHistory := append(append([]RunItem(nil), currentInput...), newItems...)
-			if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolPrepared, currentAgent, preparedHistory, nil, runCtx.Usage); err != nil {
-				return nil, fmt.Errorf("persist tool-prepared checkpoint: %w", err)
+			if durableCheckpointsEnabled(cfg.Durable) {
+				preparedHistory := append(append([]RunItem(nil), currentInput...), newItems...)
+				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolPrepared, currentAgent, preparedHistory, nil, runCtx.Usage); err != nil {
+					return nil, fmt.Errorf("persist tool-prepared checkpoint: %w", err)
+				}
 			}
 			// The subagent tool can explicitly opt in to completed parent history.
 			// Do not include newItems: they contain the current assistant's tool
 			// calls without their outputs and would form invalid inherited input.
-			parentHistory := cloneParentRunItems(currentInput)
-			toolCtx := WithParentRunItems(ctx, parentHistory)
-			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(toolCtx, runCtx, currentAgent, tools, s.toolCalls, cfg)
-			if toolGuardErr != nil {
-				return nil, toolGuardErr
+			// The full-slice expression pins this turn's history even after
+			// currentInput is reassigned or appended below.
+			parentHistory := currentInput[:len(currentInput):len(currentInput)]
+			toolCtx := ctx
+			if toolCallsNeedParentHistory(tools, s.toolCalls) {
+				toolCtx = WithParentRunItems(ctx, parentHistory)
 			}
+			toolResults, toolInResults, toolOutResults, actionAudits, toolShouldPause, toolGuardErr := r.executeTools(toolCtx, runCtx, currentAgent, tools, s.toolCalls, cfg)
 			allToolInputResults = append(allToolInputResults, toolInResults...)
 			allToolOutputResults = append(allToolOutputResults, toolOutResults...)
 			allActionAuditRecords = append(allActionAuditRecords, actionAudits...)
 			allItems = append(allItems, toolResults...)
 			emitRunItems(ctx, streamEvents, toolResults)
+			if toolGuardErr != nil {
+				// The batch already ran: keep its audits, guardrail results and
+				// outputs in the partial result, and fold the turn into history
+				// when every call is paired so a resumed session does not
+				// replay side effects that already happened.
+				if toolResultsPaired(toolResults) {
+					foldedResults := toolResults
+					if cfg.ShouldTagUntrustedToolOutputs() {
+						foldedResults = wrapToolOutputsForInput(toolResults)
+					}
+					currentInput = append(currentInput, newItems...)
+					currentInput = append(currentInput, foldedResults...)
+				}
+				return nil, toolGuardErr
+			}
 			currentInput = append(currentInput, newItems...)
 			// H3: wrap tool outputs as untrusted before they become next-turn
 			// model input. Original toolResults retained in allItems untouched
@@ -1597,7 +1534,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// Three-strike escalation: when several consecutive tool turns
 			// produce only errors, inject a corrective note instead of letting
 			// the model keep grinding on a failing approach.
-			if limit := cfg.EffectiveConsecutiveToolErrorLimit(); limit > 0 {
+			{
 				outputs, errored := 0, 0
 				for _, tr := range toolResults {
 					if tr.Type == RunItemToolOutput && tr.ToolOutput != nil {
@@ -1614,7 +1551,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						consecutiveToolErrorTurns = 0
 						toolErrorEscalated = false
 					}
-					if consecutiveToolErrorTurns >= limit && !toolErrorEscalated {
+					if consecutiveToolErrorTurns >= consecutiveToolErrorLimit && !toolErrorEscalated {
 						toolErrorEscalated = true
 						escalation := RunItem{
 							Type: RunItemMessage,
@@ -1622,9 +1559,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 								"[SYSTEM] Your last %d tool turns all failed. Stop repeating the same approach. Re-read the error messages above carefully, then either: (1) try a fundamentally different approach or tool, (2) inspect the environment to understand why the calls fail, or (3) if the task is genuinely blocked, report the blocker and what you tried instead of retrying.",
 								consecutiveToolErrorTurns)},
 						}
-						currentInput = append(currentInput, escalation)
-						allItems = append(allItems, escalation)
-						emitRunItems(ctx, streamEvents, []RunItem{escalation})
+						inject(escalation)
 					}
 				}
 			}
@@ -1651,20 +1586,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryApprovalPending, currentAgent, currentInput, interruptions, runCtx.Usage); err != nil {
 					return nil, fmt.Errorf("persist approval checkpoint: %w", err)
 				}
-				return &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					Interruption:               interruptions[0],
-					Interruptions:              interruptions,
-					// currentInput already includes this turn's newItems and
-					// tool results; pending approvals are still unresolved.
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				retainToolOutput = true
+				result := buildResult(nil, currentInput)
+				result.Interruption = interruptions[0]
+				result.Interruptions = interruptions
+				return result, nil
 			}
 
 			if currentAgent.ToolUseBehavior == StopOnFirstTool || shouldStopAtTools(currentAgent, s.toolCalls) {
@@ -1688,20 +1614,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 					return nil, fmt.Errorf("persist tool-result completion checkpoint: %w", err)
 				}
-				return &RunResult{
-					FinalOutput:                finalOutput,
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					OutputGuardrailResults:     outputGuardrailResults,
-					Usage:                      runCtx.Usage,
-					// currentInput already includes this turn's newItems and
-					// tool results.
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				result := buildResult(finalOutput, currentInput)
+				result.OutputGuardrailResults = outputGuardrailResults
+				return result, nil
 			}
 
 			// Pause when a tool explicitly requests it or when the LLM called
@@ -1719,18 +1634,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryPaused, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 					return nil, fmt.Errorf("persist pause checkpoint: %w", err)
 				}
-				return &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					// currentInput already includes this turn's newItems and
-					// tool results (pause tools produce paired outputs).
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				retainToolOutput = true
+				return buildResult(nil, currentInput), nil
 			}
 		}
 	}
@@ -1741,7 +1646,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 func (r *Runner) RunStreamed(ctx context.Context, agent *Agent, input []RunItem, cfg RunConfig) *StreamedRunResult {
 	events := make(chan StreamEvent, 64)
 	done := make(chan *RunResult, 1)
-	streamed := &StreamedRunResult{Events: events, done: done}
+	detach := make(chan struct{})
+	streamed := &StreamedRunResult{Events: events, done: done, detach: detach}
 	if r == nil {
 		streamed.setErr(fmt.Errorf("runner is nil"))
 		close(events)
@@ -1796,7 +1702,7 @@ func (r *Runner) RunStreamed(ctx context.Context, agent *Agent, input []RunItem,
 				done <- &RunResult{LastAgent: agent, Usage: Usage{}}
 			}
 		}()
-		result, err := r.run(ctx, agent, input, cfg, events)
+		result, err := r.run(ctx, agent, input, cfg, &runEventSink{events: events, detached: detach})
 		if err != nil {
 			streamed.setErr(err)
 			// A budget-exhausted run still hands back its accumulated
@@ -1898,7 +1804,7 @@ func settleImmediateInput(stop context.CancelFunc, commitment *modelOutputCommit
 	return resp, err
 }
 
-func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents chan<- StreamEvent, activity func(), commitment *modelOutputCommitment) (*ModelResponse, error) {
+func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, streamEvents *runEventSink, activity *modelCallActivity, commitment *modelOutputCommitment) (*ModelResponse, error) {
 	// Consume the public streaming interface for both Run and RunStreamed so
 	// built-in and third-party models get identical activity-reset semantics.
 	stream, err := model.StreamResponse(ctx, req)
@@ -1910,9 +1816,7 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 	// sink; the sink sets providerReasoning, so re-checks below must ignore
 	// the flag once we caused it ourselves.
 	modelFedReasoningSink := false
-	if activity != nil {
-		activity() // response headers / stream establishment are progress
-	}
+	activity.Touch() // response headers / stream establishment are progress
 
 	var streamedResp *ModelResponse
 	contextFailure := func() error {
@@ -1946,18 +1850,14 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 			}
 		}
 
-		if activity != nil {
-			activity()
-		}
+		activity.Touch()
 		switch ev.Type {
 		case ModelStreamDelta:
 			if streamEvents != nil {
 				if !commitment.markVisible() && !commitment.visible() {
 					return nil, contextFailure()
 				}
-				select {
-				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}:
-				case <-ctx.Done():
+				if !streamEvents.send(ctx, StreamEvent{Type: StreamEventRawResponse, Name: "model.delta", Delta: ev.Delta}, activity) {
 					return nil, contextFailure()
 				}
 			}
@@ -1980,9 +1880,7 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 				}
 			}
 			if streamEvents != nil {
-				select {
-				case streamEvents <- StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}:
-				case <-ctx.Done():
+				if !streamEvents.send(ctx, StreamEvent{Type: StreamEventRawResponse, Name: "model.reasoning_delta", Delta: ev.Delta}, activity) {
 					return nil, contextFailure()
 				}
 			}
@@ -1997,19 +1895,51 @@ func (r *Runner) callModel(ctx context.Context, model Model, req ModelRequest, s
 	}
 }
 
+// runEventSink is the run loop's side of a RunStreamed Events channel.
+type runEventSink struct {
+	events chan<- StreamEvent
+	// detached closes when the consumer calls FinalResult: callers that only
+	// wait for the result stop draining Events, so from then on sends are
+	// best-effort instead of blocking the run forever on a full buffer.
+	detached <-chan struct{}
+}
+
+// send delivers ev, waiting for a slow consumer until ctx is done (false) or
+// the consumer detaches (ev is dropped if the buffer is full). While blocked,
+// idle accounting on activity is paused: a slow consumer is not provider
+// inactivity.
+func (s *runEventSink) send(ctx context.Context, ev StreamEvent, activity *modelCallActivity) bool {
+	select {
+	case s.events <- ev:
+		return true
+	default:
+	}
+	resume := activity.Pause()
+	defer resume()
+	select {
+	case s.events <- ev:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-s.detached:
+		select {
+		case s.events <- ev:
+		default:
+		}
+		return true
+	}
+}
+
 // emitRunItems forwards run items to the stream without ever blocking past
-// context cancellation. StreamedRunResult consumers may stop draining Events
-// (e.g. callers that only wait on FinalResult); an unguarded send would then
-// block this run goroutine forever once the channel buffer fills.
-func emitRunItems(ctx context.Context, events chan<- StreamEvent, items []RunItem) {
+// context cancellation or consumer detachment (callers that only wait on
+// FinalResult stop draining Events).
+func emitRunItems(ctx context.Context, events *runEventSink, items []RunItem) {
 	if events == nil {
 		return
 	}
 	for i := range items {
 		item := items[i]
-		select {
-		case events <- StreamEvent{Type: StreamEventRunItem, Item: &item}:
-		case <-ctx.Done():
+		if !events.send(ctx, StreamEvent{Type: StreamEventRunItem, Item: &item}, nil) {
 			return
 		}
 	}
@@ -2081,8 +2011,8 @@ type toolCallStep struct {
 
 func (*toolCallStep) step() {}
 
-// finalOutputText renders a candidate final output as text for StopGate and
-// FinalAnswerVerifier callbacks.
+// finalOutputText renders a candidate final output as text for the
+// FinalAnswerVerifier callback.
 func finalOutputText(output any) string {
 	switch v := output.(type) {
 	case nil:
@@ -2251,7 +2181,9 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 				ReadOnly:   t.IsReadOnly(),
 				Provenance: "model-tool-call",
 			}
-			authorization, authErr := cfg.ActionAuthorizer.Authorize(ctx, request)
+			authorization, authErr := callRecovering("action authorizer", func() (ActionAuthorization, error) {
+				return cfg.ActionAuthorizer.Authorize(ctx, request)
+			})
 			authorization = NormalizeActionAuthorization(authorization, authErr)
 			audit := ActionAuditRecord{Request: request, Authorization: authorization}
 			if authErr != nil {
@@ -2299,63 +2231,67 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 		}())
 	}
 
-	var wg sync.WaitGroup
 	// Build a semaphore for sub-agent concurrency if configured.
 	var sem chan struct{}
 	if maxSubAgents > 0 {
 		sem = make(chan struct{}, maxSubAgents)
 	}
-	// Turn-scoped read/write lock (codex parallel-execution pattern):
-	// parallel-safe tools (read-only and control-flow/sub-agent tools) share a
-	// read lock and run concurrently; mutating tools (Edit, Write, Bash, …)
-	// take the write lock and run exclusively. This prevents two concurrent
-	// tool calls from editing the same file or racing a shell command against
-	// an in-flight edit, while keeping read fan-out and parallel delegation fast.
-	var mutationLock sync.RWMutex
-	wg.Add(len(work))
-	for _, w := range work {
-		go func(w asyncWork) {
-			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					slots[w.idx] = toolCallResult{
-						item: RunItem{
-							Type:  RunItemToolOutput,
-							Agent: agent,
-							ToolOutput: &ToolOutputData{
-								CallID:  w.call.ID,
-								Content: fmt.Sprintf("tool %q panicked: %v", w.call.Name, rec),
-								IsError: true,
-							},
+	runOne := func(w asyncWork) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slots[w.idx] = toolCallResult{
+					item: RunItem{
+						Type:  RunItemToolOutput,
+						Agent: agent,
+						ToolOutput: &ToolOutputData{
+							CallID:  w.call.ID,
+							Content: fmt.Sprintf("tool %q panicked: %v", w.call.Name, rec),
+							IsError: true,
 						},
-					}
+					},
 				}
-			}()
-			// Apply semaphore only for sub-agent tools (Agent.AsTool wrappers),
-			// detected by Go type rather than name prefix (finding M2).
-			isSubAgent := isSubAgentTool(w.tool)
-			if sem != nil && isSubAgent {
-				sem <- struct{}{}
-				defer func() { <-sem }()
 			}
-			if isParallelSafeTool(w.tool) {
-				mutationLock.RLock()
-				defer mutationLock.RUnlock()
-			} else {
-				mutationLock.Lock()
-				defer mutationLock.Unlock()
-			}
-			slots[w.idx] = r.executeSingleTool(ctx, runCtx, agent, w.tool, w.call, cfg)
-		}(w)
+		}()
+		// Apply semaphore only for sub-agent tools (Agent.AsTool wrappers),
+		// detected by Go type rather than name prefix (finding M2).
+		if sem != nil && isSubAgentTool(w.tool) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+		}
+		slots[w.idx] = r.executeSingleTool(ctx, runCtx, agent, w.tool, w.call, cfg)
 	}
-	wg.Wait()
+
+	// Ordered phases: a mutating tool (Edit, Write, Bash, …) waits for every
+	// earlier read-only call, runs alone, and only then are later calls
+	// started, so mutations apply in call order and reads observe the state
+	// the transcript implies. Consecutive read-only calls run concurrently.
+	// Control-flow/sub-agent tools manage their own isolation: they start
+	// after earlier mutations but never hold back later calls, so long-running
+	// delegations do not serialize the rest of the batch.
+	var all, readers sync.WaitGroup
+	for _, w := range work {
+		switch {
+		case isControlFlowToolInstance(w.tool):
+			all.Go(func() { runOne(w) })
+		case isParallelSafeTool(w.tool):
+			readers.Go(func() { runOne(w) })
+		default:
+			readers.Wait()
+			runOne(w)
+		}
+	}
+	readers.Wait()
+	all.Wait()
 
 	// Collect results in order.
 	var results []RunItem
 	var allInputGuardrails []ToolGuardrailResult
 	var allOutputGuardrails []ToolGuardrailResult
 	shouldPause := false
+	var firstErr error
 
+	// Every call in the batch has already run, so collect all slots even when
+	// one failed fatally: the caller keeps them in the partial result.
 	for _, slot := range slots {
 		results = append(results, slot.item)
 		allInputGuardrails = append(allInputGuardrails, slot.inputGuardrails...)
@@ -2363,12 +2299,12 @@ func (r *Runner) executeTools(ctx context.Context, runCtx *RunContext, agent *Ag
 		if slot.shouldPause {
 			shouldPause = true
 		}
-		if slot.guardrailErr != nil {
-			return results, allInputGuardrails, allOutputGuardrails, actionAudits, shouldPause, slot.guardrailErr
+		if slot.guardrailErr != nil && firstErr == nil {
+			firstErr = slot.guardrailErr
 		}
 	}
 
-	return results, allInputGuardrails, allOutputGuardrails, actionAudits, shouldPause, nil
+	return results, allInputGuardrails, allOutputGuardrails, actionAudits, shouldPause, firstErr
 }
 
 // executeSingleTool runs one tool call with guardrails and hooks. Thread-safe.
@@ -2564,6 +2500,15 @@ func prepareToolOutputSpill(cfg *RunConfig) func() {
 	}
 }
 
+// retainToolOutputSpill keeps a default (OS-temporary) spill directory that
+// holds outputs a paused run's history still references, removing it only
+// when nothing was spilled. Caller-managed directories are left untouched.
+func retainToolOutputSpill(cfg RunConfig) {
+	if strings.TrimSpace(cfg.ToolOutputDir) == "" && cfg.toolOutputSpillDir != "" {
+		_ = os.Remove(cfg.toolOutputSpillDir) // fails, by design, when non-empty
+	}
+}
+
 func resolveExistingDir(path string) (string, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -2609,6 +2554,31 @@ func isToolGuardrailTripwire(err error) bool {
 	}
 	var outputTripwire *ToolOutputGuardrailTripwireTriggered
 	return errors.As(err, &outputTripwire)
+}
+
+// toolCallsNeedParentHistory reports whether any call in the batch targets a
+// tool that can inherit parent history (the managed subagent tool and other
+// control-flow/sub-agent tools). Other batches skip the per-turn history copy.
+func toolCallsNeedParentHistory(tools []Tool, calls []ToolCallData) bool {
+	for _, call := range calls {
+		for _, t := range tools {
+			if t.Name() == call.Name && isControlFlowToolInstance(t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// toolResultsPaired reports whether every result is a tool output, i.e. no
+// call in the batch is left awaiting approval without a paired output.
+func toolResultsPaired(results []RunItem) bool {
+	for _, item := range results {
+		if item.Type != RunItemToolOutput {
+			return false
+		}
+	}
+	return true
 }
 
 // isParallelSafeTool reports whether a tool may run concurrently with other
@@ -2840,6 +2810,18 @@ func safeExecuteTool(t Tool, ctx context.Context, input json.RawMessage, workDir
 
 // fireRunHook safely calls a RunHooks callback if hooks is non-nil.
 // A panic in user-supplied hooks is recovered so it cannot crash the host.
+// callRecovering invokes a host-supplied callback, converting a panic into an
+// error so a buggy callback fails the run instead of crashing the host.
+func callRecovering[T any](name string, fn func() (T, error)) (out T, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			var zero T
+			out, err = zero, fmt.Errorf("%s panicked: %v", name, rec)
+		}
+	}()
+	return fn()
+}
+
 func fireRunHook(hooks RunHooks, fn func(RunHooks)) {
 	if hooks == nil {
 		return
@@ -3467,8 +3449,35 @@ func isContextLengthExceededError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "context_length_exceeded") ||
-		strings.Contains(msg, "exceeds the context window")
+	for _, phrase := range contextLengthErrorPhrases {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+	// "too many tokens" is also how some providers phrase throughput
+	// throttling (e.g. Bedrock "Too many tokens, please wait"), which
+	// compaction cannot fix.
+	return strings.Contains(msg, "too many tokens") &&
+		!strings.Contains(msg, "please wait") &&
+		!strings.Contains(msg, "rate limit") &&
+		!strings.Contains(msg, "rate_limit") &&
+		!strings.Contains(msg, "per minute") &&
+		!strings.Contains(msg, "throttl") &&
+		!strings.Contains(msg, "status 429")
+}
+
+// contextLengthErrorPhrases are provider phrasings for a request that does not
+// fit the model's context window: OpenAI ("context_length_exceeded", "maximum
+// context length"), Anthropic ("prompt is too long: N tokens > M maximum"),
+// Bedrock ("input is too long"), Gemini ("exceeds the maximum number of
+// tokens").
+var contextLengthErrorPhrases = []string{
+	"context_length_exceeded",
+	"exceeds the context window",
+	"prompt is too long",
+	"maximum context length",
+	"input is too long",
+	"exceeds the maximum number of tokens",
 }
 
 // isEncryptedContentError detects provider rejections of encrypted context

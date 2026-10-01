@@ -47,10 +47,14 @@ func (t *AutoTracker) Update(newItems []RunItem) {
 	var turnToolCalls []string
 	var turnToolSignatures []string
 	var turnErrors []string
+	turnSucceeded := false
 	for _, item := range newItems {
 		if item.Type == RunItemToolCall && item.ToolCall != nil {
 			turnToolCalls = append(turnToolCalls, item.ToolCall.Name)
 			turnToolSignatures = append(turnToolSignatures, toolCallSignature(item.ToolCall.Name, item.ToolCall.Input))
+		}
+		if item.Type == RunItemToolOutput && item.ToolOutput != nil && !item.ToolOutput.IsError {
+			turnSucceeded = true
 		}
 		if item.Type == RunItemToolOutput && item.ToolOutput != nil && item.ToolOutput.IsError {
 			msg := item.ToolOutput.Content
@@ -75,6 +79,12 @@ func (t *AutoTracker) Update(newItems []RunItem) {
 			t.recentToolCalls = t.recentToolCalls[1:]
 			t.recentToolSignatures = t.recentToolSignatures[1:]
 		}
+	}
+	// The same-error breaker targets errors with no progress in between; a
+	// successful tool call ends the streak so sporadic identical errors
+	// spread across hours of productive work never trip it.
+	if turnSucceeded {
+		t.recentErrors = nil
 	}
 	for _, errText := range turnErrors {
 		t.recentErrors = append(t.recentErrors, errText)

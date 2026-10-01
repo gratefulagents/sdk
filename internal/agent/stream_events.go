@@ -91,6 +91,11 @@ type StreamedRunResult struct {
 	Events <-chan StreamEvent
 	done   chan *RunResult
 
+	// detach is closed by FinalResult so the run stops waiting on an Events
+	// consumer that may never drain it.
+	detach     chan struct{}
+	detachOnce sync.Once
+
 	// resultOnce/result make FinalResult idempotent: only the first call
 	// receives from done, later calls return the cached result instead of
 	// nil from the closed channel.
@@ -103,9 +108,14 @@ type StreamedRunResult struct {
 
 // FinalResult blocks until the run completes and returns the result.
 // It is safe to call multiple times; every call returns the same result.
+// Draining Events is optional: once FinalResult is called, events the
+// consumer has not kept up with are dropped instead of stalling the run.
 func (s *StreamedRunResult) FinalResult() *RunResult {
 	if s == nil {
 		return nil
+	}
+	if s.detach != nil {
+		s.detachOnce.Do(func() { close(s.detach) })
 	}
 	s.resultOnce.Do(func() {
 		s.result = <-s.done

@@ -211,9 +211,9 @@ exhaust agent memory.
 ### Bounded local reads
 
 Read-oriented tools cap local file/image reads before buffering content in
-memory. `read_file` returns at most 100 KiB, image loading rejects files larger
-than 20 MiB before reading them, and exact file editing rejects files larger
-than 5 MiB. These are availability controls, not confidentiality controls.
+memory. `read_file` returns at most 100 KiB of text, image reads reject files
+larger than 20 MiB before reading them and attach at most 3.75 MB after
+downscaling, and exact file editing rejects files larger than 5 MiB. These are availability controls, not confidentiality controls.
 
 ### Provider retry caps
 

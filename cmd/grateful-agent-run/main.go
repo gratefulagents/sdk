@@ -427,7 +427,7 @@ func parseConfig(args []string) (cliConfig, []string, error) {
 	fs.BoolVar(&cfg.ExitZeroOnTimeout, "exit-zero-on-timeout", cfg.ExitZeroOnTimeout, "exit 0 after writing JSON when the run's own timeout expires")
 	fs.BoolVar(&cfg.ForceFinal, "force-final-summary", cfg.ForceFinal, "reserve final turn for summary")
 	fs.BoolVar(&cfg.Debug, "debug", cfg.Debug, "enable SDK debug logging")
-	fs.BoolVar(&cfg.AllowPrivateNetworkURLs, "allow-private-network-urls", cfg.AllowPrivateNetworkURLs, "allow WebFetch, Browser, and Vision tools to access private/local network URLs")
+	fs.BoolVar(&cfg.AllowPrivateNetworkURLs, "allow-private-network-urls", cfg.AllowPrivateNetworkURLs, "allow WebFetch and Browser tools to access private/local network URLs")
 	fs.BoolVar(&cfg.TerminalBenchCompliance, "terminal-bench-compliance", cfg.TerminalBenchCompliance, "block Terminal-Bench website and repository lookups from tool inputs")
 	fs.StringVar(&cfg.Output, "output", cfg.Output, "output format: text or json")
 	fs.StringVar(&cfg.EventLog, "event-log", cfg.EventLog, "write session event JSONL to this file")
