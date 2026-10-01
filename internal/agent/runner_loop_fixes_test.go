@@ -253,6 +253,7 @@ func TestIsContextLengthExceededErrorPhrasings(t *testing.T) {
 		"Input is too long for requested model.",
 		"Request has too many tokens for the model",
 		"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)",
+		"input length and `max_tokens` exceed context limit: 197232 + 8192 > 200000, decrease input length or `max_tokens` and try again",
 	} {
 		if !isContextLengthExceededError(errors.New(msg)) {
 			t.Errorf("isContextLengthExceededError(%q) = false, want true", msg)
