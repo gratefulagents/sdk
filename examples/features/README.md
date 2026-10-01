@@ -53,13 +53,12 @@ go test ./examples/features/guardrails
 | Errors and retries | [errors_retries](errors_retries/README.md) | `go test ./examples/features/errors_retries` |
 | Costs | [costs](costs/README.md) | `go test ./examples/features/costs` |
 | Policy primitives | [policy](policy/README.md) | `go test ./examples/features/policy` |
-| Memory | [memory](memory/README.md) | `go test ./examples/features/memory` |
 | Trace store | [tracestore](tracestore/README.md) | `go test ./examples/features/tracestore` |
 
 The helper packages under `internal/live*` and `internal/liverunner` are test dispatch helpers only. Application code should provide its own `agentsdk.Model`, use the provider packages directly, or assemble providers through `agentsdk.MultiProvider`.
 
 ## Feature Coverage Summary
 
-The SDK is organized around a small runtime core plus host adapters. The core features are the agent runner, model/provider abstraction, tool execution, guardrails, structured output, streaming, handoffs, sub-agents, compaction, retries, usage, costs, hooks, traces, and event streams. Host-oriented packages add runtime bundle construction, file-backed mode/role config, policy and permission mapping, MCP integration, sandboxed command execution, memory stores, conversation helpers, mode/phase helpers, built-in tools, and trace persistence.
+The SDK is organized around a small runtime core plus host adapters. The core features are the agent runner, model/provider abstraction, tool execution, guardrails, structured output, streaming, handoffs, sub-agents, compaction, retries, usage, costs, hooks, traces, and event streams. Host-oriented packages add runtime bundle construction, file-backed mode/role config, policy and permission mapping, MCP integration, sandboxed command execution, durable project state (tasks and memory), conversation helpers, mode/phase helpers, built-in tools, and trace persistence.
 
 Use these folders when you want a short example for one feature. Use [../../test/integration/openai_oauth](../../test/integration/openai_oauth/README.md) when you want the SDK-wide live OAuth integration test.

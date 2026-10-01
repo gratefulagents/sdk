@@ -28,11 +28,10 @@ If `OPENAI_OAUTH_AUTH_JSON_PATH` is unset, the tests look for `$HOME/.codex/auth
 | Modes and routing | `mode.TemplateSpec`, routing helpers, phase gates | Verifies phase tool access, role routing, completion/reset decisions, RBAC denial, plan gates, and git-clean gates. |
 | Specialists | `RoleCatalog`, `BuildSpecialistsFromCatalog` | Converts role specs into agent specialists with expected names/access metadata. |
 | Policy | `RuntimePolicy`, `ToolPolicy`, `PermissionMode` | Confirms default policy normalization, read-only filtering, shell command blocking, and approval-gated mutation. |
-| Built-in tools | `tools.NewRegistry` and file/search/shell/LSP/web/browser/signal/memory tools | Verifies registry membership and direct correctness for write/edit/read (including image reads)/glob/grep/list/bash/memory/signal tools. |
+| Built-in tools | `tools.NewRegistry` and file/search/shell/LSP/web/browser/signal tools | Verifies registry membership and direct correctness for write/edit/read (including image reads)/glob/grep/list/bash/signal tools. |
 | Tool security | Workspace path resolution, read-only registry, web/browser URL validation, shell blockers | Rejects workspace escape writes, read-only write exposure, loopback/private URL fetches, and blocked shell commands. |
 | MCP | `mcp.BuildTools`, break-glass helpers | Wraps an MCP manager as SDK tools, verifies argument forwarding/result conversion, and checks break-glass prompt content. |
 | Sandbox | `sandbox.Default`, `sandbox.Request` | Runs a bounded read-only shell command through the sandbox facade and checks output/exit code. |
-| Memory | `memory.Store`, `NoopEmbedder`, `tools/memory.Tool` | Stores/searches/deletes memories through both store API and tool API; verifies deterministic no-op embeddings. |
 | Events and observability | `EventStream`, `SessionEventStream`, `events.LineWriter`, `RunHooks`, `TracingProcessor` | Asserts run hooks, typed host events, tool events, text events, trace starts, and span starts. |
 | Trace store | `tracestore.FilesystemTraceStore` | Creates run directories, appends traces, writes scores, and filters listed runs. |
 | Context compaction | `MaybeCompactRunItems`, `ContextCompactor` | Verifies deterministic SDK compaction and live provider-native Responses compaction. |

@@ -12,7 +12,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,9 +32,8 @@ type FilesystemOptions struct {
 	WorkDir   string
 	Actor     string
 	RunID     string
-	// Embedder enables embeddings-backed hybrid memory recall. When nil,
-	// SearchMemories falls back to the lexical keyword search and behaves
-	// exactly as before.
+	// Embedder enables embeddings-backed hybrid memory search. When nil,
+	// SearchMemories ranks by LexicalScore alone.
 	Embedder Embedder
 	// Hybrid tunes lexical/semantic fusion. When nil, DefaultHybridConfig is
 	// used. Ignored when Embedder is nil.
@@ -59,12 +57,6 @@ type memoriesIndex struct {
 	SchemaVersion int       `json:"schema_version"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	Memories      []Memory  `json:"memories"`
-}
-
-type sessionsIndex struct {
-	SchemaVersion int              `json:"schema_version"`
-	UpdatedAt     time.Time        `json:"updated_at"`
-	Sessions      []SessionSummary `json:"sessions"`
 }
 
 func NewFilesystemStore(opts FilesystemOptions) (*FilesystemStore, error) {
@@ -341,17 +333,12 @@ func (b *fsBackend) snapshot(st *state) error {
 	for _, task := range st.tasks {
 		tasks = append(tasks, cloneTask(task))
 	}
-	sortTasks(tasks)
+	SortTasks(tasks)
 	memories := make([]Memory, 0, len(st.memories))
 	for _, mem := range st.memories {
 		memories = append(memories, cloneMemory(mem))
 	}
-	sort.SliceStable(memories, func(i, j int) bool { return memories[i].UpdatedAt.After(memories[j].UpdatedAt) })
-	sessions := make([]SessionSummary, 0, len(st.sessions))
-	for _, summary := range st.sessions {
-		sessions = append(sessions, cloneSession(summary))
-	}
-	sort.SliceStable(sessions, func(i, j int) bool { return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt) })
+	sortMemories(memories)
 
 	if err := writeJSONAtomic(filepath.Join(b.stateDir, "indexes", "project.json"), st.project); err != nil {
 		return err
@@ -360,9 +347,6 @@ func (b *fsBackend) snapshot(st *state) error {
 		return err
 	}
 	if err := writeJSONAtomic(filepath.Join(b.stateDir, "indexes", "memories.json"), memoriesIndex{SchemaVersion: SchemaVersion, UpdatedAt: now, Memories: memories}); err != nil {
-		return err
-	}
-	if err := writeJSONAtomic(filepath.Join(b.stateDir, "indexes", "sessions.json"), sessionsIndex{SchemaVersion: SchemaVersion, UpdatedAt: now, Sessions: sessions}); err != nil {
 		return err
 	}
 	return nil
@@ -487,132 +471,6 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-func applyPatch(task *Task, patch TaskPatch, now time.Time) {
-	if patch.Title != nil {
-		task.Title = strings.TrimSpace(*patch.Title)
-	}
-	if patch.Description != nil {
-		task.Description = strings.TrimSpace(*patch.Description)
-	}
-	if patch.Type != nil {
-		task.Type = normalizeTaskType(*patch.Type)
-	}
-	if patch.Status != nil {
-		task.Status = normalizeTaskStatus(*patch.Status)
-		if task.Status == TaskStatusClosed {
-			task.ClosedAt = &now
-		} else {
-			task.ClosedAt = nil
-		}
-	}
-	if patch.Priority != nil {
-		task.Priority = normalizePriority(*patch.Priority)
-	}
-	if patch.Assignee != nil {
-		task.Assignee = strings.TrimSpace(*patch.Assignee)
-	}
-	if patch.ReplaceLabels {
-		task.Labels = uniqueNonEmpty(patch.Labels)
-	}
-	if patch.Metadata != nil {
-		task.Metadata = cloneRaw(*patch.Metadata)
-	}
-	task.UpdatedAt = now
-}
-
-func hasOpenBlocker(st *state, task Task) bool {
-	for _, depID := range task.DependsOn {
-		dep, ok := st.tasks[depID]
-		if !ok || dep.Status != TaskStatusClosed {
-			return true
-		}
-	}
-	return false
-}
-
-func recomputeBlocks(st *state) {
-	for id, task := range st.tasks {
-		task.Blocks = nil
-		st.tasks[id] = task
-	}
-	for id, task := range st.tasks {
-		for _, depID := range task.DependsOn {
-			dep, ok := st.tasks[depID]
-			if !ok {
-				continue
-			}
-			dep.Blocks = appendUnique(dep.Blocks, id)
-			st.tasks[depID] = dep
-		}
-	}
-}
-
-func normalizeTaskType(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case TaskTypeBug:
-		return TaskTypeBug
-	case TaskTypeFeature, "feat":
-		return TaskTypeFeature
-	case TaskTypeChore:
-		return TaskTypeChore
-	case TaskTypeEpic:
-		return TaskTypeEpic
-	default:
-		return TaskTypeTask
-	}
-}
-
-func normalizeTaskStatus(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case TaskStatusInProgress, "in-progress", "claimed":
-		return TaskStatusInProgress
-	case TaskStatusBlocked:
-		return TaskStatusBlocked
-	case TaskStatusClosed, "done", "completed":
-		return TaskStatusClosed
-	case TaskStatusDeferred:
-		return TaskStatusDeferred
-	default:
-		return TaskStatusOpen
-	}
-}
-
-func normalizePriority(value int) int {
-	if value < 0 {
-		return 0
-	}
-	if value > 4 {
-		return 4
-	}
-	return value
-}
-
-func normalizeMemoryKind(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case MemoryKindPinned:
-		return MemoryKindPinned
-	case MemoryKindEpisodic:
-		return MemoryKindEpisodic
-	case MemoryKindProcedural:
-		return MemoryKindProcedural
-	default:
-		return MemoryKindSemantic
-	}
-}
-
-func normalizeMemoryScope(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case MemoryScopeUser:
-		return MemoryScopeUser
-	case MemoryScopeTask:
-		return MemoryScopeTask
-	case MemoryScopeFile:
-		return MemoryScopeFile
-	default:
-		return MemoryScopeProject
-	}
-}
-
 func sanitizeProjectID(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder
@@ -635,56 +493,6 @@ func sanitizeProjectID(value string) string {
 func newID(prefix string) string {
 	id := strings.ReplaceAll(uuid.NewString(), "-", "")
 	return prefix + "_" + id[:12]
-}
-
-func sortTasks(tasks []Task) {
-	sort.SliceStable(tasks, func(i, j int) bool {
-		if tasks[i].Status != tasks[j].Status {
-			return tasks[i].Status < tasks[j].Status
-		}
-		if tasks[i].Priority != tasks[j].Priority {
-			return tasks[i].Priority < tasks[j].Priority
-		}
-		if !tasks[i].UpdatedAt.Equal(tasks[j].UpdatedAt) {
-			return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
-		}
-		return tasks[i].ID < tasks[j].ID
-	})
-}
-
-func limitTasks(tasks []Task, limit int) []Task {
-	if limit > 0 && len(tasks) > limit {
-		tasks = tasks[:limit]
-	}
-	out := make([]Task, len(tasks))
-	copy(out, tasks)
-	return out
-}
-
-func memoryMatchesQuery(mem Memory, query string) bool {
-	haystack := strings.ToLower(strings.Join(append([]string{mem.Content, mem.Kind, mem.Scope}, append(mem.Tags, append(mem.TaskIDs, mem.FilePaths...)...)...), " "))
-	if strings.Contains(haystack, query) {
-		return true
-	}
-	for _, term := range strings.Fields(query) {
-		if strings.Contains(haystack, term) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchesAny(actual string, wanted []string) bool {
-	if len(wanted) == 0 {
-		return true
-	}
-	actual = strings.ToLower(strings.TrimSpace(actual))
-	for _, want := range wanted {
-		if actual == strings.ToLower(strings.TrimSpace(want)) {
-			return true
-		}
-	}
-	return false
 }
 
 func matchesLabels(actual, wanted []string) bool {
@@ -768,20 +576,12 @@ func cloneMemoryPtr(mem Memory) *Memory {
 }
 
 func cloneMemory(mem Memory) Memory {
-	mem.Tags = append([]string(nil), mem.Tags...)
-	mem.TaskIDs = append([]string(nil), mem.TaskIDs...)
-	mem.FilePaths = append([]string(nil), mem.FilePaths...)
-	mem.Metadata = cloneRaw(mem.Metadata)
-	if mem.LastReadAt != nil {
-		t := *mem.LastReadAt
-		mem.LastReadAt = &t
+	mem.Citations = append([]Citation(nil), mem.Citations...)
+	if mem.LastUsedAt != nil {
+		t := *mem.LastUsedAt
+		mem.LastUsedAt = &t
 	}
 	return mem
-}
-
-func cloneSession(summary SessionSummary) SessionSummary {
-	summary.TaskIDs = append([]string(nil), summary.TaskIDs...)
-	return summary
 }
 
 func cloneRaw(raw json.RawMessage) json.RawMessage {

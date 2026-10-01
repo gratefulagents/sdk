@@ -315,7 +315,7 @@ func TestRegistryCapabilityParity(t *testing.T) {
 		"github-pull-request":  ToolFeatures{GitHubPullRequest: true}.hasRegistryTools(),
 		"github-issue":         ToolFeatures{GitHubIssue: true}.hasRegistryTools(),
 	}
-	hostOnly := map[string]bool{"memory": true}
+	hostOnly := map[string]bool{}
 	seen := map[string]bool{}
 	for _, capability := range sdktools.RegistryCapabilities() {
 		if seen[capability.Family] {
@@ -365,7 +365,7 @@ func TestBuildToolBundleStrictProjectStateCanExposeMemoryOnly(t *testing.T) {
 	for _, tool := range bundle.Tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"memory_remember", "memory_recall", "memory_list", "memory_update", "memory_delete", "memory_stats"} {
+	for _, want := range []string{"memory_search", "memory_get", "memory_save", "memory_verify", "memory_delete"} {
 		if !names[want] {
 			t.Fatalf("missing memory tool %q; names=%v", want, toolNames(bundle.Tools))
 		}
@@ -454,11 +454,11 @@ func TestBuildToolBundleIncludesProjectStateTools(t *testing.T) {
 		"task_ready",
 		"task_claim",
 		"task_close",
-		"memory_remember",
-		"memory_recall",
-		"memory_update",
+		"memory_search",
+		"memory_get",
+		"memory_save",
+		"memory_verify",
 		"memory_delete",
-		"memory_stats",
 		"prime_context",
 	} {
 		if !names[want] {

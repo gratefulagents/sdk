@@ -36,9 +36,8 @@ flowchart TD
 - `pkg/agentsdk/host/fileconfig`: file-backed mode and role config.
 - `pkg/agentsdk/tracestore`: filesystem trace persistence.
 - `pkg/agentsdk/otel`: OpenTelemetry bridge.
-- `pkg/agentsdk/memory`: memory store and embedding helpers.
-- `pkg/agentsdk/projectstate`: durable event-sourced project state with typed tasks and typed long-term memories. Memory recall is lexical by default and hybrid (lexical + embedding cosine similarity) when an `Embedder` is configured.
-- `pkg/agentsdk/tools/projectstate`: agent-facing tools over a `projectstate.Store` (`task_*`, `memory_remember`, `memory_recall`, `memory_list`, `memory_update`, `memory_delete`, `memory_stats`, `prime_context`). See [Project State Tools](projectstate-tools.md) for enablement and usage examples.
+- `pkg/agentsdk/projectstate`: durable event-sourced project state with typed tasks and short, typed, citable memories (preference, decision, fact, procedure), plus a deterministic briefing (`PrimeContext`/`RenderBriefing`). Memory search is lexical (`LexicalScore`) by default and hybrid (lexical + embedding cosine similarity) when an `Embedder` is configured. Exported pure helpers (validation, scoring, briefing selection, task helpers) are shared with other `Store` implementations.
+- `pkg/agentsdk/tools/projectstate`: agent-facing tools over a `projectstate.Store` (`task_*`, `memory_search`, `memory_get`, `memory_save`, `memory_verify`, `memory_delete`, `prime_context`). See [Project State Tools](projectstate-tools.md) for enablement and usage examples.
 - `cmd/grateful-agent-run`: CLI and evaluation harness.
 - `examples`: focused runnable examples.
 - `test/integration`: live integration suites.

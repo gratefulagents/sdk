@@ -39,8 +39,8 @@ type SQLiteOptions struct {
 	WorkDir   string
 	Actor     string
 	RunID     string
-	// Embedder enables embeddings-backed hybrid memory recall. When nil,
-	// SearchMemories falls back to lexical keyword search.
+	// Embedder enables embeddings-backed hybrid memory search. When nil,
+	// SearchMemories ranks by LexicalScore alone.
 	Embedder Embedder
 	// Hybrid tunes lexical/semantic fusion. When nil, DefaultHybridConfig is used.
 	Hybrid *HybridConfig

@@ -91,27 +91,76 @@ func TestFilesystemStoreMemoriesAndPrime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Kind: MemoryKindPinned, Content: "Use append-only project state.", Tags: []string{"state"}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Kind: MemoryKindProcedural, Content: "Run focused projectstate tests after storage changes.", TaskIDs: []string{task.ID}}); err != nil {
-		t.Fatal(err)
-	}
-	memories, err := store.SearchMemories(ctx, MemoryFilter{Query: "focused"})
+	decision, err := store.SaveMemory(ctx, SaveMemoryInput{Kind: MemoryKindDecision, Title: "Use append-only project state", Body: "State is event-sourced so it can be replayed after crashes."})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(memories) != 1 || memories[0].Kind != MemoryKindProcedural {
-		t.Fatalf("memories = %+v", memories)
+	procedure, err := store.SaveMemory(ctx, SaveMemoryInput{Kind: MemoryKindProcedure, Title: "Test storage changes", Body: "Run focused projectstate tests after storage changes.", Citations: []Citation{{Path: "pkg/agentsdk/projectstate"}}})
+	if err != nil {
+		t.Fatal(err)
 	}
+	hits, err := store.SearchMemories(ctx, MemoryQuery{Query: "focused"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != procedure.ID || hits[0].Score <= 0 {
+		t.Fatalf("hits = %+v", hits)
+	}
+	hits, err = store.SearchMemories(ctx, MemoryQuery{Query: "focused", Kinds: []string{MemoryKindDecision}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("kind-filtered hits = %+v, want none", hits)
+	}
+
+	if _, err := store.VerifyMemory(ctx, procedure.ID, "abc1234"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchMemories(ctx, []string{procedure.ID, "mem_unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.SaveMemory(ctx, SaveMemoryInput{ID: procedure.ID, Kind: MemoryKindProcedure, Title: "Test storage changes", Body: "Run go test ./pkg/agentsdk/projectstate/... after storage changes."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.UseCount != 1 || updated.LastUsedAt == nil || !updated.CreatedAt.Equal(procedure.CreatedAt) || updated.CommitSHA != "" {
+		t.Fatalf("updated memory = %+v, want preserved usage and created_at", updated)
+	}
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{ID: "mem_missing", Title: "x", Body: "y"}); err == nil {
+		t.Fatal("saving an unknown id should fail")
+	}
+
+	listed, err := store.ListMemories(ctx, MemoryFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || listed[0].ID != decision.ID || listed[1].ID != procedure.ID {
+		t.Fatalf("listed = %+v, want decision before procedure", listed)
+	}
+
 	prime, err := store.PrimeContext(ctx, PrimeOptions{Actor: "tester"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Durable Project State", task.ID, "Use append-only project state."} {
+	for _, want := range []string{"Durable Project State", task.ID, "Memory Index (2 of 2)", "- " + decision.ID + " [decision] Use append-only project state"} {
 		if !strings.Contains(prime, want) {
 			t.Fatalf("prime missing %q:\n%s", want, prime)
 		}
+	}
+	again, err := store.PrimeContext(ctx, PrimeOptions{Actor: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != prime {
+		t.Fatalf("prime is not deterministic:\n%s\n---\n%s", prime, again)
+	}
+
+	if err := store.DeleteMemory(ctx, decision.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetMemory(ctx, decision.ID); err == nil {
+		t.Fatal("deleted memory still readable")
 	}
 }
 
