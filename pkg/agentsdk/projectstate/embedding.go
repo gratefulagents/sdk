@@ -4,13 +4,11 @@ import (
 	"context"
 	"math"
 	"sort"
-	"strings"
 	"time"
 )
 
 // Embedder turns text into dense vectors for semantic memory retrieval. It is
-// optional: when a FilesystemStore has no embedder, memory recall falls back to
-// the lexical keyword search and behaves exactly as before.
+// optional: without an embedder, SearchMemories ranks by LexicalScore alone.
 //
 // Implementations should be safe for concurrent use and should embed the input
 // slice as a batch, returning one vector per input in the same order.
@@ -30,8 +28,9 @@ type HybridConfig struct {
 	LexicalWeight float64
 	// DenseWeight weights the semantic (cosine similarity) score.
 	DenseWeight float64
-	// PinnedBoost is added to the score of pinned memories so durable facts
-	// surface ahead of incidental matches of equal relevance.
+	// PinnedBoost is added to the score of preference and decision memories
+	// so durable guidance surfaces ahead of incidental matches of equal
+	// relevance.
 	PinnedBoost float64
 	// RecencyWeight weights an exponential recency score in [0,1].
 	RecencyWeight float64
@@ -43,7 +42,7 @@ type HybridConfig struct {
 }
 
 // DefaultHybridConfig returns balanced defaults: semantic similarity leads,
-// keyword overlap supports it, pinned memories get a small boost, and recency
+// keyword overlap supports it, preferences and decisions get a small boost, and recency
 // is a light tie-breaker with a 30 day half-life.
 func DefaultHybridConfig() HybridConfig {
 	return HybridConfig{
@@ -67,105 +66,55 @@ func (c HybridConfig) normalized() HybridConfig {
 	return c
 }
 
-// scoredMemory pairs a memory with its fused relevance score.
-type scoredMemory struct {
-	memory Memory
-	score  float64
-}
-
-// rankHybrid fuses lexical and semantic signals into a ranked memory list.
+// rankHybrid scores candidates against query, best first, dropping those with
+// no relevance signal.
 //
-// queryVec may be nil (no embedder or embedding failure); in that case only the
-// lexical signal contributes, so the function degrades gracefully to keyword
-// ranking instead of failing the recall. vectors maps memory ID to its cached
-// embedding; memories without a vector simply score 0 on the dense axis.
-func rankHybrid(query string, candidates []Memory, queryVec []float32, vectors map[string][]float32, cfg HybridConfig, now time.Time) []Memory {
+// Without a query vector (no embedder, or the query embedding failed) the score
+// is LexicalScore alone. With one, the score fuses the lexical score with
+// cosine similarity against the cached vectors, plus the kind boost and
+// recency weight from cfg. Memories without a cached vector score 0 on the
+// dense axis.
+func rankHybrid(query string, candidates []Memory, queryVec []float32, vectors map[string][]float32, cfg HybridConfig, now time.Time) []MemoryHit {
 	cfg = cfg.normalized()
-	terms := strings.Fields(strings.ToLower(strings.TrimSpace(query)))
-
-	lexRaw := make([]float64, len(candidates))
-	var maxLex float64
-	for i, mem := range candidates {
-		lexRaw[i] = lexicalScore(mem, terms)
-		if lexRaw[i] > maxLex {
-			maxLex = lexRaw[i]
-		}
-	}
-
-	scored := make([]scoredMemory, 0, len(candidates))
-	for i, mem := range candidates {
-		var lexNorm float64
-		if maxLex > 0 {
-			lexNorm = lexRaw[i] / maxLex
-		}
-		var denseNorm float64
+	hits := make([]MemoryHit, 0, len(candidates))
+	for _, mem := range candidates {
+		lex := LexicalScore(query, mem)
+		score := lex
 		if len(queryVec) > 0 {
+			var dense float64
 			if vec, ok := vectors[mem.ID]; ok && len(vec) > 0 {
-				denseNorm = math.Max(0, cosineSimilarity(queryVec, vec))
+				dense = math.Max(0, cosineSimilarity(queryVec, vec))
+			}
+			// Boosts amplify relevance; they must not manufacture it.
+			if lex == 0 && dense == 0 {
+				continue
+			}
+			score = cfg.LexicalWeight*lex + cfg.DenseWeight*dense
+			if mem.Kind == MemoryKindPreference || mem.Kind == MemoryKindDecision {
+				score += cfg.PinnedBoost
+			}
+			if cfg.RecencyWeight > 0 {
+				score += cfg.RecencyWeight * recencyScore(mem.UpdatedAt, now, cfg.RecencyHalfLife)
+			}
+			if score < cfg.MinScore {
+				continue
 			}
 		}
-		// No relevance signal at all: pinned/recency boosts amplify relevance,
-		// they must not manufacture it, or recall pads the limit with
-		// query-irrelevant memories.
-		if lexNorm == 0 && denseNorm == 0 {
+		if score <= 0 {
 			continue
 		}
-		score := cfg.LexicalWeight*lexNorm + cfg.DenseWeight*denseNorm
-		if mem.Kind == MemoryKindPinned {
-			score += cfg.PinnedBoost
-		}
-		if cfg.RecencyWeight > 0 {
-			score += cfg.RecencyWeight * recencyScore(mem.UpdatedAt, now, cfg.RecencyHalfLife)
-		}
-		if score < cfg.MinScore {
-			continue
-		}
-		scored = append(scored, scoredMemory{memory: cloneMemory(mem), score: score})
+		hits = append(hits, MemoryHit{Memory: cloneMemory(mem), Score: score})
 	}
-
-	sort.SliceStable(scored, func(i, j int) bool {
-		if scored[i].score != scored[j].score {
-			return scored[i].score > scored[j].score
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Score != hits[j].Score {
+			return hits[i].Score > hits[j].Score
 		}
-		return scored[i].memory.UpdatedAt.After(scored[j].memory.UpdatedAt)
+		if !hits[i].UpdatedAt.Equal(hits[j].UpdatedAt) {
+			return hits[i].UpdatedAt.After(hits[j].UpdatedAt)
+		}
+		return hits[i].ID < hits[j].ID
 	})
-
-	out := make([]Memory, len(scored))
-	for i := range scored {
-		out[i] = scored[i].memory
-	}
-	return out
-}
-
-// lexicalScore ranks a memory against query terms using term frequency plus a
-// coverage bonus for matching distinct terms. It is deliberately simple and
-// deterministic so hybrid ranking stays testable without a live embedder.
-func lexicalScore(mem Memory, terms []string) float64 {
-	if len(terms) == 0 {
-		return 0
-	}
-	haystack := strings.ToLower(strings.Join(append([]string{mem.Content, mem.Kind, mem.Scope}, append(mem.Tags, append(mem.TaskIDs, mem.FilePaths...)...)...), " "))
-	if haystack == "" {
-		return 0
-	}
-	var tf float64
-	var covered int
-	for _, term := range terms {
-		if term == "" {
-			continue
-		}
-		if n := strings.Count(haystack, term); n > 0 {
-			tf += float64(n)
-			covered++
-		}
-	}
-	if covered == 0 {
-		return 0
-	}
-	// Coverage of distinct query terms is weighted more heavily than raw term
-	// frequency so a memory matching every term outranks one that merely
-	// repeats a single term.
-	return tf + 2*float64(covered)
+	return hits
 }
 
 // recencyScore returns an exponential decay in (0,1]: 1 at age 0, 0.5 at one

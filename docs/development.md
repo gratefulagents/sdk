@@ -98,7 +98,6 @@ every test file under `examples/features/` to the env it uses under the
 | `guardrails` | `guardrails_test.go` | OpenAI OAuth (first two tests) | same as above |
 | `handoffs_subagents` | `handoffs_subagents_test.go` | OpenAI OAuth | same as above |
 | `mcp` | `mcp_test.go` | none (offline) | — |
-| `memory` | `memory_test.go` | none (offline) | — |
 | `model_abstraction` | `model_abstraction_test.go` | OpenAI OAuth | same as above |
 | `observability` | `observability_test.go` | OpenAI OAuth | same as above |
 | `policy` | `policy_test.go` | OpenAI OAuth (`TestRunnerToolPolicyExample` only; `TestPolicyExample` is offline) | same as above |

@@ -1,33 +1,54 @@
 // Package projectstate implements durable, event-sourced project state for
-// agents: typed tasks, typed long-term memories, session summaries, and a
-// prime-context builder. State is persisted under a state directory as an
-// append-only event log (events.jsonl) with derived JSON indexes, so it
-// survives process restarts and context compaction.
+// agents: typed tasks, typed citable memories, and a deterministic briefing.
+// State is persisted as an append-only event log (events.jsonl for
+// FilesystemStore, an events table for SQLiteStore) and rebuilt by replay, so
+// it survives process restarts and context compaction.
 //
-// # Memory model
+// # Memory model (v2)
 //
-// Memories are typed by Kind (pinned, semantic, episodic, procedural) and
-// Scope (project, user, task, file). Store them with UpsertMemory, retrieve
-// them with SearchMemories (query required) or ListMemories, and surface a
-// compact session-start summary with PrimeContext.
+// A Memory is a short, typed, citable piece of durable knowledge: a one-line
+// Title (≤ MaxMemoryTitleLen) and a Body (≤ MaxMemoryBodyLen). Kinds are:
 //
-// # Hybrid recall
+//   - preference: how the user/owner wants work done
+//   - decision: durable product/architecture decisions with rationale
+//   - fact: non-obvious facts and gotchas about the project
+//   - procedure: repeatable how-tos
 //
-// By default SearchMemories ranks memories with a lexical keyword score. When
-// a FilesystemStore is configured with an Embedder, recall becomes hybrid: it
-// fuses the normalized lexical score with cosine similarity over cached
-// embeddings, plus a small pinned boost and recency decay (all tunable via
-// HybridConfig). Candidates are filtered by kind and tags but not by keyword,
-// so semantically relevant memories surface even when they share no exact
-// terms with the query. With no Embedder, recall falls back to the lexical
-// path unchanged, so embeddings are fully optional and backward compatible.
+// Citations anchor a memory to workspace-relative file paths or URLs, and
+// CommitSHA records the repository HEAD when it was last saved or verified, so
+// callers can detect staleness (cited files changed or removed, or VerifiedAt
+// older than MemoryStaleAfter) and re-verify with VerifyMemory. TouchMemories
+// records reads; usage feeds briefing selection.
 //
-// Embeddings are computed on write and cached in indexes/embeddings.json,
-// keyed by content hash and model so the cache self-invalidates when a
-// memory's content or the embedding model changes. Memories written before an
-// embedder was configured are backfilled lazily on the next recall. Embedding
-// failures never block writes and degrade recall to whatever vectors already
-// exist alongside the lexical signal.
+// SaveMemory validates input with ValidateMemoryInput, creates (empty ID) or
+// fully replaces (existing ID) a memory, and enforces DefaultMemoryCap so the
+// set is consolidated rather than accumulated. Legacy v1 memory.upserted
+// events are replayed into v2 memories (title derived with LegacyMemoryTitle,
+// kinds mapped with NormalizeMemoryKind); v1 session summaries are ignored.
+//
+// # Recall
+//
+// SearchMemories ranks memories by LexicalScore, the weighted fraction of
+// query tokens found in the title (1.0) or body/citations (0.6). When a store
+// is configured with an Embedder, the lexical score is fused with cosine
+// similarity over cached embeddings of Title+"\n"+Body, plus a small boost for
+// preferences/decisions and a recency weight (tunable via HybridConfig).
+// Embeddings are cached on write keyed by content hash and model, backfilled
+// lazily on search, and failures never block writes; recall degrades to the
+// lexical signal.
+//
+// # Briefing
+//
+// PrimeContext renders RenderBriefing: the active task, ready and blocked
+// work, and a memory index (id, kind, title) chosen by SelectBriefingMemories
+// within BriefingMemoryBudget bytes. Output contains no timestamps and is
+// deterministic for a given state, so it is prompt-cache friendly. Agents load
+// full memories on demand by id and search for anything not listed.
+//
+// The exported pure helpers (NormalizeMemoryKind, ValidateMemoryInput,
+// LexicalScore, Similarity, SelectBriefingMemories, RenderBriefing, the task
+// helpers, ...) are shared with other Store implementations so behavior stays
+// identical across backends.
 //
 // # Embedders
 //

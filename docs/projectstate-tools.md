@@ -27,85 +27,75 @@ store, err := projectstate.NewFilesystemStore(projectstate.FilesystemOptions{
 	WorkDir:   workDir,
 	Actor:     "assistant",
 })
-tools := projectstatetools.Tools(store, "assistant")
+tools := projectstatetools.Tools(store, "assistant", projectstatetools.WithWorkDir(workDir))
 ```
+
+`WithWorkDir` lets the memory tools record the repository HEAD on save and
+check cited files for staleness. Without it only the age rule applies.
 
 ## Memory Tools
 
-`memory_remember` writes or replaces a typed memory. Use it for durable facts,
-preferences, procedures, and episode summaries that should survive context
-compaction.
+Memories are short, typed, citable pieces of durable knowledge: a one-line
+title (max 120 characters), a body (max 1500 characters), a kind, and optional
+citations (workspace-relative paths or URLs). Kinds are `preference` (how the
+user wants work done), `decision` (durable choices with rationale), `fact`
+(non-obvious facts and gotchas), and `procedure` (repeatable how-tos). Progress
+logs and PR changelogs do not belong in memory.
 
-```json
-{
-  "content": "User prefers compact engineering answers.",
-  "kind": "semantic",
-  "scope": "user",
-  "tags": ["preference", "style"]
-}
-```
-
-`memory_recall` searches memories by query, kind, and tag. Recall is lexical by
-default and becomes hybrid lexical plus embedding similarity when the store has
-an embedder.
+`memory_search` ranks memories by query (lexical by default, hybrid lexical plus
+embedding similarity when the store has an embedder). Hits include a snippet,
+a score rounded to two decimals, and `stale`/`stale_reason` when the memory
+needs re-verification.
 
 ```json
 {
   "query": "answer style",
-  "tags": ["preference"],
+  "kinds": ["preference"],
   "limit": 5
 }
 ```
 
-`memory_list` lists memories without requiring a query. Use it for inspection,
-audits, and workflows that need exact memory IDs.
+`memory_get` returns one memory in full plus `stale`/`stale_reason`, and records
+the use. A memory is stale when a cited file no longer exists, cited files
+changed since the commit it was verified at, or it has not been verified for
+90 days.
+
+```json
+{ "id": "mem_abc123" }
+```
+
+`memory_save` creates a memory (no `id`) or replaces one (`id`; omitted fields
+keep their current values). New memories that are near-duplicates of existing
+ones are rejected with the candidate ids unless `allow_duplicate` is true. The
+result carries a `warning` when the text reads like a progress log.
 
 ```json
 {
-  "kinds": ["semantic"],
-  "tags": ["preference"]
+  "kind": "preference",
+  "title": "Compact engineering answers",
+  "body": "The user wants compact answers with concrete file references.",
+  "citations": [{ "path": "docs/style.md" }]
 }
 ```
 
-`memory_update` edits an existing memory by ID. Omitted fields preserve the
-current value, while an empty array clears tags, task IDs, or file paths.
+`memory_verify` marks a memory as re-checked against its sources (records the
+current HEAD and resets the age). `memory_delete` removes an obsolete memory.
 
 ```json
-{
-  "id": "mem_abc123",
-  "content": "User prefers compact answers with concrete file references.",
-  "kind": "procedural",
-  "tags": ["preference", "style"]
-}
-```
-
-`memory_delete` removes one memory by ID.
-
-```json
-{
-  "id": "mem_abc123"
-}
-```
-
-`memory_stats` summarizes the current memory set by kind, scope, and tag. It
-accepts the same kind and tag filters as `memory_list`.
-
-```json
-{
-  "tags": ["preference"]
-}
+{ "id": "mem_abc123", "reason": "superseded by mem_def456" }
 ```
 
 ## Context Priming
 
-`prime_context` returns a compact project-state summary for the start of a run.
-Use it when an agent should see active tasks, recent session summaries, and
-selected long-term memories before planning work.
+`prime_context` returns a deterministic project-state briefing for the start of
+a run: the active task, ready and blocked work, and a memory index
+(`- <id> [<kind>] <title>`) selected within a fixed byte budget. Preferences and
+decisions are listed first; facts and procedures are ranked by use and recency.
+Agents load full memories with `memory_get` and search for anything not listed.
 
 ```json
 {
   "active_task_id": "task_abc123",
-  "memory_limit": 8,
-  "session_limit": 3
+  "ready_limit": 8
 }
 ```

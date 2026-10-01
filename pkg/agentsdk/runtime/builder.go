@@ -298,7 +298,6 @@ func (b *Builder) Build(ctx context.Context) (*Bundle, error) {
 				Actor:        projectStateActor(cfg),
 				ActiveTaskID: cfg.ProjectStateActiveTaskID,
 				ReadyLimit:   8,
-				MemoryLimit:  8,
 			}); err != nil {
 				b.emitLog("project state warning: " + err.Error())
 			} else if strings.TrimSpace(prime) != "" {
@@ -928,12 +927,11 @@ func projectStateTools(cfg Config, features ProjectStateFeatures) []agentsdk.Too
 	}
 	if features.MemoryTools {
 		for _, name := range []string{
-			"memory_remember",
-			"memory_recall",
-			"memory_list",
-			"memory_update",
+			"memory_search",
+			"memory_get",
+			"memory_save",
+			"memory_verify",
 			"memory_delete",
-			"memory_stats",
 		} {
 			allowed[name] = true
 		}
@@ -941,7 +939,7 @@ func projectStateTools(cfg Config, features ProjectStateFeatures) []agentsdk.Too
 	if features.PrimeTool {
 		allowed["prime_context"] = true
 	}
-	return filterNamedTools(sdkprojectstatetools.Tools(cfg.ProjectStateStore, projectStateActor(cfg)), allowed)
+	return filterNamedTools(sdkprojectstatetools.Tools(cfg.ProjectStateStore, projectStateActor(cfg), sdkprojectstatetools.WithWorkDir(cfg.WorkDir)), allowed)
 }
 
 func asyncSubAgentToolNames(features AsyncSubAgentFeatures) map[string]bool {

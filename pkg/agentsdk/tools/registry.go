@@ -6,14 +6,12 @@ import (
 	"strings"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
-	sdkmemory "github.com/gratefulagents/sdk/pkg/agentsdk/memory"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/browser"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/fs"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
-	memorytool "github.com/gratefulagents/sdk/pkg/agentsdk/tools/memory"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/signal"
@@ -51,7 +49,6 @@ func RegistryCapabilities() []RegistryCapability {
 		{Family: "attach-repository", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAttachRepositoryTool"}},
 		{Family: "github-pull-request", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithGitHubPullRequestTool"}},
 		{Family: "github-issue", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithGitHubIssueTool"}},
-		{Family: "memory", Classification: RegistryCapabilityHostOnly, Options: []string{"WithMemoryStore"}},
 	}
 }
 
@@ -68,7 +65,6 @@ type Registry struct {
 	disableWeb              bool
 	allowPrivateNetworkURLs bool
 	readFileImages          bool
-	memoryTool              *memorytool.Tool
 	lspTool                 *lsp.Tool
 	commandSandboxConfig    *sandbox.Config
 	asyncShell              bool
@@ -150,12 +146,6 @@ func WithInteractiveTerminal() RegistryOption {
 // absolute path the Browser tool reports.
 func WithReadFileImages() RegistryOption {
 	return func(r *Registry) { r.readFileImages = true }
-}
-
-func WithMemoryStore(store sdkmemory.Store, namespace, sourceRun, repoURL string) RegistryOption {
-	return func(r *Registry) {
-		r.memoryTool = memorytool.New(store, namespace, sourceRun, repoURL)
-	}
 }
 
 func WithAttachRepositoryTool(opts ...sdkgit.AttachRepositoryOption) RegistryOption {
@@ -299,9 +289,6 @@ func NewRegistry(workDir string, opts ...RegistryOption) *Registry {
 	}
 	if r.readFileImages && effectiveBrowserScreenshotDir != "" {
 		readFile.AllowedImageDirs = append(readFile.AllowedImageDirs, effectiveBrowserScreenshotDir)
-	}
-	if r.memoryTool != nil {
-		r.Register(r.memoryTool)
 	}
 	if r.attachRepositoryTool != nil {
 		r.Register(r.attachRepositoryTool)

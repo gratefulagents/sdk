@@ -12,13 +12,13 @@ import (
 )
 
 // embedWriteTimeout bounds the best-effort embedding call on the memory write
-// path so an unreachable provider cannot stall UpsertMemory for the embedder's
+// path so an unreachable provider cannot stall SaveMemory for the embedder's
 // full HTTP timeout.
 const embedWriteTimeout = 5 * time.Second
 
 // backend abstracts durable persistence for the projectstate engine. The engine
-// keeps all storage-agnostic logic (event sourcing, task/memory/session
-// semantics, hybrid recall, priming) and delegates only the read/write of the
+// keeps all storage-agnostic logic (event sourcing, task/memory semantics,
+// hybrid recall, priming) and delegates only the read/write of the
 // durable event log, derived snapshots, and the embedding cache to a backend.
 //
 // Two backends are provided: a filesystem backend (append-only events.jsonl plus
@@ -63,7 +63,6 @@ type state struct {
 	project  Project
 	tasks    map[string]Task
 	memories map[string]Memory
-	sessions map[string]SessionSummary
 	lastSeq  int64
 }
 
@@ -107,9 +106,9 @@ func (s *engine) CreateTask(ctx context.Context, in CreateTaskInput) (*Task, err
 			ID:          newID("task"),
 			Title:       title,
 			Description: strings.TrimSpace(in.Description),
-			Type:        normalizeTaskType(in.Type),
+			Type:        NormalizeTaskType(in.Type),
 			Status:      TaskStatusOpen,
-			Priority:    normalizePriority(in.Priority),
+			Priority:    NormalizePriority(in.Priority),
 			Assignee:    strings.TrimSpace(in.Assignee),
 			DependsOn:   uniqueNonEmpty(in.DependsOn),
 			Labels:      uniqueNonEmpty(in.Labels),
@@ -119,7 +118,7 @@ func (s *engine) CreateTask(ctx context.Context, in CreateTaskInput) (*Task, err
 			Metadata:    cloneRaw(in.Metadata),
 		}
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		out = cloneTaskPtr(task)
 		return task, nil
 	})
@@ -133,9 +132,9 @@ func (s *engine) UpdateTask(ctx context.Context, id string, patch TaskPatch) (*T
 		if !ok {
 			return nil, fmt.Errorf("task %q not found", id)
 		}
-		applyPatch(&task, patch, now)
+		ApplyTaskPatch(&task, patch, now)
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		out = cloneTaskPtr(task)
 		return taskUpdatePayload{ID: task.ID, Patch: patch, Task: task}, nil
 	})
@@ -158,7 +157,7 @@ func (s *engine) ClaimTask(ctx context.Context, id, actor string) (*Task, error)
 		task.UpdatedAt = now
 		task.ClosedAt = nil
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		out = cloneTaskPtr(task)
 		return taskClaimedPayload{ID: task.ID, Actor: claimant, At: now}, nil
 	})
@@ -184,7 +183,7 @@ func (s *engine) CloseTask(ctx context.Context, id, reason string) (*Task, error
 			})
 		}
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		out = cloneTaskPtr(task)
 		return taskClosedPayload{ID: task.ID, Reason: strings.TrimSpace(reason), At: now, Task: task}, nil
 	})
@@ -198,26 +197,9 @@ func (s *engine) ReadyTasks(ctx context.Context, filter TaskFilter) ([]Task, err
 	}
 	tasks := make([]Task, 0, len(st.tasks))
 	for _, task := range st.tasks {
-		if task.Status != TaskStatusOpen {
-			continue
-		}
-		if !matchesLabels(task.Labels, filter.Labels) {
-			continue
-		}
-		actor := firstNonEmpty(filter.Actor, filter.Assignee)
-		if filter.Assignee != "" && task.Assignee != "" && task.Assignee != filter.Assignee {
-			continue
-		}
-		if !filter.IncludeAssigned && task.Assignee != "" && task.Assignee != actor {
-			continue
-		}
-		if hasOpenBlocker(st, task) {
-			continue
-		}
-		tasks = append(tasks, cloneTask(task))
+		tasks = append(tasks, task)
 	}
-	sortTasks(tasks)
-	return limitTasks(tasks, filter.Limit), nil
+	return ReadyFromTasks(tasks, filter), nil
 }
 
 func (s *engine) ListTasks(ctx context.Context) ([]Task, error) {
@@ -229,7 +211,7 @@ func (s *engine) ListTasks(ctx context.Context) ([]Task, error) {
 	for _, task := range st.tasks {
 		tasks = append(tasks, cloneTask(task))
 	}
-	sortTasks(tasks)
+	SortTasks(tasks)
 	return tasks, nil
 }
 
@@ -262,7 +244,7 @@ func (s *engine) AddDependency(ctx context.Context, taskID, dependsOnID string) 
 		task.DependsOn = appendUnique(task.DependsOn, dependsOnID)
 		task.UpdatedAt = now
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		return dependencyPayload{ID: taskID, DependsOn: dependsOnID, At: now}, nil
 	})
 }
@@ -278,7 +260,7 @@ func (s *engine) RemoveDependency(ctx context.Context, taskID, dependsOnID strin
 		task.DependsOn = removeString(task.DependsOn, dependsOnID)
 		task.UpdatedAt = now
 		st.tasks[task.ID] = task
-		recomputeBlocks(st)
+		RecomputeBlocks(st.tasks)
 		return dependencyPayload{ID: taskID, DependsOn: dependsOnID, At: now}, nil
 	})
 }
@@ -305,33 +287,76 @@ func (s *engine) AddComment(ctx context.Context, taskID, actor, body string) (*T
 	return out, err
 }
 
-func (s *engine) UpsertMemory(ctx context.Context, in UpsertMemoryInput) (*Memory, error) {
+func (s *engine) ReleaseClaims(ctx context.Context, actor, note string) ([]Task, error) {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return nil, fmt.Errorf("actor is required")
+	}
+	note = strings.TrimSpace(note)
+	var out []Task
+	err := s.mutate(ctx, "task.claims_released", func(st *state, now time.Time) (any, error) {
+		var released []Task
+		for _, task := range st.tasks {
+			if task.Status != TaskStatusInProgress || task.Assignee != actor {
+				continue
+			}
+			task.Status = TaskStatusOpen
+			task.Assignee = ""
+			task.ClosedAt = nil
+			task.UpdatedAt = now
+			if note != "" {
+				task.Comments = append(task.Comments, TaskComment{ID: newID("comment"), Actor: actor, Body: note, CreatedAt: now})
+			}
+			st.tasks[task.ID] = task
+			released = append(released, cloneTask(task))
+		}
+		if len(released) == 0 {
+			return nil, nil
+		}
+		SortTasks(released)
+		out = released
+		return claimsReleasedPayload{Actor: actor, Note: note, At: now, Tasks: released}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *engine) SaveMemory(ctx context.Context, in SaveMemoryInput) (*Memory, error) {
+	if err := ValidateMemoryInput(&in); err != nil {
+		return nil, err
+	}
 	var out *Memory
-	err := s.mutate(ctx, "memory.upserted", func(st *state, now time.Time) (any, error) {
-		content := strings.TrimSpace(in.Content)
-		if content == "" {
-			return nil, fmt.Errorf("memory content is required")
-		}
-		id := strings.TrimSpace(in.ID)
-		createdAt := now
-		if existing, ok := st.memories[id]; ok {
-			createdAt = existing.CreatedAt
-		}
-		if id == "" {
-			id = newID("mem")
-		}
+	err := s.mutate(ctx, "memory.saved", func(st *state, now time.Time) (any, error) {
 		mem := Memory{
-			ID:        id,
-			Kind:      normalizeMemoryKind(in.Kind),
-			Scope:     normalizeMemoryScope(in.Scope),
-			Content:   content,
-			Tags:      uniqueNonEmpty(in.Tags),
-			TaskIDs:   uniqueNonEmpty(in.TaskIDs),
-			FilePaths: uniqueNonEmpty(in.FilePaths),
-			SourceRun: firstNonEmpty(in.SourceRun, s.runID),
-			CreatedAt: createdAt,
-			UpdatedAt: now,
-			Metadata:  cloneRaw(in.Metadata),
+			ID:         in.ID,
+			Kind:       in.Kind,
+			Title:      in.Title,
+			Body:       in.Body,
+			Citations:  in.Citations,
+			CommitSHA:  in.CommitSHA,
+			SourceRun:  firstNonEmpty(in.SourceRun, s.runID),
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			VerifiedAt: now,
+		}
+		if mem.ID != "" {
+			existing, ok := st.memories[mem.ID]
+			if !ok {
+				return nil, fmt.Errorf("memory %q not found; omit id to create a new memory", mem.ID)
+			}
+			mem.CreatedAt = existing.CreatedAt
+			mem.UseCount = existing.UseCount
+			mem.LastUsedAt = existing.LastUsedAt
+			// SourceRun records the creator; later editors (including the
+			// consolidator) must not take ownership of shared memories.
+			mem.SourceRun = firstNonEmpty(existing.SourceRun, mem.SourceRun)
+		} else {
+			if len(st.memories) >= DefaultMemoryCap {
+				return nil, fmt.Errorf("project already has %d memories (cap %d). Consolidate instead: update an existing memory with memory_save and its id, or remove obsolete ones with memory_delete", len(st.memories), DefaultMemoryCap)
+			}
+			mem.ID = newID("mem")
 		}
 		st.memories[mem.ID] = mem
 		out = cloneMemoryPtr(mem)
@@ -340,69 +365,76 @@ func (s *engine) UpsertMemory(ctx context.Context, in UpsertMemoryInput) (*Memor
 	if err != nil {
 		return nil, err
 	}
-	if out != nil {
-		// Best-effort: caching the embedding must never fail the write. A
-		// missing vector is backfilled lazily on the next recall. Bound the
-		// embedding call so a dead provider cannot stall the write path for
-		// the full HTTP client timeout.
-		embedCtx, cancel := context.WithTimeout(ctx, embedWriteTimeout)
-		if err := s.cacheMemoryEmbedding(embedCtx, out.ID, out.Content); err != nil {
-			log.Printf("projectstate: caching embedding for memory %s failed (will backfill on recall): %v", out.ID, err)
-		}
-		cancel()
+	// Best-effort: caching the embedding must never fail the write. A missing
+	// vector is backfilled lazily on the next search. Bound the embedding call
+	// so a dead provider cannot stall the write path for the full HTTP timeout.
+	embedCtx, cancel := context.WithTimeout(ctx, embedWriteTimeout)
+	if err := s.cacheMemoryEmbedding(embedCtx, out.ID, memoryEmbedText(*out)); err != nil {
+		log.Printf("projectstate: caching embedding for memory %s failed (will backfill on search): %v", out.ID, err)
 	}
-	return out, err
+	cancel()
+	return out, nil
 }
 
-func (s *engine) SearchMemories(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
-	if strings.TrimSpace(filter.Query) == "" {
-		return nil, fmt.Errorf("query is required")
-	}
-	if s.embedder == nil {
-		return s.listMemories(ctx, filter, true)
-	}
-	return s.searchHybrid(ctx, filter)
-}
-
-// searchHybrid ranks memories by fusing the lexical keyword signal with cosine
-// similarity over cached embeddings. Candidates are filtered by kind and tags
-// but not by keyword, so semantically relevant memories surface even when they
-// share no exact terms with the query.
-func (s *engine) searchHybrid(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
-	// Embed the query first. If the embedding provider is unavailable or times
-	// out we have no semantic signal, so fall back to the lexical search rather
-	// than ranking every kind/tag match by recency and pinned boosts (which
-	// would return query-irrelevant memories).
-	vecs, embErr := s.embedder.Embed(ctx, []string{filter.Query})
-	if embErr != nil || len(vecs) != 1 || len(vecs[0]) == 0 {
-		return s.listMemories(ctx, filter, true)
-	}
-	queryVec := vecs[0]
-
+func (s *engine) GetMemory(ctx context.Context, id string) (*Memory, error) {
 	st, err := s.loadState(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var candidates []Memory
-	for _, mem := range st.memories {
-		if !matchesAny(mem.Kind, filter.Kinds) || !matchesLabels(mem.Tags, filter.Tags) {
-			continue
-		}
-		candidates = append(candidates, mem)
+	mem, ok := st.memories[strings.TrimSpace(id)]
+	if !ok {
+		return nil, fmt.Errorf("memory %q not found", id)
 	}
+	return cloneMemoryPtr(mem), nil
+}
+
+// SearchMemories ranks memories by LexicalScore and, when an Embedder is
+// configured, fuses in cosine similarity over cached embeddings.
+func (s *engine) SearchMemories(ctx context.Context, q MemoryQuery) ([]MemoryHit, error) {
+	query := strings.TrimSpace(q.Query)
+	if query == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = defaultSearchLimit
+	}
+	st, err := s.loadState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	candidates := filterMemoryKinds(st.memories, q.Kinds)
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	vectors := s.ensureEmbeddings(ctx, candidates)
-	ranked := rankHybrid(filter.Query, candidates, queryVec, vectors, s.hybrid, time.Now().UTC())
-	if filter.Limit > 0 && len(ranked) > filter.Limit {
-		ranked = ranked[:filter.Limit]
+	var queryVec []float32
+	var vectors map[string][]float32
+	if s.embedder != nil {
+		// Without a query vector there is no semantic signal; rank lexically
+		// rather than failing the search.
+		if vecs, err := s.embedder.Embed(ctx, []string{query}); err == nil && len(vecs) == 1 && len(vecs[0]) > 0 {
+			queryVec = vecs[0]
+			vectors = s.ensureEmbeddings(ctx, candidates)
+		}
 	}
-	return ranked, nil
+	hits := rankHybrid(query, candidates, queryVec, vectors, s.hybrid, time.Now().UTC())
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return hits, nil
 }
 
 func (s *engine) ListMemories(ctx context.Context, filter MemoryFilter) ([]Memory, error) {
-	return s.listMemories(ctx, filter, false)
+	st, err := s.loadState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := filterMemoryKinds(st.memories, filter.Kinds)
+	sortMemories(out)
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
 }
 
 func (s *engine) DeleteMemory(ctx context.Context, id string) error {
@@ -422,78 +454,82 @@ func (s *engine) DeleteMemory(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *engine) SaveSessionSummary(ctx context.Context, summary SessionSummary) (*SessionSummary, error) {
-	var out *SessionSummary
-	err := s.mutate(ctx, "session.summary_saved", func(st *state, now time.Time) (any, error) {
-		if strings.TrimSpace(summary.Summary) == "" {
-			return nil, fmt.Errorf("session summary is required")
+func (s *engine) VerifyMemory(ctx context.Context, id, commitSHA string) (*Memory, error) {
+	id = strings.TrimSpace(id)
+	commitSHA = strings.TrimSpace(commitSHA)
+	var out *Memory
+	err := s.mutate(ctx, "memory.verified", func(st *state, now time.Time) (any, error) {
+		mem, ok := st.memories[id]
+		if !ok {
+			return nil, fmt.Errorf("memory %q not found", id)
 		}
-		if strings.TrimSpace(summary.ID) == "" {
-			summary.ID = newID("session")
-			summary.CreatedAt = now
-		}
-		if existing, ok := st.sessions[summary.ID]; ok && !existing.CreatedAt.IsZero() {
-			summary.CreatedAt = existing.CreatedAt
-		}
-		summary.RunID = firstNonEmpty(summary.RunID, s.runID)
-		summary.UpdatedAt = now
-		summary.TaskIDs = uniqueNonEmpty(summary.TaskIDs)
-		st.sessions[summary.ID] = summary
-		cp := cloneSession(summary)
-		out = &cp
-		return summary, nil
+		p := memoryVerifiedPayload{ID: id, CommitSHA: commitSHA, At: now}
+		applyMemoryVerified(&mem, p)
+		st.memories[id] = mem
+		out = cloneMemoryPtr(mem)
+		return p, nil
 	})
 	return out, err
 }
 
-func (s *engine) ListSessionSummaries(ctx context.Context, limit int) ([]SessionSummary, error) {
-	st, err := s.loadState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]SessionSummary, 0, len(st.sessions))
-	for _, session := range st.sessions {
-		out = append(out, cloneSession(session))
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+func (s *engine) TouchMemories(ctx context.Context, ids []string) error {
+	return s.mutate(ctx, "memory.touched", func(st *state, now time.Time) (any, error) {
+		var known []string
+		for _, id := range uniqueNonEmpty(ids) {
+			if _, ok := st.memories[id]; ok {
+				known = append(known, id)
+			}
+		}
+		if len(known) == 0 {
+			return nil, nil
+		}
+		p := memoryTouchedPayload{IDs: known, At: now}
+		applyMemoryTouched(st, p)
+		return p, nil
+	})
 }
 
-func (s *engine) listMemories(ctx context.Context, filter MemoryFilter, requireQuery bool) ([]Memory, error) {
-	st, err := s.loadState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	query := strings.ToLower(strings.TrimSpace(filter.Query))
-	if requireQuery && query == "" {
-		return nil, fmt.Errorf("query is required")
-	}
-	var out []Memory
-	for _, mem := range st.memories {
-		if !matchesAny(mem.Kind, filter.Kinds) || !matchesLabels(mem.Tags, filter.Tags) {
-			continue
+func filterMemoryKinds(memories map[string]Memory, kinds []string) []Memory {
+	wanted := map[string]bool{}
+	for _, kind := range kinds {
+		if strings.TrimSpace(kind) != "" {
+			wanted[NormalizeMemoryKind(kind)] = true
 		}
-		if query != "" && !memoryMatchesQuery(mem, query) {
+	}
+	out := make([]Memory, 0, len(memories))
+	for _, mem := range memories {
+		if len(wanted) > 0 && !wanted[mem.Kind] {
 			continue
 		}
 		out = append(out, cloneMemory(mem))
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Kind == MemoryKindPinned && out[j].Kind != MemoryKindPinned {
-			return true
+	return out
+}
+
+var memoryKindRank = map[string]int{
+	MemoryKindPreference: 0,
+	MemoryKindDecision:   1,
+	MemoryKindProcedure:  2,
+	MemoryKindFact:       3,
+}
+
+// sortMemories orders by kind priority (preference, decision, procedure,
+// fact), then UpdatedAt desc, then ID.
+func sortMemories(memories []Memory) {
+	sort.SliceStable(memories, func(i, j int) bool {
+		ri, rj := memoryKindRank[memories[i].Kind], memoryKindRank[memories[j].Kind]
+		if ri != rj {
+			return ri < rj
 		}
-		if out[i].Kind != MemoryKindPinned && out[j].Kind == MemoryKindPinned {
-			return false
+		if !memories[i].UpdatedAt.Equal(memories[j].UpdatedAt) {
+			return memories[i].UpdatedAt.After(memories[j].UpdatedAt)
 		}
-		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+		return memories[i].ID < memories[j].ID
 	})
-	if filter.Limit > 0 && len(out) > filter.Limit {
-		out = out[:filter.Limit]
-	}
-	return out, nil
+}
+
+func memoryEmbedText(mem Memory) string {
+	return mem.Title + "\n" + mem.Body
 }
 
 func (s *engine) mutate(ctx context.Context, eventType string, fn func(*state, time.Time) (any, error)) error {
@@ -502,6 +538,9 @@ func (s *engine) mutate(ctx context.Context, eventType string, fn func(*state, t
 		payload, err := fn(st, now)
 		if err != nil {
 			return err
+		}
+		if payload == nil {
+			return nil
 		}
 		st.project.UpdatedAt = now
 		if err := s.appendEventLocked(st, eventType, payload, now); err != nil {
@@ -545,7 +584,6 @@ func (s *engine) loadStateLocked() (*state, error) {
 	st := &state{
 		tasks:    make(map[string]Task),
 		memories: make(map[string]Memory),
-		sessions: make(map[string]SessionSummary),
 	}
 	events, err := s.backend.loadEvents()
 	if err != nil {
@@ -559,7 +597,7 @@ func (s *engine) loadStateLocked() (*state, error) {
 			return nil, fmt.Errorf("apply event %d %s: %w", ev.Seq, ev.Type, err)
 		}
 	}
-	recomputeBlocks(st)
+	RecomputeBlocks(st.tasks)
 	return st, nil
 }
 
@@ -602,7 +640,8 @@ func (s *engine) snapshotLocked(st *state) error {
 	return s.backend.snapshot(st)
 }
 
-// PrimeContext renders the durable project state into a compact briefing block.
+// PrimeContext renders the durable project state with RenderBriefing.
+// MemoryLimit is not used: the memory index is bounded by BriefingMemoryBudget.
 func (s *engine) PrimeContext(ctx context.Context, opts PrimeOptions) (string, error) {
 	st, err := s.loadState(ctx)
 	if err != nil {
@@ -612,66 +651,21 @@ func (s *engine) PrimeContext(ctx context.Context, opts PrimeOptions) (string, e
 	if opts.ReadyLimit <= 0 {
 		opts.ReadyLimit = 8
 	}
-	if opts.MemoryLimit <= 0 {
-		opts.MemoryLimit = 8
+	tasks := make([]Task, 0, len(st.tasks))
+	for _, task := range st.tasks {
+		tasks = append(tasks, task)
 	}
-
-	var b strings.Builder
-	b.WriteString("## Durable Project State\n")
-	if st.project.ProjectID != "" {
-		b.WriteString("Project: " + st.project.ProjectID + "\n")
+	memories := make([]Memory, 0, len(st.memories))
+	for _, mem := range st.memories {
+		memories = append(memories, mem)
 	}
-	if st.project.WorkDir != "" {
-		b.WriteString("Workspace: " + st.project.WorkDir + "\n")
-	}
-
-	active := activeTask(st, opts)
-	if active != nil {
-		b.WriteString("\n### Active Task\n")
-		writeTaskLine(&b, *active)
-		if active.Description != "" {
-			b.WriteString("  " + oneLine(active.Description, 220) + "\n")
-		}
-		if len(active.DependsOn) > 0 {
-			b.WriteString("  Depends on: " + strings.Join(active.DependsOn, ", ") + "\n")
-		}
-	}
-
-	ready := readyFromState(st, TaskFilter{Actor: opts.Actor, Limit: opts.ReadyLimit})
-	if len(ready) > 0 {
-		b.WriteString("\n### Ready Work\n")
-		for _, task := range ready {
-			writeTaskLine(&b, task)
-		}
-	}
-
-	blocked := blockedTasks(st, 5)
-	if len(blocked) > 0 {
-		b.WriteString("\n### Blocked Work\n")
-		for _, task := range blocked {
-			writeTaskLine(&b, task)
-		}
-	}
-
-	pinned, recent := memoriesForPrime(st, opts.MemoryLimit)
-	if len(pinned) > 0 {
-		b.WriteString("\n### Pinned Memories\n")
-		for _, mem := range pinned {
-			b.WriteString("- " + oneLine(mem.Content, 220) + memorySuffix(mem) + "\n")
-		}
-	}
-	if len(recent) > 0 {
-		b.WriteString("\n### Recent Memories\n")
-		for _, mem := range recent {
-			b.WriteString("- " + oneLine(mem.Content, 180) + memorySuffix(mem) + "\n")
-		}
-	}
-
-	out := strings.TrimSpace(b.String())
-	if out == "## Durable Project State" {
-		out += "\nNo durable tasks or memories yet."
-	}
-	return out, nil
+	return RenderBriefing(BriefingInput{
+		ProjectID: st.project.ProjectID,
+		Active:    ActiveTask(tasks, opts.ActiveTaskID, opts.Actor),
+		Ready:     ReadyFromTasks(tasks, TaskFilter{Actor: opts.Actor, Limit: opts.ReadyLimit}),
+		Blocked:   BlockedFromTasks(tasks, 5),
+		Memories:  memories,
+	}), nil
 }
 
 func applyEvent(st *state, ev Event) error {
@@ -751,24 +745,50 @@ func applyEvent(st *state, ev Event) error {
 		task.DependsOn = removeString(task.DependsOn, p.DependsOn)
 		task.UpdatedAt = p.At
 		st.tasks[task.ID] = task
-	case "memory.upserted":
+	case "memory.saved":
 		var mem Memory
 		if err := json.Unmarshal(ev.Payload, &mem); err != nil {
 			return err
 		}
 		st.memories[mem.ID] = mem
+	case "memory.upserted":
+		var legacy legacyMemory
+		if err := json.Unmarshal(ev.Payload, &legacy); err != nil {
+			return err
+		}
+		mem := legacy.toMemory()
+		st.memories[mem.ID] = mem
+	case "memory.verified":
+		var p memoryVerifiedPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			return err
+		}
+		if mem, ok := st.memories[p.ID]; ok {
+			applyMemoryVerified(&mem, p)
+			st.memories[p.ID] = mem
+		}
+	case "memory.touched":
+		var p memoryTouchedPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			return err
+		}
+		applyMemoryTouched(st, p)
 	case "memory.deleted":
 		var p memoryDeletedPayload
 		if err := json.Unmarshal(ev.Payload, &p); err != nil {
 			return err
 		}
 		delete(st.memories, p.ID)
-	case "session.summary_saved":
-		var summary SessionSummary
-		if err := json.Unmarshal(ev.Payload, &summary); err != nil {
+	case "task.claims_released":
+		var p claimsReleasedPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
 			return err
 		}
-		st.sessions[summary.ID] = summary
+		for _, task := range p.Tasks {
+			st.tasks[task.ID] = task
+		}
+	case "session.summary_saved":
+		// v1 session summaries were never read back; v2 drops them.
 	default:
 		return nil
 	}
@@ -810,6 +830,72 @@ type memoryDeletedPayload struct {
 	At time.Time `json:"at"`
 }
 
+type memoryVerifiedPayload struct {
+	ID        string    `json:"id"`
+	CommitSHA string    `json:"commit_sha,omitempty"`
+	At        time.Time `json:"at"`
+}
+
+type memoryTouchedPayload struct {
+	IDs []string  `json:"ids"`
+	At  time.Time `json:"at"`
+}
+
+type claimsReleasedPayload struct {
+	Actor string    `json:"actor"`
+	Note  string    `json:"note,omitempty"`
+	At    time.Time `json:"at"`
+	Tasks []Task    `json:"tasks"`
+}
+
+// legacyMemory is the v1 memory.upserted payload.
+type legacyMemory struct {
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	Content   string    `json:"content"`
+	FilePaths []string  `json:"file_paths"`
+	SourceRun string    `json:"source_run"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (l legacyMemory) toMemory() Memory {
+	mem := Memory{
+		ID:         l.ID,
+		Kind:       NormalizeMemoryKind(l.Kind),
+		Title:      LegacyMemoryTitle(l.Content),
+		Body:       strings.TrimSpace(l.Content),
+		SourceRun:  l.SourceRun,
+		CreatedAt:  l.CreatedAt,
+		UpdatedAt:  l.UpdatedAt,
+		VerifiedAt: l.UpdatedAt,
+	}
+	for _, path := range uniqueNonEmpty(l.FilePaths) {
+		mem.Citations = append(mem.Citations, Citation{Path: path})
+	}
+	return mem
+}
+
+func applyMemoryVerified(mem *Memory, p memoryVerifiedPayload) {
+	mem.VerifiedAt = p.At
+	if p.CommitSHA != "" {
+		mem.CommitSHA = p.CommitSHA
+	}
+}
+
+func applyMemoryTouched(st *state, p memoryTouchedPayload) {
+	for _, id := range p.IDs {
+		mem, ok := st.memories[id]
+		if !ok {
+			continue
+		}
+		at := p.At
+		mem.UseCount++
+		mem.LastUsedAt = &at
+		st.memories[id] = mem
+	}
+}
+
 // readEmbeddings loads the cached vectors via the backend.
 func (s *engine) readEmbeddings() (map[string]embeddingRecord, error) {
 	return s.backend.readEmbeddings()
@@ -829,7 +915,7 @@ func (s *engine) upsertEmbeddings(records map[string]embeddingRecord) error {
 	return s.backend.upsertEmbeddings(records, model)
 }
 
-// cacheMemoryEmbedding embeds a single memory's content and persists it. It is
+// cacheMemoryEmbedding embeds a single memory's text and persists it. It is
 // best-effort: embedding failures are returned but callers on the write path
 // ignore them so storing a memory never fails because the embedder is down.
 func (s *engine) cacheMemoryEmbedding(ctx context.Context, id, content string) error {
@@ -876,15 +962,13 @@ func (s *engine) ensureEmbeddings(ctx context.Context, memories []Memory) map[st
 	var missingIDs []string
 	var missingText []string
 	for _, mem := range memories {
-		if rec, ok := records[mem.ID]; ok && rec.fresh(mem.Content, model) {
+		text := memoryEmbedText(mem)
+		if rec, ok := records[mem.ID]; ok && rec.fresh(text, model) {
 			vectors[mem.ID] = rec.Vector
 			continue
 		}
-		if mem.Content == "" {
-			continue
-		}
 		missingIDs = append(missingIDs, mem.ID)
-		missingText = append(missingText, mem.Content)
+		missingText = append(missingText, text)
 	}
 
 	if len(missingText) == 0 {

@@ -62,9 +62,9 @@ func TestHybridSemanticRecall(t *testing.T) {
 	emb := &fakeEmbedder{
 		model: "fake-1",
 		vectors: map[string][]float32{
-			"The user prefers the vim editor.":    {1, 0, 0},
-			"Deploys run every Friday afternoon.": {0, 1, 0},
-			"What is my favorite text editor?":    {0.95, 0.1, 0},
+			"Editor\nThe user prefers the vim editor.":     {1, 0, 0},
+			"Deploys\nDeploys run every Friday afternoon.": {0, 1, 0},
+			"What is my favorite text editor?":             {0.95, 0.1, 0},
 		},
 	}
 	store, err := NewFilesystemStore(FilesystemOptions{
@@ -75,22 +75,22 @@ func TestHybridSemanticRecall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Kind: MemoryKindSemantic, Content: "The user prefers the vim editor."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Kind: MemoryKindPreference, Title: "Editor", Body: "The user prefers the vim editor."}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Kind: MemoryKindSemantic, Content: "Deploys run every Friday afternoon."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Kind: MemoryKindFact, Title: "Deploys", Body: "Deploys run every Friday afternoon."}); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := store.SearchMemories(ctx, MemoryFilter{Query: "What is my favorite text editor?"})
+	got, err := store.SearchMemories(ctx, MemoryQuery{Query: "What is my favorite text editor?"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) == 0 {
 		t.Fatal("hybrid recall returned no memories")
 	}
-	if got[0].Content != "The user prefers the vim editor." {
-		t.Fatalf("top hybrid result = %q, want the editor memory", got[0].Content)
+	if got[0].Body != "The user prefers the vim editor." {
+		t.Fatalf("top hybrid result = %q, want the editor memory", got[0].Body)
 	}
 }
 
@@ -99,23 +99,23 @@ func TestHybridSemanticRecall(t *testing.T) {
 func TestHybridCachesEmbeddings(t *testing.T) {
 	ctx := context.Background()
 	emb := &fakeEmbedder{model: "fake-1", vectors: map[string][]float32{
-		"alpha fact": {1, 0, 0},
-		"beta fact":  {0, 1, 0},
+		"alpha\nalpha fact": {1, 0, 0},
+		"beta\nbeta fact":   {0, 1, 0},
 	}}
 	dir := filepath.Join(t.TempDir(), "state")
 	store, err := NewFilesystemStore(FilesystemOptions{StateDir: dir, Embedder: emb})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "alpha fact"}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "alpha", Body: "alpha fact"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "beta fact"}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "beta", Body: "beta fact"}); err != nil {
 		t.Fatal(err)
 	}
 	callsAfterWrite := emb.calls
 
-	if _, err := store.SearchMemories(ctx, MemoryFilter{Query: "alpha fact"}); err != nil {
+	if _, err := store.SearchMemories(ctx, MemoryQuery{Query: "alpha fact"}); err != nil {
 		t.Fatal(err)
 	}
 	// The two stored memories were already embedded on write, so recall should
@@ -125,28 +125,28 @@ func TestHybridCachesEmbeddings(t *testing.T) {
 	}
 }
 
-// TestLexicalFallbackWithoutEmbedder ensures behavior is unchanged when no
-// embedder is configured.
+// TestLexicalFallbackWithoutEmbedder ensures search ranks by LexicalScore and
+// drops non-matching memories when no embedder is configured.
 func TestLexicalFallbackWithoutEmbedder(t *testing.T) {
 	ctx := context.Background()
 	store, err := NewFilesystemStore(FilesystemOptions{StateDir: filepath.Join(t.TempDir(), "state")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Run focused tests after storage changes."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "Testing", Body: "Run focused tests after storage changes."}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Use append-only project state."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "Storage", Body: "Use append-only project state."}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.SearchMemories(ctx, MemoryFilter{Query: "focused"})
+	got, err := store.SearchMemories(ctx, MemoryQuery{Query: "focused"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Content != "Run focused tests after storage changes." {
+	if len(got) != 1 || got[0].Body != "Run focused tests after storage changes." {
 		t.Fatalf("lexical fallback = %+v", got)
 	}
-	if _, err := store.SearchMemories(ctx, MemoryFilter{Query: ""}); err == nil {
+	if _, err := store.SearchMemories(ctx, MemoryQuery{Query: ""}); err == nil {
 		t.Fatal("empty query should error")
 	}
 }
@@ -161,7 +161,7 @@ func (errEmbedder) Embed(context.Context, []string) ([][]float32, error) {
 
 // TestQueryEmbeddingFailureFallsBackToLexical verifies that when the query
 // embedding cannot be computed, recall falls back to query-relevant lexical
-// search instead of returning every memory ranked by recency/pinned boosts.
+// search instead of returning every memory ranked by recency/kind boosts.
 func TestQueryEmbeddingFailureFallsBackToLexical(t *testing.T) {
 	ctx := context.Background()
 	store, err := NewFilesystemStore(FilesystemOptions{
@@ -171,17 +171,17 @@ func TestQueryEmbeddingFailureFallsBackToLexical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Run focused tests after storage changes."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "Testing", Body: "Run focused tests after storage changes."}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.UpsertMemory(ctx, UpsertMemoryInput{Content: "Use append-only project state."}); err != nil {
+	if _, err := store.SaveMemory(ctx, SaveMemoryInput{Title: "Storage", Body: "Use append-only project state."}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.SearchMemories(ctx, MemoryFilter{Query: "focused"})
+	got, err := store.SearchMemories(ctx, MemoryQuery{Query: "focused"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Content != "Run focused tests after storage changes." {
+	if len(got) != 1 || got[0].Body != "Run focused tests after storage changes." {
 		t.Fatalf("query-embedding-failure fallback = %+v, want only the lexically matching memory", got)
 	}
 }

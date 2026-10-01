@@ -79,20 +79,16 @@ Browser screenshot output is configured with `BrowserScreenshotDir`; with `Visio
 
 `RegistryCapabilities` is the canonical classification manifest. A static parity test checks every capability-producing `RegistryOption` against that manifest, and runtime tests require every runtime-built-in manifest family to have feature wiring. Adding a registry family without a runtime-built-in, host-only, or configuration-only classification fails tests.
 
-## Intentionally host-only families
+## Host-specific tools
 
-`Memory` is intentionally host-only. It requires a caller-owned durable `memory.Store` plus host-specific namespace, run, and repository identity; the generic runtime cannot safely invent these values. Hosts can use the supported `ExtraTools` extension path:
+No registry family is currently host-only. Durable project memory is provided by the project-state tools (`memory_search`, `memory_get`, `memory_save`, `memory_verify`, `memory_delete`; see [Project State Tools](projectstate-tools.md)), which the runtime wires through `ProjectStateFeatures`. Host-specific tools and adapters that are not SDK registry capabilities use the supported `ExtraTools` extension path:
 
 ```go
-memoryTool := memory.New(store, namespace, sourceRun, repoURL)
-
 bundle, err := runtime.BuildToolBundle(ctx, runtime.Config{
     WorkDir: "/workspace/repo",
     Features: &runtime.Features{
         Tools: runtime.ToolFeatures{ExtraTools: true},
     },
-    ExtraTools: []agentsdk.Tool{memoryTool},
+    ExtraTools: []agentsdk.Tool{hostTool},
 })
 ```
-
-The same path supports host-specific tools and adapters that are not SDK registry capabilities.

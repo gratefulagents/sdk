@@ -3,18 +3,42 @@ package projectstatetools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/projectstate"
 )
 
-func Tools(store projectstate.Store, actor string) []agentsdk.Tool {
+// Option configures Tools.
+type Option func(*baseTool)
+
+// WithWorkDir sets the workspace directory used to record the HEAD commit on
+// memory saves and to check cited files for staleness.
+func WithWorkDir(dir string) Option {
+	return func(t *baseTool) { t.workDir = strings.TrimSpace(dir) }
+}
+
+// Tools returns the task, memory, and prime_context tools over store.
+func Tools(store projectstate.Store, actor string, opts ...Option) []agentsdk.Tool {
 	if store == nil {
 		return nil
 	}
 	base := baseTool{store: store, actor: strings.TrimSpace(actor)}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&base)
+		}
+	}
+	base.checker = NewGitStalenessChecker(base.workDir)
 	return []agentsdk.Tool{
 		&taskCreateTool{baseTool: base},
 		&taskReadyTool{baseTool: base},
@@ -24,19 +48,20 @@ func Tools(store projectstate.Store, actor string) []agentsdk.Tool {
 		&taskCloseTool{baseTool: base},
 		&taskCommentTool{baseTool: base},
 		&taskLinkTool{baseTool: base},
-		&memoryRememberTool{baseTool: base},
-		&memoryRecallTool{baseTool: base},
-		&memoryListTool{baseTool: base},
-		&memoryUpdateTool{baseTool: base},
+		&memorySearchTool{baseTool: base},
+		&memoryGetTool{baseTool: base},
+		&memorySaveTool{baseTool: base},
+		&memoryVerifyTool{baseTool: base},
 		&memoryDeleteTool{baseTool: base},
-		&memoryStatsTool{baseTool: base},
 		&primeContextTool{baseTool: base},
 	}
 }
 
 type baseTool struct {
-	store projectstate.Store
-	actor string
+	store   projectstate.Store
+	actor   string
+	workDir string
+	checker *GitStalenessChecker
 }
 
 func (t baseTool) IsEnabled(*agentsdk.RunContext) bool { return t.store != nil }
@@ -47,7 +72,7 @@ type taskCreateTool struct{ baseTool }
 
 func (t *taskCreateTool) Name() string { return "task_create" }
 func (t *taskCreateTool) Description() string {
-	return "Create a durable project task in the filesystem event log. Use for work that should survive sessions and context compaction."
+	return "Create a durable project task. Use for work that should survive sessions and context compaction."
 }
 func (t *taskCreateTool) IsReadOnly() bool { return false }
 func (t *taskCreateTool) InputSchema() json.RawMessage {
@@ -292,233 +317,372 @@ func (t *taskLinkTool) Execute(ctx context.Context, raw json.RawMessage, _ strin
 	return jsonToolResult(map[string]string{"id": in.ID, "depends_on": in.DependsOn, "action": firstNonEmpty(in.Action, "add")}, err), nil
 }
 
-type memoryRememberTool struct{ baseTool }
+const snippetRunes = 240
 
-func (t *memoryRememberTool) Name() string { return "memory_remember" }
-func (t *memoryRememberTool) Description() string {
-	return "Store a durable typed project memory in the filesystem event log."
+// StalenessChecker decides whether a memory needs re-verification.
+type StalenessChecker interface {
+	Check(ctx context.Context, m projectstate.Memory) (stale bool, reason string)
 }
-func (t *memoryRememberTool) IsReadOnly() bool { return false }
-func (t *memoryRememberTool) InputSchema() json.RawMessage {
+
+const gitTimeout = 5 * time.Second
+
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{4,64}$`)
+
+// GitStalenessChecker flags memories whose cited files are gone or changed
+// since CommitSHA, or whose VerifiedAt is older than MemoryStaleAfter. Without
+// a directory only the age rule applies. Git failures never mark a memory
+// stale.
+type GitStalenessChecker struct {
+	dir string
+	now func() time.Time
+}
+
+func NewGitStalenessChecker(dir string) *GitStalenessChecker {
+	return &GitStalenessChecker{dir: strings.TrimSpace(dir), now: time.Now}
+}
+
+func (c *GitStalenessChecker) Check(ctx context.Context, m projectstate.Memory) (bool, string) {
+	if c.dir != "" {
+		var paths []string
+		for _, citation := range m.Citations {
+			if citation.Path == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(c.dir, filepath.FromSlash(citation.Path))); errors.Is(err, os.ErrNotExist) {
+				return true, "cited file " + citation.Path + " no longer exists"
+			}
+			paths = append(paths, citation.Path)
+		}
+		if m.CommitSHA != "" && len(paths) > 0 {
+			if stale, reason := c.checkCommit(ctx, m.CommitSHA, paths); stale {
+				return true, reason
+			}
+		}
+	}
+	if !m.VerifiedAt.IsZero() {
+		if age := c.now().Sub(m.VerifiedAt); age > projectstate.MemoryStaleAfter {
+			return true, fmt.Sprintf("not verified for %d days", int(age.Hours()/24))
+		}
+	}
+	return false, ""
+}
+
+func (c *GitStalenessChecker) checkCommit(ctx context.Context, sha string, paths []string) (bool, string) {
+	if !commitSHAPattern.MatchString(sha) {
+		return true, "verification commit not found"
+	}
+	if _, err := c.git(ctx, "rev-parse", "--verify", "--quiet", sha+"^{commit}"); err != nil {
+		var exitErr *exec.ExitError
+		// Exit status 1 is "no such object"; anything else (not a repo, git
+		// missing, timeout) is an environment problem, not staleness.
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true, "verification commit not found"
+		}
+		return false, ""
+	}
+	// Compare committed history only (sha..HEAD): memories are stamped with
+	// HEAD on save/verify, so uncommitted edits in the working tree must not
+	// make a just-saved memory stale.
+	out, err := c.git(ctx, append([]string{"--literal-pathspecs", "diff", "--name-only", "--relative", sha, "HEAD", "--"}, paths...)...)
+	if err != nil {
+		return false, ""
+	}
+	changed := strings.Fields(out)
+	if len(changed) == 0 {
+		return false, ""
+	}
+	return true, "cited files changed since verification: " + strings.Join(changed, ", ")
+}
+
+// HeadSHA returns the repository HEAD commit, or "" when unavailable.
+func (c *GitStalenessChecker) HeadSHA(ctx context.Context) string {
+	if c.dir == "" {
+		return ""
+	}
+	out, err := c.git(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func (c *GitStalenessChecker) git(ctx context.Context, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", c.dir}, args...)...)
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+type memorySearchTool struct{ baseTool }
+
+func (t *memorySearchTool) Name() string { return "memory_search" }
+func (t *memorySearchTool) Description() string {
+	return "Search durable project memory (user preferences, decisions, facts/gotchas, procedures saved by earlier runs). " +
+		"Search before re-investigating anything the project may already know, and before saving a new memory. " +
+		"Returns ranked hits with a body snippet; use memory_get for the full text. Hits marked stale must be re-verified before you rely on them."
+}
+func (t *memorySearchTool) IsReadOnly() bool { return true }
+func (t *memorySearchTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
-		"type":"object",
-		"properties":{
-			"id":{"type":"string"},
-			"content":{"type":"string"},
-			"kind":{"type":"string","enum":["pinned","semantic","episodic","procedural"]},
-			"scope":{"type":"string","enum":["project","user","task","file"]},
-			"tags":{"type":"array","items":{"type":"string"}},
-			"task_ids":{"type":"array","items":{"type":"string"}},
-			"file_paths":{"type":"array","items":{"type":"string"}}
+		"type": "object",
+		"properties": {
+			"query": {"type": "string", "description": "Keywords or a natural-language question."},
+			"kinds": {"type": "array", "items": {"type": "string", "enum": ["preference", "decision", "fact", "procedure"]}, "description": "Optional kind filter."},
+			"limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum hits (default 8)."}
 		},
-		"required":["content"]
+		"required": ["query"]
 	}`)
 }
-func (t *memoryRememberTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
-	var in projectstate.UpsertMemoryInput
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return errorResult("Invalid input: %v", err), nil
-	}
-	mem, err := t.store.UpsertMemory(ctx, in)
-	return jsonToolResult(mem, err), nil
+
+type memorySearchHit struct {
+	ID          string  `json:"id"`
+	Kind        string  `json:"kind"`
+	Title       string  `json:"title"`
+	Snippet     string  `json:"snippet"`
+	Score       float64 `json:"score"`
+	Stale       bool    `json:"stale,omitempty"`
+	StaleReason string  `json:"stale_reason,omitempty"`
 }
 
-type memoryRecallTool struct{ baseTool }
-
-func (t *memoryRecallTool) Name() string { return "memory_recall" }
-func (t *memoryRecallTool) Description() string {
-	return "Search durable typed project memories."
-}
-func (t *memoryRecallTool) IsReadOnly() bool { return true }
-func (t *memoryRecallTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}},"required":["query"]}`)
-}
-func (t *memoryRecallTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
-	var in projectstate.MemoryFilter
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return errorResult("Invalid input: %v", err), nil
-	}
-	memories, err := t.store.SearchMemories(ctx, in)
-	return jsonToolResult(memories, err), nil
-}
-
-type memoryListTool struct{ baseTool }
-
-func (t *memoryListTool) Name() string { return "memory_list" }
-func (t *memoryListTool) Description() string {
-	return "List durable typed project memories."
-}
-func (t *memoryListTool) IsReadOnly() bool { return true }
-func (t *memoryListTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"kinds":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"}}}`)
-}
-func (t *memoryListTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
-	var in projectstate.MemoryFilter
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return errorResult("Invalid input: %v", err), nil
-	}
-	memories, err := t.store.ListMemories(ctx, in)
-	return jsonToolResult(memories, err), nil
-}
-
-type memoryUpdateTool struct{ baseTool }
-
-func (t *memoryUpdateTool) Name() string { return "memory_update" }
-func (t *memoryUpdateTool) Description() string {
-	return "Update an existing durable typed project memory by id. Omitted fields keep their current values."
-}
-func (t *memoryUpdateTool) IsReadOnly() bool { return false }
-func (t *memoryUpdateTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type":"object",
-		"properties":{
-			"id":{"type":"string"},
-			"content":{"type":"string"},
-			"kind":{"type":"string","enum":["pinned","semantic","episodic","procedural"]},
-			"scope":{"type":"string","enum":["project","user","task","file"]},
-			"tags":{"type":"array","items":{"type":"string"}},
-			"task_ids":{"type":"array","items":{"type":"string"}},
-			"file_paths":{"type":"array","items":{"type":"string"}},
-			"source_run":{"type":"string"}
-		},
-		"required":["id"]
-	}`)
-}
-func (t *memoryUpdateTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+func (t *memorySearchTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
 	var in struct {
-		ID        string   `json:"id"`
-		Content   *string  `json:"content"`
-		Kind      *string  `json:"kind"`
-		Scope     *string  `json:"scope"`
-		Tags      []string `json:"tags"`
-		TaskIDs   []string `json:"task_ids"`
-		FilePaths []string `json:"file_paths"`
-		SourceRun *string  `json:"source_run"`
+		Query string   `json:"query"`
+		Kinds []string `json:"kinds"`
+		Limit int      `json:"limit"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return errorResult("Invalid input: %v", err), nil
 	}
-	existing, err := memoryByID(ctx, t.store, in.ID)
+	hits, err := t.store.SearchMemories(ctx, projectstate.MemoryQuery{Query: in.Query, Kinds: in.Kinds, Limit: in.Limit})
 	if err != nil {
 		return jsonToolResult(nil, err), nil
 	}
-	update := projectstate.UpsertMemoryInput{
-		ID:        existing.ID,
-		Kind:      existing.Kind,
-		Scope:     existing.Scope,
-		Content:   existing.Content,
-		Tags:      existing.Tags,
-		TaskIDs:   existing.TaskIDs,
-		FilePaths: existing.FilePaths,
-		SourceRun: existing.SourceRun,
-		Metadata:  existing.Metadata,
+	out := make([]memorySearchHit, 0, len(hits))
+	for _, hit := range hits {
+		stale, reason := t.checker.Check(ctx, hit.Memory)
+		out = append(out, memorySearchHit{
+			ID:          hit.ID,
+			Kind:        hit.Kind,
+			Title:       hit.Title,
+			Snippet:     snippet(hit.Body, snippetRunes),
+			Score:       math.Round(hit.Score*100) / 100,
+			Stale:       stale,
+			StaleReason: reason,
+		})
 	}
-	if in.Content != nil {
-		update.Content = *in.Content
-	}
-	if in.Kind != nil {
-		update.Kind = *in.Kind
-	}
-	if in.Scope != nil {
-		update.Scope = *in.Scope
-	}
-	if in.Tags != nil {
-		update.Tags = in.Tags
-	}
-	if in.TaskIDs != nil {
-		update.TaskIDs = in.TaskIDs
-	}
-	if in.FilePaths != nil {
-		update.FilePaths = in.FilePaths
-	}
-	if in.SourceRun != nil {
-		update.SourceRun = *in.SourceRun
-	}
-	mem, err := t.store.UpsertMemory(ctx, update)
-	return jsonToolResult(mem, err), nil
+	return jsonToolResult(out, nil), nil
 }
 
-type memoryDeleteTool struct{ baseTool }
+type memoryGetTool struct{ baseTool }
 
-func (t *memoryDeleteTool) Name() string { return "memory_delete" }
-func (t *memoryDeleteTool) Description() string {
-	return "Delete one durable typed project memory by id."
+func (t *memoryGetTool) Name() string { return "memory_get" }
+func (t *memoryGetTool) Description() string {
+	return "Read one durable project memory in full by id (ids come from the briefing's Memory Index or memory_search). " +
+		"If the result is stale, re-verify it against its cited files/URLs before relying on it: " +
+		"call memory_verify if it still holds, memory_save with its id to correct it, or memory_delete if it is obsolete."
 }
-func (t *memoryDeleteTool) IsReadOnly() bool { return false }
-func (t *memoryDeleteTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)
+func (t *memoryGetTool) IsReadOnly() bool { return true }
+func (t *memoryGetTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string","description":"Memory id, e.g. mem_ab12cd34ef56."}},"required":["id"]}`)
 }
-func (t *memoryDeleteTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+
+type memoryWithStaleness struct {
+	projectstate.Memory
+	Stale       bool   `json:"stale"`
+	StaleReason string `json:"stale_reason,omitempty"`
+}
+
+func (t *memoryGetTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
 	var in struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return errorResult("Invalid input: %v", err), nil
 	}
-	err := t.store.DeleteMemory(ctx, in.ID)
-	return jsonToolResult(map[string]string{"id": strings.TrimSpace(in.ID), "status": "deleted"}, err), nil
-}
-
-type memoryStatsTool struct{ baseTool }
-
-func (t *memoryStatsTool) Name() string { return "memory_stats" }
-func (t *memoryStatsTool) Description() string {
-	return "Summarize durable typed project memory counts by kind, scope, and tag."
-}
-func (t *memoryStatsTool) IsReadOnly() bool { return true }
-func (t *memoryStatsTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"kinds":{"type":"array","items":{"type":"string"}},"tags":{"type":"array","items":{"type":"string"}}}}`)
-}
-func (t *memoryStatsTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
-	var in projectstate.MemoryFilter
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return errorResult("Invalid input: %v", err), nil
-	}
-	memories, err := t.store.ListMemories(ctx, in)
+	mem, err := t.store.GetMemory(ctx, in.ID)
 	if err != nil {
 		return jsonToolResult(nil, err), nil
 	}
-	stats := memoryStats{
-		Total:   len(memories),
-		ByKind:  map[string]int{},
-		ByScope: map[string]int{},
-		ByTag:   map[string]int{},
+	// Usage tracking is best-effort; a failed touch must not hide the memory.
+	_ = t.store.TouchMemories(ctx, []string{mem.ID})
+	return jsonToolResult(t.withStaleness(ctx, *mem), nil), nil
+}
+
+type memorySaveTool struct{ baseTool }
+
+func (t *memorySaveTool) Name() string { return "memory_save" }
+func (t *memorySaveTool) Description() string {
+	return "Save durable project knowledge for future runs. Save only what is reusable later and not obvious from the code or docs: " +
+		"user preferences, decisions with their rationale, non-obvious facts and gotchas, and repeatable procedures. " +
+		"Never save progress logs, task status, or PR/commit changelogs. " +
+		"Keep the title to one line and the body short; cite the files (workspace-relative paths) or URLs that support it so it can be re-verified later. " +
+		"Prefer updating an existing memory over adding a new one: search first, then pass its id to replace it (omitted fields keep their current values). " +
+		"Without an id a new memory is created; near-duplicates of existing memories are rejected unless allow_duplicate is true."
+}
+func (t *memorySaveTool) IsReadOnly() bool { return false }
+func (t *memorySaveTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"id": {"type": "string", "description": "Existing memory id to replace. Omit to create a new memory."},
+			"kind": {"type": "string", "enum": ["preference", "decision", "fact", "procedure"], "description": "preference: how the user wants work done; decision: a durable choice and its rationale; fact: a non-obvious fact or gotcha; procedure: a repeatable how-to."},
+			"title": {"type": "string", "description": "One-line summary (max 120 characters)."},
+			"body": {"type": "string", "description": "The reusable knowledge (max 1500 characters). For decisions include the rationale."},
+			"citations": {
+				"type": "array",
+				"description": "Evidence supporting the memory.",
+				"items": {
+					"type": "object",
+					"properties": {
+						"path": {"type": "string", "description": "Workspace-relative file path."},
+						"url": {"type": "string", "description": "Issue, PR, or documentation URL."}
+					}
+				}
+			},
+			"allow_duplicate": {"type": "boolean", "description": "Create even when a similar memory exists. Only for genuinely distinct knowledge."}
+		}
+	}`)
+}
+
+func (t *memorySaveTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in struct {
+		ID             string                   `json:"id"`
+		Kind           *string                  `json:"kind"`
+		Title          *string                  `json:"title"`
+		Body           *string                  `json:"body"`
+		Citations      *[]projectstate.Citation `json:"citations"`
+		AllowDuplicate bool                     `json:"allow_duplicate"`
 	}
-	for _, mem := range memories {
-		stats.ByKind[mem.Kind]++
-		stats.ByScope[mem.Scope]++
-		for _, tag := range mem.Tags {
-			tag = strings.TrimSpace(tag)
-			if tag != "" {
-				stats.ByTag[tag]++
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	save := projectstate.SaveMemoryInput{ID: strings.TrimSpace(in.ID), SourceRun: t.actor}
+	if save.ID != "" {
+		existing, err := t.store.GetMemory(ctx, save.ID)
+		if err != nil {
+			return jsonToolResult(nil, err), nil
+		}
+		save.Kind, save.Title, save.Body = existing.Kind, existing.Title, existing.Body
+		save.Citations = existing.Citations
+		save.CommitSHA = existing.CommitSHA
+	}
+	if in.Kind != nil {
+		save.Kind = *in.Kind
+	}
+	if in.Title != nil {
+		save.Title = *in.Title
+	}
+	if in.Body != nil {
+		save.Body = *in.Body
+	}
+	if in.Citations != nil {
+		save.Citations = *in.Citations
+	}
+	if t.workDir != "" {
+		save.CommitSHA = t.checker.HeadSHA(ctx)
+	}
+	if err := projectstate.ValidateMemoryInput(&save); err != nil {
+		return jsonToolResult(nil, err), nil
+	}
+	if save.ID == "" && !in.AllowDuplicate {
+		if dupes := t.duplicates(ctx, save.Title, save.Body); len(dupes) > 0 {
+			var b strings.Builder
+			b.WriteString("Not saved: this looks like a duplicate of existing memory:\n")
+			for _, hit := range dupes {
+				fmt.Fprintf(&b, "- %s [%s] %s\n", hit.ID, hit.Kind, hit.Title)
 			}
+			b.WriteString("Update one of them instead by calling memory_save with its id (read it first with memory_get). " +
+				"Set allow_duplicate=true only if this is genuinely distinct knowledge.")
+			return agentsdk.ToolResult{Content: b.String(), IsError: true}, nil
 		}
 	}
-	return jsonToolResult(stats, nil), nil
-}
-
-type memoryStats struct {
-	Total   int            `json:"total"`
-	ByKind  map[string]int `json:"by_kind"`
-	ByScope map[string]int `json:"by_scope"`
-	ByTag   map[string]int `json:"by_tag"`
-}
-
-func memoryByID(ctx context.Context, store projectstate.Store, id string) (projectstate.Memory, error) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return projectstate.Memory{}, fmt.Errorf("memory id is required")
-	}
-	memories, err := store.ListMemories(ctx, projectstate.MemoryFilter{})
+	mem, err := t.store.SaveMemory(ctx, save)
 	if err != nil {
-		return projectstate.Memory{}, err
+		return jsonToolResult(nil, err), nil
 	}
-	for _, mem := range memories {
-		if mem.ID == id {
-			return mem, nil
+	return jsonToolResult(struct {
+		Memory  *projectstate.Memory `json:"memory"`
+		Warning string               `json:"warning,omitempty"`
+	}{mem, projectstate.ProgressLogWarning(mem.Title, mem.Body)}, nil), nil
+}
+
+func (t *memorySaveTool) duplicates(ctx context.Context, title, body string) []projectstate.MemoryHit {
+	hits, err := t.store.SearchMemories(ctx, projectstate.MemoryQuery{Query: title + " " + body, Limit: 5})
+	if err != nil {
+		return nil
+	}
+	var out []projectstate.MemoryHit
+	for _, hit := range hits {
+		if projectstate.Similarity(title, body, hit.Title, hit.Body) >= projectstate.DuplicateThreshold {
+			out = append(out, hit)
 		}
 	}
-	return projectstate.Memory{}, fmt.Errorf("memory %q not found", id)
+	return out
+}
+
+type memoryVerifyTool struct{ baseTool }
+
+func (t *memoryVerifyTool) Name() string { return "memory_verify" }
+func (t *memoryVerifyTool) Description() string {
+	return "Mark a memory as re-verified. Call it only after re-checking a stale memory against its cited files/URLs and confirming it is still true; " +
+		"it records the current commit and clears the age-based staleness. If the memory is wrong, use memory_save with its id or memory_delete instead."
+}
+func (t *memoryVerifyTool) IsReadOnly() bool { return false }
+func (t *memoryVerifyTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}`)
+}
+func (t *memoryVerifyTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	mem, err := t.store.VerifyMemory(ctx, in.ID, t.checker.HeadSHA(ctx))
+	if err != nil {
+		return jsonToolResult(nil, err), nil
+	}
+	return jsonToolResult(t.withStaleness(ctx, *mem), nil), nil
+}
+
+type memoryDeleteTool struct{ baseTool }
+
+func (t *memoryDeleteTool) Name() string { return "memory_delete" }
+func (t *memoryDeleteTool) Description() string {
+	return "Delete a durable project memory that is obsolete, wrong, or superseded by another memory."
+}
+func (t *memoryDeleteTool) IsReadOnly() bool { return false }
+func (t *memoryDeleteTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string","description":"Why the memory is no longer valid."}},"required":["id"]}`)
+}
+func (t *memoryDeleteTool) Execute(ctx context.Context, raw json.RawMessage, _ string) (agentsdk.ToolResult, error) {
+	var in struct {
+		ID     string `json:"id"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return errorResult("Invalid input: %v", err), nil
+	}
+	err := t.store.DeleteMemory(ctx, in.ID)
+	out := map[string]string{"id": strings.TrimSpace(in.ID), "status": "deleted"}
+	if reason := strings.TrimSpace(in.Reason); reason != "" {
+		out["reason"] = reason
+	}
+	return jsonToolResult(out, err), nil
+}
+
+func (t baseTool) withStaleness(ctx context.Context, mem projectstate.Memory) memoryWithStaleness {
+	stale, reason := t.checker.Check(ctx, mem)
+	return memoryWithStaleness{Memory: mem, Stale: stale, StaleReason: reason}
+}
+
+func snippet(body string, max int) string {
+	body = strings.Join(strings.Fields(body), " ")
+	if utf8.RuneCountInString(body) <= max {
+		return body
+	}
+	return string([]rune(body)[:max]) + "..."
 }
 
 type primeContextTool struct{ baseTool }

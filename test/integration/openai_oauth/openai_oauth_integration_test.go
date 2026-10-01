@@ -18,7 +18,6 @@ import (
 	sdkguardrails "github.com/gratefulagents/sdk/pkg/agentsdk/guardrails"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/host/fileconfig"
 	sdkmcp "github.com/gratefulagents/sdk/pkg/agentsdk/mcp"
-	sdkmemory "github.com/gratefulagents/sdk/pkg/agentsdk/memory"
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
 	sdkpolicy "github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
@@ -446,9 +445,8 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 		sdktools.WithSignalTools(),
 		sdktools.WithBrowserTools(),
 		sdktools.WithReadFileImages(),
-		sdktools.WithMemoryStore(sdkmemory.NewInMemoryStore(), "integration", "run-1", "https://example.test/repo"),
 	)
-	for _, name := range []string{"AskUserQuestion", "Bash", "Browser", "Edit", "LSP", "Memory", "WebFetch", "Write", "glob", "grep", "list_files", "present_plan", "read_file"} {
+	for _, name := range []string{"AskUserQuestion", "Bash", "Browser", "Edit", "LSP", "WebFetch", "Write", "glob", "grep", "list_files", "present_plan", "read_file"} {
 		if registry.Get(name) == nil {
 			t.Fatalf("registry missing %q; names=%v", name, registry.Names())
 		}
@@ -487,24 +485,6 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 	bashResult, err := registry.Get("Bash").Execute(ctx, json.RawMessage(`{"command":"printf shell-ok","timeout":5000}`), workDir)
 	if err != nil || strings.TrimSpace(bashResult.Content) != "shell-ok" {
 		t.Fatalf("Bash result=%+v err=%v", bashResult, err)
-	}
-	memoryStoreResult, err := registry.Get("Memory").Execute(ctx, json.RawMessage(`{"action":"store","content":"OAuth integration memory","tags":["integration"]}`), workDir)
-	if err != nil || memoryStoreResult.IsError {
-		t.Fatalf("Memory store result=%+v err=%v", memoryStoreResult, err)
-	}
-	var storedMemory struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(memoryStoreResult.Content), &storedMemory); err != nil || storedMemory.ID == "" {
-		t.Fatalf("stored memory payload=%q err=%v", memoryStoreResult.Content, err)
-	}
-	memorySearchResult, err := registry.Get("Memory").Execute(ctx, json.RawMessage(`{"action":"search","content":"OAuth","tags":["integration"],"limit":2}`), workDir)
-	if err != nil || memorySearchResult.IsError || !strings.Contains(memorySearchResult.Content, storedMemory.ID) {
-		t.Fatalf("Memory search result=%+v err=%v", memorySearchResult, err)
-	}
-	memoryDeleteResult, err := registry.Get("Memory").Execute(ctx, json.RawMessage(fmt.Sprintf(`{"action":"delete","id":%q}`, storedMemory.ID)), workDir)
-	if err != nil || memoryDeleteResult.IsError {
-		t.Fatalf("Memory delete result=%+v err=%v", memoryDeleteResult, err)
 	}
 	questionResult, err := registry.Get("AskUserQuestion").Execute(ctx, json.RawMessage(`{"question":"Pick one","choices":["a","b"],"allow_freeform":false}`), workDir)
 	if err != nil || !strings.Contains(questionResult.Content, `"allow_freeform":false`) {
@@ -984,7 +964,7 @@ func TestSDKSecurityRegressionCoverage(t *testing.T) {
 	})
 }
 
-func TestLiveOpenAIOAuthHostConfigMemoryEventsMCPTracesSandboxCompactionCostsAndWorkflowLogic(t *testing.T) {
+func TestLiveOpenAIOAuthHostConfigEventsMCPTracesSandboxCompactionCostsAndWorkflowLogic(t *testing.T) {
 	ctx := context.Background()
 	runner, model := liveOpenAIRunner(t)
 	processor := &recordingTracingProcessor{}
@@ -1083,20 +1063,6 @@ Find facts carefully.
 	}
 	if nudge := agentsdk.BuildSmartNudge(auto, "discover"); !strings.Contains(nudge, "tool") {
 		t.Fatalf("smart nudge = %q", nudge)
-	}
-
-	memories := sdkmemory.NewInMemoryStore()
-	stored, err := memories.Store(ctx, "repo", "Prefer live OAuth SDK tests", []string{"testing"}, "run-1", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found, err := memories.Search(ctx, "repo", "OAuth", []string{"testing"}, 5)
-	if err != nil || len(found) != 1 || found[0].ID != stored.ID {
-		t.Fatalf("memory search = %+v err=%v", found, err)
-	}
-	vector, err := (&sdkmemory.NoopEmbedder{Dimension: 3}).Embed(ctx, "anything")
-	if err != nil || sdkmemory.VectorLiteral(vector) != "[0,0,0]" {
-		t.Fatalf("noop embedding=%v err=%v", vector, err)
 	}
 
 	var typedEvents []sdkevents.Event
