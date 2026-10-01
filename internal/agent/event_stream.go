@@ -343,9 +343,6 @@ func (es *EventStream) Emit(ev ContentEvent) {
 	if ev.TaskID == "" && es.taskID != "" {
 		ev.TaskID = es.taskID
 	}
-	if ev.Timestamp.IsZero() {
-		ev.Timestamp = time.Now()
-	}
 	l := es.logger
 	bus := es.events
 	es.mu.Unlock()
@@ -354,24 +351,33 @@ func (es *EventStream) Emit(ev ContentEvent) {
 		ev = bus.annotateSubagent(ev)
 	}
 
-	if l != nil {
-		l.Event(ev)
+	// The write mutex is shared by the parent stream and every child
+	// (subagent) stream. Stamping the timestamp, writing, and broadcasting
+	// under it keeps timestamp order, file order, and subscriber order
+	// identical across concurrently emitting agents; stamping under the
+	// per-stream mutex let a subagent event carry an earlier timestamp than
+	// a parent event written before it.
+	es.writeMu.Lock()
+	if ev.Timestamp.IsZero() {
+		ev.Timestamp = time.Now()
+	}
+	data, err := json.Marshal(ev)
+	if err == nil {
+		data = append(data, '\n')
+		// Event stream writes are best-effort: if the underlying writer
+		// (e.g. a closed pipe to the host) fails there is no recovery path
+		// here. Callers who need delivery guarantees should use a
+		// buffered/durable writer.
+		_, _ = es.w.Write(data)
 	}
 	if bus != nil {
 		bus.broadcast(ev)
 	}
-
-	data, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-	data = append(data, '\n')
-	es.writeMu.Lock()
-	// Event stream writes are best-effort: if the underlying writer (e.g. a
-	// closed pipe to the host) fails there is no recovery path here. Callers
-	// who need delivery guarantees should use a buffered/durable writer.
-	_, _ = es.w.Write(data)
 	es.writeMu.Unlock()
+
+	if l != nil {
+		l.Event(ev)
+	}
 }
 
 // EmitText emits an assistant text event.
