@@ -907,6 +907,7 @@ type taskRunSnapshot struct {
 	toolPolicy              *ToolPolicy
 	retryPolicy             *RetryPolicy
 	modelCallTimeout        time.Duration
+	maxRetainedToolImages   int
 	compactionConfig        CompactionConfig
 	compactionModelResolver CompactionModelResolver
 	maxTurns                int
@@ -1031,6 +1032,7 @@ func (r *SubAgentRegistry) SpawnAsyncWithOptions(ctx context.Context, agentName,
 		// fail the whole sub-agent instead.
 		snap.retryPolicy = nestedCfg.RetryPolicy
 		snap.modelCallTimeout = nestedCfg.ModelCallTimeout
+		snap.maxRetainedToolImages = nestedCfg.MaxRetainedToolImages
 		// Configure is session-scoped, but a live mode switch can clamp the
 		// current parent turn further. Async children must inherit that turn's
 		// effective access and may never widen it back to the startup value.
@@ -1208,6 +1210,7 @@ func (r *SubAgentRegistry) runTask(ctx context.Context, taskID, parentCallID str
 			HandoffHistory:            snap.handoffHistory,
 			RetryPolicy:               snap.retryPolicy,
 			ModelCallTimeout:          snap.modelCallTimeout,
+			MaxRetainedToolImages:     snap.maxRetainedToolImages,
 			CompactionConfig:          snap.compactionConfig,
 			CompactionModelResolver:   snap.compactionModelResolver,
 			CompactionRecorder:        snap.compactionRecorder,
@@ -1596,6 +1599,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 		snap.compactionFailureReporter = nestedCfg.CompactionFailureReporter
 		snap.retryPolicy = nestedCfg.RetryPolicy
 		snap.modelCallTimeout = nestedCfg.ModelCallTimeout
+		snap.maxRetainedToolImages = nestedCfg.MaxRetainedToolImages
 		if NormalizeToolAccessLevel(nestedCfg.ToolAccessLevel) == ToolAccessLevelReadOnly {
 			snap.toolAccessLevel = ToolAccessLevelReadOnly
 		}

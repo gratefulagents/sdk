@@ -149,6 +149,7 @@ type NestedRunConfig struct {
 	ToolOutputGuardrails      []ToolOutputGuardrail
 	RetryPolicy               *RetryPolicy
 	ModelCallTimeout          time.Duration
+	MaxRetainedToolImages     int
 	UntrustedToolOutputs      *bool
 	MaxToolOutputBytes        int
 	ToolOutputDir             string
@@ -167,6 +168,7 @@ func WithNestedRunConfig(ctx context.Context, cfg RunConfig) context.Context {
 		ToolOutputGuardrails:      cfg.ToolOutputGuardrails,
 		RetryPolicy:               cfg.RetryPolicy,
 		ModelCallTimeout:          cfg.ModelCallTimeout,
+		MaxRetainedToolImages:     cfg.MaxRetainedToolImages,
 		UntrustedToolOutputs:      cfg.UntrustedToolOutputs,
 		MaxToolOutputBytes:        cfg.MaxToolOutputBytes,
 		ToolOutputDir:             cfg.ToolOutputDir,
