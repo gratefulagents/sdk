@@ -56,8 +56,7 @@ func TestCopilotRoutesClaudeToAnthropicMessages(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotModel = body.Model
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4.8","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		writeAnthropicSuccess(w, "msg_1", "claude-opus-4.8")
 	}))
 	defer srv.Close()
 
@@ -116,8 +115,7 @@ func TestCopilotClaudeUsesAdaptiveThinking(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4.8","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		writeAnthropicSuccess(w, "msg_1", "claude-opus-4.8")
 	}))
 	defer srv.Close()
 
@@ -315,8 +313,7 @@ func TestCopilotClaude45UsesEnabledThinking(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4.5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		writeAnthropicSuccess(w, "msg_1", "claude-sonnet-4.5")
 	}))
 	defer srv.Close()
 

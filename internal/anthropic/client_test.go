@@ -48,7 +48,7 @@ func TestCreateMessageReportsStreamingActivity(t *testing.T) {
 			`event: message_stop`,
 			`data: {"type":"message_stop"}`,
 			``,
-		}, "\n")))
+		}, "\n") + "\n"))
 	}))
 	defer srv.Close()
 
@@ -96,7 +96,7 @@ func TestCreateMessageStreamReportsToolArgumentActivity(t *testing.T) {
 			`event: message_stop`,
 			`data: {"type":"message_stop"}`,
 			``,
-		}, "\n")))
+		}, "\n") + "\n"))
 	}))
 	defer srv.Close()
 
@@ -141,16 +141,8 @@ func TestNewClient_OAuthHeaders(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		gotAPIKey = r.Header.Get("x-api-key")
 		gotBeta = r.Header.Get("anthropic-beta")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test",
-			"type":"message",
-			"role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5",
-			"stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(reliabilityCompleteSSE))
 	}))
 	defer srv.Close()
 
@@ -305,13 +297,8 @@ func TestClient_TokenSourceRefreshesOn401(t *testing.T) {
 			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"expired"}}`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test","type":"message","role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5","stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(reliabilityCompleteSSE))
 	}))
 	defer srv.Close()
 
@@ -339,13 +326,8 @@ func TestNewClient_OAuthClaudeCodeShaping(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUA = r.Header.Get("User-Agent")
 		gotDirect = r.Header.Get("anthropic-dangerous-direct-browser-access")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_test","type":"message","role":"assistant",
-			"content":[{"type":"text","text":"ok"}],
-			"model":"claude-sonnet-4-5","stop_reason":"end_turn",
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(reliabilityCompleteSSE))
 	}))
 	defer srv.Close()
 
