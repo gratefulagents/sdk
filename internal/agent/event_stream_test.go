@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestEventStreamEmit(t *testing.T) {
@@ -219,5 +221,47 @@ func TestEventStreamSubscribeReceivesChildSubagentEvents(t *testing.T) {
 	}
 	if subagent.AgentName != "worker" || len(subagent.WaitingOn) != 1 || subagent.WaitingOn[0] != "task-parent" || subagent.MessagesReceived != 1 {
 		t.Fatalf("unexpected subagent payload: %+v", subagent)
+	}
+}
+
+// TestEmitTimestampsFollowWriteOrderAcrossChildStreams guards the ordering
+// contract consumers rely on: parent and child (subagent) streams share one
+// writer, and the stamped timestamps must never go backwards in file order.
+func TestEmitTimestampsFollowWriteOrderAcrossChildStreams(t *testing.T) {
+	var buf bytes.Buffer
+	parent := NewEventStream(&buf)
+	children := []*EventStream{
+		NewChildEventStream(parent, "task-a"),
+		NewChildEventStream(parent, "task-b"),
+		NewChildEventStream(parent, "task-c"),
+	}
+	var wg sync.WaitGroup
+	for _, es := range append(children, parent) {
+		wg.Add(1)
+		go func(es *EventStream) {
+			defer wg.Done()
+			for range 200 {
+				es.EmitText("x")
+			}
+		}(es)
+	}
+	wg.Wait()
+
+	var prev time.Time
+	lines := 0
+	dec := json.NewDecoder(&buf)
+	for dec.More() {
+		var ev ContentEvent
+		if err := dec.Decode(&ev); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if ev.Timestamp.Before(prev) {
+			t.Fatalf("event %d timestamp %v precedes previous %v in file order", lines, ev.Timestamp, prev)
+		}
+		prev = ev.Timestamp
+		lines++
+	}
+	if lines != 800 {
+		t.Fatalf("got %d events, want 800", lines)
 	}
 }
