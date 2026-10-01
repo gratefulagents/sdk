@@ -357,8 +357,11 @@ func TestNewClient_OAuthClaudeCodeShaping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateMessage() error = %v", err)
 	}
-	if gotUA != oauthUserAgent {
-		t.Fatalf("User-Agent = %q, want %q", gotUA, oauthUserAgent)
+	// Keep the expected wire identity independent of the implementation constant
+	// so reverting to a version rejected by Anthropic fails this regression test.
+	const wantUA = "claude-cli/2.1.280 (external, cli)"
+	if gotUA != wantUA {
+		t.Fatalf("User-Agent = %q, want %q", gotUA, wantUA)
 	}
 	if gotDirect != "true" {
 		t.Fatalf("anthropic-dangerous-direct-browser-access = %q, want true", gotDirect)
