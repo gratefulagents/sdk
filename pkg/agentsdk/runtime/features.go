@@ -31,14 +31,14 @@ type ToolFeatures struct {
 	WebFetch            bool
 	AsyncShell          bool
 	Browser             bool
-	Vision              bool
+	Vision              bool // read_file may return image files as image attachments
 	InteractiveTerminal bool
 	Think               bool
 	AttachRepository    bool
 	GitHubPullRequest   bool
 	GitHubIssue         bool
 	ExtraTools          bool
-	VisionAnalyzer      bool
+	VisionAnalyzer      bool // offer the runtime vision analyzer to sdkvision.AnalyzerConsumer tools
 	Signals             SignalFeatures
 }
 
@@ -192,7 +192,7 @@ func legacyFeatures(cfg Config) Features {
 }
 
 func (f ToolFeatures) hasRegistryTools() bool {
-	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.ApplyPatch || f.Move || f.Delete || f.WebFetch || f.AsyncShell || f.Browser || f.Vision || f.InteractiveTerminal || f.Think || f.AttachRepository || f.GitHubPullRequest || f.GitHubIssue
+	return f.ListFiles || f.ReadFile || f.Glob || f.Grep || f.LSP || f.Bash || f.Write || f.Edit || f.ApplyPatch || f.Move || f.Delete || f.WebFetch || f.AsyncShell || f.Browser || f.InteractiveTerminal || f.Think || f.AttachRepository || f.GitHubPullRequest || f.GitHubIssue
 }
 
 func (f ToolFeatures) hasSignals() bool {

@@ -101,12 +101,40 @@ type LLMToolApproval struct {
 // sent to the model.
 func BuildLLMRequestSnapshot(agentName string, req ModelRequest) *LLMRequestSnapshot {
 	overhead := estimateModelRequestOverheadTokens(req.Instructions, req.Tools, req.Settings)
-	inputEstimate := estimateRunItemsTokens(req.Input)
+	return buildLLMRequestSnapshot(agentName, req, estimateRunItemsTokens(req.Input), overhead, nil)
+}
+
+// requestSnapshotter builds the per-turn request snapshots of one run. It
+// remembers tool-call inputs already validated on earlier turns so the
+// replayed history is not re-validated as JSON on every turn.
+type requestSnapshotter struct {
+	validInputs map[string]int // tool call ID -> validated input length
+}
+
+func (s *requestSnapshotter) validated(call ToolCallData) bool {
+	if s == nil {
+		return false
+	}
+	n, ok := s.validInputs[call.ID]
+	return ok && n == len(call.Input)
+}
+
+func (s *requestSnapshotter) markValid(call ToolCallData) {
+	if s == nil || call.ID == "" {
+		return
+	}
+	if s.validInputs == nil {
+		s.validInputs = map[string]int{}
+	}
+	s.validInputs[call.ID] = len(call.Input)
+}
+
+func buildLLMRequestSnapshot(agentName string, req ModelRequest, inputEstimate, overhead int, snapshotter *requestSnapshotter) *LLMRequestSnapshot {
 	snap := &LLMRequestSnapshot{
 		AgentName:                    agentName,
 		Model:                        req.Model,
 		Instructions:                 req.Instructions,
-		InputItems:                   SnapshotRunItems(req.Input),
+		InputItems:                   snapshotRunItems(req.Input, snapshotter),
 		Tools:                        SnapshotTools(req.Tools),
 		Settings:                     req.Settings,
 		InputTokenEstimate:           inputEstimate,
@@ -189,6 +217,10 @@ func SnapshotTools(tools []Tool) []LLMToolSnapshot {
 }
 
 func SnapshotRunItems(items []RunItem) []LLMRunItemSnapshot {
+	return snapshotRunItems(items, nil)
+}
+
+func snapshotRunItems(items []RunItem, snapshotter *requestSnapshotter) []LLMRunItemSnapshot {
 	if len(items) == 0 {
 		return nil
 	}
@@ -207,7 +239,17 @@ func SnapshotRunItems(items []RunItem) []LLMRunItemSnapshot {
 			}
 		case RunItemToolCall:
 			if item.ToolCall != nil {
-				tc := snapshotToolCall(*item.ToolCall)
+				call := *item.ToolCall
+				var tc LLMToolCall
+				switch {
+				case snapshotter.validated(call):
+					tc = LLMToolCall{ID: call.ID, Name: call.Name, Input: append(json.RawMessage(nil), call.Input...)}
+				case snapshotter != nil && len(call.Input) > 0 && json.Valid(call.Input):
+					snapshotter.markValid(call)
+					tc = LLMToolCall{ID: call.ID, Name: call.Name, Input: append(json.RawMessage(nil), call.Input...)}
+				default:
+					tc = snapshotToolCall(call)
+				}
 				snap.ToolCall = &tc
 			}
 		case RunItemToolOutput:

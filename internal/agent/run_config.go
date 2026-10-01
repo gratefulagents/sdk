@@ -68,30 +68,61 @@ func immediateInputContext(parent context.Context, signal ImmediateInputSignal, 
 	}
 }
 
+// modelCallActivity reports progress to a model-call idle context. A nil
+// *modelCallActivity is a valid no-op.
+type modelCallActivity struct {
+	touch func()
+	pause func() (resume func())
+}
+
+// Touch records provider stream activity, resetting the idle timer.
+func (a *modelCallActivity) Touch() {
+	if a != nil && a.touch != nil {
+		a.touch()
+	}
+}
+
+// Pause suspends idle accounting until the returned resume func is called.
+// The runner pauses while it is blocked handing output to a slow stream
+// consumer, which must not be mistaken for provider inactivity.
+func (a *modelCallActivity) Pause() (resume func()) {
+	if a == nil || a.pause == nil {
+		return func() {}
+	}
+	return a.pause()
+}
+
 // modelCallIdleContext derives a context cancelled after timeout elapses with
-// no model stream activity. activity resets the idle timer. Callers classify
-// the winner atomically through context.Cause before invoking cancel.
+// no model stream activity. activity resets (or pauses) the idle timer.
+// Callers classify the winner atomically through context.Cause before
+// invoking cancel.
 func modelCallIdleContext(parent context.Context, timeout time.Duration) (
 	ctx context.Context,
-	activity func(),
+	activity *modelCallActivity,
 	cancel context.CancelFunc,
 ) {
 	to := effectiveModelCallTimeout(timeout)
 	if to <= 0 {
 		ctx, cancel := context.WithCancel(parent)
-		return ctx, func() {}, cancel
+		return ctx, nil, cancel
 	}
 
 	callCtx, cancelCause := context.WithCancelCause(parent)
 	var stateMu sync.Mutex
 	lastActivity := time.Now()
 	stopped := false
+	paused := 0
 	var timer *time.Timer
 	var checkIdle func()
 	checkIdle = func() {
 		stateMu.Lock()
 		if stopped || callCtx.Err() != nil {
 			stopped = true
+			stateMu.Unlock()
+			return
+		}
+		if paused > 0 {
+			timer.Reset(to)
 			stateMu.Unlock()
 			return
 		}
@@ -115,6 +146,20 @@ func modelCallIdleContext(parent context.Context, timeout time.Duration) (
 		lastActivity = time.Now()
 		timer.Reset(to)
 	}
+	pause := func() func() {
+		stateMu.Lock()
+		paused++
+		stateMu.Unlock()
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				stateMu.Lock()
+				paused--
+				stateMu.Unlock()
+				touch()
+			})
+		}
+	}
 	stop := func() {
 		stateMu.Lock()
 		if stopped {
@@ -126,7 +171,7 @@ func modelCallIdleContext(parent context.Context, timeout time.Duration) (
 		stateMu.Unlock()
 		cancelCause(context.Canceled)
 	}
-	return modelactivity.WithSink(callCtx, touch), touch, stop
+	return modelactivity.WithSink(callCtx, touch), &modelCallActivity{touch: touch, pause: pause}, stop
 }
 
 // ImmediateInputPoller injects user messages at runner interruptible boundaries.
@@ -330,13 +375,7 @@ type RunConfig struct {
 	// removes spills when the run returns. Spills are disabled for read-only runs.
 	ToolOutputDir      string
 	toolOutputSpillDir string
-	// TracingDisabled suppresses the spans the runner itself emits
-	// (generation, function, handoff, trace lifecycle) for this run. It does
-	// NOT affect spans emitted by a ProgressTracker wired via
-	// SetTracingProcessor (session, subagent, retry, compaction) — the host
-	// owns that processor and controls it directly.
-	TracingDisabled  bool
-	TracingProcessor TracingProcessor // export spans to external systems
+	TracingProcessor   TracingProcessor // export spans to external systems
 
 	// Trace, if set, is used instead of creating a new trace per Run().
 	// This allows multiple Run() calls (e.g. across phases) to share a single
@@ -366,12 +405,8 @@ type RunConfig struct {
 	// Typically set to the cloned repo directory so all tools operate inside the repo.
 	WorkDir string
 
-	// ErrorHandler is called when the run encounters an error. If set, the handler
-	// decides whether to retry, abort, or continue. If nil, errors abort immediately.
-	ErrorHandler RunErrorHandler
-
 	// RetryPolicy optionally retries model-call errors. Provider retry advice
-	// and ErrorHandler still run; this policy is an SDK-level fallback.
+	// still runs; this policy is an SDK-level fallback.
 	RetryPolicy *RetryPolicy
 
 	// AdditionalInstructions are appended to the agent instructions for this run.
@@ -399,26 +434,8 @@ type RunConfig struct {
 	// (Terminus 2 double-confirm pattern).
 	RequireCompletionConfirmation bool
 
-	// ConsecutiveToolErrorLimit escalates when this many consecutive tool
-	// turns produce only errors: the runner injects a corrective note telling
-	// the model to change approach or report the blocker (the 12-factor
-	// three-strike rule). 0 uses DefaultConsecutiveToolErrorLimit; negative
-	// disables escalation.
-	ConsecutiveToolErrorLimit int
-
-	// StopGate is a deterministic finalization gate. When set, it runs on
-	// every candidate final answer; returning ok=false blocks finalization
-	// and feeds the feedback back to the model. After StopGateMaxBlocks
-	// consecutive blocks (default DefaultStopGateMaxBlocks) the gate is
-	// bypassed so a broken gate cannot loop forever (Claude Code stop-hook
-	// pattern). Consecutive-block tracking resets when the model makes
-	// progress with tools.
-	StopGate func(ctx context.Context, finalText string) (ok bool, feedback string)
-	// StopGateMaxBlocks caps consecutive StopGate blocks. 0 = default.
-	StopGateMaxBlocks int
-
 	// FinalAnswerVerifier, when set, reviews the candidate final answer once
-	// per run (after StopGate passes). Non-empty feedback is injected and the
+	// per run. Non-empty feedback is injected and the
 	// run continues instead of finalizing — typically wired to a read-only
 	// critic sub-agent that tries to refute the result (adversarial
 	// verification). Errors from the verifier are logged and ignored.
@@ -485,33 +502,9 @@ const DefaultSubAgentMaxTurns = 50
 // for the model to diagnose failures.
 const DefaultMaxToolOutputBytes = 16 * 1024
 
-// DefaultConsecutiveToolErrorLimit is the consecutive all-error tool-turn
-// threshold that triggers a corrective escalation note.
-const DefaultConsecutiveToolErrorLimit = 3
-
-// DefaultStopGateMaxBlocks caps consecutive StopGate blocks before the gate
-// is bypassed.
-const DefaultStopGateMaxBlocks = 8
-
-// EffectiveConsecutiveToolErrorLimit returns the escalation threshold, or 0
-// when escalation is disabled.
-func (c *RunConfig) EffectiveConsecutiveToolErrorLimit() int {
-	if c.ConsecutiveToolErrorLimit < 0 {
-		return 0
-	}
-	if c.ConsecutiveToolErrorLimit == 0 {
-		return DefaultConsecutiveToolErrorLimit
-	}
-	return c.ConsecutiveToolErrorLimit
-}
-
-// EffectiveStopGateMaxBlocks returns the consecutive-block cap for StopGate.
-func (c *RunConfig) EffectiveStopGateMaxBlocks() int {
-	if c.StopGateMaxBlocks > 0 {
-		return c.StopGateMaxBlocks
-	}
-	return DefaultStopGateMaxBlocks
-}
+// consecutiveToolErrorLimit is the consecutive all-error tool-turn threshold
+// that triggers a corrective escalation note (three-strike rule).
+const consecutiveToolErrorLimit = 3
 
 // EffectiveMaxTurns returns MaxTurns or DefaultMaxTurns if unset.
 func (c *RunConfig) EffectiveMaxTurns() int {

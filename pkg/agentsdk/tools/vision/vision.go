@@ -2,8 +2,6 @@ package vision
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/internal/pathutil"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
@@ -24,109 +21,17 @@ type AnalyzeFn func(ctx context.Context, imageData []byte, mimeType, prompt stri
 // caller-requested image detail level.
 type AnalyzeWithDetailFn func(ctx context.Context, imageData []byte, mimeType, prompt, detailLevel string) (string, error)
 
-// Tool loads images into the active model conversation.
-type Tool struct {
-	AnalyzeFn               AnalyzeFn
-	AnalyzeWithDetailFn     AnalyzeWithDetailFn
-	AllowPrivateNetworkURLs bool
-	// AllowedImageDirs contains host-managed directories outside the workspace
-	// whose images may be loaded, such as the Browser tool's screenshot dir.
-	AllowedImageDirs []string
+// AnalyzerConsumer is implemented by tools that need a host-supplied text
+// vision analyzer (for example a desktop computer-use tool). The runtime
+// builder offers its provider-backed analyzer to every consumer whose
+// VisionAnalyzer returns nil.
+type AnalyzerConsumer interface {
+	VisionAnalyzer() AnalyzeWithDetailFn
+	SetVisionAnalyzer(AnalyzeWithDetailFn)
 }
 
-type input struct {
-	ImagePath   string `json:"image_path"`
-	URL         string `json:"url"`
-	Prompt      string `json:"prompt"`
-	DetailLevel string `json:"detail_level"`
-}
-
-func (t *Tool) Name() string { return "AnalyzeImage" }
-
-func (t *Tool) Description() string {
-	return "Loads an image from a local file path or URL directly into your visual context. Inspect the image yourself to answer the prompt; no separate text analysis is generated."
-}
-
-func (t *Tool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"image_path": {
-				"type": "string",
-				"description": "Workspace-relative image path or absolute path returned by the Browser screenshot action"
-			},
-			"url": {
-				"type": "string",
-				"description": "URL of the image to analyze"
-			},
-			"prompt": {
-				"type": "string",
-				"description": "What to analyze or describe (e.g., 'describe the UI layout', 'find visual bugs', 'extract text')"
-			},
-			"detail_level": {
-				"type": "string",
-				"enum": ["low", "high"],
-				"description": "Analysis detail level (default: high)"
-			}
-		},
-		"required": ["prompt"]
-	}`)
-}
-
-func (t *Tool) IsReadOnly() bool { return true }
-
-func (t *Tool) IsEnabled(_ *agentsdk.RunContext) bool { return true }
-
-func (t *Tool) NeedsApproval() bool { return false }
-
-func (t *Tool) TimeoutSeconds() int { return 0 }
-
-func (t *Tool) Execute(ctx context.Context, raw json.RawMessage, workDir string) (agentsdk.ToolResult, error) {
-	var in input
-	if err := json.Unmarshal(raw, &in); err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Invalid input: %v", err), IsError: true}, nil
-	}
-	if in.Prompt == "" {
-		return agentsdk.ToolResult{Content: "prompt is required", IsError: true}, nil
-	}
-	if in.ImagePath == "" && in.URL == "" {
-		return agentsdk.ToolResult{Content: "either image_path or url is required", IsError: true}, nil
-	}
-
-	var imageData []byte
-	var mimeType string
-	var err error
-	if in.ImagePath != "" {
-		imageData, mimeType, err = LoadImageFromFileInDirs(workDir, in.ImagePath, t.AllowedImageDirs...)
-	} else {
-		imageData, mimeType, err = LoadImageFromURLWithOptions(ctx, in.URL, web.URLSecurityOptions{
-			AllowPrivateNetworkURLs: t.AllowPrivateNetworkURLs,
-		})
-	}
-	if err != nil {
-		return agentsdk.ToolResult{Content: fmt.Sprintf("Failed to load image: %v", err), IsError: true}, nil
-	}
-
-	return agentsdk.ToolResult{
-		Content: in.Prompt,
-		Images: []agentsdk.ImageAttachment{{
-			MediaType: mimeType,
-			Data:      base64.StdEncoding.EncodeToString(imageData),
-			Detail:    normalizeDetailLevel(in.DetailLevel),
-		}},
-	}, nil
-}
-
-func normalizeDetailLevel(detailLevel string) string {
-	switch strings.ToLower(strings.TrimSpace(detailLevel)) {
-	case "low":
-		return "low"
-	default:
-		return "high"
-	}
-}
-
-const maxImageSize = 20 * 1024 * 1024
+// MaxImageFileSize bounds the bytes read for a single image before decoding.
+const MaxImageFileSize = 20 * 1024 * 1024
 
 var newSafeHTTPClientWithOptions = web.NewSafeHTTPClientWithOptions
 
@@ -171,15 +76,15 @@ func LoadImageFromFileInDirs(workDir, path string, allowedDirs ...string) ([]byt
 	if !info.Mode().IsRegular() {
 		return nil, "", fmt.Errorf("%s is not a regular file", absPath)
 	}
-	if info.Size() > maxImageSize {
-		return nil, "", fmt.Errorf("image too large (%d bytes, max %d)", info.Size(), maxImageSize)
+	if info.Size() > MaxImageFileSize {
+		return nil, "", fmt.Errorf("image too large (%d bytes, max %d)", info.Size(), MaxImageFileSize)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxImageSize+1))
+	data, err := io.ReadAll(io.LimitReader(f, MaxImageFileSize+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("reading file: %w", err)
 	}
-	if len(data) > maxImageSize {
-		return nil, "", fmt.Errorf("image too large (> %d bytes)", maxImageSize)
+	if len(data) > MaxImageFileSize {
+		return nil, "", fmt.Errorf("image too large (> %d bytes)", MaxImageFileSize)
 	}
 	return data, DetectImageMIME(absPath, data), nil
 }
@@ -211,12 +116,12 @@ func LoadImageFromURLWithOptions(ctx context.Context, imageURL string, opts web.
 		return nil, "", fmt.Errorf("HTTP %d fetching image", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageSize+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxImageFileSize+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("reading response: %w", err)
 	}
-	if len(data) > maxImageSize {
-		return nil, "", fmt.Errorf("image too large (> %d bytes)", maxImageSize)
+	if len(data) > MaxImageFileSize {
+		return nil, "", fmt.Errorf("image too large (> %d bytes)", MaxImageFileSize)
 	}
 
 	mimeType := resp.Header.Get("Content-Type")

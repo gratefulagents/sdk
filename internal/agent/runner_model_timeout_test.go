@@ -243,15 +243,10 @@ func (*committedThenSilentModel) Provider() string                       { retur
 
 func TestRunnerDoesNotRetryIdleTimeoutAfterOutputCommitted(t *testing.T) {
 	model := &committedThenSilentModel{}
-	var handlerCalls atomic.Int32
 	streamed := NewRunnerWithModel(model).RunStreamed(context.Background(), &Agent{Name: "test"}, nil, RunConfig{
 		MaxTurns:         2,
 		ModelCallTimeout: 50 * time.Millisecond,
 		RetryPolicy:      &RetryPolicy{MaxRetries: 1},
-		ErrorHandler: func(RunErrorData) RunErrorHandlerResult {
-			handlerCalls.Add(1)
-			return RunErrorHandlerResult{Action: ErrorActionRetry}
-		},
 	})
 	for range streamed.Events {
 	}
@@ -260,9 +255,6 @@ func TestRunnerDoesNotRetryIdleTimeoutAfterOutputCommitted(t *testing.T) {
 	}
 	if calls := model.calls.Load(); calls != 1 {
 		t.Fatalf("model calls = %d, want no retry after visible output", calls)
-	}
-	if calls := handlerCalls.Load(); calls != 0 {
-		t.Fatalf("error handler calls = %d, want committed output to bypass retry decisions", calls)
 	}
 }
 
@@ -289,24 +281,16 @@ func (*internalReasoningErrorModel) Provider() string                       { re
 func TestRunnerDoesNotRetryAfterProviderEmitsInternalReasoning(t *testing.T) {
 	model := &internalReasoningErrorModel{}
 	var events bytes.Buffer
-	var handlerCalls atomic.Int32
 	_, err := NewRunnerWithModel(model).Run(context.Background(), &Agent{Name: "test"}, nil, RunConfig{
 		MaxTurns:    2,
 		Hooks:       NewPlatformHooks(NewProgressTracker(), NewEventStream(&events)),
 		RetryPolicy: &RetryPolicy{MaxRetries: 1},
-		ErrorHandler: func(RunErrorData) RunErrorHandlerResult {
-			handlerCalls.Add(1)
-			return RunErrorHandlerResult{Action: ErrorActionRetry}
-		},
 	})
 	if err == nil {
 		t.Fatal("Run() error = nil, want provider failure")
 	}
 	if calls := model.calls.Load(); calls != 1 {
 		t.Fatalf("model calls = %d, want no retry after internal reasoning", calls)
-	}
-	if calls := handlerCalls.Load(); calls != 0 {
-		t.Fatalf("error handler calls = %d, want committed reasoning to bypass retry decisions", calls)
 	}
 	if !bytes.Contains(events.Bytes(), []byte("visible internal reasoning")) {
 		t.Fatal("internal reasoning was not emitted to the event stream")

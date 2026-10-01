@@ -3,7 +3,6 @@ package openai_vision_integration_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"image"
 	"image/color"
 	"image/png"
@@ -12,15 +11,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gratefulagents/sdk/pkg/agentsdk"
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 	sdkruntime "github.com/gratefulagents/sdk/pkg/agentsdk/runtime"
-	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 const liveVisionModel = sdkopenai.DefaultChatModel
 
-func TestLiveOpenAIOAuthAnalyzeImageToolUsesGPT55(t *testing.T) {
+func TestLiveOpenAIOAuthVisionAnalyzerUsesGPT55(t *testing.T) {
 	if liveTestsSkipped() {
 		t.Skip("GRATEFUL_LIVE_TESTS=skip")
 	}
@@ -29,7 +26,7 @@ func TestLiveOpenAIOAuthAnalyzeImageToolUsesGPT55(t *testing.T) {
 		t.Skip("set OPENAI_OAUTH_AUTH_JSON_PATH or provide $HOME/.codex/auth.json to run live OpenAI OAuth vision integration tests")
 	}
 
-	result := executeLiveVisionTool(t, sdkruntime.Config{
+	text := analyzeLiveImage(t, sdkruntime.Config{
 		Provider:                 "openai",
 		Model:                    liveVisionModel,
 		BaseURL:                  envOr("OPENAI_BASE_URL", "https://chatgpt.com/backend-api/codex"),
@@ -38,10 +35,10 @@ func TestLiveOpenAIOAuthAnalyzeImageToolUsesGPT55(t *testing.T) {
 		OpenAIOAuthAccountID:     strings.TrimSpace(os.Getenv("OPENAI_OAUTH_ACCOUNT_ID")),
 		OpenAIOAuthAccountIDPath: strings.TrimSpace(os.Getenv("OPENAI_OAUTH_ACCOUNT_ID_PATH")),
 	})
-	requireVisionLiveOK(t, result.Content)
+	requireVisionLiveOK(t, text)
 }
 
-func TestLiveOpenAIAPIKeyAnalyzeImageToolUsesGPT55(t *testing.T) {
+func TestLiveOpenAIAPIKeyVisionAnalyzerUsesGPT55(t *testing.T) {
 	if liveTestsSkipped() {
 		t.Skip("GRATEFUL_LIVE_TESTS=skip")
 	}
@@ -50,69 +47,34 @@ func TestLiveOpenAIAPIKeyAnalyzeImageToolUsesGPT55(t *testing.T) {
 		t.Skip("set OPENAI_API_KEY to run live OpenAI API-key vision integration tests")
 	}
 
-	result := executeLiveVisionTool(t, sdkruntime.Config{
+	text := analyzeLiveImage(t, sdkruntime.Config{
 		Provider: "openai",
 		Model:    liveVisionModel,
 		APIKey:   apiKey,
 		BaseURL:  strings.TrimSpace(os.Getenv("OPENAI_API_BASE_URL")),
 		APIMode:  "responses",
 	})
-	requireVisionLiveOK(t, result.Content)
+	requireVisionLiveOK(t, text)
 }
 
-func executeLiveVisionTool(t *testing.T, cfg sdkruntime.Config) agentsdk.ToolResult {
+func analyzeLiveImage(t *testing.T, cfg sdkruntime.Config) string {
 	t.Helper()
-	ctx := context.Background()
-	workDir := t.TempDir()
-	imagePath := filepath.Join(workDir, "vision-test.png")
-	if err := os.WriteFile(imagePath, testPNG(t), 0o644); err != nil {
-		t.Fatal(err)
+	cfg.WorkDir = t.TempDir()
+	analyzer := sdkruntime.VisionAnalyzer(cfg)
+	if analyzer == nil {
+		t.Fatal("runtime did not provide an OpenAI vision analyzer")
 	}
-
-	visionTool := &sdkvision.Tool{}
-	cfg.WorkDir = workDir
-	cfg.EnableTools = true
-	cfg.DisableDefaultTools = true
-	cfg.DisableSignalTools = true
-	cfg.ExtraTools = []agentsdk.Tool{visionTool}
-
-	bundle, err := sdkruntime.BuildToolBundle(ctx, cfg)
+	text, err := analyzer(context.Background(), testPNG(t), "image/png", "Look at the image. Reply exactly with: vision live ok", "low")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("vision analyzer error: %v", err)
 	}
-	if visionTool.AnalyzeWithDetailFn == nil {
-		t.Fatal("runtime did not wire OpenAI AnalyzeImage")
-	}
-
-	var tool agentsdk.Tool
-	for _, candidate := range bundle.Tools {
-		if candidate.Name() == "AnalyzeImage" {
-			tool = candidate
-			break
-		}
-	}
-	if tool == nil {
-		t.Fatalf("AnalyzeImage tool missing; tools=%v", toolNames(bundle.Tools))
-	}
-
-	result, err := tool.Execute(ctx, json.RawMessage(`{
-		"image_path": "vision-test.png",
-		"prompt": "Look at the image. Reply exactly with: vision live ok",
-		"detail_level": "low"
-	}`), workDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.IsError {
-		t.Fatalf("AnalyzeImage returned error: %s", result.Content)
-	}
-	return result
+	return text
 }
 
 func requireVisionLiveOK(t *testing.T, text string) {
 	t.Helper()
 	if !strings.Contains(normalize(text), "vision live ok") {
-		t.Fatalf("AnalyzeImage content = %q, want phrase %q", text, "vision live ok")
+		t.Fatalf("vision analyzer text = %q, want phrase %q", text, "vision live ok")
 	}
 }
 
@@ -165,14 +127,4 @@ func envOr(key, fallback string) string {
 
 func liveTestsSkipped() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("GRATEFUL_LIVE_TESTS")), "skip")
-}
-
-func toolNames(tools []agentsdk.Tool) []string {
-	names := make([]string, 0, len(tools))
-	for _, tool := range tools {
-		if tool != nil {
-			names = append(names, tool.Name())
-		}
-	}
-	return names
 }

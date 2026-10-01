@@ -833,35 +833,6 @@ func TestAgentAsToolSanitizesToolName(t *testing.T) {
 	}
 }
 
-func TestRunnerErrorHandlerAbortOverridesRetryPolicy(t *testing.T) {
-	model := &mockModel{
-		errors: []error{errors.New("do not retry")},
-	}
-	runner := NewRunnerWithModel(model)
-	agent := &Agent{Name: "test"}
-
-	_, err := runner.Run(context.Background(), agent, nil, RunConfig{
-		MaxTurns: 2,
-		ErrorHandler: func(RunErrorData) RunErrorHandlerResult {
-			return RunErrorHandlerResult{Action: ErrorActionAbort}
-		},
-		RetryPolicy: &RetryPolicy{
-			MaxRetries: 3,
-			Backoff: RetryBackoffSettings{
-				InitialDelayMS: 0,
-				MaxDelayMS:     0,
-				Multiplier:     1,
-			},
-		},
-	})
-	if err == nil {
-		t.Fatal("Run() error = nil, want abort error")
-	}
-	if model.callIdx != 1 {
-		t.Fatalf("model calls = %d, want no retry after abort", model.callIdx)
-	}
-}
-
 func TestRunnerRunStreamedUsesModelStreamDeltas(t *testing.T) {
 	model := &mockModel{
 		responses: []*ModelResponse{

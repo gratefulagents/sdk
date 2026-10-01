@@ -33,6 +33,23 @@ func (t *Trace) AddSpan(s *Span) {
 	t.Spans = append(t.Spans, s)
 }
 
+// retainedSpan returns the copy of a finished span kept in Trace.Spans.
+// Generation spans drop their request/response snapshots (processors already
+// received them via OnSpanEnd) so a long run does not retain a copy of the
+// whole conversation per turn.
+func retainedSpan(s *Span) *Span {
+	data, ok := s.Data.(*GenerationSpanData)
+	if !ok || data == nil || (data.Request == nil && data.Response == nil) {
+		return s
+	}
+	light := *data
+	light.Request = nil
+	light.Response = nil
+	retained := *s
+	retained.Data = &light
+	return &retained
+}
+
 // Finish marks the trace as complete.
 func (t *Trace) Finish() {
 	t.EndTime = time.Now()

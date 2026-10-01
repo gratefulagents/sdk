@@ -18,6 +18,7 @@ import (
 	sdktools "github.com/gratefulagents/sdk/pkg/agentsdk/tools"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	sdklsp "github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
+	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
@@ -162,6 +163,7 @@ func TestBuildToolBundleStrictFeaturesSelectParityToolsDeterministically(t *test
 		ApplyPatch:          true,
 		Move:                true,
 		Delete:              true,
+		ReadFile:            true,
 		Browser:             true,
 		Vision:              true,
 		InteractiveTerminal: true,
@@ -177,9 +179,7 @@ func TestBuildToolBundleStrictFeaturesSelectParityToolsDeterministically(t *test
 		LSPConfig:               sdklsp.Config{Command: "typescript-language-server", LanguageID: "typescript"},
 		GitHubCommandRunner:     runner,
 		GitHubArtifactSink:      sink,
-		VisionAnalyzeWithDetailFn: func(context.Context, []byte, string, string, string) (string, error) {
-			return "ok", nil
-		},
+		BrowserScreenshotDir:    t.TempDir(),
 	}
 	first, err := BuildToolBundle(context.Background(), cfg)
 	if err != nil {
@@ -199,7 +199,7 @@ func TestBuildToolBundleStrictFeaturesSelectParityToolsDeterministically(t *test
 	}()
 
 	want := map[string]bool{
-		"AnalyzeImage": true, "ApplyPatch": true, "Browser": true, "Delete": true, "LSP": true,
+		"read_file": true, "ApplyPatch": true, "Browser": true, "Delete": true, "LSP": true,
 		"Move": true, "Terminal": true, "create_github_issue": true, "create_pull_request": true, "think": true,
 	}
 	got := map[string]bool{}
@@ -215,9 +215,9 @@ func TestBuildToolBundleStrictFeaturesSelectParityToolsDeterministically(t *test
 			if !reflect.DeepEqual(actualConfig, cfg.LSPConfig) {
 				t.Fatalf("LSP Config = %#v, want %#v", actualConfig, cfg.LSPConfig)
 			}
-		case *sdkvision.Tool:
-			if typed.AnalyzeWithDetailFn == nil {
-				t.Fatal("Vision analyzer was not injected")
+		case *search.ReadFileTool:
+			if !typed.Images || !reflect.DeepEqual(typed.AllowedImageDirs, []string{cfg.BrowserScreenshotDir}) {
+				t.Fatalf("read_file images = %v, dirs = %v; want images from %q", typed.Images, typed.AllowedImageDirs, cfg.BrowserScreenshotDir)
 			}
 		case *sdkgit.CreatePullRequestTool:
 			if typed.Runner != runner || typed.Sink != sink {
@@ -286,7 +286,12 @@ func TestBuildToolBundleLegacyDoesNotEnableOptInTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"AnalyzeImage", "Browser", "Terminal", "think", "create_pull_request", "create_github_issue"} {
+	for _, tool := range bundle.Tools {
+		if readFile, ok := tool.(*search.ReadFileTool); ok && readFile.Images {
+			t.Fatal("legacy read_file unexpectedly returns images")
+		}
+	}
+	for _, name := range []string{"Browser", "Terminal", "think", "create_pull_request", "create_github_issue"} {
 		for _, tool := range bundle.Tools {
 			if tool.Name() == name {
 				t.Fatalf("legacy tool selection unexpectedly enabled %q", name)
@@ -305,7 +310,7 @@ func TestRegistryCapabilityParity(t *testing.T) {
 		"async-shell":          ToolFeatures{AsyncShell: true}.hasRegistryTools(),
 		"signals":              ToolFeatures{Signals: SignalFeatures{AskUserQuestion: true}}.hasSignals(),
 		"browser":              ToolFeatures{Browser: true}.hasRegistryTools(),
-		"vision":               ToolFeatures{Vision: true}.hasRegistryTools(),
+		"vision":               ToolFeatures{ReadFile: true, Vision: true}.hasRegistryTools(),
 		"interactive-terminal": ToolFeatures{InteractiveTerminal: true}.hasRegistryTools(),
 		"think":                ToolFeatures{Think: true}.hasRegistryTools(),
 		"attach-repository":    ToolFeatures{AttachRepository: true}.hasRegistryTools(),
@@ -518,8 +523,21 @@ func TestVisionModelCandidatesPrefersConfiguredModel(t *testing.T) {
 	}
 }
 
+type visionConsumerTool struct {
+	agentsdk.Tool
+	analyzer sdkvision.AnalyzeWithDetailFn
+}
+
+func (t *visionConsumerTool) VisionAnalyzer() sdkvision.AnalyzeWithDetailFn { return t.analyzer }
+
+func (t *visionConsumerTool) SetVisionAnalyzer(fn sdkvision.AnalyzeWithDetailFn) { t.analyzer = fn }
+
+func newVisionConsumerTool() *visionConsumerTool {
+	return &visionConsumerTool{Tool: &agentsdk.FunctionTool{ToolName: "vision_consumer", ReadOnly: true}}
+}
+
 func TestBuildToolBundleWiresOpenAIVisionAnalyzer(t *testing.T) {
-	visionTool := &sdkvision.Tool{}
+	consumer := newVisionConsumerTool()
 	bundle, err := BuildToolBundle(context.Background(), Config{
 		Provider:            "openai",
 		APIKey:              "sk-test",
@@ -527,24 +545,67 @@ func TestBuildToolBundleWiresOpenAIVisionAnalyzer(t *testing.T) {
 		EnableTools:         true,
 		DisableDefaultTools: true,
 		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{visionTool},
+		ExtraTools:          []agentsdk.Tool{consumer},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bundle.Tools) != 1 || bundle.Tools[0] != visionTool {
-		t.Fatalf("tools = %v, want supplied vision tool", toolNames(bundle.Tools))
+	if len(bundle.Tools) != 1 || bundle.Tools[0] != consumer {
+		t.Fatalf("tools = %v, want supplied consumer tool", toolNames(bundle.Tools))
 	}
-	if visionTool.AnalyzeWithDetailFn == nil {
-		t.Fatal("AnalyzeWithDetailFn was not wired")
+	if consumer.analyzer == nil {
+		t.Fatal("vision analyzer was not wired")
+	}
+}
+
+func TestBuildToolBundleSkipsVisionAnalyzerForIneligibleProvider(t *testing.T) {
+	consumer := newVisionConsumerTool()
+	_, err := BuildToolBundle(context.Background(), Config{
+		Provider:            "anthropic",
+		APIKey:              "sk-test",
+		WorkDir:             t.TempDir(),
+		EnableTools:         true,
+		DisableDefaultTools: true,
+		DisableSignalTools:  true,
+		ExtraTools:          []agentsdk.Tool{consumer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumer.analyzer != nil {
+		t.Fatal("vision analyzer wired for a provider without image analysis")
+	}
+}
+
+func TestBuildToolBundleUsesConfiguredVisionAnalyzer(t *testing.T) {
+	consumer := newVisionConsumerTool()
+	_, err := BuildToolBundle(context.Background(), Config{
+		Provider:            "anthropic",
+		WorkDir:             t.TempDir(),
+		EnableTools:         true,
+		DisableDefaultTools: true,
+		DisableSignalTools:  true,
+		ExtraTools:          []agentsdk.Tool{consumer},
+		VisionAnalyzer: func(context.Context, []byte, string, string, string) (string, error) {
+			return "configured", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumer.analyzer == nil {
+		t.Fatal("configured analyzer was not wired")
+	}
+	if got, err := consumer.analyzer(context.Background(), nil, "", "", "high"); err != nil || got != "configured" {
+		t.Fatalf("analyzer = %q, %v; want configured nil", got, err)
 	}
 }
 
 func TestBuildToolBundleDoesNotOverrideCustomVisionAnalyzer(t *testing.T) {
-	custom := sdkvision.AnalyzeWithDetailFn(func(context.Context, []byte, string, string, string) (string, error) {
+	consumer := newVisionConsumerTool()
+	consumer.analyzer = func(context.Context, []byte, string, string, string) (string, error) {
 		return "custom", nil
-	})
-	visionTool := &sdkvision.Tool{AnalyzeWithDetailFn: custom}
+	}
 	_, err := BuildToolBundle(context.Background(), Config{
 		Provider:            "openai",
 		APIKey:              "sk-test",
@@ -552,15 +613,12 @@ func TestBuildToolBundleDoesNotOverrideCustomVisionAnalyzer(t *testing.T) {
 		EnableTools:         true,
 		DisableDefaultTools: true,
 		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{visionTool},
+		ExtraTools:          []agentsdk.Tool{consumer},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if visionTool.AnalyzeWithDetailFn == nil {
-		t.Fatal("custom analyzer was removed")
-	}
-	got, err := visionTool.AnalyzeWithDetailFn(context.Background(), nil, "", "", "high")
+	got, err := consumer.analyzer(context.Background(), nil, "", "", "high")
 	if err != nil || got != "custom" {
 		t.Fatalf("custom analyzer = %q, %v; want custom nil", got, err)
 	}

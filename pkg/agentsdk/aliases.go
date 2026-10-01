@@ -99,11 +99,7 @@ type DurableCheckpoint = agent.DurableCheckpoint
 type DurableCheckpointHook = agent.DurableCheckpointHook
 type DurableRunConfig = agent.DurableRunConfig
 type RunContext = agent.RunContext
-type RunErrorAction = agent.RunErrorAction
-type RunErrorData = agent.RunErrorData
 type RunErrorDetails = agent.RunErrorDetails
-type RunErrorHandler = agent.RunErrorHandler
-type RunErrorHandlerResult = agent.RunErrorHandlerResult
 type RunHooks = agent.RunHooks
 type ToolEndErrorHook = agent.ToolEndErrorHook
 type RunItem = agent.RunItem
@@ -211,10 +207,6 @@ const (
 
 	ToolAccessLevelFull     = agent.ToolAccessLevelFull
 	ToolAccessLevelReadOnly = agent.ToolAccessLevelReadOnly
-
-	ErrorActionRetry    = agent.ErrorActionRetry
-	ErrorActionAbort    = agent.ErrorActionAbort
-	ErrorActionContinue = agent.ErrorActionContinue
 
 	ReasoningNone    = agent.ReasoningNone
 	ReasoningMinimal = agent.ReasoningMinimal

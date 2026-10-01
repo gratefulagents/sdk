@@ -2,7 +2,6 @@ package vision
 
 import (
 	"context"
-	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,34 +13,6 @@ import (
 
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
-
-func TestExecuteReturnsNativeImage(t *testing.T) {
-	dir := t.TempDir()
-	data := []byte{0x89, 'P', 'N', 'G'}
-	if err := os.WriteFile(filepath.Join(dir, "pixel.png"), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, configured := range []bool{false, true} {
-		tool := &Tool{}
-		if configured {
-			tool.AnalyzeWithDetailFn = func(context.Context, []byte, string, string, string) (string, error) {
-				t.Fatal("separate analyzer must not be called")
-				return "", nil
-			}
-		}
-		result, err := tool.Execute(context.Background(), []byte(`{"image_path":"pixel.png","prompt":"inspect","detail_level":"low"}`), dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if result.IsError || result.Content != "inspect" || len(result.Images) != 1 {
-			t.Fatalf("result = %+v", result)
-		}
-		image := result.Images[0]
-		if image.MediaType != "image/png" || image.Data != base64.StdEncoding.EncodeToString(data) || image.Detail != "low" {
-			t.Fatalf("image = %+v", image)
-		}
-	}
-}
 
 func TestLoadImageFromFileInDirsAllowsManagedAbsolutePath(t *testing.T) {
 	workDir := t.TempDir()
@@ -125,7 +96,7 @@ func TestLoadImageFromFileRejectsOversizedBeforeFullRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(maxImageSize + 1); err != nil {
+	if err := f.Truncate(MaxImageFileSize + 1); err != nil {
 		_ = f.Close()
 		t.Fatal(err)
 	}

@@ -445,12 +445,10 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 		sdktools.WithPermissionMode(sdkpolicy.PermissionModeWorkspaceWrite),
 		sdktools.WithSignalTools(),
 		sdktools.WithBrowserTools(),
-		sdktools.WithVisionTools(func(_ context.Context, imageData []byte, mimeType, prompt string) (string, error) {
-			return fmt.Sprintf("vision ok %s %d %s", mimeType, len(imageData), prompt), nil
-		}),
+		sdktools.WithReadFileImages(),
 		sdktools.WithMemoryStore(sdkmemory.NewInMemoryStore(), "integration", "run-1", "https://example.test/repo"),
 	)
-	for _, name := range []string{"AnalyzeImage", "AskUserQuestion", "Bash", "Browser", "Edit", "LSP", "Memory", "WebFetch", "Write", "glob", "grep", "list_files", "present_plan", "read_file"} {
+	for _, name := range []string{"AskUserQuestion", "Bash", "Browser", "Edit", "LSP", "Memory", "WebFetch", "Write", "glob", "grep", "list_files", "present_plan", "read_file"} {
 		if registry.Get(name) == nil {
 			t.Fatalf("registry missing %q; names=%v", name, registry.Names())
 		}
@@ -517,9 +515,9 @@ func TestLiveOpenAIOAuthProvidersPoliciesModesRoutingToolRegistryAndSecurity(t *
 		t.Fatalf("present_plan result=%+v err=%v", planResult, err)
 	}
 	must(t, os.WriteFile(filepath.Join(workDir, "pixel.png"), tinyPNG(), 0o644))
-	visionResult, err := registry.Get("AnalyzeImage").Execute(ctx, json.RawMessage(`{"image_path":"pixel.png","prompt":"smoke","detail_level":"low"}`), workDir)
-	if err != nil || visionResult.IsError || !strings.Contains(visionResult.Content, "vision ok image/png") {
-		t.Fatalf("AnalyzeImage result=%+v err=%v", visionResult, err)
+	imageResult, err := registry.Get("read_file").Execute(ctx, json.RawMessage(`{"path":"pixel.png"}`), workDir)
+	if err != nil || imageResult.IsError || len(imageResult.Images) != 1 || imageResult.Images[0].MediaType != "image/png" || !strings.Contains(imageResult.Content, "Image file pixel.png (1x1, image/png)") {
+		t.Fatalf("read_file image result=%+v err=%v", imageResult, err)
 	}
 	webResult, err := registry.Get("WebFetch").Execute(ctx, json.RawMessage(`{"url":"http://127.0.0.1:1/"}`), workDir)
 	if err != nil || !webResult.IsError || !strings.Contains(strings.ToLower(webResult.Content), "private or local") {
@@ -918,7 +916,7 @@ func TestSDKSecurityRegressionCoverage(t *testing.T) {
 			workDir,
 			sdktools.WithPermissionMode(sdkpolicy.PermissionModeWorkspaceWrite),
 			sdktools.WithBrowserTools(),
-			sdktools.WithVisionTools(func(context.Context, []byte, string, string) (string, error) { return "vision ok", nil }),
+			sdktools.WithReadFileImages(),
 		)
 		writeResult, err := registry.Get("Write").Execute(ctx, json.RawMessage(`{"file_path":"link.txt","content":"after"}`), workDir)
 		if err != nil || !writeResult.IsError {
@@ -937,13 +935,9 @@ func TestSDKSecurityRegressionCoverage(t *testing.T) {
 
 		outsideImage := filepath.Join(root, "outside.png")
 		must(t, os.WriteFile(outsideImage, tinyPNG(), 0o644))
-		visionFileResult, err := registry.Get("AnalyzeImage").Execute(ctx, json.RawMessage(fmt.Sprintf(`{"image_path":%q,"prompt":"inspect"}`, outsideImage)), workDir)
-		if err != nil || !visionFileResult.IsError || !strings.Contains(visionFileResult.Content, "outside the workspace root") {
-			t.Fatalf("AnalyzeImage file escape result=%+v err=%v", visionFileResult, err)
-		}
-		visionURLResult, err := registry.Get("AnalyzeImage").Execute(ctx, json.RawMessage(`{"url":"http://127.0.0.1:1/pixel.png","prompt":"inspect"}`), workDir)
-		if err != nil || !visionURLResult.IsError || !strings.Contains(strings.ToLower(visionURLResult.Content), "private or local") {
-			t.Fatalf("AnalyzeImage SSRF result=%+v err=%v", visionURLResult, err)
+		imageEscapeResult, err := registry.Get("read_file").Execute(ctx, json.RawMessage(fmt.Sprintf(`{"path":%q}`, outsideImage)), workDir)
+		if err == nil || len(imageEscapeResult.Images) != 0 {
+			t.Fatalf("read_file image escape result=%+v err=%v", imageEscapeResult, err)
 		}
 		webResult, err := registry.Get("WebFetch").Execute(ctx, json.RawMessage(`{"url":"http://127.0.0.1:1/"}`), workDir)
 		if err != nil || !webResult.IsError || !strings.Contains(strings.ToLower(webResult.Content), "private or local") {

@@ -79,7 +79,7 @@ func summarizeRemovedItemsWithModel(ctx context.Context, model Model, modelName 
 		}
 	}
 	body := strings.TrimSpace(strings.Join(parts, "\n"))
-	body = strings.TrimSpace(strings.TrimPrefix(body, "[COMPACTED HISTORY SUMMARY]"))
+	body = strings.TrimSpace(strings.TrimPrefix(body, compactionSummaryPrefix))
 	if body == "" {
 		return "", resp.Usage, fmt.Errorf("model returned empty compaction summary")
 	}
@@ -125,8 +125,7 @@ func flattenRunItemsForSummary(items []RunItem, maxChars int) string {
 			// A prior compaction summary is the only memory of everything
 			// compacted before it: truncating it like an ordinary message
 			// would erode accumulated context by ~2k chars per generation.
-			if item.Agent != nil && item.Agent.Name == "context-summary" &&
-				strings.HasPrefix(strings.TrimSpace(item.Message.Text), "[COMPACTED HISTORY SUMMARY]") {
+			if isLocalCompactionSummary(item) {
 				limit = 16000
 			}
 			fmt.Fprintf(&b, "[%s] %s\n\n", role, truncateForTranscript(item.Message.Text, limit))

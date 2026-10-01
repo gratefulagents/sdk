@@ -96,17 +96,16 @@ type Config struct {
 	ToolAccess             agentsdk.ToolAccessLevel
 	// AllowedMutatingTools lists exact host-trusted tool names that remain
 	// available when ToolAccess is read-only.
-	AllowedMutatingTools      []string
-	PermissionMode            policy.PermissionMode
-	GitRemoteWrites           policy.GitRemoteWrites
-	CommandSandboxConfig      *sdksandbox.Config
-	LSPConfig                 sdklsp.Config
-	BrowserScreenshotDir      string
-	VisionAnalyzeFn           sdkvision.AnalyzeFn
-	VisionAnalyzeWithDetailFn sdkvision.AnalyzeWithDetailFn
-	GitHubCommandRunner       sdkgit.CommandRunner
-	GitHubArtifactSink        sdkgit.ArtifactSink
-	Features                  *Features
+	AllowedMutatingTools []string
+	PermissionMode       policy.PermissionMode
+	GitRemoteWrites      policy.GitRemoteWrites
+	CommandSandboxConfig *sdksandbox.Config
+	LSPConfig            sdklsp.Config
+	BrowserScreenshotDir string
+	VisionAnalyzer       sdkvision.AnalyzeWithDetailFn // overrides the provider-derived analyzer; see VisionAnalyzer
+	GitHubCommandRunner  sdkgit.CommandRunner
+	GitHubArtifactSink   sdkgit.ArtifactSink
+	Features             *Features
 
 	EnableTools             bool
 	EnableMCP               bool
@@ -488,11 +487,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 			)
 		}
 		if features.value.Tools.Vision {
-			if cfg.VisionAnalyzeWithDetailFn != nil {
-				registryOptions = append(registryOptions, sdktools.WithVisionToolsWithDetail(cfg.VisionAnalyzeWithDetailFn))
-			} else {
-				registryOptions = append(registryOptions, sdktools.WithVisionTools(cfg.VisionAnalyzeFn))
-			}
+			registryOptions = append(registryOptions, sdktools.WithReadFileImages())
 		}
 		if features.value.Tools.InteractiveTerminal {
 			registryOptions = append(registryOptions, sdktools.WithInteractiveTerminal())
@@ -531,7 +526,7 @@ func BuildToolBundle(ctx context.Context, cfg Config) (ToolBundle, error) {
 		}
 	}
 	if features.value.Tools.Vision || features.value.Tools.VisionAnalyzer {
-		bundle.Tools = attachOpenAIVisionAnalyzer(cfg, bundle.Tools)
+		attachVisionAnalyzer(bundle.Tools, VisionAnalyzer(cfg))
 	}
 	bundle.Tools = filterGitRemoteWriteTools(bundle.Tools, cfg.GitRemoteWrites)
 
@@ -559,22 +554,30 @@ type openAIVisionModel interface {
 	AnalyzeImageWithDetail(ctx context.Context, imageData []byte, mimeType, prompt, detail string) (string, error)
 }
 
-func attachOpenAIVisionAnalyzer(cfg Config, tools []agentsdk.Tool) []agentsdk.Tool {
+// VisionAnalyzer returns cfg.VisionAnalyzer when set, otherwise a lazily
+// initialized analyzer backed by the configured OpenAI provider, or nil when
+// the provider cannot analyze images.
+func VisionAnalyzer(cfg Config) sdkvision.AnalyzeWithDetailFn {
+	if cfg.VisionAnalyzer != nil {
+		return cfg.VisionAnalyzer
+	}
 	if !openAIVisionEligible(cfg) {
-		return tools
+		return nil
 	}
-	analyzeFn := openAIVisionAnalyzeFn(cfg)
+	return openAIVisionAnalyzeFn(cfg)
+}
+
+func attachVisionAnalyzer(tools []agentsdk.Tool, analyzeFn sdkvision.AnalyzeWithDetailFn) {
+	if analyzeFn == nil {
+		return
+	}
 	for _, tool := range tools {
-		visionTool, ok := tool.(*sdkvision.Tool)
-		if !ok || visionTool == nil {
+		consumer, ok := tool.(sdkvision.AnalyzerConsumer)
+		if !ok || consumer.VisionAnalyzer() != nil {
 			continue
 		}
-		if visionTool.AnalyzeFn != nil || visionTool.AnalyzeWithDetailFn != nil {
-			continue
-		}
-		visionTool.AnalyzeWithDetailFn = analyzeFn
+		consumer.SetVisionAnalyzer(analyzeFn)
 	}
-	return tools
 }
 
 func openAIVisionEligible(cfg Config) bool {
@@ -997,7 +1000,6 @@ func registryToolNames(features ToolFeatures) map[string]bool {
 	add(features.WebFetch, "WebFetch")
 	add(features.AsyncShell, "BashStart", "BashPoll", "BashKill")
 	add(features.Browser, "Browser")
-	add(features.Vision, "AnalyzeImage")
 	add(features.InteractiveTerminal, "Terminal")
 	add(features.Think, "think")
 	add(features.AttachRepository, "attach_repository")

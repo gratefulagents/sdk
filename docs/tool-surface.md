@@ -68,14 +68,14 @@ The SDK configures and confines servers; it does not bundle language-server bina
 | Async shell | `AsyncShell` | Write permission mode |
 | Signals | individual `Signals` fields | None |
 | Browser | `Browser` | `AllowPrivateNetworkURLs` must be true because Chromium cannot enforce the public-only policy across redirects/subresources |
-| Vision | `Vision` | Inject an analyzer or use an eligible OpenAI provider adapter |
+| Image reads (`read_file` returns images) | `Vision` | `ReadFile`; images are downscaled to ≤2000px long edge and ≤3.75 MB. `VisionAnalyzer` separately offers the configured (or eligible OpenAI) analyzer to `vision.AnalyzerConsumer` tools |
 | Interactive terminal | `InteractiveTerminal` | Danger-full-access and enabled Git remote writes |
 | Think | `Think` | None |
 | Attach repository | `AttachRepository` | Write permission mode |
 | GitHub pull request | `GitHubPullRequest` | Write permission mode and enabled Git remote writes |
 | GitHub issue | `GitHubIssue` | Write permission mode |
 
-Browser screenshot output is configured with `BrowserScreenshotDir`. GitHub tools accept `GitHubCommandRunner` and `GitHubArtifactSink`. Registry permission checks, PR remote-write filtering, URL policy, and all session/process closers remain active through builder wiring. Strict name filtering is deterministic and never enables an unselected sibling family.
+Browser screenshot output is configured with `BrowserScreenshotDir`; with `Vision`, `read_file` also accepts absolute paths inside that directory. GitHub tools accept `GitHubCommandRunner` and `GitHubArtifactSink`. Registry permission checks, PR remote-write filtering, URL policy, and all session/process closers remain active through builder wiring. Strict name filtering is deterministic and never enables an unselected sibling family.
 
 `RegistryCapabilities` is the canonical classification manifest. A static parity test checks every capability-producing `RegistryOption` against that manifest, and runtime tests require every runtime-built-in manifest family to have feature wiring. Adding a registry family without a runtime-built-in, host-only, or configuration-only classification fails tests.
 
