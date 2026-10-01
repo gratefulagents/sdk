@@ -161,27 +161,6 @@ func TestRegistryReadFileImagesDefaultOff(t *testing.T) {
 	}
 }
 
-func TestRegistryVisionAnalyzer(t *testing.T) {
-	if NewRegistry(t.TempDir()).VisionAnalyzer() != nil {
-		t.Fatal("VisionAnalyzer() without option = non-nil")
-	}
-	r := NewRegistry(t.TempDir(), WithVisionAnalyzer(func(context.Context, []byte, string, string, string) (string, error) {
-		return "seen", nil
-	}))
-	analyzer := r.VisionAnalyzer()
-	if analyzer == nil {
-		t.Fatal("VisionAnalyzer() = nil")
-	}
-	if got, err := analyzer(context.Background(), nil, "", "", ""); err != nil || got != "seen" {
-		t.Fatalf("analyzer = %q, %v", got, err)
-	}
-	for _, tool := range r.Tools() {
-		if strings.Contains(strings.ToLower(tool.Name()), "image") {
-			t.Fatalf("WithVisionAnalyzer registered tool %q", tool.Name())
-		}
-	}
-}
-
 func TestRegistryDoesNotRegisterUnconfinedBrowserByDefault(t *testing.T) {
 	r := NewRegistry(t.TempDir(), WithBrowserTools())
 	if tool := r.Get("Browser"); tool != nil {

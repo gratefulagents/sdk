@@ -38,7 +38,6 @@ type ToolFeatures struct {
 	GitHubPullRequest   bool
 	GitHubIssue         bool
 	ExtraTools          bool
-	VisionAnalyzer      bool // offer the runtime vision analyzer to sdkvision.AnalyzerConsumer tools
 	Signals             SignalFeatures
 }
 
@@ -124,21 +123,20 @@ func legacyFeatures(cfg Config) Features {
 	signalTools := (cfg.EnableTools || cfg.EnableSubAgents) && !cfg.DisableSignalTools
 	return Features{
 		Tools: ToolFeatures{
-			ListFiles:      defaultTools,
-			ReadFile:       defaultTools,
-			Glob:           defaultTools,
-			Grep:           defaultTools,
-			LSP:            defaultTools,
-			Bash:           defaultTools,
-			Write:          defaultTools,
-			Edit:           defaultTools,
-			ApplyPatch:     defaultTools,
-			Move:           defaultTools,
-			Delete:         defaultTools,
-			WebFetch:       defaultTools && !cfg.DisableWebTools,
-			AsyncShell:     defaultTools && cfg.EnableAsyncShell,
-			ExtraTools:     cfg.EnableTools || cfg.EnableSubAgents,
-			VisionAnalyzer: cfg.EnableTools || cfg.EnableSubAgents,
+			ListFiles:  defaultTools,
+			ReadFile:   defaultTools,
+			Glob:       defaultTools,
+			Grep:       defaultTools,
+			LSP:        defaultTools,
+			Bash:       defaultTools,
+			Write:      defaultTools,
+			Edit:       defaultTools,
+			ApplyPatch: defaultTools,
+			Move:       defaultTools,
+			Delete:     defaultTools,
+			WebFetch:   defaultTools && !cfg.DisableWebTools,
+			AsyncShell: defaultTools && cfg.EnableAsyncShell,
+			ExtraTools: cfg.EnableTools || cfg.EnableSubAgents,
 			Signals: SignalFeatures{
 				AskUserQuestion: signalTools,
 				PresentPlan:     signalTools,

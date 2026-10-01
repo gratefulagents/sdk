@@ -68,7 +68,7 @@ The SDK configures and confines servers; it does not bundle language-server bina
 | Async shell | `AsyncShell` | Write permission mode |
 | Signals | individual `Signals` fields | None |
 | Browser | `Browser` | `AllowPrivateNetworkURLs` must be true because Chromium cannot enforce the public-only policy across redirects/subresources |
-| Image reads (`read_file` returns images) | `Vision` | `ReadFile`; images are downscaled to ≤2000px long edge and ≤3.75 MB. `VisionAnalyzer` separately offers the configured (or eligible OpenAI) analyzer to `vision.AnalyzerConsumer` tools |
+| Image reads (`read_file` returns images) | `Vision` | `ReadFile`; images are downscaled to ≤2000px long edge and ≤3.75 MB and returned directly to the run model. Computer-use screenshots retain their captured pixels and geometry |
 | Interactive terminal | `InteractiveTerminal` | Danger-full-access and enabled Git remote writes |
 | Think | `Think` | None |
 | Attach repository | `AttachRepository` | Write permission mode |

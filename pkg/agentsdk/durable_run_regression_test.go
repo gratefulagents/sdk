@@ -170,3 +170,21 @@ func TestStoredRunCheckpointKeepsAttemptStartAndLightEvents(t *testing.T) {
 		t.Fatalf("attempts after resume = %+v", snapshot.Attempts)
 	}
 }
+
+func TestCustomCheckpointImageStrippingDoesNotMutateCaller(t *testing.T) {
+	images := []ImageAttachment{{MediaType: "image/png", Data: "private-image-payload"}}
+	original := []LLMRunItemSnapshot{
+		{Type: "message", MessageText: "picture", MessageImages: images},
+		{Type: "tool_output", ToolOutput: &ToolOutputData{CallID: "read", Content: "screenshot", Images: images}},
+	}
+	got := stripCheckpointImages(original)
+	if len(got[0].MessageImages) != 0 || len(got[1].ToolOutput.Images) != 0 {
+		t.Fatal("checkpoint contains image attachments")
+	}
+	if got[0].MessageText != "picture\n[image omitted]" || got[1].ToolOutput.Content != "screenshot\n[image omitted]" {
+		t.Fatal("missing image placeholders")
+	}
+	if len(original[0].MessageImages) != 1 || len(original[1].ToolOutput.Images) != 1 {
+		t.Fatal("caller image attachments mutated")
+	}
+}

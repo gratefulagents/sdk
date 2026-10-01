@@ -71,6 +71,10 @@ func PrepareImage(data []byte) (PreparedImage, error) {
 	if int64(cfg.Width)*int64(cfg.Height) > maxDecodePixels {
 		return PreparedImage{}, fmt.Errorf("image dimensions %dx%d exceed %d pixels", cfg.Width, cfg.Height, maxDecodePixels)
 	}
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return PreparedImage{}, fmt.Errorf("decoding image: %w", err)
+	}
 	result := PreparedImage{
 		MediaType:      "image/" + format,
 		Width:          cfg.Width,
@@ -83,10 +87,6 @@ func PrepareImage(data []byte) (PreparedImage, error) {
 		return result, nil
 	}
 
-	src, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return PreparedImage{}, fmt.Errorf("decoding image: %w", err)
-	}
 	w, h := fitLongEdge(cfg.Width, cfg.Height, MaxImageLongEdge)
 	img := resize(src, w, h)
 

@@ -216,6 +216,8 @@ func SnapshotTools(tools []Tool) []LLMToolSnapshot {
 	return out
 }
 
+// SnapshotRunItems captures persistence-safe history, replacing image attachments
+// with placeholders without changing the live items.
 func SnapshotRunItems(items []RunItem) []LLMRunItemSnapshot {
 	return snapshotRunItems(items, nil)
 }
@@ -225,7 +227,7 @@ func snapshotRunItems(items []RunItem, snapshotter *requestSnapshotter) []LLMRun
 		return nil
 	}
 	out := make([]LLMRunItemSnapshot, 0, len(items))
-	for _, item := range items {
+	for _, item := range StripImagesForPersistence(items) {
 		snap := LLMRunItemSnapshot{Type: runItemTypeName(item.Type)}
 		if item.Agent != nil {
 			snap.AgentName = item.Agent.Name

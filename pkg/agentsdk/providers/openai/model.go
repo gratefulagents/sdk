@@ -3,7 +3,6 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -182,37 +181,6 @@ func (m *OpenAIModel) GetResponse(ctx context.Context, req agentsdk.ModelRequest
 		resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.StopReason)
 
 	return mr, nil
-}
-
-// AnalyzeImage analyzes a loaded image with the default high-detail Responses
-// image-input path.
-func (m *OpenAIModel) AnalyzeImage(ctx context.Context, imageData []byte, mimeType, prompt string) (string, error) {
-	return m.AnalyzeImageWithDetail(ctx, imageData, mimeType, prompt, "high")
-}
-
-// AnalyzeImageWithDetail analyzes a loaded image using OpenAI Responses image
-// input. It intentionally uses the model resolved on this OpenAIModel, so SDK
-// callers can pin the vision model to gpt-5.5 independently of the agent model.
-func (m *OpenAIModel) AnalyzeImageWithDetail(ctx context.Context, imageData []byte, mimeType, prompt, detail string) (string, error) {
-	if m == nil || m.client == nil {
-		return "", errors.New("openai model is not configured")
-	}
-	if len(imageData) == 0 {
-		return "", errors.New("image data is empty")
-	}
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return "", errors.New("prompt is required")
-	}
-	resp, err := m.client.AnalyzeImage(ctx, m.resolveModel(), dataURLForImage(imageData, mimeType), prompt, detail)
-	if err != nil {
-		return "", err
-	}
-	text := strings.TrimSpace(anthropicText(resp))
-	if text == "" {
-		return "", fmt.Errorf("openai vision response contained no text")
-	}
-	return text, nil
 }
 
 func (m *OpenAIModel) CompactContext(ctx context.Context, req agentsdk.ModelRequest) (*agentsdk.CompactionResult, error) {
@@ -573,27 +541,6 @@ func convertAnthropicResponse(resp *internalanthropic.CreateMessageResponse) *ag
 		Raw:     resp,
 		EndTurn: resp.EndTurn,
 	}
-}
-
-func dataURLForImage(imageData []byte, mimeType string) string {
-	mimeType = strings.TrimSpace(strings.Split(mimeType, ";")[0])
-	if mimeType == "" || strings.ContainsAny(mimeType, " \t\r\n,") {
-		mimeType = "application/octet-stream"
-	}
-	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(imageData)
-}
-
-func anthropicText(resp *internalanthropic.CreateMessageResponse) string {
-	if resp == nil {
-		return ""
-	}
-	var parts []string
-	for _, block := range resp.Content {
-		if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
-			parts = append(parts, block.Text)
-		}
-	}
-	return strings.Join(parts, "\n")
 }
 
 func anthropicMessagesToRunItems(messages []internalanthropic.Message) []agentsdk.RunItem {

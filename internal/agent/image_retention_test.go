@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -186,6 +187,47 @@ func TestElideOldImagesNegativeKeepDropsAll(t *testing.T) {
 	}
 }
 
+func TestElideOldImagesExactDefaultLimit(t *testing.T) {
+	if DefaultMaxRecentImages != 3 {
+		t.Fatalf("default limit = %d, want 3", DefaultMaxRecentImages)
+	}
+	for total := 0; total <= 10; total++ {
+		var items []RunItem
+		for i := 1; i <= total; i++ {
+			if i%2 == 0 {
+				items = append(items, userImageItem("user", i))
+			} else {
+				items = append(items, toolImageItem("tool", i))
+			}
+		}
+		got := elideOldImages(items, DefaultMaxRecentImages)
+		ids := imageIDs(got)
+		if len(ids) != min(total, 3) {
+			t.Fatalf("total=%d kept=%v", total, ids)
+		}
+		for i, id := range ids {
+			if want := fmt.Sprintf("img-%d", total-len(ids)+1+i); id != want {
+				t.Fatalf("total=%d kept=%v, want newest images", total, ids)
+			}
+		}
+	}
+}
+
+func TestElideOldImagesRepeatedPartialTrimHasOnePlaceholder(t *testing.T) {
+	items := elideOldImages([]RunItem{toolImageItem("shots", 1, 2, 3, 4)}, 3)
+	items = append(items, userImageItem("latest", 5))
+	got := elideOldImages(items, 3)
+	if got[0].ToolOutput.Content != "shots\n"+elidedImagePlaceholder {
+		t.Fatalf("repeated placeholder: %q", got[0].ToolOutput.Content)
+	}
+	if want := []string{"img-3", "img-4", "img-5"}; !reflect.DeepEqual(imageIDs(got), want) {
+		t.Fatalf("images = %v, want %v", imageIDs(got), want)
+	}
+	if again := elideOldImages(got, 3); !sameSlice(again, got) {
+		t.Fatal("repeated pruning without new images allocated a slice")
+	}
+}
+
 func TestStripImagesForPersistence(t *testing.T) {
 	items := []RunItem{
 		userImageItem("look", 1),
@@ -209,6 +251,18 @@ func TestStripImagesForPersistence(t *testing.T) {
 	}
 	if got[2].ToolOutput.CallID != items[2].ToolOutput.CallID {
 		t.Fatal("tool output metadata lost")
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range imageIDs(items) {
+		if strings.Contains(string(encoded), id) {
+			t.Fatalf("persisted image payload %q", id)
+		}
+	}
+	if strings.Contains(string(encoded), `"images"`) || !strings.Contains(string(encoded), persistedImagePlaceholder) {
+		t.Fatalf("persisted items = %s", encoded)
 	}
 
 	clean := []RunItem{toolImageItem("none")}

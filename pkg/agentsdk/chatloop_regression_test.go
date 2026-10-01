@@ -135,6 +135,10 @@ func TestChatLoopPairsRemainingCallsWhenApprovalResolutionFails(t *testing.T) {
 	}
 	assertToolCallsPaired(t, store.items)
 	assertToolCallsPaired(t, result.NewItems)
+	assertToolCallsPaired(t, result.FinalHistory)
+	if result.IsInterrupted() {
+		t.Fatal("settled approvals still reported as interrupted")
+	}
 }
 
 func TestChatLoopApprovalRoundsWithProgressDoNotHitResumeLimit(t *testing.T) {
@@ -277,5 +281,48 @@ func TestChatLoopCancelsBackgroundSubAgentsWhenCancelled(t *testing.T) {
 			t.Fatalf("background sub-agent still %s after ChatLoop cancellation", task.Status)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestChatLoopPreservesExecutedOutputWhenCompletionCheckpointFails(t *testing.T) {
+	writes := 0
+	failed := false
+	var saved DurableCheckpoint
+	cfg := &DurableRunConfig{
+		RunID: "approved-effect", AttemptID: "attempt",
+		Checkpoint: func(_ context.Context, cp DurableCheckpoint) error {
+			if cp.Boundary == DurableBoundaryToolCompleted && writes == 1 && !failed {
+				failed = true
+				return errors.New("temporary storage failure after execution")
+			}
+			saved = cp
+			return nil
+		},
+	}
+	model := &scriptedChatModel{responses: []*ModelResponse{toolCallResponse("write-1", "write")}}
+	result, err := NewChatLoop(ChatLoopOptions{
+		Runner:       NewRunnerWithModel(model),
+		Agent:        &Agent{Name: "loop", Model: "demo", Tools: []Tool{okTool("write", func() { writes++ })}},
+		RunConfig:    RunConfig{MaxTurns: 3, ToolPolicy: &ToolPolicy{ApprovalRequired: true}, Durable: cfg},
+		ApprovalGate: approvingGate{approved: true},
+	}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "persist approved tool completion") {
+		t.Fatalf("error = %v", err)
+	}
+	if writes != 1 || saved.Boundary != DurableBoundaryToolCompleted {
+		t.Fatalf("writes=%d boundary=%s", writes, saved.Boundary)
+	}
+	assertToolCallsPaired(t, result.FinalHistory)
+	found := false
+	for _, item := range saved.History {
+		if item.ToolOutput != nil && item.ToolOutput.CallID == "write-1" {
+			found = true
+			if item.ToolOutput.IsError || item.ToolOutput.Content != "write ok" {
+				t.Fatalf("executed tool misrepresented: %+v", item.ToolOutput)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("executed output absent from checkpoint")
 	}
 }

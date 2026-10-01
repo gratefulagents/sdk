@@ -3,6 +3,7 @@ package openai_vision_integration_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"image"
 	"image/color"
 	"image/png"
@@ -11,13 +12,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gratefulagents/sdk/pkg/agentsdk"
+	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
 	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 	sdkruntime "github.com/gratefulagents/sdk/pkg/agentsdk/runtime"
 )
 
 const liveVisionModel = sdkopenai.DefaultChatModel
 
-func TestLiveOpenAIOAuthVisionAnalyzerUsesGPT55(t *testing.T) {
+func TestLiveOpenAIOAuthNativeImageInput(t *testing.T) {
 	if liveTestsSkipped() {
 		t.Skip("GRATEFUL_LIVE_TESTS=skip")
 	}
@@ -38,7 +41,7 @@ func TestLiveOpenAIOAuthVisionAnalyzerUsesGPT55(t *testing.T) {
 	requireVisionLiveOK(t, text)
 }
 
-func TestLiveOpenAIAPIKeyVisionAnalyzerUsesGPT55(t *testing.T) {
+func TestLiveOpenAIAPIKeyNativeImageInput(t *testing.T) {
 	if liveTestsSkipped() {
 		t.Skip("GRATEFUL_LIVE_TESTS=skip")
 	}
@@ -60,21 +63,39 @@ func TestLiveOpenAIAPIKeyVisionAnalyzerUsesGPT55(t *testing.T) {
 func analyzeLiveImage(t *testing.T, cfg sdkruntime.Config) string {
 	t.Helper()
 	cfg.WorkDir = t.TempDir()
-	analyzer := sdkruntime.VisionAnalyzer(cfg)
-	if analyzer == nil {
-		t.Fatal("runtime did not provide an OpenAI vision analyzer")
-	}
-	text, err := analyzer(context.Background(), testPNG(t), "image/png", "Look at the image. Reply exactly with: vision live ok", "low")
+	provider, err := sdkproviders.NewProviderFromConfig(sdkruntime.ProviderSpec(cfg))
 	if err != nil {
-		t.Fatalf("vision analyzer error: %v", err)
+		t.Fatal(err)
 	}
-	return text
+	model, err := provider.GetModel(cfg.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := model.GetResponse(context.Background(), agentsdk.ModelRequest{
+		Input: []agentsdk.RunItem{{
+			Type: agentsdk.RunItemMessage,
+			Message: &agentsdk.MessageOutput{
+				Text:   "Look at the image. Reply exactly with: vision live ok",
+				Images: []agentsdk.ImageAttachment{{MediaType: "image/png", Data: base64.StdEncoding.EncodeToString(testPNG(t)), Detail: "low"}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("native image request: %v", err)
+	}
+	var text strings.Builder
+	for _, item := range response.Items {
+		if item.Message != nil {
+			text.WriteString(item.Message.Text)
+		}
+	}
+	return text.String()
 }
 
 func requireVisionLiveOK(t *testing.T, text string) {
 	t.Helper()
 	if !strings.Contains(normalize(text), "vision live ok") {
-		t.Fatalf("vision analyzer text = %q, want phrase %q", text, "vision live ok")
+		t.Fatalf("native image response text = %q, want phrase %q", text, "vision live ok")
 	}
 }
 

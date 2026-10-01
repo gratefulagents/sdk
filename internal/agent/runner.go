@@ -389,7 +389,7 @@ func (r *Runner) ExecuteApprovedTool(ctx context.Context, agent *Agent, call Too
 	if result.guardrailErr == nil && cfg.Durable != nil {
 		durableHistory = append(durableHistory, result.item)
 		if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryToolCompleted, agent, durableHistory, nil, runCtx.Usage); err != nil {
-			return RunItem{}, result.inputGuardrails, result.outputGuardrails, result.shouldPause, fmt.Errorf("persist approved tool completion: %w", err)
+			return result.item, result.inputGuardrails, result.outputGuardrails, result.shouldPause, fmt.Errorf("persist approved tool completion: %w", err)
 		}
 	}
 	return result.item, result.inputGuardrails, result.outputGuardrails, result.shouldPause, result.guardrailErr
@@ -573,23 +573,29 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	// joined sub-agent results; capped so a model cannot extend forever.
 	finalJoinExtensions := 0
 
+	inject := func(items ...RunItem) {
+		currentInput = append(currentInput, items...)
+		allItems = append(allItems, items...)
+		emitRunItems(ctx, streamEvents, items)
+	}
+
 	// finalizeImmediateInput atomically closes input admission, or folds any
 	// steering accepted before that point into history and asks the caller to
 	// continue instead of returning a terminal result.
-	finalizeImmediateInput := func() (bool, error) {
+	finalizeImmediateInput := func(prior ...RunItem) (bool, error) {
 		if cfg.ImmediateInputFinalizer == nil {
 			return false, nil
 		}
 		items, err := callRecovering("immediate input finalizer", func() ([]RunItem, error) { return cfg.ImmediateInputFinalizer(ctx) })
 		if err != nil {
+			currentInput = append(currentInput, prior...)
 			return false, err
 		}
 		if len(items) == 0 {
 			return false, nil
 		}
-		currentInput = append(currentInput, items...)
-		allItems = append(allItems, items...)
-		emitRunItems(ctx, streamEvents, items)
+		currentInput = append(currentInput, prior...)
+		inject(items...)
 		pendingCompletion = false
 		return true, nil
 	}
@@ -604,6 +610,21 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 	}
 	if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunStarted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 		return nil, fmt.Errorf("persist run-start checkpoint: %w", err)
+	}
+
+	buildResult := func(final any, history []RunItem) *RunResult {
+		return &RunResult{
+			FinalOutput:                final,
+			LastAgent:                  currentAgent,
+			NewItems:                   allItems,
+			RawResponses:               allResponses,
+			InputGuardrailResults:      inputGuardrailResults,
+			ToolInputGuardrailResults:  allToolInputResults,
+			ToolOutputGuardrailResults: allToolOutputResults,
+			ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
+			Usage:                      runCtx.Usage,
+			FinalHistory:               append([]RunItem(nil), history...),
+		}
 	}
 
 	// A run that ends early with the conversation still intact — context
@@ -635,17 +656,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		if ctx.Err() == nil && len(allItems) == 0 {
 			return
 		}
-		result = &RunResult{
-			LastAgent:                  currentAgent,
-			NewItems:                   allItems,
-			RawResponses:               allResponses,
-			InputGuardrailResults:      inputGuardrailResults,
-			ToolInputGuardrailResults:  allToolInputResults,
-			ToolOutputGuardrailResults: allToolOutputResults,
-			ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-			Usage:                      runCtx.Usage,
-			FinalHistory:               append([]RunItem(nil), currentInput...),
-		}
+		result = buildResult(nil, currentInput)
 	}()
 
 	for turn := 0; ; turn++ {
@@ -657,9 +668,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					return nil, joinErr
 				}
 				if len(joinItems) > 0 {
-					currentInput = append(currentInput, joinItems...)
-					allItems = append(allItems, joinItems...)
-					emitRunItems(ctx, streamEvents, joinItems)
+					inject(joinItems...)
 					finalJoinExtensions++
 					maxTurns = turn + 2
 					continue
@@ -678,17 +687,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				// hosts can persist the transcript and continue in a follow-up
 				// run. currentInput is the post-fold history of every completed
 				// turn — replay-safe, no unpaired tool_use.
-				partial := &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					InputGuardrailResults:      inputGuardrailResults,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					FinalHistory:               append([]RunItem(nil), currentInput...),
-				}
+				partial := buildResult(nil, currentInput)
 				return partial, &MaxTurnsExceeded{MaxTurns: maxTurns, PartialResult: partial}
 			}
 		}
@@ -704,9 +703,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			if err != nil {
 				log.Printf("[runner] WARN: immediate input poll failed: %v", err)
 			} else if len(immediateItems) > 0 {
-				currentInput = append(currentInput, immediateItems...)
-				allItems = append(allItems, immediateItems...)
-				emitRunItems(ctx, streamEvents, immediateItems)
+				inject(immediateItems...)
 				// Steering interrupts a completion-confirmation bounce the
 				// same way finalizeImmediateInput does.
 				pendingCompletion = false
@@ -724,9 +721,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// slower siblings keep running, instead of receiving everything at
 		// final-join.
 		if pollItems := pollSubAgentResultItems(tools); len(pollItems) > 0 {
-			currentInput = append(currentInput, pollItems...)
-			allItems = append(allItems, pollItems...)
-			emitRunItems(ctx, streamEvents, pollItems)
+			inject(pollItems...)
 		}
 		pendingSubAgentJoin := hasPendingSubAgentFinalJoin(tools)
 		joinTools := tools
@@ -797,7 +792,22 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			compactionCfg.TargetTokens = maxInt(1, int(float64(normalized.TargetTokens)/estimateCalibration))
 		}
 
+		currentInput = elideOldImages(currentInput, DefaultMaxRecentImages)
 		requestOverheadTokens := estimateModelRequestOverheadTokens(instructions, tools, settings)
+		applyCompaction := func(compacted CompactionResult, before int) error {
+			var carryForward string
+			currentInput, carryForward = applyCompactionCarryForward(ctx, compacted.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
+			if err := guardCompactionCarryForward(runCtx, currentAgent, carryForward); err != nil {
+				return err
+			}
+			runCtx.Usage.Add(compacted.Usage)
+			recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compacted.Usage)
+			if cfg.CompactionRecorder != nil {
+				after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
+				cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compacted.Summary, carryForward))
+			}
+			return nil
+		}
 		// Post-provider-compaction steady state: while the plaintext that
 		// accumulated after the newest provider compaction blob stays below
 		// the trigger, skip BOTH provider and local compaction this turn.
@@ -805,7 +815,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// total above the trigger, re-compacting it buys nothing, and the
 		// local planner must not run either: falling through to it would
 		// spend an LLM-summary call per turn on negligible growth.
-		if !compactionCfg.Enabled || !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
+		if compactionCfg.Enabled && !shouldDeferCompactionForBlobGrowth(currentInput, compactionCfg, requestOverheadTokens) {
 			compactRequest := ModelRequest{
 				Model:          modelName,
 				PromptCacheKey: cfg.PromptCacheKey,
@@ -819,16 +829,8 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(compactCtx, activeModel, compactRequest, requestOverheadTokens, compactionCfg, false)
 			compactCancel()
 			if ok {
-				var carryForward string
-				currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
-				if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-					return nil, guardErr
-				}
-				after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
-				runCtx.Usage.Add(compactResult.Usage)
-				recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
-				if cfg.CompactionRecorder != nil {
-					cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
+				if err := applyCompaction(*compactResult, before); err != nil {
+					return nil, err
 				}
 			} else {
 				if compactErr != nil {
@@ -844,14 +846,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 							compactedItems = rebuilt
 						}
 					}
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
-					}
-					after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
+					compacted := CompactionResult{Items: compactedItems, Summary: ExtractCompactionSummary(compactedItems)}
+					if err := applyCompaction(compacted, before); err != nil {
+						return nil, err
 					}
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
 					if compactErr != nil {
@@ -862,7 +859,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 		}
 
-		currentInput = pruneToolOutputImages(currentInput, cfg.MaxRetainedToolImages)
+		currentInput = elideOldImages(currentInput, DefaultMaxRecentImages)
 
 		// --- Structured turn logging ---
 		{
@@ -899,17 +896,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			taskID = parentCallID
 		}
 
-		// The request input is exactly the accumulated conversation: plan
-		// state, when a host tracks one, lives in durable history like any
-		// other context (per-request transient re-injection was removed — it
-		// made the model re-orient and re-narrate every turn).
-		requestInput := currentInput
-
 		modelRequest := ModelRequest{
 			Model:               modelName,
 			PromptCacheKey:      cfg.PromptCacheKey,
 			Instructions:        instructions,
-			Input:               requestInput,
+			Input:               currentInput,
 			Tools:               tools,
 			Settings:            settings,
 			OutputSchema:        currentAgent.OutputType,
@@ -918,7 +909,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 		// requestOverheadTokens was computed from the same instructions,
 		// tools and settings. The full request snapshot (a copy of the whole
 		// history) is only built when a tracing processor will export it.
-		requestInputTokens := estimateRunItemsTokens(requestInput)
+		requestInputTokens := estimateRunItemsTokens(currentInput)
 		var requestSnapshot *LLMRequestSnapshot
 		if captureRequestSnapshots {
 			requestSnapshot = buildLLMRequestSnapshot(currentAgent.Name, modelRequest, requestInputTokens, requestOverheadTokens, &snapshotter)
@@ -1039,6 +1030,14 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				openGenSpan = nil
 				trace.AddSpan(retainedSpan(genSpan))
 			}
+			finishFailure := func(status string) {
+				genData.Status = status
+				ev := attemptFailureEvent(attemptEvent(status), genData)
+				ev.RetryPlanned = status == "retrying" || status == "fallback"
+				ev.RetryAfterMs = genData.RetryAfterMS
+				emitLLMAttemptEvent(cfg.Hooks, ev)
+				exportGenSpan()
+			}
 
 			if immediateInputArrived && commitment.state.Load() == modelOutputInterrupted {
 				// Steering supersedes this attempt rather than failing the run. Do not
@@ -1060,9 +1059,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			}
 
 			if isContextCancellation(err) && !perCallTimeout {
-				exportGenSpan()
-				ev := attemptFailureEvent(attemptEvent("failed"), genData)
-				emitLLMAttemptEvent(cfg.Hooks, ev)
+				finishFailure("failed")
 				return nil, err
 			}
 
@@ -1076,21 +1073,18 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// Every recovery/retry path below re-issues the SAME turn (turn--
 			// before continue): retries are bounded by their own budgets and
 			// must never consume MaxTurns.
-			if !strippedEncryptedThisTurn && isEncryptedContentError(err) {
+			if !streamOutputWasCommitted(err) && !strippedEncryptedThisTurn && isEncryptedContentError(err) {
 				if stripped, removed := stripUndecryptableEncryptedItems(currentInput); removed > 0 {
 					strippedEncryptedThisTurn = true
 					log.Printf("[runner] WARN: provider rejected encrypted context items; stripped %d and retrying: %v", removed, err)
 					currentInput = stripped
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
 					turn--
 					continue
 				}
 			}
 
-			if !forcedCompactionThisTurn && isContextLengthExceededError(err) {
+			if !streamOutputWasCommitted(err) && !forcedCompactionThisTurn && isContextLengthExceededError(err) {
 				forcedCompactionThisTurn = true
 				forcedRequest := ModelRequest{
 					Model:          modelName,
@@ -1105,21 +1099,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				compactResult, before, after, ok, compactErr := compactRunItemsWithModelAPI(forcedCompactCtx, activeModel, forcedRequest, requestOverheadTokens, compactionCfg, true)
 				forcedCompactCancel()
 				if ok {
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactResult.Items, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
+					if err := applyCompaction(*compactResult, before); err != nil {
+						return nil, err
 					}
-					after = estimateRunItemsTokens(currentInput) + requestOverheadTokens
-					runCtx.Usage.Add(compactResult.Usage)
-					recordOutOfBandUsage(cfg.Hooks, activeModel, modelName, compactResult.Usage)
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before, after, appendCompactionSummaryCarryForward(compactResult.Summary, carryForward))
-					}
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
 					turn--
 					continue
 				} else if compactErr != nil {
@@ -1140,21 +1123,11 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 							compactedItems = rebuilt
 						}
 					}
-					var carryForward string
-					currentInput, carryForward = applyCompactionCarryForward(ctx, compactedItems, currentInput, cfg, compactionCfg, requestOverheadTokens)
-					if guardErr := guardCompactionCarryForward(runCtx, currentAgent, carryForward); guardErr != nil {
-						return nil, guardErr
+					compacted := CompactionResult{Items: compactedItems, Summary: ExtractCompactionSummary(compactedItems)}
+					if err := applyCompaction(compacted, before+requestOverheadTokens); err != nil {
+						return nil, err
 					}
-					// Report request-level totals like the proactive path: the
-					// forced plan above is item-only, so add the overhead back.
-					after := estimateRunItemsTokens(currentInput) + requestOverheadTokens
-					if cfg.CompactionRecorder != nil {
-						cfg.CompactionRecorder(before+requestOverheadTokens, after, appendCompactionSummaryCarryForward(ExtractCompactionSummary(currentInput), carryForward))
-					}
-					ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-					ev.RetryPlanned = true
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("retrying")
 					turn--
 					continue
 				} else if cfg.CompactionFailureReporter != nil && reason != "disabled" && reason != "below-threshold" {
@@ -1174,39 +1147,16 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					genData.FallbackFromModel = requestedModelName
 					genData.FallbackToModel = fallbackModel
 					genData.FallbackReason = reason
-					genData.Status = "fallback"
-					genSpan.Data = genData
-					ev := attemptFailureEvent(attemptEvent("fallback"), genData)
-					ev.RetryPlanned = true
-					ev.FallbackPlanned = true
-					ev.FallbackFromModel = requestedModelName
-					ev.FallbackToModel = fallbackModel
-					ev.FallbackReason = reason
-					emitLLMAttemptEvent(cfg.Hooks, ev)
-					exportGenSpan()
+					finishFailure("fallback")
 					turn--
 					continue
 				}
 			}
 
-			if !streamOutputWasCommitted(err) && shouldRetryWithPolicy(cfg.RetryPolicy, turnRetryAttempt) && !retryPolicyBlockedByAdvice(advice) {
-				delay := cfg.RetryPolicy.DelayForAttempt(turnRetryAttempt - 1)
-				// A provider-directed delay (e.g. 429 Retry-After) is on the
-				// provider's clock: never retry sooner than it asked for.
-				if advice != nil && advice.RetryAfterMS > delay.Milliseconds() {
-					delay = time.Duration(advice.RetryAfterMS) * time.Millisecond
-				}
-				cappedMS := capRetryAfterMS(delay.Milliseconds())
-				delay = time.Duration(cappedMS) * time.Millisecond
+			if delay, retry := modelRetryDelay(cfg.RetryPolicy, advice, turnRetryAttempt); retry && !streamOutputWasCommitted(err) {
 				genData.RetryScheduled = true
-				genData.RetryAfterMS = cappedMS
-				genData.Status = "retrying"
-				genSpan.Data = genData
-				ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-				ev.RetryPlanned = true
-				ev.RetryAfterMs = genData.RetryAfterMS
-				emitLLMAttemptEvent(cfg.Hooks, ev)
-				exportGenSpan()
+				genData.RetryAfterMS = delay.Milliseconds()
+				finishFailure("retrying")
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -1215,36 +1165,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				turn--
 				continue
 			}
-
-			if !streamOutputWasCommitted(err) && advice != nil && advice.ShouldRetry && turnRetryAttempt <= maxAdviceRetriesPerTurn {
-				cappedMS := capRetryAfterMS(int64(advice.RetryAfterMS))
-				if cappedMS <= 0 {
-					// The provider asked for a retry without saying when (e.g.
-					// a 429 with no Retry-After/reset headers). Never retry
-					// immediately: rate limits recover on the provider's
-					// clock, and a zero delay hammers the API in a tight loop.
-					cappedMS = capRetryAfterMS(adviceRetryDelay(cfg.RetryPolicy, turnRetryAttempt).Milliseconds())
-				}
-				genData.RetryScheduled = true
-				genData.RetryAfterMS = cappedMS
-				genData.Status = "retrying"
-				genSpan.Data = genData
-				ev := attemptFailureEvent(attemptEvent("retrying"), genData)
-				ev.RetryPlanned = true
-				ev.RetryAfterMs = genData.RetryAfterMS
-				emitLLMAttemptEvent(cfg.Hooks, ev)
-				exportGenSpan()
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(time.Duration(cappedMS) * time.Millisecond):
-				}
-				turn--
-				continue
-			}
-			ev := attemptFailureEvent(attemptEvent("failed"), genData)
-			emitLLMAttemptEvent(cfg.Hooks, ev)
-			exportGenSpan()
+			finishFailure("failed")
 			return nil, &AgentError{Message: fmt.Sprintf("model call failed on turn %d", turn), Cause: err}
 		}
 
@@ -1378,6 +1299,13 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 
 		switch s := step.(type) {
 		case *finalOutputStep:
+			continueWith := func(feedback ...RunItem) {
+				currentInput = append(currentInput, newItems...)
+				currentInput = append(currentInput, feedback...)
+				currentInput = recordAndPruneResponseCompaction(currentInput)
+				allItems = append(allItems, feedback...)
+				emitRunItems(ctx, streamEvents, feedback)
+			}
 			// Match Codex CLI's Responses loop: a completed text-only response requests
 			// another sample only when the backend explicitly sends end_turn=false.
 			// Message phase is descriptive and does not independently control the loop.
@@ -1385,8 +1313,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// so end_turn=true cannot cancel tool-driven continuation.
 			if resp.EndTurn != nil && !*resp.EndTurn {
 				pendingCompletion = false
-				currentInput = append(currentInput, newItems...)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
+				continueWith()
 				continue
 			}
 
@@ -1395,11 +1322,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, joinErr
 			}
 			if len(joinItems) > 0 {
-				currentInput = append(currentInput, newItems...)
-				currentInput = append(currentInput, joinItems...)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
-				allItems = append(allItems, joinItems...)
-				emitRunItems(ctx, streamEvents, joinItems)
+				continueWith(joinItems...)
 				if turn >= maxTurns-1 && finalJoinExtensions < maxSubAgentFinalJoinExtensions {
 					finalJoinExtensions++
 					maxTurns++
@@ -1417,11 +1340,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					Type:    RunItemMessage,
 					Message: &MessageOutput{Text: completionConfirmationPrompt},
 				}
-				currentInput = append(currentInput, newItems...)
-				currentInput = append(currentInput, confirmItem)
-				currentInput = recordAndPruneResponseCompaction(currentInput)
-				allItems = append(allItems, confirmItem)
-				emitRunItems(ctx, streamEvents, []RunItem{confirmItem})
+				continueWith(confirmItem)
 				if turn >= maxTurns-1 {
 					maxTurns++
 				}
@@ -1442,11 +1361,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 						Type:    RunItemMessage,
 						Message: &MessageOutput{Text: "[SYSTEM] An independent reviewer examined your answer before finalization and raised these points. Address the valid ones (with tools if needed), then provide your final answer again:\n" + feedback},
 					}
-					currentInput = append(currentInput, newItems...)
-					currentInput = append(currentInput, verifyItem)
-					currentInput = recordAndPruneResponseCompaction(currentInput)
-					allItems = append(allItems, verifyItem)
-					emitRunItems(ctx, streamEvents, []RunItem{verifyItem})
+					continueWith(verifyItem)
 					pendingCompletion = false
 					if turn >= maxTurns-1 {
 						maxTurns++
@@ -1459,8 +1374,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 			// Steering accepted before this point wins and gets another turn;
 			// steering racing after it receives a clear finalizing error.
 			if cfg.ImmediateInputFinalizer != nil {
-				currentInput = append(currentInput, newItems...)
-				if continued, finalizeErr := finalizeImmediateInput(); finalizeErr != nil {
+				if continued, finalizeErr := finalizeImmediateInput(newItems...); finalizeErr != nil {
 					return nil, finalizeErr
 				} else if continued {
 					currentInput = recordAndPruneResponseCompaction(currentInput)
@@ -1469,7 +1383,6 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					}
 					continue
 				}
-				currentInput = currentInput[:len(currentInput)-len(newItems)]
 			}
 
 			// Record compaction stats and keep the pruned transcript: when
@@ -1493,23 +1406,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				return nil, fmt.Errorf("persist run-completed checkpoint: %w", err)
 			}
 
-			return &RunResult{
-				FinalOutput:                s.output,
-				LastAgent:                  currentAgent,
-				NewItems:                   allItems,
-				RawResponses:               allResponses,
-				InputGuardrailResults:      inputGuardrailResults,
-				OutputGuardrailResults:     outputGuardrailResults,
-				ToolInputGuardrailResults:  allToolInputResults,
-				ToolOutputGuardrailResults: allToolOutputResults,
-				ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-				Usage:                      runCtx.Usage,
-				// The final-output branch returns before this turn's newItems
-				// are folded into currentInput, so the continuation state is
-				// currentInput + newItems — pruned when the final response
-				// carried a provider compaction item.
-				FinalHistory: finalHistory,
-			}, nil
+			result := buildResult(s.output, finalHistory)
+			result.OutputGuardrailResults = outputGuardrailResults
+			return result, nil
 
 		case *handoffStep:
 			handoffSpan := NewSpan("handoff", spanParent, &HandoffSpanData{FromAgent: currentAgent.Name, ToAgent: s.target.Name})
@@ -1660,9 +1559,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 								"[SYSTEM] Your last %d tool turns all failed. Stop repeating the same approach. Re-read the error messages above carefully, then either: (1) try a fundamentally different approach or tool, (2) inspect the environment to understand why the calls fail, or (3) if the task is genuinely blocked, report the blocker and what you tried instead of retrying.",
 								consecutiveToolErrorTurns)},
 						}
-						currentInput = append(currentInput, escalation)
-						allItems = append(allItems, escalation)
-						emitRunItems(ctx, streamEvents, []RunItem{escalation})
+						inject(escalation)
 					}
 				}
 			}
@@ -1690,20 +1587,10 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					return nil, fmt.Errorf("persist approval checkpoint: %w", err)
 				}
 				retainToolOutput = true
-				return &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					Interruption:               interruptions[0],
-					Interruptions:              interruptions,
-					// currentInput already includes this turn's newItems and
-					// tool results; pending approvals are still unresolved.
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				result := buildResult(nil, currentInput)
+				result.Interruption = interruptions[0]
+				result.Interruptions = interruptions
+				return result, nil
 			}
 
 			if currentAgent.ToolUseBehavior == StopOnFirstTool || shouldStopAtTools(currentAgent, s.toolCalls) {
@@ -1727,20 +1614,9 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 				if err := emitDurableCheckpoint(ctx, cfg.Durable, &durableSequence, DurableBoundaryRunCompleted, currentAgent, currentInput, nil, runCtx.Usage); err != nil {
 					return nil, fmt.Errorf("persist tool-result completion checkpoint: %w", err)
 				}
-				return &RunResult{
-					FinalOutput:                finalOutput,
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					OutputGuardrailResults:     outputGuardrailResults,
-					Usage:                      runCtx.Usage,
-					// currentInput already includes this turn's newItems and
-					// tool results.
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				result := buildResult(finalOutput, currentInput)
+				result.OutputGuardrailResults = outputGuardrailResults
+				return result, nil
 			}
 
 			// Pause when a tool explicitly requests it or when the LLM called
@@ -1759,18 +1635,7 @@ func (r *Runner) run(ctx context.Context, agent *Agent, input []RunItem, cfg Run
 					return nil, fmt.Errorf("persist pause checkpoint: %w", err)
 				}
 				retainToolOutput = true
-				return &RunResult{
-					LastAgent:                  currentAgent,
-					NewItems:                   allItems,
-					RawResponses:               allResponses,
-					ToolInputGuardrailResults:  allToolInputResults,
-					ToolOutputGuardrailResults: allToolOutputResults,
-					ActionAuditRecords:         append([]ActionAuditRecord(nil), allActionAuditRecords...),
-					Usage:                      runCtx.Usage,
-					// currentInput already includes this turn's newItems and
-					// tool results (pause tools produce paired outputs).
-					FinalHistory: append([]RunItem(nil), currentInput...),
-				}, nil
+				return buildResult(nil, currentInput), nil
 			}
 		}
 	}

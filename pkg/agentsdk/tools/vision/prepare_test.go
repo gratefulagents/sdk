@@ -127,6 +127,27 @@ func TestPrepareImageRejectsNonImage(t *testing.T) {
 	}
 }
 
+func TestPrepareImageRejectsTruncatedSmallImages(t *testing.T) {
+	var jpegData bytes.Buffer
+	if err := jpeg.Encode(&jpegData, solidImage(40, 20), nil); err != nil {
+		t.Fatal(err)
+	}
+	for format, data := range map[string][]byte{
+		"png":  encodePNG(t, solidImage(40, 20)),
+		"jpeg": jpegData.Bytes(),
+	} {
+		t.Run(format, func(t *testing.T) {
+			truncated := data[:len(data)-10]
+			if _, _, err := image.DecodeConfig(bytes.NewReader(truncated)); err != nil {
+				t.Fatalf("fixture must have a valid header: %v", err)
+			}
+			if _, err := PrepareImage(truncated); err == nil {
+				t.Fatal("accepted truncated image with a valid header")
+			}
+		})
+	}
+}
+
 func TestIsImagePath(t *testing.T) {
 	for path, want := range map[string]bool{
 		"a.png": true, "b.JPG": true, "c.jpeg": true, "d.gif": true, "e.webp": true,

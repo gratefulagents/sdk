@@ -269,15 +269,9 @@ func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) 
 	// GPT-5.x / codex (non-spark) on Copilot/OpenAI are ~400K context (not the
 	// ~1M once assumed): trigger ~360K (90%), target ~200K (50%). Providers
 	// that genuinely expose ~1M are corrected upward by provider metadata.
-	case strings.HasPrefix(m, "gpt-5.5"):
-		return 360000, 200000
-	case strings.HasPrefix(m, "gpt-5.4"):
-		return 360000, 200000
-	case strings.HasPrefix(m, "gpt-5.3-codex"):
-		return 360000, 200000
-	case strings.HasPrefix(m, "gpt-5.2-codex"):
-		return 360000, 200000
-	case strings.HasPrefix(m, "gpt-5.2"), strings.HasPrefix(m, "gpt-5.1"):
+	case strings.HasPrefix(m, "gpt-5.5"), strings.HasPrefix(m, "gpt-5.4"),
+		strings.HasPrefix(m, "gpt-5.3-codex"), strings.HasPrefix(m, "gpt-5.2"),
+		strings.HasPrefix(m, "gpt-5.1"):
 		return 360000, 200000
 	// Claude Fable 5: 1M context on Copilot and Anthropic (models.dev).
 	// Provider /models limits under-report this deployment (claims a 200K
@@ -285,15 +279,6 @@ func CompactionDefaultsForModel(model string) (triggerTokens, targetTokens int) 
 	// resolver is authoritative; this static fallback matches it.
 	case strings.Contains(m, "fable"):
 		return 900000, 500000
-	// Claude Opus 4: 200K context → trigger at 180K, target 100K
-	case strings.Contains(m, "opus-4"):
-		return 180000, 100000
-	// Claude Sonnet 4: 200K context → trigger at 180K, target 100K
-	case strings.Contains(m, "sonnet-4"):
-		return 180000, 100000
-	// Claude Haiku: 200K context → trigger at 180K, target 100K
-	case strings.Contains(m, "haiku"):
-		return 180000, 100000
 	default:
 		return 180000, 100000
 	}
@@ -472,11 +457,8 @@ type RunConfig struct {
 	// disables both safeguards.
 	ModelCallTimeout time.Duration
 
-	// MaxRetainedToolImages bounds how many tool-output images (for example
-	// computer-use screenshots) stay in the conversation. Before each model
-	// call, images on older tool outputs are dropped oldest-first, in chunks of
-	// this size so the retained prefix stays stable for prompt caching. Pruning
-	// is permanent, so durable history shrinks too. 0 means unlimited.
+	// Deprecated: Runner retains only the latest three images across messages
+	// and tool outputs, regardless of this value. Persisted snapshots omit images.
 	MaxRetainedToolImages int
 }
 

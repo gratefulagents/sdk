@@ -17,7 +17,6 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/signal"
-	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
 
@@ -46,7 +45,7 @@ func RegistryCapabilities() []RegistryCapability {
 		{Family: "async-shell", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAsyncShellTools"}},
 		{Family: "signals", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithSignalTools"}},
 		{Family: "browser", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithBrowserTools"}},
-		{Family: "vision", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithReadFileImages", "WithVisionAnalyzer"}},
+		{Family: "vision", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithReadFileImages"}},
 		{Family: "interactive-terminal", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithInteractiveTerminal"}},
 		{Family: "think", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithThinkTool"}},
 		{Family: "attach-repository", Classification: RegistryCapabilityRuntimeBuiltIn, Options: []string{"WithAttachRepositoryTool"}},
@@ -69,7 +68,6 @@ type Registry struct {
 	disableWeb              bool
 	allowPrivateNetworkURLs bool
 	readFileImages          bool
-	visionAnalyzer          vision.AnalyzeWithDetailFn
 	memoryTool              *memorytool.Tool
 	lspTool                 *lsp.Tool
 	commandSandboxConfig    *sandbox.Config
@@ -152,12 +150,6 @@ func WithInteractiveTerminal() RegistryOption {
 // absolute path the Browser tool reports.
 func WithReadFileImages() RegistryOption {
 	return func(r *Registry) { r.readFileImages = true }
-}
-
-// WithVisionAnalyzer stores a host vision analyzer for tools that need text
-// analysis of images (for example desktop computer use). It registers no tool.
-func WithVisionAnalyzer(fn vision.AnalyzeWithDetailFn) RegistryOption {
-	return func(r *Registry) { r.visionAnalyzer = fn }
 }
 
 func WithMemoryStore(store sdkmemory.Store, namespace, sourceRun, repoURL string) RegistryOption {
@@ -338,14 +330,6 @@ func (r *Registry) WorkDir() string {
 		return ""
 	}
 	return r.workDir
-}
-
-// VisionAnalyzer returns the analyzer configured with WithVisionAnalyzer.
-func (r *Registry) VisionAnalyzer() vision.AnalyzeWithDetailFn {
-	if r == nil {
-		return nil
-	}
-	return r.visionAnalyzer
 }
 
 // Register adds a tool to the registry.

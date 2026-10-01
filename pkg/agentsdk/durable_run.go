@@ -143,6 +143,9 @@ func (s *StoredRun) checkpoint(ctx context.Context, cp DurableCheckpoint) error 
 	if errors.Is(s.leaseErr, durable.ErrLeaseLost) {
 		return fmt.Errorf("renew ownership: %w", s.leaseErr)
 	}
+	// Custom checkpoint producers can supply snapshots without going through
+	// SnapshotRunItems. Enforce attachment stripping at the storage boundary too.
+	cp.History = stripCheckpointImages(cp.History)
 	payload, err := json.Marshal(cp)
 	if err != nil {
 		return fmt.Errorf("encode checkpoint: %w", err)
@@ -217,4 +220,30 @@ func (s *StoredRun) Close(ctx context.Context) error {
 		s.lease = durable.Lease{}
 	}
 	return err
+}
+
+func stripCheckpointImages(items []LLMRunItemSnapshot) []LLMRunItemSnapshot {
+	var out []LLMRunItemSnapshot
+	for i, item := range items {
+		if len(item.MessageImages) == 0 && (item.ToolOutput == nil || len(item.ToolOutput.Images) == 0) {
+			continue
+		}
+		if out == nil {
+			out = append([]LLMRunItemSnapshot(nil), items...)
+		}
+		if len(item.MessageImages) > 0 {
+			out[i].MessageImages = nil
+			out[i].MessageText += "\n[image omitted]"
+		}
+		if item.ToolOutput != nil && len(item.ToolOutput.Images) > 0 {
+			value := *item.ToolOutput
+			value.Images = nil
+			value.Content += "\n[image omitted]"
+			out[i].ToolOutput = &value
+		}
+	}
+	if out == nil {
+		return items
+	}
+	return out
 }

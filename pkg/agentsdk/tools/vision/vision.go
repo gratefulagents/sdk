@@ -14,22 +14,6 @@ import (
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/web"
 )
 
-// AnalyzeFn performs vision analysis for a loaded image.
-type AnalyzeFn func(ctx context.Context, imageData []byte, mimeType, prompt string) (string, error)
-
-// AnalyzeWithDetailFn performs vision analysis for a loaded image with the
-// caller-requested image detail level.
-type AnalyzeWithDetailFn func(ctx context.Context, imageData []byte, mimeType, prompt, detailLevel string) (string, error)
-
-// AnalyzerConsumer is implemented by tools that need a host-supplied text
-// vision analyzer (for example a desktop computer-use tool). The runtime
-// builder offers its provider-backed analyzer to every consumer whose
-// VisionAnalyzer returns nil.
-type AnalyzerConsumer interface {
-	VisionAnalyzer() AnalyzeWithDetailFn
-	SetVisionAnalyzer(AnalyzeWithDetailFn)
-}
-
 // MaxImageFileSize bounds the bytes read for a single image before decoding.
 const MaxImageFileSize = 20 * 1024 * 1024
 

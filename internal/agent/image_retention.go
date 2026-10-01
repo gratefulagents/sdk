@@ -1,5 +1,7 @@
 package agent
 
+import "strings"
+
 // DefaultMaxRecentImages is how many of the most recent image attachments stay
 // in model context; older images are replaced with a text placeholder.
 const DefaultMaxRecentImages = 3
@@ -86,6 +88,9 @@ func retainTail(images []ImageAttachment, kept int) []ImageAttachment {
 }
 
 func appendPlaceholder(text, placeholder string) string {
+	if strings.HasSuffix(text, placeholder) {
+		return text
+	}
 	if text == "" {
 		return placeholder
 	}

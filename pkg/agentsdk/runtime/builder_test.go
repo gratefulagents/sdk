@@ -13,14 +13,12 @@ import (
 	sdkmode "github.com/gratefulagents/sdk/pkg/agentsdk/mode"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/policy"
 	sdkproviders "github.com/gratefulagents/sdk/pkg/agentsdk/providers"
-	sdkopenai "github.com/gratefulagents/sdk/pkg/agentsdk/providers/openai"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/sandbox"
 	sdktools "github.com/gratefulagents/sdk/pkg/agentsdk/tools"
 	sdkgit "github.com/gratefulagents/sdk/pkg/agentsdk/tools/git"
 	sdklsp "github.com/gratefulagents/sdk/pkg/agentsdk/tools/lsp"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/search"
 	"github.com/gratefulagents/sdk/pkg/agentsdk/tools/shell"
-	sdkvision "github.com/gratefulagents/sdk/pkg/agentsdk/tools/vision"
 )
 
 func TestProviderSpecDefaultsOpenAIToAPIKey(t *testing.T) {
@@ -483,144 +481,6 @@ func TestBuildToolBundleCanUseOnlyHostTools(t *testing.T) {
 	}
 	if len(bundle.Tools) != 1 || bundle.Tools[0].Name() != "host_tool" {
 		t.Fatalf("tools = %v, want only host_tool", toolNames(bundle.Tools))
-	}
-}
-
-func TestVisionModelCandidatesPrefersConfiguredModel(t *testing.T) {
-	cases := []struct {
-		name string
-		cfg  Config
-		want []string
-	}{
-		{
-			name: "openai parent model first with default fallback",
-			cfg:  Config{Provider: "openai", Model: "gpt-test-mini"},
-			want: []string{"gpt-test-mini", sdkopenai.DefaultChatModel},
-		},
-		{
-			name: "empty model falls back to default only",
-			cfg:  Config{Provider: "openai"},
-			want: []string{sdkopenai.DefaultChatModel},
-		},
-		{
-			name: "model equal to default is not duplicated",
-			cfg:  Config{Provider: "openai", Model: sdkopenai.DefaultChatModel},
-			want: []string{sdkopenai.DefaultChatModel},
-		},
-		{
-			name: "multi provider prefixes the fallback",
-			cfg:  Config{Provider: "multi", Model: "anthropic/claude-test"},
-			want: []string{"anthropic/claude-test", "openai/" + sdkopenai.DefaultChatModel},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := visionModelCandidates(tc.cfg)
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("visionModelCandidates = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-type visionConsumerTool struct {
-	agentsdk.Tool
-	analyzer sdkvision.AnalyzeWithDetailFn
-}
-
-func (t *visionConsumerTool) VisionAnalyzer() sdkvision.AnalyzeWithDetailFn { return t.analyzer }
-
-func (t *visionConsumerTool) SetVisionAnalyzer(fn sdkvision.AnalyzeWithDetailFn) { t.analyzer = fn }
-
-func newVisionConsumerTool() *visionConsumerTool {
-	return &visionConsumerTool{Tool: &agentsdk.FunctionTool{ToolName: "vision_consumer", ReadOnly: true}}
-}
-
-func TestBuildToolBundleWiresOpenAIVisionAnalyzer(t *testing.T) {
-	consumer := newVisionConsumerTool()
-	bundle, err := BuildToolBundle(context.Background(), Config{
-		Provider:            "openai",
-		APIKey:              "sk-test",
-		WorkDir:             t.TempDir(),
-		EnableTools:         true,
-		DisableDefaultTools: true,
-		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{consumer},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bundle.Tools) != 1 || bundle.Tools[0] != consumer {
-		t.Fatalf("tools = %v, want supplied consumer tool", toolNames(bundle.Tools))
-	}
-	if consumer.analyzer == nil {
-		t.Fatal("vision analyzer was not wired")
-	}
-}
-
-func TestBuildToolBundleSkipsVisionAnalyzerForIneligibleProvider(t *testing.T) {
-	consumer := newVisionConsumerTool()
-	_, err := BuildToolBundle(context.Background(), Config{
-		Provider:            "anthropic",
-		APIKey:              "sk-test",
-		WorkDir:             t.TempDir(),
-		EnableTools:         true,
-		DisableDefaultTools: true,
-		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{consumer},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if consumer.analyzer != nil {
-		t.Fatal("vision analyzer wired for a provider without image analysis")
-	}
-}
-
-func TestBuildToolBundleUsesConfiguredVisionAnalyzer(t *testing.T) {
-	consumer := newVisionConsumerTool()
-	_, err := BuildToolBundle(context.Background(), Config{
-		Provider:            "anthropic",
-		WorkDir:             t.TempDir(),
-		EnableTools:         true,
-		DisableDefaultTools: true,
-		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{consumer},
-		VisionAnalyzer: func(context.Context, []byte, string, string, string) (string, error) {
-			return "configured", nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if consumer.analyzer == nil {
-		t.Fatal("configured analyzer was not wired")
-	}
-	if got, err := consumer.analyzer(context.Background(), nil, "", "", "high"); err != nil || got != "configured" {
-		t.Fatalf("analyzer = %q, %v; want configured nil", got, err)
-	}
-}
-
-func TestBuildToolBundleDoesNotOverrideCustomVisionAnalyzer(t *testing.T) {
-	consumer := newVisionConsumerTool()
-	consumer.analyzer = func(context.Context, []byte, string, string, string) (string, error) {
-		return "custom", nil
-	}
-	_, err := BuildToolBundle(context.Background(), Config{
-		Provider:            "openai",
-		APIKey:              "sk-test",
-		WorkDir:             t.TempDir(),
-		EnableTools:         true,
-		DisableDefaultTools: true,
-		DisableSignalTools:  true,
-		ExtraTools:          []agentsdk.Tool{consumer},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := consumer.analyzer(context.Background(), nil, "", "", "high")
-	if err != nil || got != "custom" {
-		t.Fatalf("custom analyzer = %q, %v; want custom nil", got, err)
 	}
 }
 

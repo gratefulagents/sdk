@@ -220,6 +220,16 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 		return nil
 	}
 
+	// Approval settlement changes the continuation, not just NewItems. Return
+	// the paired history and clear resolved interruptions on every exit.
+	settledResult := func(result *RunResult) *RunResult {
+		combined := combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+		combined.FinalHistory = append([]RunItem(nil), history...)
+		combined.Interruption = nil
+		combined.Interruptions = nil
+		return combined
+	}
+
 	for rounds := 0; ; rounds++ {
 		// A durable resume restores the checkpoint's usage into the run, so
 		// only the usage above it is new to this loop.
@@ -274,7 +284,7 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			// tool_use with a denied approval and error output so the
 			// persisted history stays replayable.
 			err := settle(denyPendingInterruptions(pending, "tool call denied: no approval gate configured"), "denied approval")
-			combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+			combined = settledResult(result)
 			if err != nil {
 				return combined, err
 			}
@@ -285,7 +295,7 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			if err := settle(denyPendingInterruptions(pending, "tool call not executed: "+limitErr.Error()), "denied approval"); err != nil {
 				limitErr = errors.Join(limitErr, err)
 			}
-			combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+			combined = settledResult(result)
 			return combined, limitErr
 		}
 		// Resolve every pending approval from the turn: parallel tool
@@ -322,7 +332,7 @@ func (l *ChatLoop) Run(ctx context.Context) (*RunResult, error) {
 			stalledRounds++
 		}
 		settleErr := settle(items, "approval")
-		combined = combineLoopResult(result, allNewItems, allResponses, allToolInputResults, allToolOutputResults, totalUsage)
+		combined = settledResult(result)
 		if resolveErr != nil || settleErr != nil {
 			return combined, errors.Join(resolveErr, settleErr)
 		}

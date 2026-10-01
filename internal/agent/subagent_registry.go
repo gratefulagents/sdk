@@ -1636,6 +1636,7 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	var agent *Agent
 	var taskCtx context.Context
 	var cancel context.CancelFunc
+	launched := false
 	if !completedResume {
 		agent = r.agents[entry.task.AgentName]
 		if agent == nil {
@@ -1643,6 +1644,11 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 			return fmt.Errorf("%w: task %q agent %q is not configured", ErrSubAgentResumeRejected, taskID, entry.task.AgentName)
 		}
 		taskCtx, cancel = context.WithCancel(context.Background())
+		defer func() {
+			if !launched {
+				cancel()
+			}
+		}()
 	}
 	entry.securityBaseline = currentSecurity
 	entry.task.Error = ""
@@ -1663,9 +1669,6 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	r.mu.Unlock()
 
 	if err := r.persistSchedulerCheckpointLocked(); err != nil {
-		if cancel != nil {
-			cancel()
-		}
 		r.mu.Lock()
 		if current, exists := r.tasks[taskID]; exists && current.generation == transitionGeneration {
 			current.task = previousTask
@@ -1691,11 +1694,15 @@ func (r *SubAgentRegistry) ResumeRestoredTask(ctx context.Context, taskID string
 	current, launch := r.tasks[taskID]
 	launch = launch && current.generation == transitionGeneration && current.task.Status == SubAgentTaskPending
 	if launch {
-		go r.runTask(taskCtx, taskID, parentCallID, agent, taskSnapshot.Message, current.parentContext, childAccess, snap, resume, trace, processor, parentSpanID)
+		parentContext := current.parentContext
+		go func() {
+			defer cancel()
+			r.runTask(taskCtx, taskID, parentCallID, agent, taskSnapshot.Message, parentContext, childAccess, snap, resume, trace, processor, parentSpanID)
+		}()
+		launched = true
 	}
 	r.mu.Unlock()
 	if !launch {
-		cancel()
 		return nil
 	}
 	r.signalChangeWithoutCheckpoint()

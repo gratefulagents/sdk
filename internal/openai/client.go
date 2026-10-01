@@ -779,29 +779,6 @@ func (c *Client) CreateMessage(ctx context.Context, req anthropic.CreateMessageR
 	return out, nil
 }
 
-// AnalyzeImage sends a single image plus prompt through the OpenAI Responses
-// image-input path and returns the assembled assistant message.
-func (c *Client) AnalyzeImage(ctx context.Context, model, imageURL, prompt, detail string) (*anthropic.CreateMessageResponse, error) {
-	if c == nil {
-		return nil, errors.New("openai client is nil")
-	}
-	params, err := imageAnalysisResponseParams(model, imageURL, prompt, detail)
-	if err != nil {
-		return nil, err
-	}
-
-	var out *anthropic.CreateMessageResponse
-	err = c.doWithRetry(ctx, func(ctx context.Context) error {
-		var callErr error
-		out, callErr = c.createViaResponses(ctx, params)
-		return callErr
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *Client) shouldUseResponsesFirst(model string) bool {
 	_ = model
 	return c.apiMode != apiModeChat
@@ -1153,56 +1130,6 @@ func toResponseParams(req anthropic.CreateMessageRequest) (responses.ResponseNew
 	params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention("24h")
 
 	return params, nil
-}
-
-func imageAnalysisResponseParams(model, imageURL, prompt, detail string) (responses.ResponseNewParams, error) {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		model = DefaultChatModel
-	}
-	imageURL = strings.TrimSpace(imageURL)
-	if imageURL == "" {
-		return responses.ResponseNewParams{}, fmt.Errorf("image URL is required")
-	}
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return responses.ResponseNewParams{}, fmt.Errorf("prompt is required")
-	}
-
-	imageContent := responses.ResponseInputContentParamOfInputImage(normalizeImageAnalysisDetail(detail))
-	imageContent.OfInputImage.ImageURL = param.NewOpt(imageURL)
-	content := responses.ResponseInputMessageContentListParam{
-		responses.ResponseInputContentParamOfInputText(prompt),
-		imageContent,
-	}
-
-	params := responses.ResponseNewParams{
-		Model:           model,
-		MaxOutputTokens: sdk.Int(4096),
-		Input: responses.ResponseNewParamsInputUnion{
-			OfInputItemList: responses.ResponseInputParam{
-				responses.ResponseInputItemParamOfMessage(content, responses.EasyInputMessageRoleUser),
-			},
-		},
-	}
-	params.Instructions = sdk.String("Analyze the image and answer the user's prompt. Be concise and specific.")
-	params.Truncation = responses.ResponseNewParamsTruncation("auto")
-	params.Store = sdk.Bool(false)
-	params.PromptCacheRetention = responses.ResponseNewParamsPromptCacheRetention("in_memory")
-	return params, nil
-}
-
-func normalizeImageAnalysisDetail(detail string) responses.ResponseInputImageDetail {
-	switch strings.ToLower(strings.TrimSpace(detail)) {
-	case "low":
-		return responses.ResponseInputImageDetailLow
-	case "original":
-		return responses.ResponseInputImageDetailOriginal
-	case "auto":
-		return responses.ResponseInputImageDetailAuto
-	default:
-		return responses.ResponseInputImageDetailHigh
-	}
 }
 
 func toCompactParams(req anthropic.CreateMessageRequest, includeCodexExtras bool) (responses.ResponseCompactParams, error) {
